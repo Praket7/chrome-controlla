@@ -33,9 +33,9 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-07 | partial | 3 | bounded wait and durable state tested with local async fixture; no Promise/CDP/bridge worker route or reconnecting MCP client |
 | CC-08 | unimplemented | 5 | none |
 | CC-09 | partial | 2/4 | target/frame/browser revisions and stale-handle fixtures pass; Phase 4 guard compares caller-supplied identity/dependency snapshots; no authoritative app identity observer |
-| CC-10 | partial | 4 | typed snapshot guard yields on identity/dependency mismatch; fixture checks only compare snapshots. No DOM event stream / check-dispatch race injection or measured browser dispatch window; unsafe mutation prevention remains unqualified |
-| CC-11 | partial | 4 | strict-background guard returns `NeedsForeground` before the injected dispatch callback when native routing is required; OS focus/cursor/clipboard isolation unverified |
-| CC-12 | partial | 4 | typed action variants and Unicode fixture value echo exist; no real input dispatch, semantic locator resolution, masked/contenteditable/event-dependent/click/drag postcondition fixtures |
+| CC-10 | partial | 4 | deterministic CDP websocket fixture mutates target navigation after final pre-dispatch check; next write command is withheld. Fixture measured probe-to-fill arrival at 2773 us in the recorded run; real Chrome/page handlers remain non-atomic |
+| CC-11 | partial | 4 | strict-background mouse input returns `NeedsForeground`; text uses page/CDP-only routes. No OS focus/cursor/clipboard observer, so native isolation remains unverified |
+| CC-12 | partial | 4 | revision-bound CDP fill/insert/sequential-key commands, exact locator matching, text readback, click and drag with declared predicates tested against websocket fixtures; installed Chrome 154 headless verifies ordinary input fill/insert/ASCII keys and value/caret readback; masks, IME/contenteditable, overlays, real drag/canvas remain unqualified |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
 | CC-14 | unimplemented | 6 | none |
 | CC-15 | unimplemented | 5 | none |
@@ -57,9 +57,9 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B07 | fixture_verified | 3 | independent fixture endpoint effect remains one after lost reply; replay traverses dispatch gate and is refused; recovery preserves acknowledged delivery as sent, while claim-before-send crash remains unknown with zero effects |
 | B08 | fixture_verified | 2 | closed/reused target references rejected; fresh target identity required |
 | B09 | partial | 4 | caller account revision mismatch yields before fixture dispatch; no live account switch observer |
-| B10 | partial | 4 | dependency snapshot mismatch yields; no live field edit detection or input value fixture |
+| B10 | partial | 4 | account/dependency snapshot mismatch yields before CDP call; race fixture withholds next write after navigation event; no authoritative in-page user-edit observer |
 | B11 | partial | 4 | unchanged dependency snapshot permits continuation; no semantic DOM churn observer or sound unrelated-change exclusion evidence |
-| B12 | partial | 4 | external-change invalidation type fixture only; no geometry/hit-target recheck or overlay interception fixture |
+| B12 | partial | 4 | click/drag check fresh element geometry and hit target at source/destination points; mock CDP fixture does not evaluate real overlay interception |
 | B13 | fixture_verified | 2 | frame navigation/revision and OOPIF replacement fixtures |
 | B14 | unimplemented | 5 | none |
 | B15 | unimplemented | 5 | none |
@@ -69,10 +69,10 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B19 | partial | 3 | persisted deadline survives reopen; queued expiry is failed/deadline_error/not_sent; dispatched expiry is unknown while preserving acknowledged sent or unacknowledged unknown delivery; real Promise and worker cancellation route remain absent |
 | B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
 | B21 | fixture_verified | 2 | concurrent mutations for the same shared document serialize |
-| B22 | partial | 4 | Unicode typed value fixture only; masked input, grapheme/IME, contenteditable and event-dependent behavior unverified |
-| B23 | partial | 4 | drag is represented as a typed action only; no fresh geometry or DOM/canvas result fixture |
-| B24 | partial | 4 | strict-background native-required route yields before dispatch callback; no OS clipboard observer, so isolation unverified |
-| B25 | partial | 4 | strict-background native-required route yields before dispatch callback; no OS focus/cursor observer, so isolation unverified |
+| B22 | partial | 4 | Unicode fill, insert and sequential-key routes pass mock CDP fixtures; installed Chrome ordinary text input verifies `héllo 👋λa` and caret position after fill/insert/ASCII typing; masks, contenteditable, IME, and event-dependent behavior remain unsupported/unverified |
+| B23 | partial | 4 | drag dispatch is gated on refreshed source/destination geometry and a declared final bounds predicate; fixture verifies command sequence/predicate response, not real DOM movement or canvas semantics |
+| B24 | partial | 4 | no system clipboard route is called by input implementation; no independent OS clipboard observer, so unchanged state is unverified |
+| B25 | partial | 4 | strict-background mouse actions return `NeedsForeground`; text focus is page-level. OS focus/cursor remain unobserved |
 | B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
 | B27 | unimplemented | 6 | none |
 | B28 | unimplemented | 7 | none |
@@ -83,7 +83,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B33 | unimplemented | 5 | none |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
-| B36 | partial | 4 | strict-background native-required route reports NeedsForeground; no native-dialog fixture or platform observer |
+| B36 | partial | 4 | unqualified mouse/native route reports `NeedsForeground`; no native-dialog fixture or platform observer |
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 
@@ -216,6 +216,19 @@ Sol approved the local journal gate after reviewing two correction rounds. Tests
 | `cargo test -p controlla-browser --locked --offline input::tests` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 4 typed snapshot/action-callback tests pass, including caller-revision mismatch, strict-background fail-closed behavior, Unicode fixture value echo, and invalidation; no browser DOM dispatch |
 | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 68 passed, 1 ignored in browser unit tests; 7 phase2 integration, 3 runtime unit, 8 CLI, 10 jobs, 3 registry integration tests passed; formatting and Clippy clean |
 | `npm run check:provenance && node scripts/check-doc-links.mjs && git diff --check` | pass | macOS 26 | 13 extraction digests and 22 retained tests verified; 14 Markdown files checked; no whitespace errors |
-| Red-first evidence | not recorded | Phase 4 implementation history | New tests were run after implementation; no pre-implementation failing execution is claimed |
+| Red-first evidence | pass | installed Chrome fixture | Initial smoke failed with `input fixture navigation did not create a frame` and an empty frame graph because targets created after connection bootstrap had not enabled Page/Runtime. After provider launch bootstrapped the attached target session, the same real Chrome fixture passed with DOM value/caret readback. Earlier callback-only tests still have no pre-implementation RED run. |
 
-The input module is a guard/data model only. `SemanticLocator` is not resolved against a DOM; `perform_input` calls an injected fixture callback and does not issue CDP input. No actual masked/contenteditable/IME/event-dependent input, click/drag geometry/hit revalidation, overlay/frame swap dispatch race, or race-window measurement exists. Native focus/cursor/clipboard isolation is unverified. This is partial Phase 4 progress, not acceptance completion.
+This entry records the initial guard-only commit and is superseded by the Phase 4 continuation entry below. Native focus/cursor/clipboard isolation remains unverified.
+
+
+## Phase 4 CDP input continuation — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --locked --offline guarded_text_actions_use_revision_bound_cdp_and_race_yields -- --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | websocket fixture exercised guarded fill of `héllo 👋`, `Input.insertText`, sequential ASCII keyDown/char/keyUp, click and drag CDP sequences, text readbacks, click value and drag bounds postconditions; strict-background click returned `NeedsForeground`; navigation injected after the final focus check caused the next write to be withheld. Probe-to-fill request arrival measured 2773 us in this run. Separate installed Chrome 154.0.8037.98 headless DOM fixture passed revision-bound fill, insert, and ASCII sequential keys; actual readback was `héllo 👋λa` and UTF-16 caret position 10. Does not qualify masks, IME/contenteditable variants, canvas, or native state. |
+| `cargo test -p controlla-browser --locked --offline input::tests` | pass | macOS 26 / Darwin 25.6 arm64 | 5 focused guard tests: navigation/account/document/dependency invalidation, strict-background native requirement, zero/multiple locator failure, external invalidation, and UTF-16 selection replacement behavior |
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | formatting and warning-free Clippy; full workspace test counts recorded in continuation report |
+
+Text dispatch supports ordinary input and textarea controls only; sequential typing is printable ASCII only. IME and masked/contenteditable/event-dependent inputs remain unqualified. Click/drag require explicit predicates; drag verifies final DOM bounding-box coordinates only. Canvas object movement is unqualified. Check and remote effect are still non-atomic: navigation is observed in the fixture before the mutation request, but a page-side event or remote state change can happen after the last local reference check and before/while Chrome processes the request. Native OS focus/cursor/clipboard isolation is not claimed.
+
+| `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome 154.0.8037.98 | Isolated headless Chrome opened a local `data:` input fixture; guarded fill, insert, and sequential ASCII key dispatch all reported verified readback. Final DOM value `héllo 👋λa`; `selectionStart=10` UTF-16 code units. The ignored test disables preserve-on-drop for failure cleanup and shuts down the isolated profile explicitly on success. This covers ordinary `<input type=text>` only. |

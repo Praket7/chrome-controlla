@@ -3,21 +3,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum SemanticLocator {
-    RoleName { role: String, name: String },
-    Label(String),
-    Placeholder(String),
-    TestId(String),
-    Css(String),
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub type SemanticLocator = super::Locator;
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputAction {
     Fill(String),
     Insert(String),
     SequentialKeys(String),
-    Click { x: f64, y: f64 },
-    Drag { from: (f64, f64), to: (f64, f64) },
+    Click {
+        x: f64,
+        y: f64,
+        postcondition: ClickPostcondition,
+    },
+    Drag {
+        from: (f64, f64),
+        to: (f64, f64),
+        postcondition: DragPostcondition,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ClickPostcondition {
+    ActiveElement,
+    Value(String),
+    Attribute { name: String, value: String },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DragPostcondition {
+    pub left: f64,
+    pub top: f64,
+    pub tolerance: f64,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuardDecision {
@@ -37,10 +50,433 @@ pub struct GuardSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvalidationSet(pub BTreeSet<String>);
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DispatchEvidence {
-    pub accepted: bool,
-    pub observed_value: Option<String>,
-    pub route: &'static str,
+pub enum InputOutcome {
+    Applied {
+        observed_value: Option<String>,
+        postcondition_verified: bool,
+        elapsed_micros: u128,
+    },
+    Unsupported(&'static str),
+    NeedsForeground,
+}
+pub struct GuardedInput<'a> {
+    pub expected: &'a GuardSnapshot,
+    pub current: &'a GuardSnapshot,
+    pub locator: &'a SemanticLocator,
+    pub action: &'a InputAction,
+    pub expected_value: &'a str,
+}
+
+fn resolve_element_script(locator: &SemanticLocator) -> Result<String, super::BrowserError> {
+    let v = serde_json::to_string(locator)
+        .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+    Ok(format!(
+        r#"(()=>{{const l={v};let es=[];if(l.Css)es=[...document.querySelectorAll(l.Css)];else if(l.TestId)es=[...document.querySelectorAll('[data-testid]')].filter(e=>e.getAttribute('data-testid')===l.TestId);else if(l.Placeholder)es=[...document.querySelectorAll('[placeholder]')].filter(e=>e.getAttribute('placeholder')===l.Placeholder);else if(l.Label)es=[...document.querySelectorAll('label')].filter(e=>e.innerText.trim()===l.Label).map(e=>e.control).filter(Boolean);else if(l.Text)es=[...document.querySelectorAll('button,a,[role],label,[data-testid]')].filter(e=>e.innerText.trim()===l.Text);else if(l.AltText)es=[...document.querySelectorAll('[alt]')].filter(e=>e.getAttribute('alt')===l.AltText);else if(l.Href)es=[...document.querySelectorAll('a[href]')].filter(e=>e.getAttribute('href').includes(l.Href));else if(l.RoleName)es=[...document.querySelectorAll('[role],button,input,textarea,a')].filter(e=>(e.getAttribute('role')||({{BUTTON:'button',INPUT:'textbox',TEXTAREA:'textbox',A:'link'}}[e.tagName])||'')===l.RoleName.role&&(e.getAttribute('aria-label')||e.innerText||e.value||'').trim()===l.RoleName.name);if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match',count:es.length}};return {{ok:true,e:es[0]}};}})()"#
+    ))
+}
+
+fn locator_script(locator: &SemanticLocator) -> Result<String, super::BrowserError> {
+    let resolve = resolve_element_script(locator)?;
+    Ok(format!(
+        r#"(()=>{{const r={resolve};if(!r.ok)return r;const e=r.e,b=e.getBoundingClientRect(),s=getComputedStyle(e),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);return {{ok:true,count:1,tag:e.tagName,type:e.type||'',editable:e.isContentEditable,disabled:!!e.disabled,visible:b.width>0&&b.height>0&&s.visibility!=='hidden'&&s.display!=='none',hit:!!h&&(h===e||e.contains(h)),value:e.value??'',selectionStart:e.selectionStart,selectionEnd:e.selectionEnd}};}})()"#
+    ))
+}
+
+fn click_postcondition_script(
+    locator: &SemanticLocator,
+    condition: &ClickPostcondition,
+) -> Result<String, super::BrowserError> {
+    let resolve = resolve_element_script(locator)?;
+    let predicate = match condition {
+        ClickPostcondition::ActiveElement => "document.activeElement===e".to_owned(),
+        ClickPostcondition::Value(value) => format!(
+            "(e.value??e.innerText??'')==={}",
+            serde_json::to_string(value)
+                .map_err(|x| super::BrowserError::InvalidResponse(x.to_string()))?
+        ),
+        ClickPostcondition::Attribute { name, value } => format!(
+            "e.getAttribute({})==={}",
+            serde_json::to_string(name)
+                .map_err(|x| super::BrowserError::InvalidResponse(x.to_string()))?,
+            serde_json::to_string(value)
+                .map_err(|x| super::BrowserError::InvalidResponse(x.to_string()))?
+        ),
+    };
+    Ok(format!(
+        "(()=>{{const r={resolve};if(!r.ok)return false;const e=r.e;return {predicate};}})()"
+    ))
+}
+
+fn drag_postcondition_script(
+    locator: &SemanticLocator,
+    condition: DragPostcondition,
+) -> Result<String, super::BrowserError> {
+    let resolve = resolve_element_script(locator)?;
+    if !condition.left.is_finite()
+        || !condition.top.is_finite()
+        || !condition.tolerance.is_finite()
+        || condition.tolerance < 0.0
+    {
+        return Err(super::BrowserError::InvalidResponse(
+            "drag postcondition bounds must be finite with non-negative tolerance".into(),
+        ));
+    }
+    Ok(format!(
+        r#"(()=>{{const r={resolve};if(!r.ok)return false;const b=r.e.getBoundingClientRect();return Math.abs(b.left-{})<={}&&Math.abs(b.top-{})<={};}})()"#,
+        condition.left, condition.tolerance, condition.top, condition.tolerance
+    ))
+}
+
+fn validate_match_result(value: &serde_json::Value) -> Result<(), super::BrowserError> {
+    if value["ok"] == true && value["count"] == 1 {
+        Ok(())
+    } else if value["reason"] == "ambiguous" || value["count"].as_u64().is_some_and(|n| n > 1) {
+        Err(super::BrowserError::StaleReference(
+            "ambiguous semantic locator".into(),
+        ))
+    } else {
+        Err(super::BrowserError::StaleReference(
+            "semantic locator has no match".into(),
+        ))
+    }
+}
+
+fn replacement_value(before: &str, start: u64, end: u64, inserted: &str) -> Option<String> {
+    let units: Vec<u16> = before.encode_utf16().collect();
+    let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
+    if start > end || end > units.len() {
+        return None;
+    }
+    let prefix = String::from_utf16(&units[..start]).ok()?;
+    let suffix = String::from_utf16(&units[end..]).ok()?;
+    Some(format!("{prefix}{inserted}{suffix}"))
+}
+
+impl super::BrowserConnection {
+    /// Resolve one locator and dispatch supported text input through the guarded CDP target route.
+    /// Page scripts can still mutate state between any validation and its remote effect.
+    pub async fn perform_guarded_input(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+        input: GuardedInput<'_>,
+    ) -> Result<InputOutcome, super::BrowserError> {
+        let GuardedInput {
+            expected,
+            current,
+            locator,
+            action,
+            expected_value,
+        } = input;
+        if expected.strict_background && current.requires_native {
+            return Ok(InputOutcome::NeedsForeground);
+        }
+        if expected.strict_background
+            && matches!(action, InputAction::Click { .. } | InputAction::Drag { .. })
+        {
+            return Ok(InputOutcome::NeedsForeground);
+        }
+        if validate_step(expected, current) != GuardDecision::Allow {
+            return Err(super::BrowserError::StaleReference(
+                "input guard changed".into(),
+            ));
+        }
+        locator.validate()?;
+        if matches!(locator, SemanticLocator::BackendNodeId(_)) {
+            return Ok(InputOutcome::Unsupported(
+                "backend node locators need an independently validated DOM node route",
+            ));
+        }
+        let start = Instant::now();
+        let probe = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.evaluate", serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true,"awaitPromise":false})).await?;
+        let p = &probe["result"]["value"];
+        validate_match_result(p)?;
+        if p["value"].as_str() != Some(expected_value) {
+            return Err(super::BrowserError::StaleReference(
+                "field value changed since the guarded plan".into(),
+            ));
+        }
+        if p["visible"] != true || p["disabled"] == true {
+            return Err(super::BrowserError::StaleReference(
+                "input target is not actionable".into(),
+            ));
+        }
+        let value = match action {
+            InputAction::Fill(v) | InputAction::Insert(v) | InputAction::SequentialKeys(v) => {
+                Some(v.as_str())
+            }
+            InputAction::Click { .. } | InputAction::Drag { .. } => None,
+        };
+        let expected_value = match action {
+            InputAction::Fill(text) => Some(text.clone()),
+            InputAction::Insert(text) | InputAction::SequentialKeys(text) => {
+                let (Some(before), Some(start), Some(end)) = (
+                    p["value"].as_str(),
+                    p["selectionStart"].as_u64(),
+                    p["selectionEnd"].as_u64(),
+                ) else {
+                    return Ok(InputOutcome::Unsupported(
+                        "input selection range is unavailable",
+                    ));
+                };
+                let Some(result) = replacement_value(before, start, end, text) else {
+                    return Ok(InputOutcome::Unsupported(
+                        "insertion splits an unsupported UTF-16 selection boundary",
+                    ));
+                };
+                Some(result)
+            }
+            _ => None,
+        };
+        let tag = p["tag"].as_str().unwrap_or_default();
+        let typ = p["type"].as_str().unwrap_or_default();
+        let contenteditable = p["editable"] == true;
+        if value.is_some()
+            && (contenteditable
+                || !matches!(
+                    (tag, typ),
+                    ("TEXTAREA", _) | ("INPUT", "text" | "search" | "email" | "url" | "tel")
+                ))
+        {
+            return Ok(InputOutcome::Unsupported(
+                "only ordinary text inputs and textareas are qualified",
+            ));
+        }
+        let resolve = resolve_element_script(locator)?;
+        let focused = if value.is_some() {
+            self.target_ref_command(sessions,reference,principal,revisions,"Runtime.evaluate",serde_json::json!({"expression":format!("(()=>{{const r={resolve};if(!r.ok)return false;r.e.focus();return document.activeElement===r.e;}})()"),"returnByValue":true})).await?
+        } else {
+            serde_json::json!({"result":{"value":true}})
+        };
+        if focused["result"]["value"] != true {
+            return Err(super::BrowserError::StaleReference(
+                "target became ambiguous or could not be focused in page".into(),
+            ));
+        }
+        if matches!(action, InputAction::SequentialKeys(s) if !s.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+        {
+            return Ok(InputOutcome::Unsupported(
+                "sequential key events support ASCII only; use fill or insert for Unicode text",
+            ));
+        }
+        let valid_point = |x: f64, y: f64| x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0;
+        if let Some((x, y)) = match action {
+            InputAction::Click { x, y, .. } => Some((*x, *y)),
+            InputAction::Drag { from, .. } => Some(*from),
+            _ => None,
+        } {
+            if !valid_point(x, y) {
+                return Err(super::BrowserError::InvalidResponse(
+                    "mouse coordinates must be finite and non-negative".into(),
+                ));
+            }
+            let check = format!(
+                "(()=>{{const r={resolve};if(!r.ok||{x}>=innerWidth||{y}>=innerHeight)return false;const e=r.e,b=e.getBoundingClientRect(),h=document.elementFromPoint({x},{y});return b.width>0&&b.height>0&&{x}>=b.left&&{x}<=b.right&&{y}>=b.top&&{y}<=b.bottom&&!!h&&(h===e||e.contains(h));}})()"
+            );
+            let valid = self
+                .target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":check,"returnByValue":true}),
+                )
+                .await?;
+            if valid["result"]["value"] != true {
+                return Err(super::BrowserError::StaleReference(
+                    "click/drag geometry or hit target changed".into(),
+                ));
+            }
+        }
+        if let InputAction::Drag { to: (x, y), .. } = action {
+            if !valid_point(*x, *y) {
+                return Err(super::BrowserError::InvalidResponse(
+                    "mouse coordinates must be finite and non-negative".into(),
+                ));
+            }
+            let check = format!(
+                "(()=>{{const r={resolve};if(!r.ok||{x}>=innerWidth||{y}>=innerHeight)return false;const e=r.e,b=e.getBoundingClientRect(),h=document.elementFromPoint({x},{y});return b.width>0&&b.height>0&&{x}>=b.left&&{x}<=b.right&&{y}>=b.top&&{y}<=b.bottom&&!!h&&(h===e||e.contains(h));}})()"
+            );
+            let valid = self
+                .target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":check,"returnByValue":true}),
+                )
+                .await?;
+            if valid["result"]["value"] != true {
+                return Err(super::BrowserError::StaleReference(
+                    "drag destination geometry or hit target changed".into(),
+                ));
+            }
+        }
+        if value.is_some() {
+            let latest = self
+                .target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true}),
+                )
+                .await?;
+            if latest["result"]["value"]["value"].as_str() != Some(input.expected_value) {
+                return Err(super::BrowserError::StaleReference(
+                    "field value changed in the guard-to-dispatch window".into(),
+                ));
+            }
+        }
+        // Give already-arrived lifecycle events a scheduling turn before the
+        // next target_ref_command performs its final revision check.
+        tokio::task::yield_now().await;
+        match action {
+            InputAction::Fill(text) => {
+                let text = serde_json::to_string(text)
+                    .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+                let expression = format!(
+                    r#"(() => {{const r={resolve};if(!r.ok)return false;const e=r.e,d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');d?.set?.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()"#
+                );
+                let sent = self
+                    .target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Runtime.evaluate",
+                        serde_json::json!({"expression":expression,"returnByValue":true}),
+                    )
+                    .await?;
+                if sent["result"]["value"] != true {
+                    return Err(super::BrowserError::StaleReference(
+                        "target changed before fill".into(),
+                    ));
+                }
+            }
+            InputAction::Insert(text) => {
+                self.target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Input.insertText",
+                    serde_json::json!({"text":text}),
+                )
+                .await?;
+            }
+            InputAction::SequentialKeys(text) => {
+                for c in text.chars() {
+                    self.target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({"type":"keyDown","key":c.to_string()}),
+                    )
+                    .await?;
+                    self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchKeyEvent",serde_json::json!({"type":"char","text":c.to_string(),"unmodifiedText":c.to_string()})).await?;
+                    self.target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({"type":"keyUp","key":c.to_string()}),
+                    )
+                    .await?;
+                }
+            }
+            InputAction::Click {
+                x,
+                y,
+                postcondition,
+            } => {
+                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1})).await?;
+                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1})).await?;
+                let expression = click_postcondition_script(locator, postcondition)?;
+                let result = self
+                    .target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Runtime.evaluate",
+                        serde_json::json!({"expression":expression,"returnByValue":true}),
+                    )
+                    .await?;
+                if result["result"]["value"] != true {
+                    return Err(super::BrowserError::InvalidResponse(
+                        "click postcondition failed".into(),
+                    ));
+                }
+                return Ok(InputOutcome::Applied {
+                    observed_value: None,
+                    postcondition_verified: true,
+                    elapsed_micros: start.elapsed().as_micros(),
+                });
+            }
+            InputAction::Drag {
+                from,
+                to,
+                postcondition,
+            } => {
+                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mousePressed","x":from.0,"y":from.1,"button":"left","buttons":1,"clickCount":1})).await?;
+                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseMoved","x":to.0,"y":to.1,"button":"left","buttons":1})).await?;
+                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseReleased","x":to.0,"y":to.1,"button":"left","buttons":0,"clickCount":1})).await?;
+                let expression = drag_postcondition_script(locator, *postcondition)?;
+                let result = self
+                    .target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Runtime.evaluate",
+                        serde_json::json!({"expression":expression,"returnByValue":true}),
+                    )
+                    .await?;
+                if result["result"]["value"] != true {
+                    return Err(super::BrowserError::InvalidResponse(
+                        "drag position postcondition failed".into(),
+                    ));
+                }
+                return Ok(InputOutcome::Applied {
+                    observed_value: None,
+                    postcondition_verified: true,
+                    elapsed_micros: start.elapsed().as_micros(),
+                });
+            }
+        }
+        let readback = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true}),
+            )
+            .await?;
+        let observed = readback["result"]["value"]["value"]
+            .as_str()
+            .map(str::to_owned);
+        if observed != expected_value {
+            return Err(super::BrowserError::InvalidResponse(
+                "input postcondition did not match requested value".into(),
+            ));
+        }
+        Ok(InputOutcome::Applied {
+            observed_value: observed,
+            postcondition_verified: true,
+            elapsed_micros: start.elapsed().as_micros(),
+        })
+    }
 }
 
 pub fn validate_step(expected: &GuardSnapshot, current: &GuardSnapshot) -> GuardDecision {
@@ -65,31 +501,6 @@ pub fn on_external_change(event: Option<&str>) -> InvalidationSet {
             .unwrap_or_default(),
     )
 }
-pub fn perform_input<F>(
-    expected: &GuardSnapshot,
-    current: &GuardSnapshot,
-    action: &InputAction,
-    dispatch: F,
-) -> Result<DispatchEvidence, GuardDecision>
-where
-    F: FnOnce(&InputAction) -> DispatchEvidence,
-{
-    let decision = validate_step(expected, current);
-    if decision != GuardDecision::Allow {
-        return Err(decision);
-    }
-    // The check/dispatch gap is necessarily non-atomic with page event handlers and remote effects.
-    Ok(dispatch(action))
-}
-pub fn measure_check_dispatch_race<F>(check: F) -> u128
-where
-    F: FnOnce(),
-{
-    let at = Instant::now();
-    check();
-    at.elapsed().as_micros()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +524,18 @@ mod tests {
             GuardDecision::Yield("identity_changed")
         );
         c = e.clone();
+        c.document += 1;
+        assert_eq!(
+            validate_step(&e, &c),
+            GuardDecision::Yield("identity_changed")
+        );
+        c = e.clone();
+        c.navigation += 1;
+        assert_eq!(
+            validate_step(&e, &c),
+            GuardDecision::Yield("identity_changed")
+        );
+        c = e.clone();
         c.dependencies.insert("field:value".into());
         assert_eq!(validate_step(&e, &c), GuardDecision::Allow);
         c = e.clone();
@@ -127,36 +550,32 @@ mod tests {
         let e = snapshot();
         let mut c = e.clone();
         c.requires_native = true;
-        assert_eq!(
-            perform_input(&e, &c, &InputAction::Insert("λ".into()), |_| panic!(
-                "must not dispatch"
-            )),
-            Err(GuardDecision::NeedsForeground)
-        );
+        assert_eq!(validate_step(&e, &c), GuardDecision::NeedsForeground);
     }
     #[test]
-    fn guarded_dispatch_preserves_unicode_and_reports_observed_fixture_value() {
-        let e = snapshot();
-        let evidence = perform_input(&e, &e, &InputAction::Fill("héllo 👋".into()), |a| {
-            let InputAction::Fill(v) = a else {
-                unreachable!()
-            };
-            DispatchEvidence {
-                accepted: true,
-                observed_value: Some(v.clone()),
-                route: "fixture",
-            }
-        })
-        .unwrap();
-        assert_eq!(evidence.observed_value.as_deref(), Some("héllo 👋"));
-    }
-    #[test]
-    fn race_window_is_measured_and_external_change_invalidates() {
-        let elapsed = measure_check_dispatch_race(|| std::hint::black_box(()));
-        assert!(elapsed < 1_000_000);
+    fn external_change_invalidates() {
         assert_eq!(
             on_external_change(Some("overlay")),
             InvalidationSet(["overlay".into()].into_iter().collect())
         );
+    }
+    #[test]
+    fn semantic_matches_fail_closed_on_zero_or_multiple_results() {
+        assert!(validate_match_result(&serde_json::json!({"ok":true,"count":1})).is_ok());
+        assert!(matches!(
+            validate_match_result(&serde_json::json!({"ok":false,"reason":"no_match","count":0})),
+            Err(super::super::BrowserError::StaleReference(_))
+        ));
+        assert!(
+            matches!(validate_match_result(&serde_json::json!({"ok":false,"reason":"ambiguous","count":2})),Err(super::super::BrowserError::StaleReference(reason)) if reason.contains("ambiguous"))
+        );
+    }
+    #[test]
+    fn insertion_postcondition_uses_utf16_selection_indices() {
+        assert_eq!(
+            replacement_value("A👋B", 3, 3, "λ").as_deref(),
+            Some("A👋λB")
+        );
+        assert_eq!(replacement_value("A👋B", 2, 2, "x"), None);
     }
 }

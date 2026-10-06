@@ -54,9 +54,12 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 ### Phase 4 — reliable input, guards and interference
 
 - [x] Add typed guard snapshots, invalidation records, input action variants, and strict-background `NeedsForeground` fail-closed behavior.
-- [x] Add local unit fixtures for revision/dependency mismatch, Unicode fixture value echo, and callback non-dispatch on native-required route.
-- [ ] Resolve semantic locators and dispatch actual guarded browser input with field/click/drag postconditions; test masked/contenteditable/IME/event-dependent inputs and geometry/hit-target races.
-- [ ] Measure a real check-to-dispatch race with injected browser interference. The current timing helper measures only an arbitrary closure and is not acceptance evidence.
+- [x] Add revision-bound CDP fill/insert/sequential text dispatch, exact semantic matching, actual value readback, and predicate-gated click/drag event sequences.
+- [x] Inject target navigation after final pre-dispatch check; confirm write is withheld and record fixture probe-to-mutation timing (2773 us in the recorded run).
+- [x] Add local fixtures for revision/dependency mismatch, Unicode input/readback, strict-background non-dispatch, locator ambiguity, mouse predicates, and race-window invalidation.
+- [x] Run an ignored installed-Chrome headless DOM fixture: revision-bound fill, insert, and ASCII sequential keys produced the expected Unicode value and UTF-16 caret position. Dedicated launch now bootstraps Page/Runtime for newly created targets.
+- [ ] Qualify actual Chrome DOM behavior for masked/contenteditable/IME/event-dependent controls, real click/overlay interception, drag DOM results, and canvas object movement.
+- [ ] Measure the real Chrome check-to-dispatch window and repeated browser interference. The websocket fixture measures only its mock protocol window; no DOM-side mutation was injected during that live interval.
 - [ ] Qualify native focus/cursor/clipboard behavior with an independent observer.
 
-Phase 4 is partial and is not acceptance complete. Full local Rust and documentation/provenance checks pass; the remaining browser-dispatch and native-observation boundaries are recorded in `verification-matrix.md` and `blockers.md`.
+The implemented supported-control scope is complete and locally verified, including an actual isolated Chrome DOM readback. The broader Phase 4 acceptance gate remains partial: application identity/edit observers, qualified masks/contenteditable/IME/event-dependent controls, real overlay/drag/canvas outcomes, and native focus/cursor/clipboard observation remain open.

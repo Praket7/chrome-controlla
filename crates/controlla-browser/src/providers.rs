@@ -105,6 +105,38 @@ impl DedicatedChromeProvider {
                 return Err(error.into());
             }
         };
+        let attached_session = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, targets) = connection.target_snapshot().await;
+                if let Some(target) = targets.iter().find(|target| target.id == target_id)
+                    && target.attached
+                    && let Some(session_id) = target.session_id.clone()
+                {
+                    break session_id;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let attached_session = match attached_session {
+            Ok(session_id) => session_id,
+            Err(_) => {
+                let _ = connection
+                    .command(None, "Target.closeTarget", json!({"targetId": target_id}))
+                    .await;
+                let _ = registry.release_session(&session.id, |_| Ok(()));
+                process.stop();
+                return Err(ProviderError::Browser(BrowserError::Timeout));
+            }
+        };
+        if let Err(error) = connection.bootstrap_target(attached_session).await {
+            let _ = connection
+                .command(None, "Target.closeTarget", json!({"targetId": target_id}))
+                .await;
+            let _ = registry.release_session(&session.id, |_| Ok(()));
+            process.stop();
+            return Err(error.into());
+        }
         Ok(DedicatedBrowserSession {
             process: process.preserve_after_launch(),
             connection,
@@ -1501,10 +1533,11 @@ mod tests {
                 "real-chrome-fixture",
             )
             .unwrap();
-        let session = provider
-            .launch(&mut registry, &handle, "about:blank")
-            .await
-            .unwrap();
+        let page =
+            "data:text/html,%3Cinput%20id%3D%22field%22%20type%3D%22text%22%20value%3D%22%22%3E";
+        let mut session = provider.launch(&mut registry, &handle, page).await.unwrap();
+        // A failed assertion must not leave this test's isolated Chrome alive.
+        session.process.preserve_on_drop = false;
         assert!(session.profile_directory().is_dir());
         let (_, targets) = session.connection().target_snapshot().await;
         assert_eq!(
@@ -1530,6 +1563,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["result"]["value"], "visible");
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let target_now = session
+                    .connection()
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .get(&target.id)
+                    .cloned();
+                if let Some(target_now) = target_now
+                    && let Ok(ready) = session
+                        .connection()
+                        .target_command(
+                            &target.id,
+                            target_now.generation,
+                            &target_now.revision,
+                            "Runtime.evaluate",
+                            json!({"expression":"!!document.querySelector('#field')","returnByValue":true}),
+                        )
+                        .await
+                    && ready["result"]["value"] == true
+                    && let Some(frame) = session
+                        .connection()
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .values()
+                        .find(|frame| frame.target_id == target.id)
+                {
+                    break frame.id.clone();
+                }
+                let frames = session.connection().frames.read().await;
+                drop(frames);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let frames = session
+                .connection()
+                .frames
+                .try_read()
+                .map(|frames| format!("{:?}", frames.frames.values().collect::<Vec<_>>()))
+                .unwrap_or_else(|error| error.to_string());
+            panic!("input fixture navigation did not create a frame: {error:?}; target={target:?}; frames={frames}");
+        });
+        let reference = session
+            .connection()
+            .capture_target_ref(&registry, &handle, &target.id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+        let snapshot = crate::input::GuardSnapshot {
+            navigation: 1,
+            account: 1,
+            document: 1,
+            dependencies: ["#field".into()].into_iter().collect(),
+            strict_background: true,
+            requires_native: false,
+        };
+        let locator = crate::input::SemanticLocator::Css("#field".into());
+        let fill = crate::input::InputAction::Fill("héllo 👋".into());
+        let filled = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(filled,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋")
+        );
+        session.connection().target_ref_command(&registry,&reference,"real-chrome-fixture",crate::sessions::IdentityRevisions{account:1,document:1},"Runtime.evaluate",json!({"expression":"(()=>{const e=document.querySelector('#field');e.setSelectionRange(e.value.length,e.value.length);return e.selectionStart})()","returnByValue":true})).await.unwrap();
+        let insert = crate::input::InputAction::Insert("λ".into());
+        let inserted = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &insert,
+                    expected_value: "héllo 👋",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(inserted,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋λ")
+        );
+        let keys = crate::input::InputAction::SequentialKeys("a".into());
+        let typed = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &keys,
+                    expected_value: "héllo 👋λ",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(typed,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋λa")
+        );
+        let position=session.connection().target_ref_command(&registry,&reference,"real-chrome-fixture",crate::sessions::IdentityRevisions{account:1,document:1},"Runtime.evaluate",json!({"expression":"({value:document.querySelector('#field').value,selectionStart:document.querySelector('#field').selectionStart})","returnByValue":true})).await.unwrap();
+        assert_eq!(position["result"]["value"]["value"], "héllo 👋λa");
+        assert_eq!(
+            position["result"]["value"]["selectionStart"],
+            "héllo 👋λa".encode_utf16().count()
+        );
         struct TestOwnedTargetObserver;
         impl IndependentTargetObserver for TestOwnedTargetObserver {
             fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {
