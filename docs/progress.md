@@ -54,7 +54,7 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 ### Phase 4 — reliable input, guards and interference
 
 - [x] Add typed guard snapshots, invalidation records, input action variants, and strict-background `NeedsForeground` fail-closed behavior.
-- [x] Add revision-bound CDP fill/insert/sequential text dispatch, exact semantic matching, actual value readback, and predicate-gated click/drag event sequences.
+- [x] Add revision-bound CDP fill/insert/sequential text dispatch, exact semantic matching, actual value readback, and predicate-gated click/drag event sequences. Final fill evaluation compares the live value immediately before writing; insert and every key event refresh value/focus immediately before each send.
 - [x] Inject target navigation after final pre-dispatch check; confirm write is withheld and record fixture probe-to-mutation timing (2773 us in the recorded run).
 - [x] Add local fixtures for revision/dependency mismatch, Unicode input/readback, strict-background non-dispatch, locator ambiguity, mouse predicates, and race-window invalidation.
 - [x] Run an ignored installed-Chrome headless DOM fixture: revision-bound fill, insert, and ASCII sequential keys produced the expected Unicode value and UTF-16 caret position. Dedicated launch now bootstraps Page/Runtime for newly created targets.
@@ -62,4 +62,4 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [ ] Measure the real Chrome check-to-dispatch window and repeated browser interference. The websocket fixture measures only its mock protocol window; no DOM-side mutation was injected during that live interval.
 - [ ] Qualify native focus/cursor/clipboard behavior with an independent observer.
 
-The implemented supported-control scope is complete and locally verified, including an actual isolated Chrome DOM readback. The broader Phase 4 acceptance gate remains partial: application identity/edit observers, qualified masks/contenteditable/IME/event-dependent controls, real overlay/drag/canvas outcomes, and native focus/cursor/clipboard observation remain open.
+The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. Focused mock coverage passes; the real Chrome DOM readback predates this follow-up. The broader Phase 4 acceptance gate remains partial: application identity/edit observers, qualified masks/contenteditable/IME/event-dependent controls, real overlay/drag/canvas outcomes, repeated adversarial interference, and native focus/cursor/clipboard observation remain open.

@@ -57,6 +57,7 @@ pub enum InputOutcome {
         elapsed_micros: u128,
     },
     Unsupported(&'static str),
+    Stale(&'static str),
     NeedsForeground,
 }
 pub struct GuardedInput<'a> {
@@ -316,23 +317,6 @@ impl super::BrowserConnection {
                 ));
             }
         }
-        if value.is_some() {
-            let latest = self
-                .target_ref_command(
-                    sessions,
-                    reference,
-                    principal,
-                    revisions,
-                    "Runtime.evaluate",
-                    serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true}),
-                )
-                .await?;
-            if latest["result"]["value"]["value"].as_str() != Some(input.expected_value) {
-                return Err(super::BrowserError::StaleReference(
-                    "field value changed in the guard-to-dispatch window".into(),
-                ));
-            }
-        }
         // Give already-arrived lifecycle events a scheduling turn before the
         // next target_ref_command performs its final revision check.
         tokio::task::yield_now().await;
@@ -340,8 +324,10 @@ impl super::BrowserConnection {
             InputAction::Fill(text) => {
                 let text = serde_json::to_string(text)
                     .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+                let expected = serde_json::to_string(input.expected_value)
+                    .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
                 let expression = format!(
-                    r#"(() => {{const r={resolve};if(!r.ok)return false;const e=r.e,d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');d?.set?.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()"#
+                    r#"(() => {{const r={resolve};if(!r.ok)return {{stale:false}};const e=r.e;if(e.value!=={expected})return {{stale:true}};const d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');d?.set?.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{stale:false,applied:true}};}})()"#
                 );
                 let sent = self
                     .target_ref_command(
@@ -353,13 +339,31 @@ impl super::BrowserConnection {
                         serde_json::json!({"expression":expression,"returnByValue":true}),
                     )
                     .await?;
-                if sent["result"]["value"] != true {
-                    return Err(super::BrowserError::StaleReference(
-                        "target changed before fill".into(),
+                if sent["result"]["value"]["stale"] == true {
+                    return Ok(InputOutcome::Stale(
+                        "field value changed immediately before fill",
                     ));
+                }
+                if sent["result"]["value"]["applied"] != true {
+                    return Ok(InputOutcome::Stale("fill target could not be resolved"));
                 }
             }
             InputAction::Insert(text) => {
+                if !self
+                    .text_guard_matches(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        &resolve,
+                        input.expected_value,
+                    )
+                    .await?
+                {
+                    return Ok(InputOutcome::Stale(
+                        "field value or focus changed immediately before insert",
+                    ));
+                }
                 self.target_ref_command(
                     sessions,
                     reference,
@@ -371,7 +375,23 @@ impl super::BrowserConnection {
                 .await?;
             }
             InputAction::SequentialKeys(text) => {
+                let mut live_value = input.expected_value.to_owned();
                 for c in text.chars() {
+                    if !self
+                        .text_guard_matches(
+                            sessions,
+                            reference,
+                            principal,
+                            revisions,
+                            &resolve,
+                            &live_value,
+                        )
+                        .await?
+                    {
+                        return Ok(InputOutcome::Stale(
+                            "field value or focus changed immediately before key event",
+                        ));
+                    }
                     self.target_ref_command(
                         sessions,
                         reference,
@@ -381,7 +401,38 @@ impl super::BrowserConnection {
                         serde_json::json!({"type":"keyDown","key":c.to_string()}),
                     )
                     .await?;
+                    if !self
+                        .text_guard_matches(
+                            sessions,
+                            reference,
+                            principal,
+                            revisions,
+                            &resolve,
+                            &live_value,
+                        )
+                        .await?
+                    {
+                        return Ok(InputOutcome::Stale(
+                            "field value or focus changed immediately before character event",
+                        ));
+                    }
                     self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchKeyEvent",serde_json::json!({"type":"char","text":c.to_string(),"unmodifiedText":c.to_string()})).await?;
+                    live_value.push(c);
+                    if !self
+                        .text_guard_matches(
+                            sessions,
+                            reference,
+                            principal,
+                            revisions,
+                            &resolve,
+                            &live_value,
+                        )
+                        .await?
+                    {
+                        return Ok(InputOutcome::Stale(
+                            "field value or focus changed immediately before key release",
+                        ));
+                    }
                     self.target_ref_command(
                         sessions,
                         reference,
@@ -476,6 +527,33 @@ impl super::BrowserConnection {
             postcondition_verified: true,
             elapsed_micros: start.elapsed().as_micros(),
         })
+    }
+
+    async fn text_guard_matches(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+        resolve: &str,
+        expected_value: &str,
+    ) -> Result<bool, super::BrowserError> {
+        let expected = serde_json::to_string(expected_value)
+            .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+        let expression = format!(
+            "(()=>{{const r={resolve};return r.ok&&r.e.value==={expected}&&document.activeElement===r.e;}})()"
+        );
+        let result = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":expression,"returnByValue":true}),
+            )
+            .await?;
+        Ok(result["result"]["value"] == true)
     }
 }
 

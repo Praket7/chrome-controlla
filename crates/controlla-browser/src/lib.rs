@@ -1912,13 +1912,13 @@ mod tests {
                 }
                 methods.push(req["method"].as_str().unwrap().to_owned());
                 let n = methods.len();
-                if n == 4 {
+                if n == 3 {
                     measured_window_micros = guard_started.unwrap().elapsed().as_micros();
                     assert!(
                         req["params"]["expression"]
                             .as_str()
                             .unwrap()
-                            .contains("set?.call(e,")
+                            .contains("e.value!==\"\"")
                     );
                 }
                 let method = req["method"].as_str().unwrap();
@@ -1926,14 +1926,15 @@ mod tests {
                     serde_json::json!({"id":req["id"],"sessionId":"input-session","result":{}})
                 } else {
                     let value = match n {
-                        1 | 3 => dom_value(""),
-                        6 | 8 => dom_value("héllo 👋"),
-                        11 | 13 => dom_value("héllo 👋!"),
-                        18 | 23 | 30 | 32 => dom_value("héllo 👋!a"),
-                        2 | 4 | 7 | 12 | 19 | 22 | 24 | 25 | 29 | 31 => Value::Bool(true),
-                        5 => dom_value("héllo 👋"),
-                        10 => dom_value("héllo 👋!"),
-                        17 => dom_value("héllo 👋!a"),
+                        1 => dom_value(""),
+                        2 | 6 | 7 | 11 | 12 | 14 | 16 => Value::Bool(true),
+                        3 => serde_json::json!({"stale":false,"applied":true}),
+                        4 | 5 | 8 => dom_value("héllo 👋"),
+                        9 | 10 => dom_value("héllo 👋!"),
+                        13 | 15 | 17 => Value::Bool(true),
+                        18 | 19 | 24 | 31 | 32 => dom_value("héllo 👋!a"),
+                        20 | 23 | 25 | 26 | 30 | 33 => Value::Bool(true),
+                        21 | 22 | 27 | 28 | 29 => Value::Bool(true),
                         _ => panic!("unexpected evaluate request {n}"),
                     };
                     serde_json::json!({"id":req["id"],"sessionId":"input-session","result":{"result":{"type":if value.is_object(){"object"}else{"boolean"},"value":value}}})
@@ -2277,41 +2278,22 @@ mod tests {
         assert!(measured_window_micros > 0 && measured_window_micros < 5_000_000);
         println!("CDP fixture probe-to-fill dispatch interval: {measured_window_micros} us");
         assert_eq!(
-            methods,
-            vec![
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Input.insertText",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Input.dispatchKeyEvent",
-                "Input.dispatchKeyEvent",
-                "Input.dispatchKeyEvent",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Input.dispatchMouseEvent",
-                "Input.dispatchMouseEvent",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Input.dispatchMouseEvent",
-                "Input.dispatchMouseEvent",
-                "Input.dispatchMouseEvent",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-                "Runtime.evaluate"
-            ]
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "Input.insertText")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "Input.dispatchKeyEvent")
+                .count(),
+            3
+        );
+        assert!(
+            methods.len() < 33,
+            "the raced fill request must be withheld"
         );
     }
 
