@@ -200,7 +200,8 @@ All four chained commands exited 0; the dependency and diff checks emitted no ad
 ## Follow-up race guards — 2026-10-06
 
 - Fill now checks `e.value === expected_value` inside the same synchronous `Runtime.evaluate` that sets the value; mismatch returns the distinct `InputOutcome::Stale` result.
-- Insert refreshes value/focus immediately before its CDP send. Sequential typing does so before every `keyDown`, `char`, and `keyUp`, advancing the expected value after each character event.
+- Insert refreshes value/focus immediately before its CDP send. Sequential typing requires a collapsed caret at the UTF-16 end of the current value, then refreshes value/focus/caret before every `keyDown`, `char`, and `keyUp`, advancing the expected value and caret after each character event.
+- After a keyDown is attempted, stale/error exits attempt a matching keyUp as best-effort cleanup. This sends no text and uses the same target/session authority check, so release is not guaranteed if that authority has gone stale.
 - These checks narrow the gap only. CDP handling, page event handlers, and server-side effects are not atomic, and the fixture does not claim otherwise.
 - Focused verification: `cargo test -p controlla-browser --locked --offline guarded_text_actions_use_revision_bound_cdp_and_race_yields -- --nocapture` passed (1 test); mock fixture timing 716 us. Existing test checks the final fill expression includes the live-value comparison, exercises the per-send guards, and verifies target-navigation race withholding. It does not inject a page-side value mutation between every individual send.
 - No imported source changed; provenance digest was not changed.

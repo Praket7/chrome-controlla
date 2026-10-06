@@ -377,8 +377,7 @@ impl super::BrowserConnection {
                         principal,
                         revisions,
                         &resolve,
-                        input.expected_value,
-                        None,
+                        (input.expected_value, None),
                     )
                     .await?
                 {
@@ -407,8 +406,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
-                            &live_value,
-                            Some(caret),
+                            (&live_value, Some(caret)),
                         )
                         .await?
                     {
@@ -417,6 +415,7 @@ impl super::BrowserConnection {
                         ));
                     }
                     let key_up = serde_json::json!({"type":"keyUp","key":c.to_string()});
+                    // Cleanup releases this keyDown only; it sends no text and stays subject to target authority.
                     if let Err(error) = self
                         .target_ref_command(
                             sessions,
@@ -447,8 +446,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
-                            &live_value,
-                            Some(caret),
+                            (&live_value, Some(caret)),
                         )
                         .await;
                     if !matches!(after_key_down, Ok(true)) {
@@ -462,12 +460,11 @@ impl super::BrowserConnection {
                                 key_up.clone(),
                             )
                             .await;
-                        if let Err(error) = after_key_down {
-                            return Err(error);
+                        if !after_key_down? {
+                            return Ok(InputOutcome::Stale(
+                                "field value, focus, or caret changed before character event",
+                            ));
                         }
-                        return Ok(InputOutcome::Stale(
-                            "field value, focus, or caret changed before character event",
-                        ));
                     }
                     if let Err(error) = self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchKeyEvent",serde_json::json!({"type":"char","text":c.to_string(),"unmodifiedText":c.to_string()})).await {
                         let _ = self.target_ref_command(sessions, reference, principal, revisions, "Input.dispatchKeyEvent", key_up.clone()).await;
@@ -482,8 +479,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
-                            &live_value,
-                            Some(caret),
+                            (&live_value, Some(caret)),
                         )
                         .await;
                     self.target_ref_command(
@@ -495,10 +491,7 @@ impl super::BrowserConnection {
                         key_up,
                     )
                     .await?;
-                    if !matches!(before_key_up, Ok(true)) {
-                        if let Err(error) = before_key_up {
-                            return Err(error);
-                        }
+                    if !before_key_up? {
                         return Ok(InputOutcome::Stale(
                             "field value, focus, or caret changed before key release",
                         ));
@@ -597,9 +590,9 @@ impl super::BrowserConnection {
         principal: &str,
         revisions: super::sessions::IdentityRevisions,
         resolve: &str,
-        expected_value: &str,
-        expected_caret: Option<u64>,
+        expected: (&str, Option<u64>),
     ) -> Result<bool, super::BrowserError> {
+        let (expected_value, expected_caret) = expected;
         let expected = serde_json::to_string(expected_value)
             .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
         let caret = expected_caret.map_or_else(String::new, |n| {
