@@ -12,8 +12,8 @@ pub mod sessions;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
 pub use input::{
-    GuardDecision, GuardSnapshot, GuardedInput, InputAction, InputOutcome, InvalidationSet,
-    SemanticLocator, on_external_change, validate_step,
+    FileSelectionEvidence, GuardDecision, GuardSnapshot, GuardedFileSelection, GuardedInput,
+    InputAction, InputOutcome, InvalidationSet, SemanticLocator, on_external_change, validate_step,
 };
 pub use manager::BrowserManager;
 pub use observe::{

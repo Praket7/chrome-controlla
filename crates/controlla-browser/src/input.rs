@@ -4,6 +4,20 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 pub type SemanticLocator = super::Locator;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FileSelectionEvidence {
+    pub filename: String,
+    pub size: usize,
+    pub transaction: super::UploadTransaction,
+}
+
+pub struct GuardedFileSelection<'a> {
+    pub expected: &'a GuardSnapshot,
+    pub current: &'a GuardSnapshot,
+    pub locator: &'a SemanticLocator,
+    pub handle: &'a super::sessions::ArtifactHandle,
+}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputAction {
     Fill(String),
@@ -163,6 +177,131 @@ fn sequential_caret(value: &str, start: u64, end: u64) -> Option<u64> {
 }
 
 impl super::BrowserConnection {
+    /// Select an internally stored artifact on one guarded file input. The
+    /// returned evidence proves only that Chrome read back the selected file.
+    pub async fn select_file_input_artifact(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+        selection: GuardedFileSelection<'_>,
+    ) -> Result<FileSelectionEvidence, super::BrowserError> {
+        let GuardedFileSelection {
+            expected,
+            current,
+            locator,
+            handle,
+        } = selection;
+        if validate_step(expected, current) != GuardDecision::Allow {
+            return Err(super::BrowserError::StaleReference(
+                "file selection guard changed".into(),
+            ));
+        }
+        if expected.strict_background && current.requires_native {
+            return Err(super::BrowserError::StaleReference(
+                "file selection requires native foreground interaction".into(),
+            ));
+        }
+        locator.validate()?;
+        let metadata = sessions
+            .artifact_metadata_for(&reference.session_id, principal, handle)
+            .map_err(|_| {
+                super::BrowserError::StaleReference(
+                    "artifact handle is not authorized for this session".into(),
+                )
+            })?;
+        let path = sessions
+            .artifact_path_for(&reference.session_id, principal, handle)
+            .map_err(|_| {
+                super::BrowserError::StaleReference(
+                    "artifact handle is not authorized for this session".into(),
+                )
+            })?
+            .to_string_lossy()
+            .into_owned();
+        self.target_ref_command(
+            sessions,
+            reference,
+            principal,
+            revisions,
+            "DOM.enable",
+            serde_json::json!({}),
+        )
+        .await?;
+        let resolve = resolve_element_script(locator)?;
+        let element_expr = format!("(()=>{{const r={resolve};return r.ok?r.e:null;}})()",);
+        let element = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":element_expr,"returnByValue":false}),
+            )
+            .await?;
+        let element_id = element["result"]["objectId"].as_str().ok_or_else(|| {
+            super::BrowserError::StaleReference("file input no longer resolves".into())
+        })?;
+        let node = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "DOM.describeNode",
+                serde_json::json!({"objectId":element_id}),
+            )
+            .await?;
+        let attrs = node["node"]["attributes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let input_type = attrs
+            .chunks(2)
+            .find(|pair| pair.first().and_then(|x| x.as_str()) == Some("type"))
+            .and_then(|pair| pair.get(1))
+            .and_then(|x| x.as_str());
+        if node["node"]["nodeName"] != "INPUT" || input_type != Some("file") {
+            return Err(super::BrowserError::StaleReference(
+                "target is not an input[type=file]".into(),
+            ));
+        }
+        let connected = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.callFunctionOn", serde_json::json!({"objectId":element_id,"functionDeclaration":"function(){return this.isConnected&&this.tagName==='INPUT'&&this.type==='file'}","returnByValue":true})).await?;
+        if connected["result"]["value"] != true {
+            return Err(super::BrowserError::StaleReference(
+                "file input was replaced before selection".into(),
+            ));
+        }
+        self.target_ref_command(
+            sessions,
+            reference,
+            principal,
+            revisions,
+            "DOM.setFileInputFiles",
+            serde_json::json!({"files":[path],"objectId":element_id}),
+        )
+        .await?;
+        let readback = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.callFunctionOn", serde_json::json!({"objectId":element_id,"functionDeclaration":"function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size,type:f.type}))}","returnByValue":true})).await?;
+        let files = readback["result"]["value"].as_array().ok_or_else(|| {
+            super::BrowserError::InvalidResponse("file selection readback missing".into())
+        })?;
+        if files.len() != 1
+            || files[0]["name"] != metadata.filename
+            || files[0]["size"].as_u64() != Some(metadata.size as u64)
+        {
+            return Err(super::BrowserError::StaleReference(
+                "Chrome file selection did not match artifact metadata".into(),
+            ));
+        }
+        Ok(FileSelectionEvidence {
+            filename: metadata.filename,
+            size: metadata.size,
+            transaction: super::UploadTransaction::new(handle.opaque_id()),
+        })
+    }
+
     /// Resolve one locator and dispatch supported text input through the guarded CDP target route.
     /// Page scripts can still mutate state between any validation and its remote effect.
     pub async fn perform_guarded_input(

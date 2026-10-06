@@ -98,9 +98,42 @@ pub enum SessionError {
     OwnedTabRequiresCreationReceipt,
     UnknownSession,
     InternalClipboardTooLarge,
+    ArtifactUnsupported,
+    ArtifactInvalidFilename,
+    ArtifactEmpty,
+    ArtifactTooLarge,
+    ArtifactStoreFull,
+    ArtifactNotFound,
+    ArtifactIo,
 }
 
 const MAX_INTERNAL_CLIPBOARD_BYTES: usize = 1_048_576;
+const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SESSION_ARTIFACT_COUNT: usize = 16;
+const MAX_SESSION_ARTIFACT_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactHandle(String);
+
+impl ArtifactHandle {
+    pub fn opaque_id(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactMetadata {
+    pub handle: ArtifactHandle,
+    pub filename: String,
+    pub size: usize,
+}
+
+#[derive(Clone, Debug)]
+struct StoredArtifact {
+    metadata: ArtifactMetadata,
+    path: std::path::PathBuf,
+    directory: std::path::PathBuf,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetRef {
@@ -313,6 +346,9 @@ pub struct SessionRegistry {
     /// Ephemeral task text; never serialized or copied to the OS pasteboard.
     #[serde(skip)]
     internal_clipboard_text: BTreeMap<String, String>,
+    /// Private generated files backing opaque session handles; never serialized.
+    #[serde(skip)]
+    artifacts: BTreeMap<String, BTreeMap<String, StoredArtifact>>,
 }
 
 impl SessionRegistry {
@@ -326,6 +362,7 @@ impl SessionRegistry {
             browser_instances: BTreeMap::new(),
             inactive_sessions: BTreeSet::new(),
             internal_clipboard_text: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
         }
     }
 
@@ -340,6 +377,151 @@ impl SessionRegistry {
             return Err(SessionError::ProviderDenied(session.provider));
         }
         Ok(())
+    }
+
+    pub fn put_artifact_bytes(
+        &mut self,
+        session: &SessionHandle,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<ArtifactMetadata, SessionError> {
+        self.validate_clipboard_session(session)?;
+        if !valid_artifact_filename(filename) {
+            return Err(SessionError::ArtifactInvalidFilename);
+        }
+        if bytes.is_empty() {
+            return Err(SessionError::ArtifactEmpty);
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(SessionError::ArtifactTooLarge);
+        }
+        let current = self.artifacts.get(&session.id);
+        if current.is_some_and(|items| {
+            items.len() >= MAX_SESSION_ARTIFACT_COUNT
+                || items
+                    .values()
+                    .map(|item| item.metadata.size)
+                    .sum::<usize>()
+                    .saturating_add(bytes.len())
+                    > MAX_SESSION_ARTIFACT_BYTES
+        }) {
+            return Err(SessionError::ArtifactStoreFull);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (filename, bytes);
+            return Err(SessionError::ArtifactUnsupported);
+        }
+        #[cfg(unix)]
+        {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).map_err(|_| SessionError::ArtifactIo)?;
+            let id = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let directory = std::env::temp_dir().join(format!("controlla-artifact-{id}"));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|_| SessionError::ArtifactIo)?;
+            let path = directory.join(filename);
+            use std::io::Write;
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|_| {
+                    let _ = std::fs::remove_dir(&directory);
+                    SessionError::ArtifactIo
+                })?;
+            if file.write_all(bytes).is_err() {
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_dir(&directory);
+                return Err(SessionError::ArtifactIo);
+            }
+            let handle = ArtifactHandle(format!("artifact_{id}"));
+            let metadata = ArtifactMetadata {
+                handle: handle.clone(),
+                filename: filename.to_owned(),
+                size: bytes.len(),
+            };
+            self.artifacts
+                .entry(session.id.clone())
+                .or_default()
+                .insert(
+                    id,
+                    StoredArtifact {
+                        metadata: metadata.clone(),
+                        path,
+                        directory,
+                    },
+                );
+            Ok(metadata)
+        }
+    }
+
+    pub fn artifact_metadata(
+        &self,
+        session: &SessionHandle,
+        handle: &ArtifactHandle,
+    ) -> Result<ArtifactMetadata, SessionError> {
+        self.validate_clipboard_session(session)?;
+        self.artifacts
+            .get(&session.id)
+            .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .map(|item| item.metadata.clone())
+            .ok_or(SessionError::ArtifactNotFound)
+    }
+
+    pub(crate) fn artifact_path_for(
+        &self,
+        session_id: &str,
+        principal: &str,
+        handle: &ArtifactHandle,
+    ) -> Result<&std::path::Path, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        if session.principal != principal {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        self.validate_clipboard_session(session)?;
+        self.artifacts
+            .get(session_id)
+            .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .map(|item| item.path.as_path())
+            .ok_or(SessionError::ArtifactNotFound)
+    }
+
+    pub(crate) fn artifact_metadata_for(
+        &self,
+        session_id: &str,
+        principal: &str,
+        handle: &ArtifactHandle,
+    ) -> Result<ArtifactMetadata, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        if session.principal != principal {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        self.validate_clipboard_session(session)?;
+        self.artifacts
+            .get(session_id)
+            .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .map(|item| item.metadata.clone())
+            .ok_or(SessionError::ArtifactNotFound)
+    }
+
+    fn clear_artifacts(&mut self, session_id: &str) {
+        if let Some(items) = self.artifacts.remove(session_id) {
+            for item in items.into_values() {
+                let _ = std::fs::remove_file(item.path);
+                let _ = std::fs::remove_dir(item.directory);
+            }
+        }
     }
 
     /// Store bounded plain text for this active session only. This buffer is
@@ -705,6 +887,7 @@ impl SessionRegistry {
         mut close_tab: impl FnMut(&str) -> Result<(), String>,
     ) -> CleanupReceipt {
         let mut receipt = CleanupReceipt::default();
+        self.clear_artifacts(session_id);
         let Some(tabs) = self.tabs.get(session_id).cloned() else {
             self.internal_clipboard_text.remove(session_id);
             if self.sessions.remove(session_id).is_none() {
@@ -864,6 +1047,15 @@ impl SessionRegistry {
     }
 }
 
+fn valid_artifact_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename.len() <= 255
+        && filename != "."
+        && filename != ".."
+        && !filename.contains(['/', '\\', '\0'])
+        && !filename.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod direct_cdp_grant_tests {
     use super::*;
@@ -909,6 +1101,107 @@ mod direct_cdp_grant_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn artifacts_are_opaque_bounded_principal_scoped_ephemeral_and_released() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..Default::default()
+        });
+        let make = |registry: &mut SessionRegistry, who| {
+            registry
+                .create_session(
+                    SessionSpec {
+                        mode: SessionMode::Headless,
+                        selected_target_ids: vec![],
+                    },
+                    who,
+                )
+                .unwrap()
+        };
+        let alice = make(&mut registry, "alice");
+        let bob = make(&mut registry, "bob");
+        let artifact = registry
+            .put_artifact_bytes(&alice, "payload.txt", b"hello")
+            .unwrap();
+        assert_eq!(artifact.size, 5);
+        assert_eq!(
+            registry
+                .artifact_metadata(&alice, &artifact.handle)
+                .unwrap(),
+            artifact
+        );
+        assert_eq!(
+            registry.artifact_metadata(&bob, &artifact.handle),
+            Err(SessionError::ArtifactNotFound)
+        );
+        assert_eq!(
+            registry.artifact_path_for(&alice.id, "mallory", &artifact.handle),
+            Err(SessionError::ProviderDenied(alice.provider))
+        );
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "../escape", b"x"),
+            Err(SessionError::ArtifactInvalidFilename)
+        );
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "x\\y", b"x"),
+            Err(SessionError::ArtifactInvalidFilename)
+        );
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "", b"x"),
+            Err(SessionError::ArtifactInvalidFilename)
+        );
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "empty", b""),
+            Err(SessionError::ArtifactEmpty)
+        );
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "large", &vec![0; MAX_ARTIFACT_BYTES + 1]),
+            Err(SessionError::ArtifactTooLarge)
+        );
+        for index in 0..(MAX_SESSION_ARTIFACT_COUNT - 1) {
+            registry
+                .put_artifact_bytes(&alice, &format!("extra-{index}"), b"x")
+                .unwrap();
+        }
+        assert_eq!(
+            registry.put_artifact_bytes(&alice, "too-many", b"x"),
+            Err(SessionError::ArtifactStoreFull)
+        );
+        let private_path = registry
+            .artifact_path_for(&alice.id, "alice", &artifact.handle)
+            .unwrap()
+            .to_path_buf();
+        assert!(private_path.exists());
+        assert_eq!(private_path.file_name().unwrap(), "payload.txt");
+        assert_eq!(
+            std::fs::metadata(&private_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let serialized = serde_json::to_string(&registry).unwrap();
+        assert!(!serialized.contains(artifact.handle.opaque_id()));
+        assert!(!serialized.contains(&private_path.display().to_string()));
+        assert!(!serialized.contains("hello"));
+        let recovered: SessionRegistry = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            recovered.artifact_metadata(&alice, &artifact.handle),
+            Err(SessionError::ArtifactNotFound)
+        );
+        registry.release_session(&alice.id, |_| Ok(()));
+        assert!(!private_path.exists());
+        assert!(!private_path.parent().unwrap().exists());
+        assert_eq!(
+            registry.artifact_metadata(&alice, &artifact.handle),
+            Err(SessionError::UnknownSession)
+        );
+    }
 
     fn add_owned_fixture(registry: &mut SessionRegistry, session_id: &str, target_id: &str) {
         registry
