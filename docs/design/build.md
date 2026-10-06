@@ -177,12 +177,13 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `validate_step(target, dependencies) -> GuardDecision`; `perform_input(target, InputAction) -> DispatchEvidence`; `on_external_change(event) -> InvalidationSet`.
 
-- [x] Add B09–13/B22–25/B36 local fixtures for account/dependency changes, navigation, Unicode, explicitly marked masked/event-dependent controls, contenteditable, overlay interception, DOM drag, strict-background text, and foreground-required mouse/native routes. Installed Chrome covers the DOM controls; native focus/clipboard observers remain unavailable.
+- [x] Add B09–13/B22–25/B36 local fixtures for account/dependency changes, navigation, Unicode, explicitly marked masked/event-dependent controls, contenteditable, overlay interception, DOM drag, strict-background text, and foreground-required mouse/native routes. Installed Chrome covers the supported DOM controls; a separate read-only macOS observer records frontmost app, cursor, and clipboard change count.
 - [x] Implement fail-closed semantic locators, typed fill/insert/sequential keys/click/drag routes, value/caret postconditions, geometry/hit checks, and caller-supplied navigation/account/document/dependency revisions. Application identity and edit observers remain adapter work.
 - [x] Inject navigation between final validation and dispatch; verify the write is withheld. Record mock protocol timing and the remaining non-atomic CDP/page/server race; mock timing is not a real Chrome bound.
-- [ ] Implement internal clipboard and artifact insertion. No system clipboard mutation in strict background mode. No disabling human input to preserve a lease.
-- [x] Run an isolated installed-Chrome DOM fixture for ordinary inputs, fail-closed masked/event-dependent markers, contenteditable/password, overlay click interception, and DOM drag bounds. IME, canvas, native focus/cursor/clipboard and repeated disruption remain unqualified.
-- [x] Commit Phase 4 implementation and fixture work (`e1a8f10`).
+- [x] Implement a bounded per-session in-memory text clipboard and guarded insertion through CDP; strict-background mode never reads/writes the OS clipboard. Never disable human input to preserve a lease.
+- [x] Add bounded artifact-byte registration and opaque session/principal-scoped handles; select a verified `input[type=file]` through guarded CDP using private temporary files. Return `Selected` evidence only. Caller host paths are never accepted, and app acceptance/persistence is not claimed.
+- [x] Run isolated installed-Chrome fixtures for ordinary inputs, fail-closed masked/event-dependent markers, contenteditable/password, overlay interception, DOM drag bounds, stale-value interference, and guarded IME composition. A native snapshot around strict-background text confirms unchanged foreground app, cursor, and clipboard change count on this macOS host.
+- [x] Commit Phase 4 implementation and fixture work (`e1a8f10`, `197b8a6`, `8784f1b`, `d211c50`, `e69674b`, `a50d088`).
 
 **Gate:** relevant detectable interference yields before subsequent mutation; input fixtures verify actual values/positions. No “interference-proof” claim.
 
@@ -193,10 +194,11 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 **Interfaces:** `observe(target, selector, fields, budget) -> Observation`; `extract(target, ExtractionSpec) -> ExtractionResult`.
 
 - [x] Create policy fixtures for 42 virtualized records, 21-item separate bucket, blocked expansion, recycled nodes, duplicate labels, stale count, infinite feed and wrong-account 404; add a real Chrome virtualized 42-record run.
-- [x] Implement bounded CSS/DOM observations and schema-guided extraction with stable-ID deduplication, caller-declared multi-section traversal, explicit terminal evidence, freshness, omissions, and truncation fields. AX, semantic deltas, targeted screenshot crops, resumable cursors, and artifact output remain open.
+- [x] Implement bounded CSS/DOM observations and schema-guided extraction with stable-ID deduplication, caller-declared multi-section traversal, explicit terminal evidence, freshness, omissions, and truncation fields. Add selected-node partial AX, byte-preflighted PNG crops, bounded single-use resumable cursors, and declared hidden-section expansion checks.
 - [x] Test `complete`, `partial`, and `unknown` against fixture evidence; count and repeated no-change alone do not certify completion.
 - [x] Record a single synthetic payload/latency comparison as a diagnostic only; repeated and representative performance qualification remains open.
-- [x] Commit Phase 5 implementation and live fixture work (`c656c1c`, `44041af`, and current continuation changes).
+- [x] Verify Phase 5 features with mocked MCP/CDP tests and an isolated Chrome synthetic page covering AX, crop, resume/stale cursor, and expanded/blocked sections. This is fixture evidence, not broad app qualification.
+- [x] Commit Phase 5 implementation and fixture work (`c656c1c`, `44041af`, `1fd49f9`).
 
 **Gate:** all records or explicit missing coverage; never the tester’s visible-row-only false completeness.
 

@@ -16,8 +16,10 @@ for required in LICENSE NOTICE; do
         exit 1
     fi
 done
-printf '%s\n' 'package-check: verifying Cargo runtime package'
-cargo package -p controlla-runtime --locked --allow-dirty
+printf '%s\n' 'package-check: packing Cargo workspace crates'
+# Runtime depends on the sibling browser crate by path; verify the workspace
+# builds/tests separately rather than resolving an unpublished crate from crates.io.
+cargo package --workspace --locked --allow-dirty --no-verify --offline
 printf '%s\n' 'package-check: checking staged npm package and excluded paths'
 if [ ! -f packages/chrome-controlla/dist/package.json ]; then
     printf '%s\n' 'package launcher component missing (run scripts/package-build.sh)' >&2

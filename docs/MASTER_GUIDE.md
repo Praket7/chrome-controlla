@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: local Phase 5 preview, 2026-10-06. **The runtime now provides a local MCP stdio slice for session discovery/connection/target listing, bounded DOM observation, and multi-section extraction. Its CDP calls are verified with a mocked websocket fixture. A single separate synthetic Chrome extraction run exists; it is not a performance qualification. AX, screenshots, execute/jobs, client acceptance, and broad virtualized/hidden-section qualification remain open.**
+Version: local Phase 5 preview, 2026-10-06. **Phase 4/5 local gates now include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. MCP/CDP fixtures and an isolated synthetic Chrome page pass; representative app behavior, external MCP client acceptance, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -17,11 +17,13 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | Tool | Use it for | Avoid |
 |---|---|---|
 | `session` | Discover providers, inspect configured targets, connect with selected IDs, list references | Guessing the active tab, connecting without explicit target IDs |
-| `observe` | Bounded CSS/DOM fields from one explicit target | Full raw DOM; inferring off-screen completeness |
-| `extract` | Bounded extraction across caller-declared sections with stable IDs and completeness evidence | Treating absent account/count/terminal evidence as complete |
+| `observe` | Bounded CSS/DOM fields, selected-node AX, or a pixel-budgeted PNG crop from one explicit target | Full raw DOM/tree/image; inferring off-screen completeness |
+| `extract` | Bounded extraction across caller-declared sections with stable IDs, verified expansion controls, completeness evidence, and resumable cursors | Treating absent account/count/terminal evidence as complete |
 | `execute`, `jobs`, `guide` | Not implemented in this local Phase 5 slice | Do not call these tools or infer mutation/job support |
 
 `tools/list` carries the argument schemas for the three available tools. There is no guide resource in this slice.
+
+Guarded text and file-selection methods are available in the Rust browser library, but are not exposed as MCP tools in this preview. File selection accepts an opaque session-scoped artifact handle created from bounded bytes; it never accepts a caller host path. A successful result means Chrome selected the file and read back its name and size, not that the application accepted or saved it.
 
 ## 2. First installation and connection
 
@@ -32,7 +34,7 @@ Run `cargo run -p controlla-runtime -- mcp` from the repository during developme
 
 The `session` tool uses `action="discover"` for provider status, `action="targets"` to connect and report exact current target IDs/revisions, `action="connect"` with the explicitly selected `target_ids`, and `action="list_targets"` with the returned `session_id` to receive revision-bound `target_ref` values. Connecting can trigger Chrome's native consent flow. Tool calls do not choose the first tab or infer a target from title/order. `observe` and `extract` require a returned target reference and revalidate it against the session and current browser graph.
 
-`extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. A global record, serialized-byte, and 30-second maximum deadline budget applies across sections. Sections skipped by those budgets are returned as partial with a missing-coverage reason. Completeness is complete only when every section independently satisfies the browser library's evidence rules. Cursors remain informational, not resumable.
+`extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
 
 This preview does not implement the guide, execute, or jobs MCP tools. Do not use those names as if they were available.
 
@@ -120,9 +122,9 @@ Ask for named fields and a schema. Keep intermediate parsing/deduplication insid
 
 For a virtualized page, collect stable IDs while expanding and scrolling the correct container. Recycled DOM rows are not new item identities. A bucket count of 42 and eight rendered rows means only eight rows have been observed. Do not claim all 42 until traversal and coverage evidence support that claim.
 
-The current Rust library has revision-bound `BrowserConnection::observe` and `BrowserConnection::extract` methods; there is not yet an MCP `observe` tool. `observe` accepts a selected CSS subtree/field map and reports the target/frame freshness epoch, observation time, missing fields, item/byte truncation, and an informational cursor. `extract` takes one caller-selected scroll container and a schema whose ID field must be stable across recycled rows. Page-side scripts cap returned records/text/bytes before CDP returns; the final serialized result, including metadata, is also checked against the requested byte budget. Budgets below the metadata minimum or an oversized metadata envelope return an error. Cursors are not resumable, and sibling sections must be selected and traversed by the caller.
+The Rust library and MCP `observe` tool support selected CSS fields, a selected-node partial accessibility result, and a bounded PNG crop. `extract` accepts declared sections and returns section-scoped stable IDs, coverage evidence, and bounded single-use resumable cursors. Page scripts cap returned records/text/bytes before CDP returns; AX selection and crop pixel dimensions are bounded before the CDP result is materialized; final JSON output is checked against the requested byte budget. These limits do not impose a wall-time bound on native selector/text evaluation.
 
-An extraction is `complete` only when the account marker matches, an independently authoritative expected count matches the unique IDs observed, and a terminal marker inside the selected container is present at the scroll end across two observations with no new stable IDs. Do not pass a possibly stale UI count as authoritative. Missing requested fields, clipped values, or any limit truncation prevent `complete`. A count match, scrollbar bottom, or repeated rows without the other evidence is insufficient. Missing or mismatched account identity is `unknown`; blocked expansion, stale count, or exhausted limits are partial when records were found. Current fixtures test these classification rules and deduplication, not a real Chrome DOM traversal. The MCP tool, AX/screenshot observation, live virtualized fixtures, and resumable pagination remain unimplemented.
+An extraction is `complete` only when the account marker matches, an independently authoritative expected count matches the unique IDs observed, and a terminal marker inside the selected container is present at scroll end across two observations with no new stable IDs. Do not pass a possibly stale UI count as authoritative. Missing requested fields, clipped values, or any limit truncation prevent `complete`. A count match, scrollbar bottom, or repeated rows without the other evidence is insufficient. Missing or mismatched account identity is `unknown`; blocked expansion, stale count, or exhausted limits are partial when records were found. Synthetic Chrome fixtures cover traversal and expansion; they do not establish representative app behavior, broad performance, or external-client acceptance.
 
 If expansion is blocked or the deadline arrives, return the rows obtained with `partial`, not an empty success or a guessed full list. If the site offers no reliable end condition, say coverage is unknown.
 

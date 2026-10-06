@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0 and 1 are pushed and gated. Phase 1 hosted CI run `37465119376` passed on Ubuntu, macOS, and Windows for commit `8dbf51d`. Phase 2 code review and local fixture gate passed; its live browser and platform qualification gate remains open. Phase 1 still has no live browser or client dispatch.
+Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. Broad live-app/platform qualification remains open. File artifact selection is a Unix-only browser-library path; no MCP artifact transport or app acceptance/persistence is claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -60,23 +60,25 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [x] Run an ignored installed-Chrome headless DOM fixture: revision-bound fill, insert, and ASCII sequential keys produced the expected Unicode value and UTF-16 caret position. Dedicated launch now bootstraps Page/Runtime for newly created targets.
 - [x] Extend the isolated Chrome fixture: stale values withhold writes; marked masked/event-dependent controls and plain contenteditable fail closed; password controls return unsupported without observed values; an overlay blocks click dispatch; DOM drag verifies the moved element bounds; strict-background text works with no native requirement.
 - [x] Exercise supported installed-Chrome DOM cases: declared masked/event-dependent controls and contenteditable fail closed, password values are not exposed, an overlay blocks click, and DOM drag verifies final bounds.
-- [ ] Qualify IME, undeclared app-specific event semantics, canvas movement, and repeated live interference.
+- [x] Add guarded CDP text composition for ordinary input/textarea and verify composition events and committed Japanese text in isolated Chrome. Native OS IME candidate UI/conversion and masked/app-specific controls remain unqualified.
+- [x] Add a read-only macOS native snapshot and check foreground app, cursor position, and pasteboard change count before/after strict-background text in isolated Chrome.
+- [ ] Qualify undeclared app-specific event semantics, canvas movement beyond fail-closed refusal, and repeated live interference.
 - [ ] Measure the real Chrome check-to-dispatch window and repeated browser interference. The websocket fixture measures only its mock protocol window; no DOM-side mutation was injected during that live interval.
-- [ ] Qualify native focus/cursor/clipboard behavior with an independent observer.
+- [ ] Qualify native focus/cursor/clipboard behavior across supported OSes/modes and repeated real-user interference; current observer evidence is one macOS isolated fixture.
 
-The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. The follow-up real Chrome run covers declared masked/event-dependent controls by refusing them before mutation, plain contenteditable by refusing it, overlay interception, and a DOM drag outcome. IME, app adapters and undeclared event semantics, canvas, authoritative application identity/edit observers, repeated adversarial interference, and native focus/cursor/clipboard observation remain open; the broader Phase 4 acceptance gate remains partial.
+The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. Isolated Chrome fixtures cover marked masked/event-dependent controls and contenteditable refusals, password non-disclosure, overlay interception, DOM drag bounds, stale-value withholding, simulated IME composition, per-session internal text paste, and private-handle file selection. The read-only native observer checks focus/cursor/clipboard-change count on macOS only. OS-level IME, canvas semantics, authoritative app identity/edit observers, other OSes, repeated adversarial interference, artifact MCP transport, and app acceptance/persistence remain open.
 
 ### Phase 5 — compact observations and bounded extraction
 
-- [x] Add revision-bound `BrowserConnection::observe` with selected CSS fields, page-side item/text/byte caps, freshness timestamp/epoch, explicit missing-field/item omissions, truncation, and informational non-resumable cursor metadata. The serialized result including metadata is kept within the byte budget or returns an error.
+- [x] Add revision-bound `BrowserConnection::observe` with selected CSS fields, selected-node AX, bounded PNG crops, page-side item/text/byte caps, freshness timestamp/epoch, explicit missing-field/item omissions, truncation, and byte-bounded output.
 - [x] Add bounded scroll-container extraction with selected field schema, stable-ID deduplication, page-side record/text/byte caps, step limits, progress cursor, missing coverage and terminal evidence. A wrong-account preflight returns before issuing a scroll command; each later page script checks identity before scrolling. `complete` additionally requires an independently authoritative expected-count match, a container-scoped terminal marker at scroll end on two no-new-ID observations, and no missing/clipped/truncated evidence.
 - [x] Add policy fixtures for 42 records across recycled eight-node batches, a separate 21-item bucket, blocked expansion, duplicate labels with distinct IDs, stale count, infinite feed without terminal marker, and wrong-account 404. Fixture policy and dedup tests pass.
 - [x] Run the extraction API against a real Chrome virtualized 42-record list; wrong-account preflight returns unknown without scrolling. The one synthetic run is recorded as diagnostic evidence only.
-- [ ] Qualify hidden-section traversal and blocked expansion against a real application DOM; current blocked-expansion evidence is a policy fixture.
+- [x] Qualify declared hidden-section traversal and blocked expansion in an isolated real Chrome synthetic DOM fixture. Representative application behavior remains open.
 - [x] Add local MCP stdio `session`, `observe`, and `extract` tools. Session connects only to an opted-in loopback endpoint or Chrome permissioned auto-connect, requires explicit target IDs, and returns revision-bound target references. Extraction calls the existing bounded API for caller-declared sections under one aggregate record/byte/deadline budget.
-- [ ] Add accessibility-tree and visual-crop observation routes and resumable cursors. Existing cursors remain informational.
+- [x] Add selected-node accessibility, byte-preflighted screenshot crop, and bounded single-use resumable cursors bound to target/revision/spec.
 
-Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.99.0: focused observation tests cover mocked wrong-account/no-scroll, selector exceptions, malformed evaluation values, empty results, missing fields, expected counts, page-script limits and exact final-size enforcement. See the MCP/live synthetic entries below for later work. Page budgets do not impose a wall-time bound on native selector/text reads.
+Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.99.0: focused observation tests cover mocked wrong-account/no-scroll, selector exceptions, malformed evaluation values, empty results, missing fields, expected counts, page-script limits and exact final-size enforcement. Phase 5 advanced tests additionally bound AX selection and crop pixels, scope IDs by section, preserve deterministic cursor bindings, and mark trimmed coverage partial. Native selector/text reads still have no wall-time bound.
 
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 
@@ -85,10 +87,10 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 | MCP initialize, `tools/list`, and session discovery `tools/call` over rmcp duplex transport | pass | macOS 26 / Rust 1.99.0 | Lists session/observe/extract with object schemas and required typed fields; discovery call succeeds. |
 | MCP session connect/list-targets, observe, and two-section extract `tools/call` against mocked CDP websocket | pass | macOS 26 / Rust 1.99.0 | Exercises manager bootstrap, explicit target selection, target-ref serialization/resolution, bounded observation, and per-section completeness through actual MCP calls. |
 | Loopback endpoint policy and Direct CDP grants | pass | Rust fixtures | Rejects DNS/non-loopback, credential-bearing, malformed, and non-WebSocket endpoints. Direct CDP requires a distinct grant; shared-extension sessions remain rejected by direct CDP. |
-| Phase 5 synthetic virtualized-list extraction | pass | Installed Chrome 154.0.8037.98; commits `44041af` and current review follow-up | Latest single run extracted 42 rows; 438.17 ms / 1,860 B versus 1.39 ms / 2,760 B for full DOM. This is a diagnostic, not a performance claim. Wrong-account preflight returned unknown without scrolling; blocked expansion remains covered by policy fixture only. |
+| Phase 5 synthetic virtualized-list extraction | pass | Installed Chrome 154.0.8037.98; commits `44041af`, `1fd49f9`, and advanced-fixture follow-up | Latest single run extracted 42 rows; 438.17 ms / 1,860 B versus 1.39 ms / 2,760 B for full DOM. This is a diagnostic, not a performance claim. Wrong-account preflight returned unknown without scrolling; successful and blocked expansion are also covered by a synthetic Chrome fixture. |
 
 ## Phase 5 MCP boundaries
 
 - The stdio adapter is local-only. Explicit CDP requires `COMPTROL_ALLOW_DIRECT_CDP=1` plus `COMPTROL_CDP_ENDPOINT`; only loopback IP literals are accepted. Permissioned auto-connect requires `COMPTROL_CHROME_AUTO_CONNECT=1` and preserves Chrome's native consent prompt.
-- The synthetic list fixture does not qualify real application account markers, hidden sibling sections, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
-- `execute`, `jobs`, guide resource, AX/screenshot observation, durable MCP identity, and resumable section cursors are outside this slice.
+- Synthetic list and hidden-section fixtures do not qualify representative app account markers, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
+- `execute`, `jobs`, guide resource, durable MCP identity, and artifact output are outside this slice.

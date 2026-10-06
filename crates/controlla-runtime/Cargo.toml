@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Chrome Controlla capability decisions and local CLI"
 
 [dependencies]
-controlla-browser = { path = "../controlla-browser" }
+controlla-browser = { path = "../controlla-browser", version = "=0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
