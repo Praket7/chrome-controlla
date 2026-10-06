@@ -18,7 +18,8 @@ pub use input::{
 pub use manager::BrowserManager;
 pub use observe::{
     AccessibilityObservation, Completeness, ExpansionControl, ExtractionResult, ExtractionSpec,
-    Observation, ObserveSpec, ScreenshotCrop, ScreenshotObservation,
+    Observation, ObserveSpec, ScreenshotCrop, ScreenshotObservation, identity_marker_command,
+    observation_command, parse_observation,
 };
 pub use session::{
     BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,

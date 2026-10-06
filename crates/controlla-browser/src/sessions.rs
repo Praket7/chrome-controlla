@@ -7,6 +7,9 @@
 use crate::{FrameRecord, TargetRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REGISTRY_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +341,8 @@ pub struct CleanupReceipt {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SessionRegistry {
     grants: ProviderGrants,
+    #[serde(default)]
+    session_namespace: u64,
     next_session_id: u64,
     next_capability_revision: u64,
     sessions: BTreeMap<String, SessionHandle>,
@@ -358,6 +363,7 @@ impl SessionRegistry {
     pub fn new(grants: ProviderGrants) -> Self {
         Self {
             grants,
+            session_namespace: NEXT_REGISTRY_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             next_session_id: 1,
             next_capability_revision: 1,
             sessions: BTreeMap::new(),
@@ -617,7 +623,10 @@ impl SessionRegistry {
             return Err(SessionError::ProviderDenied(provider));
         }
         let handle = SessionHandle {
-            id: format!("session-{}", self.next_session_id),
+            id: format!(
+                "session-{}-{}",
+                self.session_namespace, self.next_session_id
+            ),
             principal: principal.into(),
             mode: spec.mode,
             provider,
@@ -1083,6 +1092,7 @@ impl Clone for SessionRegistry {
     fn clone(&self) -> Self {
         Self {
             grants: self.grants,
+            session_namespace: self.session_namespace,
             next_session_id: self.next_session_id,
             next_capability_revision: self.next_capability_revision,
             sessions: self.sessions.clone(),

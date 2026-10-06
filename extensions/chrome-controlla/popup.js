@@ -6,7 +6,7 @@ chrome.tabs.query({}).then(tabs => {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.value = String(tab.id);
-    label.append(checkbox, ` ${tab.title || tab.url}`);
+    label.append(checkbox, ` [${tab.id}] ${tab.title || tab.url}`);
     tabsEl.append(label);
   }
 });

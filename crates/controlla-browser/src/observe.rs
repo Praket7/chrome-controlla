@@ -329,11 +329,142 @@ fn observation_page_script(config: &str) -> String {
     )
 }
 
+/// Run the existing bounded observation contract over a provider-supplied
+/// command route. The provider remains responsible for target authorization
+/// and freshness checks before every command.
+pub fn observation_command(spec: &ObserveSpec) -> Result<Value, BrowserError> {
+    validate_selector(&spec.selector)?;
+    if spec.max_items == 0
+        || spec.max_items > 500
+        || spec.max_text_chars == 0
+        || spec.max_text_chars > 10_000
+        || spec.fields.len() > 32
+        || spec
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 256)
+        || !(4096..=1_000_000).contains(&spec.max_bytes)
+    {
+        return Err(BrowserError::InvalidResponse(
+            "observation limits must be 1..=500 items and positive text/byte budgets".into(),
+        ));
+    }
+    for (name, selector) in &spec.fields {
+        validate_field_name(name)?;
+        validate_selector(selector)?;
+    }
+    let max_scan_nodes = spec.max_items.saturating_mul(64).clamp(64, 65_536);
+    let expression = json!({"selector":spec.selector,"fields":spec.fields,"limit":spec.max_items,"maxScanNodes":max_scan_nodes,"chars":spec.max_text_chars,"bytes":spec.max_bytes}).to_string();
+    let script = observation_page_script(&expression);
+    Ok(json!({"expression":script,"returnByValue":true,"awaitPromise":false}))
+}
+
+pub fn parse_observation(
+    target_id: &str,
+    navigation_epoch: u64,
+    spec: &ObserveSpec,
+    response: &Value,
+) -> Result<Observation, BrowserError> {
+    let value = evaluate_object(response)?;
+    if value["budgetError"] == true {
+        return Err(BrowserError::InvalidResponse(
+            "byte budget is too small for page observation metadata".into(),
+        ));
+    }
+    let items = value["items"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| BrowserError::InvalidResponse("observation omitted items array".into()))?;
+    if items.iter().any(|item| !item.is_object()) {
+        return Err(BrowserError::InvalidResponse(
+            "observation returned a non-object item".into(),
+        ));
+    }
+    let total = value["count"]
+        .as_u64()
+        .ok_or_else(|| BrowserError::InvalidResponse("observation omitted count".into()))?
+        as usize;
+    let missing_fields = value["missing"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| BrowserError::InvalidResponse("observation omitted missing array".into()))?;
+    if missing_fields.iter().any(|field| !field.is_string()) {
+        return Err(BrowserError::InvalidResponse(
+            "observation returned a malformed missing field".into(),
+        ));
+    }
+    let clipped_fields = value["clipped"]
+        .as_u64()
+        .ok_or_else(|| BrowserError::InvalidResponse("observation omitted clipped count".into()))?;
+    let mut omissions = Vec::new();
+    if !missing_fields.is_empty() {
+        omissions.push(format!(
+            "selected fields absent: {}",
+            missing_fields
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if clipped_fields > 0 {
+        omissions.push(format!(
+            "{clipped_fields} field values were clipped to the text budget"
+        ));
+    }
+    let page_limited = value["limited"]
+        .as_bool()
+        .ok_or_else(|| BrowserError::InvalidResponse("observation omitted limited flag".into()))?;
+    if page_limited {
+        omissions.push(
+            "observation stopped at a scan or byte limit; additional matches may be omitted".into(),
+        );
+    } else if total > items.len() {
+        omissions.push(format!(
+            "{} matching elements omitted by item budget",
+            total - items.len()
+        ));
+    }
+    if spec.fields.is_empty() {
+        omissions.push("no fields selected".into());
+    }
+    fit_observation(
+        Observation {
+            target_id: target_id.to_owned(),
+            navigation_epoch,
+            observed_at_ms: now_ms(),
+            items,
+            omissions,
+            truncated: total > spec.max_items || clipped_fields > 0 || page_limited,
+            cursor: spec.cursor.clone(),
+            cursor_is_resumable: false,
+        },
+        spec.max_bytes,
+    )
+}
+
 fn account_marker_script(marker: &Option<(String, String)>) -> String {
     let marker = serde_json::to_string(marker).expect("account marker serializes");
     format!(
         "(()=>{{const m={marker};if(!m)return false;const e=document.querySelector(m[0]);return !!e&&(e.innerText||e.getAttribute('content')||'').trim()===m[1]}})()"
     )
+}
+
+/// Build a strict visible-text/content identity check for a caller-declared marker.
+/// The marker is evidence supplied by the caller, not an authoritative account claim.
+pub fn identity_marker_command(selector: &str, expected: &str) -> Result<Value, BrowserError> {
+    validate_selector(selector)?;
+    if expected.is_empty() || expected.len() > 512 || expected.chars().any(char::is_control) {
+        return Err(BrowserError::InvalidResponse(
+            "identity marker text must be 1..=512 printable bytes".into(),
+        ));
+    }
+    let marker = serde_json::to_string(&(selector, expected))
+        .map_err(|error| BrowserError::InvalidResponse(error.to_string()))?;
+    let expression = format!(
+        "(()=>{{const m={marker};const e=document.querySelector(m[0]);return !!e&&(e.innerText||e.getAttribute('content')||'').trim()===m[1]}})()"
+    );
+    Ok(json!({"expression":expression,"returnByValue":true,"awaitPromise":false}))
 }
 
 impl BrowserConnection {
@@ -461,112 +592,23 @@ impl BrowserConnection {
         revisions: IdentityRevisions,
         spec: &ObserveSpec,
     ) -> Result<Observation, BrowserError> {
-        validate_selector(&spec.selector)?;
-        if spec.max_items == 0
-            || spec.max_items > 500
-            || spec.max_text_chars == 0
-            || spec.max_text_chars > 10_000
-            || spec.fields.len() > 32
-            || spec
-                .cursor
-                .as_ref()
-                .is_some_and(|cursor| cursor.len() > 256)
-            || !(4096..=1_000_000).contains(&spec.max_bytes)
-        {
-            return Err(BrowserError::InvalidResponse(
-                "observation limits must be 1..=500 items and positive text/byte budgets".into(),
-            ));
-        }
-        for (name, selector) in &spec.fields {
-            validate_field_name(name)?;
-            validate_selector(selector)?;
-        }
-        let max_scan_nodes = spec.max_items.saturating_mul(64).clamp(64, 65_536);
-        let expression = json!({"selector":spec.selector,"fields":spec.fields,"limit":spec.max_items,"maxScanNodes":max_scan_nodes,"chars":spec.max_text_chars,"bytes":spec.max_bytes}).to_string();
-        let script = observation_page_script(&expression);
-        let value = self
+        let params = observation_command(spec)?;
+        let response = self
             .target_ref_command(
                 sessions,
                 reference,
                 principal,
                 revisions,
                 "Runtime.evaluate",
-                json!({"expression":script,"returnByValue":true,"awaitPromise":false}),
+                params,
             )
             .await?;
-        let value = evaluate_object(&value)?;
-        if value["budgetError"] == true {
-            return Err(BrowserError::InvalidResponse(
-                "byte budget is too small for page observation metadata".into(),
-            ));
-        }
-        let items = value["items"].as_array().cloned().ok_or_else(|| {
-            BrowserError::InvalidResponse("observation omitted items array".into())
-        })?;
-        if items.iter().any(|item| !item.is_object()) {
-            return Err(BrowserError::InvalidResponse(
-                "observation returned a non-object item".into(),
-            ));
-        }
-        let total = value["count"]
-            .as_u64()
-            .ok_or_else(|| BrowserError::InvalidResponse("observation omitted count".into()))?
-            as usize;
-        let mut omissions = Vec::new();
-        let missing_fields = value["missing"].as_array().cloned().ok_or_else(|| {
-            BrowserError::InvalidResponse("observation omitted missing array".into())
-        })?;
-        if missing_fields.iter().any(|field| !field.is_string()) {
-            return Err(BrowserError::InvalidResponse(
-                "observation returned a malformed missing field".into(),
-            ));
-        }
-        let clipped_fields = value["clipped"].as_u64().ok_or_else(|| {
-            BrowserError::InvalidResponse("observation omitted clipped count".into())
-        })?;
-        if !missing_fields.is_empty() {
-            omissions.push(format!(
-                "selected fields absent: {}",
-                missing_fields
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if clipped_fields > 0 {
-            omissions.push(format!(
-                "{clipped_fields} field values were clipped to the text budget"
-            ));
-        }
-        let page_limited = value["limited"].as_bool().ok_or_else(|| {
-            BrowserError::InvalidResponse("observation omitted limited flag".into())
-        })?;
-        if page_limited {
-            omissions.push(
-                "observation stopped at a scan or byte limit; additional matches may be omitted"
-                    .into(),
-            );
-        } else if total > items.len() {
-            omissions.push(format!(
-                "{} matching elements omitted by item budget",
-                total - items.len()
-            ));
-        }
-        if spec.fields.is_empty() {
-            omissions.push("no fields selected".into());
-        }
-        let result = Observation {
-            target_id: reference.target_id.clone(),
-            navigation_epoch: reference.frame_revision,
-            observed_at_ms: now_ms(),
-            items,
-            omissions,
-            truncated: total > spec.max_items || clipped_fields > 0 || page_limited,
-            cursor: spec.cursor.clone(),
-            cursor_is_resumable: false,
-        };
-        fit_observation(result, spec.max_bytes)
+        parse_observation(
+            &reference.target_id,
+            reference.frame_revision,
+            spec,
+            &response,
+        )
     }
 
     /// Traverse a scroll container a fixed number of times, deduplicating by a

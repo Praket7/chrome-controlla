@@ -1,6 +1,7 @@
 use controlla_browser::{
-    BrowserManager, ExpansionControl, ExtractionSpec, ObserveSpec, ScreenshotCrop, SessionProvider,
-    connect_permissioned_auto_connect, list_sessions,
+    BrowserManager, ExpansionControl, ExtractionSpec, GuardSnapshot, GuardedFileSelection,
+    ObserveSpec, ScreenshotCrop, SessionProvider, connect_permissioned_auto_connect,
+    identity_marker_command, list_sessions, observation_command, parse_observation,
     sessions::{
         IdentityRevisions, ProviderGrants, SessionMode, SessionRegistry, SessionSpec, TargetRef,
     },
@@ -73,6 +74,13 @@ struct ObserveArgs {
     target_ref: TargetRefInput,
     spec: ObserveInput,
 }
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SharedObserveArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    spec: ObserveInput,
+}
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
     session_id: String,
@@ -101,8 +109,31 @@ struct ScreenshotArgs {
     max_bytes: usize,
 }
 
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ArtifactRegisterArgs {
+    session_id: String,
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct FileSelectArgs {
+    session_id: String,
+    target_ref: TargetRefInput,
+    locator: Value,
+    artifact_handle: String,
+    account_marker: (String, String),
+}
+
 struct LiveSession {
     connection: Arc<controlla_browser::BrowserConnection>,
+    registry: Mutex<SessionRegistry>,
+    handle: controlla_browser::sessions::SessionHandle,
+}
+
+struct SharedLiveSession {
+    provider: Option<controlla_browser::providers::SharedExtensionProvider>,
+    connection: Option<controlla_browser::providers::SharedExtensionSession>,
     registry: SessionRegistry,
     handle: controlla_browser::sessions::SessionHandle,
 }
@@ -111,10 +142,211 @@ struct LiveSession {
 struct App {
     manager: BrowserManager,
     sessions: Arc<Mutex<BTreeMap<String, Arc<LiveSession>>>>,
+    shared_sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<SharedLiveSession>>>>>,
+}
+
+async fn run_file_select(s: Arc<LiveSession>, args: FileSelectArgs) -> Result<Value, String> {
+    let reference: TargetRef =
+        serde_json::from_value(serde_json::to_value(args.target_ref).map_err(|e| e.to_string())?)
+            .map_err(|_| "target_ref must be a complete current TargetRef".to_owned())?;
+    if reference.session_id != args.session_id {
+        return Err("target_ref session does not match session_id".into());
+    }
+    if s.handle.mode != SessionMode::DirectCdp || reference.principal != s.handle.principal {
+        return Err("file selection requires the matching direct CDP session".into());
+    }
+    let locator =
+        controlla_browser::Locator::from_value(&args.locator).map_err(|e| e.to_string())?;
+    let handle: controlla_browser::sessions::ArtifactHandle =
+        serde_json::from_value(json!(args.artifact_handle))
+            .map_err(|_| "artifact_handle is invalid".to_owned())?;
+    let registry = s.registry.lock().await;
+    if !registry.contains_target(&s.handle, &reference.target_id) {
+        return Err("target_ref is not bound to this session".into());
+    }
+    let revisions = IdentityRevisions {
+        account: reference.account_revision,
+        document: reference.document_revision,
+    };
+    let resolved = s
+        .connection
+        .resolve_target_ref(
+            &registry,
+            &reference,
+            &s.handle.principal,
+            revisions.account,
+            revisions.document,
+        )
+        .await
+        .map_err(|e| format!("target_ref is stale: {e:?}"))?;
+    let marker_check = identity_marker_command(&args.account_marker.0, &args.account_marker.1)
+        .map_err(|e| format!("invalid account marker: {e}"))?;
+    verify_file_select_marker(&s, &registry, &reference, revisions, &marker_check)
+        .await
+        .map_err(|error| format!("file selection withheld: {error}"))?;
+    let expected = GuardSnapshot {
+        navigation: reference.frame_revision,
+        account: reference.account_revision,
+        document: reference.document_revision,
+        dependencies: Default::default(),
+        strict_background: false,
+        requires_native: false,
+    };
+    let current = GuardSnapshot {
+        navigation: resolved.frame.revision,
+        ..expected.clone()
+    };
+    let evidence = s
+        .connection
+        .select_file_input_artifact(
+            &registry,
+            &reference,
+            &s.handle.principal,
+            revisions,
+            GuardedFileSelection {
+                expected: &expected,
+                current: &current,
+                locator: &locator,
+                handle: &handle,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    verify_file_select_marker(&s, &registry, &reference, revisions, &marker_check)
+        .await
+        .map_err(|error| {
+            format!("file may already be selected; post-selection identity check failed: {error}")
+        })?;
+    let mut result = serde_json::to_value(evidence).map_err(|e| e.to_string())?;
+    result["identity_guard"] = json!({
+        "selector": args.account_marker.0,
+        "expected_text": args.account_marker.1,
+        "evidence": "caller-declared DOM marker matched in preselection and postselection samples; no atomic account binding or app acceptance is established"
+    });
+    Ok(result)
+}
+
+async fn verify_file_select_marker(
+    s: &LiveSession,
+    registry: &SessionRegistry,
+    reference: &TargetRef,
+    revisions: IdentityRevisions,
+    command: &Value,
+) -> Result<(), String> {
+    let response = s
+        .connection
+        .target_ref_command(
+            registry,
+            reference,
+            &s.handle.principal,
+            revisions,
+            "Runtime.evaluate",
+            command.clone(),
+        )
+        .await
+        .map_err(|error| format!("identity marker check failed: {error}"))?;
+    if response.get("exceptionDetails").is_some() {
+        return Err("identity marker check threw; file selection withheld or unverifiable".into());
+    }
+    match response.pointer("/result/value") {
+        Some(Value::Bool(true)) => Ok(()),
+        Some(Value::Bool(false)) => {
+            Err("caller-declared identity marker is missing or mismatched".into())
+        }
+        _ => Err(
+            "identity marker check returned no boolean; file selection withheld or unverifiable"
+                .into(),
+        ),
+    }
+}
+
+async fn shared_frame_identity(
+    connection: &controlla_browser::providers::SharedExtensionSession,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+) -> Result<(String, String, String), String> {
+    let response = connection
+        .command(registry, handle, tab_id, "Page.getFrameTree", Value::Null)
+        .await
+        .map_err(|e| e.to_string())?;
+    let frame = response
+        .get("frameTree")
+        .and_then(|tree| tree.get("frame"))
+        .ok_or_else(|| "Page.getFrameTree omitted root frame".to_owned())?;
+    let id = frame["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Page.getFrameTree omitted root frame ID".to_owned())?;
+    let loader = frame["loaderId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Page.getFrameTree omitted root loader ID".to_owned())?;
+    let url = frame["url"]
+        .as_str()
+        .ok_or_else(|| "Page.getFrameTree omitted root frame URL".to_owned())?;
+    Ok((id.to_owned(), loader.to_owned(), url.to_owned()))
 }
 
 #[tool_router(server_handler)]
 impl App {
+    #[tool(
+        name = "artifact_register",
+        description = "Register bounded bytes under an opaque artifact handle scoped to this direct CDP session."
+    )]
+    async fn artifact_register(
+        &self,
+        Parameters(args): Parameters<ArtifactRegisterArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        if args.bytes.is_empty() || args.bytes.len() > 10 * 1024 * 1024 {
+            return Err(invalid(
+                "artifact bytes must be between 1 and 10485760 bytes",
+            ));
+        }
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        if s.handle.mode != SessionMode::DirectCdp {
+            return Err(invalid(
+                "artifact registration is currently available only for direct CDP sessions",
+            ));
+        }
+        let metadata = s
+            .registry
+            .lock()
+            .await
+            .put_artifact_bytes(&s.handle, &args.filename, &args.bytes)
+            .map_err(|e| invalid(format!("artifact registration failed: {e:?}")))?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "handle": metadata.handle, "filename": metadata.filename, "size": metadata.size,
+            "evidence": "registered in the ephemeral principal/session-scoped store"
+        })))
+    }
+
+    #[tool(
+        name = "file_select",
+        description = "Select a registered artifact after sampling a caller-declared account marker before and after selection. The samples are not atomic with selection; success proves Chrome selection/readback, not app acceptance."
+    )]
+    async fn file_select(
+        &self,
+        Parameters(args): Parameters<FileSelectArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        Ok(rmcp::handler::server::wrapper::Json(
+            run_file_select(s, args).await.map_err(invalid)?,
+        ))
+    }
+
     #[tool(
         name = "accessibility",
         description = "Return a bounded Chrome accessibility tree for an explicit target reference."
@@ -135,16 +367,17 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
-            || !s.registry.contains_target(&s.handle, &reference.target_id)
+            || !registry.contains_target(&s.handle, &reference.target_id)
         {
             return Err(invalid("target_ref is not bound to this session"));
         }
         let result = s
             .connection
             .observe_accessibility(
-                &s.registry,
+                &registry,
                 &reference,
                 &s.handle.principal,
                 IdentityRevisions {
@@ -181,16 +414,17 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
-            || !s.registry.contains_target(&s.handle, &reference.target_id)
+            || !registry.contains_target(&s.handle, &reference.target_id)
         {
             return Err(invalid("target_ref is not bound to this session"));
         }
         let result = s
             .connection
             .observe_screenshot(
-                &s.registry,
+                &registry,
                 &reference,
                 &s.handle.principal,
                 IdentityRevisions {
@@ -223,6 +457,159 @@ impl App {
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let action = args.action.as_str();
         match action {
+            "pair_shared" => {
+                let target_ids = args.target_ids.ok_or_else(|| invalid(
+                    "target_ids must explicitly select decimal Chrome tab IDs from the extension popup",
+                ))?;
+                if target_ids.is_empty()
+                    || target_ids.iter().any(|id| {
+                        !id.parse::<u32>()
+                            .is_ok_and(|parsed| parsed.to_string() == *id)
+                    })
+                    || target_ids
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != target_ids.len()
+                {
+                    return Err(invalid(
+                        "target_ids must be unique, non-empty decimal Chrome tab IDs",
+                    ));
+                }
+                let mut registry = SessionRegistry::new(ProviderGrants {
+                    shared_extension: true,
+                    ..Default::default()
+                });
+                let handle = registry
+                    .create_session(
+                        SessionSpec {
+                            mode: SessionMode::Shared,
+                            selected_target_ids: target_ids.clone(),
+                        },
+                        "local-stdio",
+                    )
+                    .map_err(|e| invalid(format!("shared session denied: {e:?}")))?;
+                let provider = controlla_browser::providers::SharedExtensionProvider::bind(
+                    &mut registry,
+                    &handle,
+                )
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+                let pairing = provider.pairing().clone();
+                let session_id = handle.id.clone();
+                self.shared_sessions.lock().await.insert(
+                    session_id.clone(),
+                    Arc::new(Mutex::new(SharedLiveSession {
+                        provider: Some(provider),
+                        connection: None,
+                        registry,
+                        handle,
+                    })),
+                );
+                Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "session_id":session_id, "target_ids":target_ids,
+                    "endpoint":pairing.endpoint, "one_session_token":pairing.token,
+                    "next":"Call session action accept_shared, then use the unpacked Chrome extension popup to check exactly these tab IDs, enter endpoint and token, and pair. This extension route uses chrome.debugger and does not require Chrome DevTools remote debugging to be enabled.",
+                    "identity":"Chrome tab IDs are not Direct CDP target references"
+                })))
+            }
+            "accept_shared" => {
+                let id = args
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| invalid("session_id is required"))?;
+                let shared = self
+                    .shared_sessions
+                    .lock()
+                    .await
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| invalid("unknown shared session_id"))?;
+                let mut shared = shared.lock().await;
+                if shared.connection.is_some() {
+                    return Err(invalid("shared extension session is already accepted"));
+                }
+                let mut provider = shared
+                    .provider
+                    .take()
+                    .ok_or_else(|| invalid("shared pairing is no longer pending"))?;
+                let connection = match provider.accept(&mut shared.registry).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        shared.provider = Some(provider);
+                        return Err(invalid(error.to_string()));
+                    }
+                };
+                shared.connection = Some(connection);
+                Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "session_id":id, "accepted":true,
+                    "target_ids":shared.connection.as_ref().unwrap().selected_targets(),
+                    "next":"Call list_shared_targets to inventory selected tabs or shared_observe for a bounded read. Extraction and input remain Direct CDP only."
+                })))
+            }
+            "list_shared_targets" => {
+                let id = args
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| invalid("session_id is required"))?;
+                let shared = self
+                    .shared_sessions
+                    .lock()
+                    .await
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| invalid("unknown shared session_id"))?;
+                let shared = shared.lock().await;
+                let connection = shared
+                    .connection
+                    .as_ref()
+                    .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+                let mut targets = Vec::new();
+                for target_id in connection.selected_targets() {
+                    let frame_tree = connection
+                        .command(
+                            &shared.registry,
+                            &shared.handle,
+                            target_id,
+                            "Page.getFrameTree",
+                            Value::Null,
+                        )
+                        .await
+                        .map_err(|e| invalid(e.to_string()))?;
+                    targets.push(json!({"chrome_tab_id":target_id,"frame_tree":frame_tree}));
+                }
+                Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "session_id":id,"targets":targets,
+                    "identity":"point-in-time extension tab inventory; no BrowserConnection TargetRef"
+                })))
+            }
+            "release_shared" => {
+                let id = args
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| invalid("session_id is required"))?;
+                let shared = self
+                    .shared_sessions
+                    .lock()
+                    .await
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| invalid("unknown shared session_id"))?;
+                let mut shared = shared.lock().await;
+                if let Some(connection) = shared.connection.as_mut() {
+                    connection
+                        .release()
+                        .await
+                        .map_err(|e| invalid(e.to_string()))?;
+                }
+                shared.connection = None;
+                shared.provider = None;
+                drop(shared);
+                self.shared_sessions.lock().await.remove(id);
+                Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "session_id":id,"released":true,"effect":"released this provider's debugger attachments"
+                })))
+            }
             "discover" => {
                 let mut providers = list_sessions();
                 if let Some(explicit) = providers
@@ -312,7 +699,7 @@ impl App {
                     id.clone(),
                     Arc::new(LiveSession {
                         connection,
-                        registry,
+                        registry: Mutex::new(registry),
                         handle,
                     }),
                 );
@@ -334,9 +721,10 @@ impl App {
                     .ok_or_else(|| invalid("unknown session_id"))?;
                 let (_, targets) = s.connection.target_snapshot().await;
                 let frames = s.connection.frames.read().await;
+                let registry = s.registry.lock().await;
                 let mut listed = Vec::new();
                 for target in targets.into_iter().filter(|t| {
-                    t.target_type == "page" && s.registry.contains_target(&s.handle, &t.id)
+                    t.target_type == "page" && registry.contains_target(&s.handle, &t.id)
                 }) {
                     let frame = frames
                         .frames
@@ -345,7 +733,7 @@ impl App {
                     if let Some(frame) = frame
                         && let Ok(reference) = s
                             .connection
-                            .capture_target_ref(&s.registry, &s.handle, &target.id, &frame.id, 0, 0)
+                            .capture_target_ref(&registry, &s.handle, &target.id, &frame.id, 0, 0)
                             .await
                     {
                         listed.push(json!({"target":target,"target_ref":reference}));
@@ -356,7 +744,7 @@ impl App {
                 ))
             }
             _ => Err(invalid(
-                "action must be discover, targets, connect, or list_targets",
+                "action must be pair_shared, accept_shared, list_shared_targets, release_shared, discover, targets, connect, or list_targets",
             )),
         }
     }
@@ -389,16 +777,17 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
-            || !s.registry.contains_target(&s.handle, &reference.target_id)
+            || !registry.contains_target(&s.handle, &reference.target_id)
         {
             return Err(invalid("target_ref is not bound to this session"));
         }
         let result = s
             .connection
             .observe(
-                &s.registry,
+                &registry,
                 &reference,
                 &s.handle.principal,
                 IdentityRevisions {
@@ -412,6 +801,88 @@ impl App {
         Ok(rmcp::handler::server::wrapper::Json(
             serde_json::to_value(result).unwrap_or(Value::Null),
         ))
+    }
+
+    #[tool(
+        name = "shared_observe",
+        description = "Read a bounded observation from one explicitly paired Chrome tab. Freshness is checked by matching root frame, loader, and URL before and after the read; this route does not create a Direct CDP TargetRef."
+    )]
+    async fn shared_observe(
+        &self,
+        Parameters(args): Parameters<SharedObserveArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let spec = ObserveSpec {
+            selector: args.spec.selector,
+            fields: args.spec.fields,
+            max_items: args.spec.max_items,
+            max_text_chars: args.spec.max_text_chars,
+            max_bytes: args.spec.max_bytes,
+            cursor: args.spec.cursor,
+        };
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let shared = shared.lock().await;
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let before = shared_frame_identity(
+            connection,
+            &shared.registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+        )
+        .await
+        .map_err(invalid)?;
+        let params = observation_command(&spec).map_err(|e| invalid(e.to_string()))?;
+        let response = connection
+            .command(
+                &shared.registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.evaluate",
+                params,
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let after = shared_frame_identity(
+            connection,
+            &shared.registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+        )
+        .await
+        .map_err(invalid)?;
+        if before != after {
+            return Err(invalid(
+                "shared target navigated during observation; result discarded as stale",
+            ));
+        }
+        let mut result = serde_json::to_value(
+            parse_observation(&args.chrome_tab_id, 0, &spec, &response)
+                .map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        result["navigation_epoch"] = Value::Null;
+        result["shared_frame_identity"] = json!({
+            "frame_id":before.0,"loader_id":before.1,
+            "freshness":"same root frame, loader, and URL before and after this read"
+        });
+        if serde_json::to_vec(&result)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > spec.max_bytes
+        {
+            return Err(invalid(
+                "byte budget is too small for shared frame identity metadata",
+            ));
+        }
+        Ok(rmcp::handler::server::wrapper::Json(result))
     }
 
     #[tool(
@@ -451,9 +922,10 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
-            || !s.registry.contains_target(&s.handle, &reference.target_id)
+            || !registry.contains_target(&s.handle, &reference.target_id)
         {
             return Err(invalid("target_ref is not bound to this session"));
         }
@@ -516,7 +988,7 @@ impl App {
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(left_ms),
                 s.connection.extract(
-                    &s.registry,
+                    &registry,
                     &reference,
                     &s.handle.principal,
                     IdentityRevisions {
@@ -747,12 +1219,18 @@ mod tests {
         assert!(names.contains(&"extract"));
         assert!(names.contains(&"accessibility"));
         assert!(names.contains(&"screenshot_crop"));
+        assert!(names.contains(&"artifact_register"));
+        assert!(names.contains(&"file_select"));
+        assert!(names.contains(&"shared_observe"));
         for name in [
             "session",
             "observe",
             "extract",
             "accessibility",
             "screenshot_crop",
+            "artifact_register",
+            "file_select",
+            "shared_observe",
         ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -765,6 +1243,17 @@ mod tests {
                 "{name} has required fields"
             );
         }
+        let file_select_schema = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "file_select")
+            .unwrap();
+        let file_select_schema = serde_json::to_value(&file_select_schema.input_schema).unwrap();
+        assert!(
+            file_select_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "account_marker"))
+        );
         let result = client
             .call_tool(
                 CallToolRequestParams::new("session")
@@ -806,6 +1295,8 @@ mod tests {
         let screenshot_calls_for_server = screenshot_calls.clone();
         let earlier_calls = Arc::new(AtomicUsize::new(0));
         let earlier_calls_for_server = earlier_calls.clone();
+        let file_select_calls = Arc::new(AtomicUsize::new(0));
+        let file_select_calls_for_server = file_select_calls.clone();
         let cdp = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
@@ -826,7 +1317,7 @@ mod tests {
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                         }
                         let value = if expr.contains("const m=") {
-                            json!(true)
+                            json!(!expr.contains("missing-marker"))
                         } else if expr.contains("missingFields") {
                             let items = if expr.contains("#bucket-left")
                                 || expr.contains("#bucket-right")
@@ -847,6 +1338,10 @@ mod tests {
                         json!({"result":{"type":"object","value":value}})
                     }
                     "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+                    "DOM.setFileInputFiles" => {
+                        file_select_calls_for_server.fetch_add(1, Ordering::SeqCst);
+                        json!({})
+                    }
                     "DOM.querySelector" => {
                         assert_eq!(request["params"]["selector"], "#fixture");
                         json!({"nodeId":2})
@@ -909,6 +1404,20 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let artifact = client
+            .call_tool(
+                CallToolRequestParams::new("artifact_register").with_arguments(args(
+                    json!({"session_id":session_id,"filename":"fixture.txt","bytes":[104,105]}),
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(!artifact.is_error.unwrap_or(false), "{artifact:?}");
+        assert_eq!(artifact.structured_content.as_ref().unwrap()["size"], 2);
+        assert_eq!(
+            artifact.structured_content.as_ref().unwrap()["filename"],
+            "fixture.txt"
+        );
         let listed = client
             .call_tool(CallToolRequestParams::new("session").with_arguments(args(
                 json!({"action":"list_targets","session_id":session_id}),
@@ -918,6 +1427,38 @@ mod tests {
         assert!(!listed.is_error.unwrap_or(false), "{listed:?}");
         let target_ref =
             listed.structured_content.as_ref().unwrap()["targets"][0]["target_ref"].clone();
+        let artifact_handle = artifact.structured_content.as_ref().unwrap()["handle"].clone();
+        let before_missing_marker = client
+            .call_tool(
+                CallToolRequestParams::new("file_select").with_arguments(args(json!({
+                    "session_id":session_id,
+                    "target_ref":target_ref,
+                    "locator":{"selector":"input[type=file]"},
+                    "artifact_handle":artifact_handle
+                }))),
+            )
+            .await;
+        assert!(
+            before_missing_marker.is_err()
+                || before_missing_marker.unwrap().is_error.unwrap_or(false)
+        );
+        let mismatched_marker = client
+            .call_tool(
+                CallToolRequestParams::new("file_select").with_arguments(args(json!({
+                    "session_id":session_id,
+                    "target_ref":target_ref,
+                    "locator":{"selector":"input[type=file]"},
+                    "artifact_handle":artifact_handle,
+                    "account_marker":["#account","missing-marker"]
+                }))),
+            )
+            .await;
+        assert!(mismatched_marker.is_err() || mismatched_marker.unwrap().is_error.unwrap_or(false));
+        assert_eq!(
+            file_select_calls.load(Ordering::SeqCst),
+            0,
+            "a mismatched marker must withhold DOM.setFileInputFiles"
+        );
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
         assert!(!observed.is_error.unwrap_or(false), "{observed:?}");
         let ax = client.call_tool(CallToolRequestParams::new("accessibility").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"selector":"#fixture","max_bytes":8192})))).await.unwrap();
@@ -1036,5 +1577,195 @@ mod tests {
             std::env::remove_var("COMPTROL_ALLOW_DIRECT_CDP");
             std::env::remove_var("COMPTROL_CDP_ENDPOINT");
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_shared_observe_is_bounded_and_discards_navigation_races() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let server = serve_directly::<RoleServer, _, _, _, _>(App::default(), server_io, None);
+        let server_task = tokio::spawn(async move { server.waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let args = |v: Value| v.as_object().unwrap().clone();
+        let invalid_pair = client
+            .call_tool(CallToolRequestParams::new("session").with_arguments(args(
+                json!({"action":"pair_shared","target_ids":["../remote"]}),
+            )))
+            .await;
+        assert!(invalid_pair.is_err() || invalid_pair.unwrap().is_error.unwrap_or(false));
+        let noncanonical = client
+            .call_tool(
+                CallToolRequestParams::new("session")
+                    .with_arguments(args(json!({"action":"pair_shared","target_ids":["0123"]}))),
+            )
+            .await;
+        assert!(noncanonical.is_err() || noncanonical.unwrap().is_error.unwrap_or(false));
+
+        let paired = client
+            .call_tool(
+                CallToolRequestParams::new("session")
+                    .with_arguments(args(json!({"action":"pair_shared","target_ids":["123"]}))),
+            )
+            .await
+            .unwrap();
+        let paired = paired.structured_content.unwrap();
+        let endpoint = paired["endpoint"].as_str().unwrap().to_owned();
+        assert!(endpoint.starts_with("ws://127.0.0.1:"));
+        assert_eq!(paired["target_ids"], json!(["123"]));
+        assert_eq!(
+            paired["identity"],
+            "Chrome tab IDs are not Direct CDP target references"
+        );
+        let session_id = paired["session_id"].as_str().unwrap().to_owned();
+        let token = paired["one_session_token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), 64);
+        let accept = client.call_tool(CallToolRequestParams::new("session").with_arguments(args(
+            json!({"action":"accept_shared","session_id":session_id}),
+        )));
+        let extension = async move {
+            let (mut peer, _) = connect_async(endpoint).await.unwrap();
+            peer.send(Message::Text(
+                json!({
+                    "type":"hello","token":token,"targets":["123"]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                peer.next().await.unwrap().unwrap().to_text().unwrap(),
+                "{\"type\":\"ready\"}"
+            );
+            peer
+        };
+        let (accepted, mut extension) = tokio::join!(accept, extension);
+        assert_eq!(
+            accepted.unwrap().structured_content.unwrap()["accepted"],
+            true
+        );
+
+        let observe_args = || {
+            args(json!({
+                "session_id":session_id,"chrome_tab_id":"123",
+                "spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}
+            }))
+        };
+        let observe = client
+            .call_tool(CallToolRequestParams::new("shared_observe").with_arguments(observe_args()));
+        let replies = async {
+            for (method, loader) in [
+                ("Page.getFrameTree", "doc-1"),
+                ("Runtime.evaluate", ""),
+                ("Page.getFrameTree", "doc-1"),
+            ] {
+                let request: Value = serde_json::from_str(
+                    extension.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], method);
+                let result = if method == "Page.getFrameTree" {
+                    json!({"frameTree":{"frame":{"id":"root","loaderId":loader,"url":"https://fixture.test/"}}})
+                } else {
+                    json!({"result":{"type":"object","value":{"items":[{"text":"ok"}],"count":1,"missing":[],"clipped":0,"limited":false}}})
+                };
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (observed, ()) = tokio::join!(observe, replies);
+        let observed = observed.unwrap().structured_content.unwrap();
+        assert_eq!(observed["items"][0]["text"], "ok");
+        assert_eq!(observed["navigation_epoch"], Value::Null);
+        assert_eq!(observed["shared_frame_identity"]["loader_id"], "doc-1");
+        assert!(observed.get("target_ref").is_none());
+        assert!(serde_json::to_vec(&observed).unwrap().len() <= 4096);
+
+        let stale_observe = client
+            .call_tool(CallToolRequestParams::new("shared_observe").with_arguments(observe_args()));
+        let navigation_replies = async {
+            for (method, loader) in [
+                ("Page.getFrameTree", "doc-1"),
+                ("Runtime.evaluate", ""),
+                ("Page.getFrameTree", "doc-2"),
+            ] {
+                let request: Value = serde_json::from_str(
+                    extension.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], method);
+                let result = if method == "Page.getFrameTree" {
+                    json!({"frameTree":{"frame":{"id":"root","loaderId":loader,"url":"https://fixture.test/"}}})
+                } else {
+                    json!({"result":{"type":"object","value":{"items":[],"count":0,"missing":[],"clipped":0,"limited":false}}})
+                };
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (stale, ()) = tokio::join!(stale_observe, navigation_replies);
+        assert!(stale.is_err() || stale.unwrap().is_error.unwrap_or(false));
+        let released = client
+            .call_tool(CallToolRequestParams::new("session").with_arguments(args(
+                json!({"action":"release_shared","session_id":session_id}),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(released.structured_content.unwrap()["released"], true);
+        client.cancel().await.unwrap();
+        let _ = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_shared_sessions_keep_distinct_registry_ids_and_can_release_independently() {
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let server = serve_directly::<RoleServer, _, _, _, _>(App::default(), server_io, None);
+        let server_task = tokio::spawn(async move { server.waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let args = |value: Value| value.as_object().unwrap().clone();
+        let pair = |tab_id: &str| {
+            CallToolRequestParams::new("session").with_arguments(args(json!({
+                "action":"pair_shared","target_ids":[tab_id]
+            })))
+        };
+        let first = client.call_tool(pair("123")).await.unwrap();
+        let second = client.call_tool(pair("456")).await.unwrap();
+        let first_id = first.structured_content.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second_id = second.structured_content.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(
+            first_id, second_id,
+            "independent registries must not collide"
+        );
+        for session_id in [&first_id, &second_id] {
+            let released = client
+                .call_tool(CallToolRequestParams::new("session").with_arguments(args(
+                    json!({"action":"release_shared","session_id":session_id}),
+                )))
+                .await
+                .unwrap();
+            assert_eq!(released.structured_content.unwrap()["released"], true);
+        }
+        client.cancel().await.unwrap();
+        let _ = server_task.await.unwrap();
     }
 }

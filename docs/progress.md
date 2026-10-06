@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. Broad live-app/platform qualification remains open. File artifact selection is a Unix-only browser-library path; no MCP artifact transport or app acceptance/persistence is claimed.
+Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -66,7 +66,7 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [ ] Measure the real Chrome check-to-dispatch window and repeated browser interference. The websocket fixture measures only its mock protocol window; no DOM-side mutation was injected during that live interval.
 - [ ] Qualify native focus/cursor/clipboard behavior across supported OSes/modes and repeated real-user interference; current observer evidence is one macOS isolated fixture.
 
-The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. Isolated Chrome fixtures cover marked masked/event-dependent controls and contenteditable refusals, password non-disclosure, overlay interception, DOM drag bounds, stale-value withholding, simulated IME composition, per-session internal text paste, and private-handle file selection. The read-only native observer checks focus/cursor/clipboard-change count on macOS only. OS-level IME, canvas semantics, authoritative app identity/edit observers, other OSes, repeated adversarial interference, artifact MCP transport, and app acceptance/persistence remain open.
+The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. Isolated Chrome fixtures cover marked masked/event-dependent controls and contenteditable refusals, password non-disclosure, overlay interception, DOM drag bounds, stale-value withholding, simulated IME composition, per-session internal text paste, and private-handle file selection. The read-only native observer checks focus/cursor/clipboard-change count on macOS only. OS-level IME, canvas semantics, authoritative app identity/edit observers, other OSes, repeated adversarial interference, and app acceptance/persistence remain open.
 
 ### Phase 5 — compact observations and bounded extraction
 
@@ -84,7 +84,7 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 | Check | Result | Environment | Evidence |
 |---|---|---|---|
-| MCP initialize, `tools/list`, and session discovery `tools/call` over rmcp duplex transport | pass | macOS 26 / Rust 1.99.0 | Lists session/observe/extract with object schemas and required typed fields; discovery call succeeds. |
+| MCP initialize, `tools/list`, and session discovery `tools/call` over rmcp duplex transport | pass | macOS 26 / Rust 1.99.0 | Lists session/observe/extract plus accessibility, screenshot crop, artifact register/file select, and shared observe tools with schemas; discovery call succeeds. |
 | MCP session connect/list-targets, observe, and two-section extract `tools/call` against mocked CDP websocket | pass | macOS 26 / Rust 1.99.0 | Exercises manager bootstrap, explicit target selection, target-ref serialization/resolution, bounded observation, and per-section completeness through actual MCP calls. |
 | Loopback endpoint policy and Direct CDP grants | pass | Rust fixtures | Rejects DNS/non-loopback, credential-bearing, malformed, and non-WebSocket endpoints. Direct CDP requires a distinct grant; shared-extension sessions remain rejected by direct CDP. |
 | Phase 5 synthetic virtualized-list extraction | pass | Installed Chrome 154.0.8037.98; commits `44041af`, `1fd49f9`, and advanced-fixture follow-up | Latest single run extracted 42 rows; 438.17 ms / 1,860 B versus 1.39 ms / 2,760 B for full DOM. This is a diagnostic, not a performance claim. Wrong-account preflight returned unknown without scrolling; successful and blocked expansion are also covered by a synthetic Chrome fixture. |
@@ -93,4 +93,4 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 - The stdio adapter is local-only. Explicit CDP requires `COMPTROL_ALLOW_DIRECT_CDP=1` plus `COMPTROL_CDP_ENDPOINT`; only loopback IP literals are accepted. Permissioned auto-connect requires `COMPTROL_CHROME_AUTO_CONNECT=1` and preserves Chrome's native consent prompt.
 - Synthetic list and hidden-section fixtures do not qualify representative app account markers, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
-- `execute`, `jobs`, guide resource, durable MCP identity, and artifact output are outside this slice.
+- `execute`, `jobs`, guide resource, durable MCP identity, artifact output/download, and shared-extension input/extraction are outside this slice.

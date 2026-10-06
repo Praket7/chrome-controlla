@@ -14,7 +14,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "723c51bce7d8792a62038f35542eee90c5698bf752689fc66ffdd406a4b97cbd",
+      "destination_sha256": "8f05b2921c970d9e1e3974f401f212c076a159f11733db0c00569fd0c4613915",
       "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
@@ -30,7 +30,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/session.rs",
       "destination_path": "crates/controlla-browser/src/session.rs",
       "source_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
-      "destination_sha256": "955fc3140681a38360a7a93911c4a94c445b5cce56885a9f1f90e5dce6d42a24",
+      "destination_sha256": "4d963dc59b9ed3c93e320065565f4496c861c8c4fa7a4fcc91ba86a383c8e23a",
       "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "436a841490ce20937533f101cfd3d42512ed0e5326271fdc33653534dd6720b9",
-      "edits": "updated relative link and document placement; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries",
+      "destination_sha256": "d78fe1bb9bdaf03b21bb49928b19c9341c4202f4db7e182faefa9154db6ef03c",
+      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },
     {

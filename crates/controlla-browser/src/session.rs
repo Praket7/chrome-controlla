@@ -163,8 +163,8 @@ fn now_ms() -> u128 {
 }
 
 /// Discover local browser surfaces without connecting to anything.
-/// Check if the companion extension native host is registered on this platform.
-fn native_bridge_available() -> bool {
+/// Check registration only; this is not a Controlla command transport.
+fn native_bridge_registered() -> bool {
     #[allow(unused_variables)]
     let host_id = "comptrol_browser_bridge";
     #[cfg(target_os = "macos")]
@@ -208,7 +208,7 @@ pub fn list_sessions() -> Vec<BrowserSession> {
     let chrome_endpoint_detected = chrome_user_data_dirs()
         .iter()
         .any(|user_data_dir| find_devtools_active_port(user_data_dir).is_some());
-    let companion_available = native_bridge_available();
+    let companion_registered = native_bridge_registered();
     vec![
         BrowserSession {
             provider: SessionProvider::PermissionedAutoConnect,
@@ -227,12 +227,14 @@ pub fn list_sessions() -> Vec<BrowserSession> {
         },
         BrowserSession {
             provider: SessionProvider::CompanionExtension,
-            available: companion_available,
-            reason: if companion_available {
-                "companion extension native host is registered; CDP commands route through the daemon"
+            // Comptrol's local HTTP API has no external command-enqueue route.
+            // Registration alone therefore cannot make this provider connectable.
+            available: false,
+            reason: if companion_registered {
+                "Comptrol Browser Bridge native host is registered, but Controlla has no command transport adapter for it; use the separate shared-extension pairing route or configure an explicitly permissioned CDP route"
                     .to_owned()
             } else {
-                "companion extension native host is not registered; install the Browser Bridge extension"
+                "Comptrol Browser Bridge native host is not registered, and Controlla has no command transport adapter for it"
                     .to_owned()
             },
             signed_in_capable: true,
@@ -278,10 +280,8 @@ pub fn select_provider(needs_signed_in: bool) -> Result<SessionProvider, String>
     if needs_signed_in {
         let extension = get(SessionProvider::CompanionExtension);
         let permissioned = get(SessionProvider::PermissionedAutoConnect);
-        // Prefer the persistent extension bridge when installed. The direct
-        // CDP route may trigger Chrome's native consent prompt for each new
-        // connection, while the extension's install permission is reviewed
-        // once by the user and then reused across tasks.
+        // Select only a provider with an implemented, currently available
+        // transport. A registered Comptrol native host alone is not one.
         if let Some(provider) =
             preferred_signed_in_provider(extension.available, permissioned.available)
         {
@@ -508,6 +508,16 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn native_host_registration_is_not_a_controlla_transport() {
+        let companion = list_sessions()
+            .into_iter()
+            .find(|session| session.provider == SessionProvider::CompanionExtension)
+            .expect("companion provider is listed");
+        assert!(!companion.available);
+        assert!(companion.reason.contains("no command transport adapter"));
     }
 
     #[test]

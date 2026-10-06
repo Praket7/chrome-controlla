@@ -110,14 +110,14 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 
 **Consumes:** upstream Git URL and researched SHA. **Produces:** clean Chrome-only repo, pinned toolchain and source inventory.
 
-- [ ] Inspect workspace instructions, Git identity/auth and existing repositories before cloning. Do not overwrite a user checkout or discard uncommitted changes.
-- [ ] Clone upstream into a separate source directory. Record fetched HEAD, remote URL and dirty state. Compare browser/core/bridge/package changes to the researched SHA; determine whether reported regressions correspond to an older binary or another route.
-- [ ] Inspect licenses and dependencies. Create a new local repository named `chrome-controlla`, preserving notices and provenance, with no credentials or browser profiles.
-- [ ] If executing this prompt includes authorized GitHub repository creation, use the authenticated user’s intended owner and create **a separate repository**, never rename/delete Comptrol. Default private when visibility is unspecified; record that choice. If the name exists, inspect ownership/content and stop before overwriting. Do not guess an alternate name or push into an unrelated repo.
-- [ ] Select and pin Rust, Node/reference runner, MCP SDK/protocol and Chrome for Testing versions supported by the environment. Document rationale and supported OS targets.
-- [ ] Extract minimal browser engine and tests, not the monolithic app registry. Create provenance mapping and a dependency check that fails if native desktop platform crates/adapters re-enter the distribution.
-- [ ] Add a CI baseline: formatting, static checks, focused Rust tests, fixtures, package/docs checks. Confirm a clean checkout can build without upstream globally installed.
-- [ ] Commit `chore: establish Chrome-only source extraction and provenance`.
+- [x] Inspect workspace instructions, Git identity/auth and existing repositories before cloning. Do not overwrite a user checkout or discard uncommitted changes.
+- [x] Clone upstream into a separate source directory. Record fetched HEAD, remote URL and dirty state. Compare browser/core/bridge/package changes to the researched SHA; determine whether reported regressions correspond to an older binary or another route.
+- [x] Inspect licenses and dependencies. Create a new local repository named `chrome-controlla`, preserving notices and provenance, with no credentials or browser profiles.
+- [x] If executing this prompt includes authorized GitHub repository creation, use the authenticated user's intended owner and create **a separate repository**, never rename/delete Comptrol. Default private when visibility is unspecified; record that choice. If the name exists, inspect ownership/content and stop before overwriting. Do not guess an alternate name or push into an unrelated repo.
+- [x] Select and pin Rust, Node/reference runner, MCP SDK/protocol and Chrome for Testing versions supported by the environment. Document rationale and supported OS targets.
+- [x] Extract minimal browser engine and tests, not the monolithic app registry. Create provenance mapping and a dependency check that fails if native desktop platform crates/adapters re-enter the distribution.
+- [x] Add a CI baseline: formatting, static checks, focused Rust tests, fixtures, package/docs checks. Confirm a clean checkout can build without upstream globally installed.
+- [x] Commit `chore: establish Chrome-only source extraction and provenance`.
 
 **Gate:** actual source reconciliation and clean build, not merely a GitHub repo URL. Owner/visibility/publication decisions are recorded. No implementation superiority claim.
 
@@ -127,13 +127,13 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 
 **Interfaces:** `evaluate_capability(ctx: &CapabilityContext, action: &str) -> CapabilityDecision`; `doctor(config: &Config) -> DiagnosticReport`; dispatch consumes the same decision function.
 
-- [ ] Write failing tests for CC-01–04 and B01–04: direct-only, bridge-only, unconfigured, denied, revoked, minimal PATH, and help with open stdin.
-- [ ] Implement early argument parsing. Help/version/list-schema never initialize browser runtime or mutate state. Invalid flags fail clearly.
-- [ ] Implement one evaluator with structured reasons; catalog is a snapshot, dispatch reevaluates. Add principal and policy revision to diagnostic correlation without secrets.
-- [ ] Report heartbeat and authenticated round-trip separately. Preserve storage/path/permission errors instead of mapping all to false. Test different process environments and daemon state paths without claiming one is the tester’s proven cause.
-- [ ] Resolve the launcher relative to the installed package or explicit path. Make cold install failures distinguish download, architecture, permission and missing executable.
-- [ ] Run focused tests and clean-install smoke; inspect packaged contents.
-- [ ] Commit `feat: unify capability decisions and standalone CLI packaging`.
+- [x] Write tests for CC-01–04 and B01–04: direct-only, bridge-only, unconfigured, denied, revoked, minimal PATH, and help with open stdin.
+- [x] Implement early argument parsing. Help/version/list-schema never initialize browser runtime or mutate state. Invalid flags fail clearly.
+- [x] Implement one evaluator with structured reasons; catalog is a snapshot, dispatch reevaluates. Add principal and policy revision to diagnostic correlation without secrets.
+- [x] Report heartbeat and authenticated round-trip separately. Preserve storage/path/permission errors instead of mapping all to false. Test different process environments and daemon state paths without claiming one is the tester's proven cause.
+- [x] Resolve the launcher relative to the installed package or explicit path. Make cold install failures distinguish download, architecture, permission and missing executable.
+- [x] Run focused tests and clean-install smoke; inspect packaged contents.
+- [x] Commit `feat: unify capability decisions and standalone CLI packaging`.
 
 **Gate:** catalog/dispatch matrix agrees under the same context; every help path exits without side effects; install works without Comptrol.
 
