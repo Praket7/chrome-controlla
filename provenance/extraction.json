@@ -14,8 +14,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "47a07e53f6a03818b317b9a7b99d19352d91110461dfc85e7e95cc021abaf3a3",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.",
+      "destination_sha256": "60180dc6bead87d45209cc19130506e822bb82fdc7fcf344205733bd2bfc50d8",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {

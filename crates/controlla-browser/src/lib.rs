@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod blocking;
+mod input;
 mod manager;
 pub mod providers;
 pub mod scheduler;
@@ -8,6 +9,10 @@ mod session;
 pub mod sessions;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
+pub use input::{
+    DispatchEvidence, GuardDecision, GuardSnapshot, InputAction, InvalidationSet, SemanticLocator,
+    measure_check_dispatch_race, on_external_change, perform_input, validate_step,
+};
 pub use manager::BrowserManager;
 pub use session::{
     BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,

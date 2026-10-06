@@ -32,10 +32,10 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-06 | unimplemented | 3 | none |
 | CC-07 | partial | 3 | bounded wait and durable state tested with local async fixture; no Promise/CDP/bridge worker route or reconnecting MCP client |
 | CC-08 | unimplemented | 5 | none |
-| CC-09 | partial | 2 | target/frame/browser revisions and stale-handle fixtures pass; application account/document revisions remain caller-supplied and unobserved |
-| CC-10 | unimplemented | 4 | none |
-| CC-11 | unimplemented | 4 | none |
-| CC-12 | unimplemented | 4 | none |
+| CC-09 | partial | 2/4 | target/frame/browser revisions and stale-handle fixtures pass; Phase 4 guard compares caller-supplied identity/dependency snapshots; no authoritative app identity observer |
+| CC-10 | partial | 4 | typed snapshot guard yields on identity/dependency mismatch; fixture checks only compare snapshots. No DOM event stream / check-dispatch race injection or measured browser dispatch window; unsafe mutation prevention remains unqualified |
+| CC-11 | partial | 4 | strict-background guard returns `NeedsForeground` before the injected dispatch callback when native routing is required; OS focus/cursor/clipboard isolation unverified |
+| CC-12 | partial | 4 | typed action variants and Unicode fixture value echo exist; no real input dispatch, semantic locator resolution, masked/contenteditable/event-dependent/click/drag postcondition fixtures |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
 | CC-14 | unimplemented | 6 | none |
 | CC-15 | unimplemented | 5 | none |
@@ -56,10 +56,10 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B06 | fixture_verified | 3 | changed request under same scoped key conflicts; principal scope is isolated |
 | B07 | fixture_verified | 3 | independent fixture endpoint effect remains one after lost reply; replay traverses dispatch gate and is refused; recovery preserves acknowledged delivery as sent, while claim-before-send crash remains unknown with zero effects |
 | B08 | fixture_verified | 2 | closed/reused target references rejected; fresh target identity required |
-| B09 | unimplemented | 4 | none |
-| B10 | unimplemented | 4 | none |
-| B11 | unimplemented | 4 | none |
-| B12 | unimplemented | 4 | none |
+| B09 | partial | 4 | caller account revision mismatch yields before fixture dispatch; no live account switch observer |
+| B10 | partial | 4 | dependency snapshot mismatch yields; no live field edit detection or input value fixture |
+| B11 | partial | 4 | unchanged dependency snapshot permits continuation; no semantic DOM churn observer or sound unrelated-change exclusion evidence |
+| B12 | partial | 4 | external-change invalidation type fixture only; no geometry/hit-target recheck or overlay interception fixture |
 | B13 | fixture_verified | 2 | frame navigation/revision and OOPIF replacement fixtures |
 | B14 | unimplemented | 5 | none |
 | B15 | unimplemented | 5 | none |
@@ -69,10 +69,10 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B19 | partial | 3 | persisted deadline survives reopen; queued expiry is failed/deadline_error/not_sent; dispatched expiry is unknown while preserving acknowledged sent or unacknowledged unknown delivery; real Promise and worker cancellation route remain absent |
 | B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
 | B21 | fixture_verified | 2 | concurrent mutations for the same shared document serialize |
-| B22 | unimplemented | 4 | none |
-| B23 | unimplemented | 4 | none |
-| B24 | unimplemented | 4 | none |
-| B25 | unimplemented | 4 | none |
+| B22 | partial | 4 | Unicode typed value fixture only; masked input, grapheme/IME, contenteditable and event-dependent behavior unverified |
+| B23 | partial | 4 | drag is represented as a typed action only; no fresh geometry or DOM/canvas result fixture |
+| B24 | partial | 4 | strict-background native-required route yields before dispatch callback; no OS clipboard observer, so isolation unverified |
+| B25 | partial | 4 | strict-background native-required route yields before dispatch callback; no OS focus/cursor observer, so isolation unverified |
 | B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
 | B27 | unimplemented | 6 | none |
 | B28 | unimplemented | 7 | none |
@@ -83,7 +83,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B33 | unimplemented | 5 | none |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
-| B36 | unimplemented | 4 | none |
+| B36 | partial | 4 | strict-background native-required route reports NeedsForeground; no native-dialog fixture or platform observer |
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 
@@ -208,3 +208,14 @@ Sol independently approved the Phase 2 code diff after reviewing launch cancella
 | `node scripts/check-provenance.mjs`, `node scripts/check-doc-links.mjs`, `git diff --check` | pass | macOS 26 | 13 source digests and 22 retained tests; local Markdown links pass; no whitespace errors |
 
 Sol approved the local journal gate after reviewing two correction rounds. Tests cover owner-scoped durable replay, concurrent admission and one-time dispatch claims, fixture send counting, crash-before-send uncertainty, acknowledged-delivery preservation, pre-send failure, bounded wait, and persisted deadlines. This is not an MCP jobs tool or live browser execution: B18/B19 remain partial for real Promise, worker cancellation, and CDP/extension routes.
+
+## Phase 4 local guard primitives — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --locked --offline input::tests` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 4 typed snapshot/action-callback tests pass, including caller-revision mismatch, strict-background fail-closed behavior, Unicode fixture value echo, and invalidation; no browser DOM dispatch |
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 68 passed, 1 ignored in browser unit tests; 7 phase2 integration, 3 runtime unit, 8 CLI, 10 jobs, 3 registry integration tests passed; formatting and Clippy clean |
+| `npm run check:provenance && node scripts/check-doc-links.mjs && git diff --check` | pass | macOS 26 | 13 extraction digests and 22 retained tests verified; 14 Markdown files checked; no whitespace errors |
+| Red-first evidence | not recorded | Phase 4 implementation history | New tests were run after implementation; no pre-implementation failing execution is claimed |
+
+The input module is a guard/data model only. `SemanticLocator` is not resolved against a DOM; `perform_input` calls an injected fixture callback and does not issue CDP input. No actual masked/contenteditable/IME/event-dependent input, click/drag geometry/hit revalidation, overlay/frame swap dispatch race, or race-window measurement exists. Native focus/cursor/clipboard isolation is unverified. This is partial Phase 4 progress, not acceptance completion.

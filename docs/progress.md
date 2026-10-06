@@ -49,3 +49,14 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [x] Sol approved the local Phase 3 journal gate after corrective reviews; full local workspace tests pass (95 passed, 1 ignored) with format, Clippy, provenance and doc-link checks. This approval does not cover the missing MCP jobs tool or browser dispatch route.
 - [ ] Add the actual jobs MCP tool and route accepted work through CDP/extension handlers; these handlers and transport do not exist in the current repository. No live browser mutation or arbitrary Promise completion is claimed.
 - [ ] Inject process crashes at every journal boundary and verify exact 12-second resolve/reject cases through both browser routes.
+
+
+### Phase 4 — reliable input, guards and interference
+
+- [x] Add typed guard snapshots, invalidation records, input action variants, and strict-background `NeedsForeground` fail-closed behavior.
+- [x] Add local unit fixtures for revision/dependency mismatch, Unicode fixture value echo, and callback non-dispatch on native-required route.
+- [ ] Resolve semantic locators and dispatch actual guarded browser input with field/click/drag postconditions; test masked/contenteditable/IME/event-dependent inputs and geometry/hit-target races.
+- [ ] Measure a real check-to-dispatch race with injected browser interference. The current timing helper measures only an arbitrary closure and is not acceptance evidence.
+- [ ] Qualify native focus/cursor/clipboard behavior with an independent observer.
+
+Phase 4 is partial and is not acceptance complete. Full local Rust and documentation/provenance checks pass; the remaining browser-dispatch and native-observation boundaries are recorded in `verification-matrix.md` and `blockers.md`.
