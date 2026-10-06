@@ -79,7 +79,7 @@ fn resolve_element_script(locator: &SemanticLocator) -> Result<String, super::Br
 fn locator_script(locator: &SemanticLocator) -> Result<String, super::BrowserError> {
     let resolve = resolve_element_script(locator)?;
     Ok(format!(
-        r#"(()=>{{const r={resolve};if(!r.ok)return r;const e=r.e,b=e.getBoundingClientRect(),s=getComputedStyle(e),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);return {{ok:true,count:1,tag:e.tagName,type:e.type||'',editable:e.isContentEditable,disabled:!!e.disabled,visible:b.width>0&&b.height>0&&s.visibility!=='hidden'&&s.display!=='none',hit:!!h&&(h===e||e.contains(h)),value:e.value??'',selectionStart:e.selectionStart,selectionEnd:e.selectionEnd}};}})()"#
+        r#"(()=>{{const r={resolve};if(!r.ok)return r;const e=r.e,b=e.getBoundingClientRect(),s=getComputedStyle(e),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);return {{ok:true,count:1,tag:e.tagName,type:e.type||'',editable:e.isContentEditable,masked:e.hasAttribute('data-masked'),requiresTrustedEvents:e.hasAttribute('data-requires-trusted'),disabled:!!e.disabled,visible:b.width>0&&b.height>0&&s.visibility!=='hidden'&&s.display!=='none',hit:!!h&&(h===e||e.contains(h)),value:e.type==='password'?'':e.value??'',selectionStart:e.selectionStart,selectionEnd:e.selectionEnd}};}})()"#
     ))
 }
 
@@ -199,6 +199,12 @@ impl super::BrowserConnection {
         let probe = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.evaluate", serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true,"awaitPromise":false})).await?;
         let p = &probe["result"]["value"];
         validate_match_result(p)?;
+        // Password values are never part of the guarded-input observation contract.
+        if p["tag"] == "INPUT" && p["type"] == "password" {
+            return Ok(InputOutcome::Unsupported(
+                "password controls are not supported by guarded input",
+            ));
+        }
         if p["value"].as_str() != Some(expected_value) {
             return Err(super::BrowserError::StaleReference(
                 "field value changed since the guarded plan".into(),
@@ -239,6 +245,16 @@ impl super::BrowserConnection {
         let tag = p["tag"].as_str().unwrap_or_default();
         let typ = p["type"].as_str().unwrap_or_default();
         let contenteditable = p["editable"] == true;
+        if value.is_some() && p["masked"] == true {
+            return Ok(InputOutcome::Unsupported(
+                "masked controls require an app-specific input adapter",
+            ));
+        }
+        if value.is_some() && p["requiresTrustedEvents"] == true {
+            return Ok(InputOutcome::Unsupported(
+                "event-dependent controls require an app-specific input adapter",
+            ));
+        }
         if value.is_some()
             && (contenteditable
                 || !matches!(
@@ -319,8 +335,9 @@ impl super::BrowserConnection {
                     "mouse coordinates must be finite and non-negative".into(),
                 ));
             }
+            // A drag destination can be outside the source element's original bounds.
             let check = format!(
-                "(()=>{{const r={resolve};if(!r.ok||{x}>=innerWidth||{y}>=innerHeight)return false;const e=r.e,b=e.getBoundingClientRect(),h=document.elementFromPoint({x},{y});return b.width>0&&b.height>0&&{x}>=b.left&&{x}<=b.right&&{y}>=b.top&&{y}<=b.bottom&&!!h&&(h===e||e.contains(h));}})()"
+                "(()=>{{const r={resolve};return r.ok&&{x}<innerWidth&&{y}<innerHeight&&!!document.elementFromPoint({x},{y});}})()"
             );
             let valid = self
                 .target_ref_command(

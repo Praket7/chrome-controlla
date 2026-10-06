@@ -1616,6 +1616,21 @@ mod tests {
             .capture_target_ref(&registry, &handle, &target.id, &frame_id, 1, 1)
             .await
             .unwrap();
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
+            )
+            .await
+            .unwrap();
         let snapshot = crate::input::GuardSnapshot {
             navigation: 1,
             account: 1,
@@ -1704,6 +1719,187 @@ mod tests {
             position["result"]["value"]["selectionStart"],
             "héllo 👋λa".encode_utf16().count()
         );
+        let stale_fill = crate::input::InputAction::Fill("must-not-write".into());
+        let stale = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &stale_fill,
+                    expected_value: "old-value",
+                },
+            )
+            .await;
+        assert!(matches!(stale, Err(crate::BrowserError::StaleReference(_))));
+
+        let masked_locator = crate::input::SemanticLocator::Css("#masked".into());
+        let masked_fill = crate::input::InputAction::Fill("2125550100".into());
+        let masked_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &masked_locator,
+                    action: &masked_fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            masked_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        let masked_value = session.connection().target_ref_command(&registry, &reference, "real-chrome-fixture", crate::sessions::IdentityRevisions { account: 1, document: 1 }, "Runtime.evaluate", json!({"expression":"document.querySelector('#masked').value","returnByValue":true})).await.unwrap();
+        assert_eq!(masked_value["result"]["value"], "");
+
+        for (selector, value) in [
+            ("#editable", "plain contenteditable"),
+            ("#dependent", "event dependent"),
+        ] {
+            let locator = crate::input::SemanticLocator::Css(selector.into());
+            let fill = crate::input::InputAction::Fill(value.into());
+            let result = session
+                .connection()
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snapshot,
+                        current: &snapshot,
+                        locator: &locator,
+                        action: &fill,
+                        expected_value: "",
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, crate::input::InputOutcome::Unsupported(_)),
+                "{selector}: {result:?}"
+            );
+        }
+        let password_locator = crate::input::SemanticLocator::Css("#password".into());
+        let password_fill = crate::input::InputAction::Fill("replacement".into());
+        let password_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &password_locator,
+                    action: &password_fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            password_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        assert!(format!("{password_result:?}").find("secret").is_none());
+
+        let covered_locator = crate::input::SemanticLocator::Css("#covered".into());
+        let covered_click = crate::input::InputAction::Click {
+            x: 280.0,
+            y: 40.0,
+            postcondition: crate::input::ClickPostcondition::ActiveElement,
+        };
+        let mut foreground_snapshot = snapshot.clone();
+        foreground_snapshot.strict_background = false;
+        let covered_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &covered_locator,
+                    action: &covered_click,
+                    expected_value: "",
+                },
+            )
+            .await;
+        assert!(matches!(
+            covered_result,
+            Err(crate::BrowserError::StaleReference(_))
+        ));
+        let covered_state = session.connection().target_ref_command(&registry, &reference, "real-chrome-fixture", crate::sessions::IdentityRevisions { account: 1, document: 1 }, "Runtime.evaluate", json!({"expression":"document.querySelector('#covered').dataset.clicked||''","returnByValue":true})).await.unwrap();
+        assert_eq!(covered_state["result"]["value"], "");
+
+        let drag_locator = crate::input::SemanticLocator::Css("#drag".into());
+        let drag = crate::input::InputAction::Drag {
+            from: (40.0, 120.0),
+            to: (160.0, 180.0),
+            postcondition: crate::input::DragPostcondition {
+                left: 140.0,
+                top: 160.0,
+                tolerance: 1.0,
+            },
+        };
+        let dragged = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &drag_locator,
+                    action: &drag,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            dragged,
+            crate::input::InputOutcome::Applied {
+                postcondition_verified: true,
+                ..
+            }
+        ));
         struct TestOwnedTargetObserver;
         impl IndependentTargetObserver for TestOwnedTargetObserver {
             fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {

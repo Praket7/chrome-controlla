@@ -177,7 +177,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `validate_step(target, dependencies) -> GuardDecision`; `perform_input(target, InputAction) -> DispatchEvidence`; `on_external_change(event) -> InvalidationSet`.
 
-- [ ] Write B09–13/B22–25/B36 fixtures: account change, field edit, unrelated churn, overlay, frame change, Unicode, masked controls, drag, focus/clipboard and foreground requirement.
+- [x] Add B09–13/B22–25/B36 local fixtures for account/dependency changes, navigation, Unicode, explicitly marked masked/event-dependent controls, contenteditable, overlay interception, DOM drag, strict-background text, and foreground-required mouse/native routes. Installed Chrome covers the DOM controls; native focus/clipboard observers remain unavailable.
 - [ ] Implement semantic locators and unambiguous matching. Add typed fill/insert/sequential keys/click/drag operations with postconditions.
 - [ ] Implement navigation/account/document guards, semantic dependency invalidation, geometry/hit checks, and conservative fallback when relevance cannot be proved.
 - [ ] Keep event handlers/remote effects in mind: DOM observations cannot guarantee atomic input. Inject a change between final validation and dispatch; measure the residual race and document stronger server revision paths where available.
