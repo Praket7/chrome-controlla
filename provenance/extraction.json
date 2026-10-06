@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://github.com/Praket7/Comptrol.git",
+    "revision": "38a9d7eae0808a04b66e57d8658167c7667b4935",
+    "commit_date": "2026-09-30",
+    "working_tree": "clean",
+    "license": "Apache-2.0"
+  },
+  "extraction_date": "2026-10-06",
+  "scope": "Only the standalone browser crate, its inline tests, adapted manifest, and source license/notice were copied. No monolithic core, desktop automation crates, adapters, release assets, profiles, or credentials were copied.",
+  "files": [
+    {
+      "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
+      "destination_path": "crates/controlla-browser/src/lib.rs",
+      "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
+      "destination_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
+    },
+    {
+      "source_path": "../Comptrol/crates/comptrol-browser/src/manager.rs",
+      "destination_path": "crates/controlla-browser/src/manager.rs",
+      "source_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
+      "destination_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
+    },
+    {
+      "source_path": "../Comptrol/crates/comptrol-browser/src/session.rs",
+      "destination_path": "crates/controlla-browser/src/session.rs",
+      "source_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
+      "destination_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
+    },
+    {
+      "source_path": "../Comptrol/crates/comptrol-browser/src/blocking.rs",
+      "destination_path": "crates/controlla-browser/src/blocking.rs",
+      "source_sha256": "594af9867288198a8f2a8847dafef1ea943ae186b0c967d195bf5c3534a9a543",
+      "destination_sha256": "594af9867288198a8f2a8847dafef1ea943ae186b0c967d195bf5c3534a9a543",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
+    },
+    {
+      "source_path": "../Comptrol/crates/comptrol-browser/Cargo.toml",
+      "destination_path": "crates/controlla-browser/Cargo.toml",
+      "source_sha256": "b6556bb46b66cb42d628602902d2e47667c1b83bc6b4636bff3306d47acc8cbc",
+      "destination_sha256": "4673a7f29a3f607c93f7458d101495c8072ab5745cc5713cc55e3224c5171f7d",
+      "edits": "renamed package, inherited workspace metadata, pinned direct dependency versions, and included package license file",
+      "license": "Apache-2.0"
+    },
+    {
+      "source_path": "../Comptrol/LICENSE",
+      "destination_path": "LICENSE",
+      "source_sha256": "e56c43af1d8c31cc7a4397cf535e32323b0123cf72aee3668e5f2bea688f52a8",
+      "destination_sha256": "e56c43af1d8c31cc7a4397cf535e32323b0123cf72aee3668e5f2bea688f52a8",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0"
+    },
+    {
+      "source_path": "../Comptrol/LICENSE",
+      "destination_path": "crates/controlla-browser/LICENSE",
+      "source_sha256": "e56c43af1d8c31cc7a4397cf535e32323b0123cf72aee3668e5f2bea688f52a8",
+      "destination_sha256": "e56c43af1d8c31cc7a4397cf535e32323b0123cf72aee3668e5f2bea688f52a8",
+      "edits": "none; byte-for-byte copy, included in published crate archive",
+      "license": "Apache-2.0"
+    },
+    {
+      "source_path": "../Comptrol/NOTICE",
+      "destination_path": "NOTICE",
+      "source_sha256": "6b3608e81f8c0514557d8f895df6b3a8b0102ad6bd8f5d3728279559bd5397af",
+      "destination_sha256": "6b3608e81f8c0514557d8f895df6b3a8b0102ad6bd8f5d3728279559bd5397af",
+      "edits": "none; byte-for-byte copy",
+      "license": "Apache-2.0"
+    },
+    {
+      "source_path": "../Comptrol/NOTICE",
+      "destination_path": "crates/controlla-browser/NOTICE",
+      "source_sha256": "6b3608e81f8c0514557d8f895df6b3a8b0102ad6bd8f5d3728279559bd5397af",
+      "destination_sha256": "6b3608e81f8c0514557d8f895df6b3a8b0102ad6bd8f5d3728279559bd5397af",
+      "edits": "none; byte-for-byte copy, included in published crate archive",
+      "license": "Apache-2.0"
+    },
+    {
+      "source_path": "../../outputs/research.md",
+      "destination_path": "docs/design/research.md",
+      "source_sha256": "4ea855401d2a4562887ccb6704fa14fb54a3132fc80b72ad08f9ea6820ef37c6",
+      "destination_sha256": "5204d892e75180efff65e2b64d1501e7b4817e1e35a21e7f3d711a4d18c20599",
+      "edits": "none",
+      "license": "user-provided design document; no third-party license asserted"
+    },
+    {
+      "source_path": "../../outputs/improvements.md",
+      "destination_path": "docs/design/improvements.md",
+      "source_sha256": "f333236504419021b4c36810acc17a795d6dc7898a14e79ba490058e873b5592",
+      "destination_sha256": "1a8112e19fe7158312e81caca4d220b44627a264f1b6c671cd916ac0aa813e21",
+      "edits": "updated relative link to relocated master guide",
+      "license": "user-provided design document; no third-party license asserted"
+    },
+    {
+      "source_path": "../../outputs/build.md",
+      "destination_path": "docs/design/build.md",
+      "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
+      "destination_sha256": "3f5316ebcb02bd31cf67cf732a8b1cab5c5528cd8fef7411828dba0f84fca077",
+      "edits": "updated relative link to relocated master guide and clarified document placement",
+      "license": "user-provided design document; no third-party license asserted"
+    },
+    {
+      "source_path": "../../outputs/MASTER_GUIDE.md",
+      "destination_path": "docs/MASTER_GUIDE.md",
+      "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
+      "destination_sha256": "0bd5c76f3ea5272c935580996100b047945c7bf04367817c9e983cc1cd35333e",
+      "edits": "updated relative links to relocated design documents",
+      "license": "user-provided design document; no third-party license asserted"
+    }
+  ],
+  "retained_tests": {
+    "count": 22,
+    "cases": [
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "upload_transaction_requires_ordered_evidence"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "upload_failure_is_terminal_and_cannot_be_overclaimed"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "download_transaction_requires_browser_and_filesystem_evidence"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "wire_locators_are_typed_and_reject_empty_identity"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "locators_and_actionability_require_safe_targets"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "reconnect_invalidates_sessions_and_increments_generation"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "target_command_rejects_stale_graph_reference_before_dispatch"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "frame_command_routes_oopif_context_over_flattened_session"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "manager_rejects_empty_endpoint_without_creating_state"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "multiplexes_out_of_order_responses_on_one_socket"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "bootstrap_enables_discovery_and_flattened_auto_attach"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "target_bootstrap_enables_required_domains_on_flattened_session"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/lib.rs",
+        "test_name": "applies_target_and_frame_lifecycle_events"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "cache_returns_live_on_first_read_then_hits"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "revision_bump_invalidates"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "missing_target_evicts"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "signed_in_selection_refuses_without_permissioned_route"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "signed_in_selection_prefers_persistent_companion_bridge"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "signed_in_selection_falls_back_to_permissioned_connection"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "unsigned_selection_prefers_explicit_or_dedicated"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "broker_lists_every_provider_with_reasons"
+      },
+      {
+        "destination_path": "crates/controlla-browser/src/session.rs",
+        "test_name": "devtools_active_port_requires_a_browser_websocket_path"
+      }
+    ]
+  },
+  "selected_toolchain": {
+    "rust": "1.99.0",
+    "node": "24.19.0",
+    "npm": "11.17.0",
+    "playwright": "1.63.0",
+    "rmcp": "3.5.1",
+    "mcp_protocol": "2026-07-28",
+    "mcp_legacy_compatibility": "2025-11-25",
+    "chrome_for_testing": "154.0.8037.92"
+  },
+  "planned_os_targets": [
+    "macOS arm64",
+    "macOS x86_64",
+    "Linux arm64",
+    "Linux x86_64",
+    "Windows x86_64"
+  ],
+  "publication_decision": {
+    "github_owner": "Praket7",
+    "repository": "chrome-controlla",
+    "visibility": "private",
+    "status": "authorized target selected; repository creation and publication pending"
+  }
+}

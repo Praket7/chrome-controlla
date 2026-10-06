@@ -1,0 +1,1256 @@
+#![deny(unsafe_code)]
+
+mod blocking;
+mod manager;
+mod session;
+
+pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
+pub use manager::BrowserManager;
+pub use session::{
+    BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,
+    connect_permissioned_auto_connect, list_sessions, select_provider,
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+
+/// Evidence stages for a browser upload. Generic CDP can normally establish
+/// selection and transfer only; application acceptance and persistence require
+/// an independent adapter or postcondition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum UploadStage {
+    Selected,
+    TransferStarted,
+    TransferCompleted,
+    ApplicationAccepted,
+    Persisted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UploadTransaction {
+    pub operation_id: String,
+    pub stage: UploadStage,
+}
+
+impl UploadTransaction {
+    pub fn new(operation_id: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            stage: UploadStage::Selected,
+        }
+    }
+
+    pub fn advance(&mut self, next: UploadStage) -> Result<(), BrowserError> {
+        let allowed = matches!(
+            (self.stage, next),
+            (UploadStage::Selected, UploadStage::TransferStarted)
+                | (UploadStage::TransferStarted, UploadStage::TransferCompleted)
+                | (
+                    UploadStage::TransferCompleted,
+                    UploadStage::ApplicationAccepted
+                )
+                | (UploadStage::ApplicationAccepted, UploadStage::Persisted)
+                | (_, UploadStage::Failed)
+        );
+        if !allowed {
+            return Err(BrowserError::InvalidResponse(format!(
+                "invalid upload transition {:?} -> {:?}",
+                self.stage, next
+            )));
+        }
+        self.stage = next;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum DownloadStage {
+    Started,
+    InProgress,
+    BrowserCompleted,
+    FileVerified,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DownloadTransaction {
+    pub operation_id: String,
+    pub guid: String,
+    pub stage: DownloadStage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Locator {
+    RoleName { role: String, name: String },
+    Label(String),
+    Placeholder(String),
+    Text(String),
+    TestId(String),
+    AltText(String),
+    Href(String),
+    Css(String),
+    BackendNodeId(i64),
+}
+
+impl Locator {
+    /// Parse the compact wire locator used by the core MCP surface.
+    ///
+    /// Keeping this conversion in the browser crate makes locator validation
+    /// consistent across CDP and future native browser backends.
+    pub fn from_value(value: &Value) -> Result<Self, BrowserError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| BrowserError::InvalidResponse("locator must be an object".to_owned()))?;
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let locator = if let (Some(role), Some(name)) = (string("role"), string("name")) {
+            Self::RoleName { role, name }
+        } else if let Some(value) = string("label") {
+            Self::Label(value)
+        } else if let Some(value) = string("placeholder") {
+            Self::Placeholder(value)
+        } else if let Some(value) = string("text") {
+            Self::Text(value)
+        } else if let Some(value) = string("test_id") {
+            Self::TestId(value)
+        } else if let Some(value) = string("alt_text") {
+            Self::AltText(value)
+        } else if let Some(value) = string("href_contains") {
+            Self::Href(value)
+        } else if let Some(value) = string("selector") {
+            Self::Css(value)
+        } else if let Some(value) = object.get("backend_node_id").and_then(Value::as_i64) {
+            Self::BackendNodeId(value)
+        } else {
+            return Err(BrowserError::InvalidResponse(
+                "locator must provide one supported identity".to_owned(),
+            ));
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        let valid = match self {
+            Self::RoleName { role, name } => !role.trim().is_empty() && !name.trim().is_empty(),
+            Self::Label(value)
+            | Self::Placeholder(value)
+            | Self::Text(value)
+            | Self::TestId(value)
+            | Self::AltText(value)
+            | Self::Href(value)
+            | Self::Css(value) => !value.trim().is_empty(),
+            Self::BackendNodeId(value) => *value > 0,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BrowserError::InvalidResponse(
+                "locator must contain a non-empty, positive identity".to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Actionability {
+    pub attached: bool,
+    pub visible: bool,
+    pub stable: bool,
+    pub enabled: bool,
+    pub receives_events: bool,
+    pub unobscured: bool,
+}
+
+impl Actionability {
+    pub fn click_ready(self) -> bool {
+        self.attached
+            && self.visible
+            && self.stable
+            && self.enabled
+            && self.receives_events
+            && self.unobscured
+    }
+
+    pub fn fill_ready(self) -> bool {
+        self.attached && self.visible && self.stable && self.enabled
+    }
+}
+
+impl DownloadTransaction {
+    pub fn new(operation_id: impl Into<String>, guid: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            guid: guid.into(),
+            stage: DownloadStage::Started,
+        }
+    }
+
+    pub fn advance(&mut self, next: DownloadStage) -> Result<(), BrowserError> {
+        let allowed = matches!(
+            (self.stage, next),
+            (DownloadStage::Started, DownloadStage::InProgress)
+                | (DownloadStage::InProgress, DownloadStage::BrowserCompleted)
+                | (DownloadStage::BrowserCompleted, DownloadStage::FileVerified)
+                | (_, DownloadStage::Failed)
+        );
+        if !allowed {
+            return Err(BrowserError::InvalidResponse(format!(
+                "invalid download transition {:?} -> {:?}",
+                self.stage, next
+            )));
+        }
+        self.stage = next;
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserError {
+    #[error("browser connection failed: {0}")]
+    Connection(String),
+    #[error("browser command channel closed")]
+    Closed,
+    #[error("browser response was invalid: {0}")]
+    InvalidResponse(String),
+    #[error("browser command cancelled")]
+    Cancelled,
+    #[error("browser event wait timed out")]
+    Timeout,
+    #[error("target reference is stale or unavailable: {0}")]
+    StaleReference(String),
+}
+
+#[derive(Debug)]
+struct OutgoingCommand {
+    id: u64,
+    session_id: Option<String>,
+    method: String,
+    params: Value,
+    response: oneshot::Sender<Result<Value, BrowserError>>,
+}
+
+type PendingCommands = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserEvent {
+    pub sequence: u64,
+    pub value: Value,
+}
+
+/// One browser-level WebSocket with a dedicated writer and reader.
+/// Commands are correlated by id and never hold a global lock during I/O.
+#[derive(Clone)]
+pub struct BrowserConnection {
+    outgoing: mpsc::Sender<OutgoingCommand>,
+    pub targets: Arc<RwLock<TargetGraph>>,
+    pub frames: Arc<RwLock<FrameGraph>>,
+    next_command_id: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    cancellation: CancellationToken,
+    events: broadcast::Sender<BrowserEvent>,
+    event_replay: Arc<Mutex<VecDeque<BrowserEvent>>>,
+    event_sequence: Arc<AtomicU64>,
+}
+
+impl BrowserConnection {
+    pub async fn connect(url: &str) -> Result<Self, BrowserError> {
+        use futures_util::{SinkExt, StreamExt};
+        let (socket, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .map_err(|error| BrowserError::Connection(error.to_string()))?;
+        let (mut writer, mut reader) = socket.split();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingCommand>(128);
+        let pending: PendingCommands = Arc::new(Mutex::new(HashMap::new()));
+        let pending_for_reader = Arc::clone(&pending);
+        let targets = Arc::new(RwLock::new(TargetGraph::default()));
+        let frames = Arc::new(RwLock::new(FrameGraph::default()));
+        let targets_for_reader = Arc::clone(&targets);
+        let frames_for_reader = Arc::clone(&frames);
+        let generation_for_reader = Arc::new(AtomicU64::new(0));
+        let generation_for_disconnect = Arc::clone(&generation_for_reader);
+        let (events, _) = broadcast::channel(512);
+        let events_for_reader = events.clone();
+        let event_replay = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+        let replay_for_reader = Arc::clone(&event_replay);
+        let event_sequence = Arc::new(AtomicU64::new(0));
+        let sequence_for_reader = Arc::clone(&event_sequence);
+        let cancellation = CancellationToken::new();
+        let cancellation_for_tasks = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation_for_tasks.cancelled() => break,
+                    outgoing = outgoing_rx.recv() => {
+                        let Some(command) = outgoing else { break };
+                        let mut message = serde_json::json!({
+                            "id": command.id,
+                            "method": command.method,
+                            "params": command.params,
+                        });
+                        if let Some(session_id) = command.session_id {
+                            message["sessionId"] = Value::String(session_id);
+                        }
+                        pending_for_reader.lock().await.insert(command.id, command.response);
+                        if writer.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let pending_for_responses = Arc::clone(&pending);
+        let cancellation_for_reader = cancellation.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) = reader.next().await {
+                let text = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        match String::from_utf8(bytes.to_vec()) {
+                            Ok(text) => text.into(),
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(id) = value.get("id").and_then(Value::as_u64) else {
+                    let event = BrowserEvent {
+                        sequence: sequence_for_reader.fetch_add(1, Ordering::AcqRel) + 1,
+                        value: value.clone(),
+                    };
+                    let _ = events_for_reader.send(event.clone());
+                    let mut replay = replay_for_reader.lock().await;
+                    if replay.len() == 512 {
+                        replay.pop_front();
+                    }
+                    replay.push_back(event);
+                    targets_for_reader.write().await.apply_event(&value);
+                    let generation = generation_for_disconnect.load(Ordering::Acquire);
+                    frames_for_reader
+                        .write()
+                        .await
+                        .apply_event_at_generation(&value, generation);
+                    continue;
+                };
+                if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
+                    let result = if let Some(error) = value.get("error") {
+                        Err(BrowserError::InvalidResponse(error.to_string()))
+                    } else {
+                        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    let _ = sender.send(result);
+                }
+            }
+            cancellation_for_reader.cancel();
+            let _generation = generation_for_disconnect.fetch_add(1, Ordering::AcqRel) + 1;
+            targets_for_reader.write().await.reconnect();
+            frames_for_reader.write().await.frames.clear();
+            let mut pending = pending_for_responses.lock().await;
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(Err(BrowserError::Closed));
+            }
+        });
+        Ok(Self {
+            outgoing: outgoing_tx,
+            targets,
+            frames,
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            generation: generation_for_reader,
+            cancellation,
+            events,
+            event_replay,
+            event_sequence,
+        })
+    }
+
+    pub async fn command(
+        &self,
+        session_id: Option<String>,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        if self.cancellation.is_cancelled() {
+            return Err(BrowserError::Closed);
+        }
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
+        self.outgoing
+            .send(OutgoingCommand {
+                id,
+                session_id,
+                method: method.into(),
+                params,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| BrowserError::Closed)?;
+        response_rx.await.map_err(|_| BrowserError::Cancelled)?
+    }
+
+    /// Receive the next protocol event from the shared browser reader. This
+    /// is intentionally separate from command correlation so event waits never
+    /// need to open or lock a target WebSocket.
+    pub async fn next_event(&self, duration: Duration) -> Result<Value, BrowserError> {
+        if let Some(event) = self.event_replay.lock().await.pop_front() {
+            return Ok(event.value);
+        }
+        let mut receiver = self.events.subscribe();
+        timeout(duration, receiver.recv())
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map(|event| event.value)
+            .map_err(|error| BrowserError::InvalidResponse(error.to_string()))
+    }
+
+    pub async fn next_event_after(
+        &self,
+        cursor: u64,
+        duration: Duration,
+    ) -> Result<BrowserEvent, BrowserError> {
+        if let Some(event) = self
+            .event_replay
+            .lock()
+            .await
+            .iter()
+            .find(|event| event.sequence > cursor)
+            .cloned()
+        {
+            return Ok(event);
+        }
+        let mut receiver = self.events.subscribe();
+        loop {
+            let event = timeout(duration, receiver.recv())
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|error| BrowserError::InvalidResponse(error.to_string()))?;
+            if event.sequence > cursor {
+                return Ok(event);
+            }
+        }
+    }
+
+    pub fn latest_event_sequence(&self) -> u64 {
+        self.event_sequence.load(Ordering::Acquire)
+    }
+
+    pub async fn bootstrap(&self) -> Result<(), BrowserError> {
+        self.command(
+            None,
+            "Target.setDiscoverTargets",
+            serde_json::json!({"discover": true}),
+        )
+        .await?;
+        self.command(
+            None,
+            "Target.setAutoAttach",
+            serde_json::json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": false,
+                "flatten": true
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn bootstrap_target(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<(), BrowserError> {
+        let session_id = session_id.into();
+        for method in [
+            "Page.enable",
+            "Runtime.enable",
+            "DOM.enable",
+            "Network.enable",
+            "Accessibility.enable",
+        ] {
+            self.command(Some(session_id.clone()), method, Value::Null)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current target graph generation and matching page records
+    /// without any network round trip. Restore verification and other waiters
+    /// poll this in-memory view instead of issuing `/json/list` discovery; the
+    /// persistent connection keeps the graph current from target events.
+    pub async fn target_snapshot(&self) -> (u64, Vec<TargetRecord>) {
+        let graph = self.targets.read().await;
+        let records = graph
+            .targets
+            .values()
+            .filter(|target| target.target_type == "page")
+            .cloned()
+            .collect();
+        (graph.generation, records)
+    }
+
+    /// Enable the required domains for all targets attached during browser
+    /// bootstrap. The graph is copied before dispatch so no graph lock is held
+    /// across WebSocket I/O.
+    pub async fn bootstrap_attached_targets(&self) -> Result<usize, BrowserError> {
+        let sessions = {
+            let graph = self.targets.read().await;
+            graph
+                .targets
+                .values()
+                .filter(|target| {
+                    target.attached && matches!(target.target_type.as_str(), "page" | "iframe")
+                })
+                .filter_map(|target| target.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for session_id in &sessions {
+            self.bootstrap_target(session_id.clone()).await?;
+        }
+        Ok(sessions.len())
+    }
+
+    /// Send a command to an already-attached target from the live graph.
+    ///
+    /// The caller must provide the target generation and revision it observed.
+    /// This makes target binding explicit and prevents a warm operation from
+    /// silently reusing a session after navigation, reconnect, or target
+    /// replacement. Ordinary warm calls therefore do not need `/json/list`.
+    pub async fn target_command(
+        &self,
+        target_id: &str,
+        expected_generation: u64,
+        expected_revision: &str,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        let session_id = {
+            let graph = self.targets.read().await;
+            let target = graph
+                .targets
+                .get(target_id)
+                .ok_or_else(|| BrowserError::StaleReference(target_id.to_owned()))?;
+            if graph.generation != expected_generation
+                || target.generation != expected_generation
+                || target.revision != expected_revision
+                || !target.attached
+            {
+                return Err(BrowserError::StaleReference(format!(
+                    "target {target_id} generation/revision changed"
+                )));
+            }
+            target
+                .session_id
+                .clone()
+                .ok_or_else(|| BrowserError::StaleReference(target_id.to_owned()))?
+        };
+        self.command(Some(session_id), method, params).await
+    }
+
+    /// Send a Runtime command in the execution context owned by a specific
+    /// frame. OOPIF events arrive on the browser socket with a flattened
+    /// session id, so the frame graph is the authoritative session/context
+    /// binding and no second page WebSocket is needed.
+    pub async fn frame_command(
+        &self,
+        frame_id: &str,
+        expected_generation: u64,
+        expected_revision: u64,
+        method: impl Into<String>,
+        mut params: Value,
+    ) -> Result<Value, BrowserError> {
+        let method = method.into();
+        let (target_id, context_id) = {
+            let frames = self.frames.read().await;
+            let frame = frames
+                .frames
+                .get(frame_id)
+                .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
+            if frame.generation != expected_generation || frame.revision != expected_revision {
+                return Err(BrowserError::StaleReference(format!(
+                    "frame {frame_id} generation/revision changed"
+                )));
+            }
+            (
+                frame.target_id.clone(),
+                frame.execution_context_ids.last().copied(),
+            )
+        };
+        let target = {
+            let targets = self.targets.read().await;
+            let target = targets
+                .targets
+                .get(&target_id)
+                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?;
+            if targets.generation != expected_generation
+                || target.generation != expected_generation
+                || !target.attached
+            {
+                return Err(BrowserError::StaleReference(target_id));
+            }
+            target
+                .session_id
+                .clone()
+                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?
+        };
+        if method == "Runtime.evaluate"
+            && let Some(context_id) = context_id
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert("contextId".to_owned(), Value::from(context_id));
+        }
+        self.command(Some(target), method, params).await
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+    pub async fn reconnect_generation(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.targets.write().await.reconnect();
+        next
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TargetRecord {
+    pub id: String,
+    pub target_type: String,
+    pub browser_context_id: Option<String>,
+    pub session_id: Option<String>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub opener_id: Option<String>,
+    pub attached: bool,
+    pub generation: u64,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TargetGraph {
+    pub generation: u64,
+    pub targets: BTreeMap<String, TargetRecord>,
+}
+
+impl TargetGraph {
+    pub fn apply_created(&mut self, target: TargetRecord) {
+        self.targets.insert(target.id.clone(), target);
+    }
+
+    pub fn apply_changed(&mut self, id: &str, url: Option<String>, title: Option<String>) {
+        if let Some(target) = self.targets.get_mut(id) {
+            target.url = url;
+            target.title = title;
+            target.revision = format!("generation:{}:target:{}", self.generation, id);
+        }
+    }
+
+    pub fn apply_destroyed(&mut self, id: &str) {
+        self.targets.remove(id);
+    }
+
+    pub fn reconnect(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        for target in self.targets.values_mut() {
+            target.attached = false;
+            target.session_id = None;
+            target.generation = self.generation;
+            target.revision = format!("generation:{}:target:{}", self.generation, target.id);
+        }
+    }
+
+    pub fn apply_event(&mut self, event: &Value) {
+        match event.get("method").and_then(Value::as_str) {
+            Some("Target.targetCreated") => {
+                if let Some(info) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetInfo"))
+                {
+                    let id = info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !id.is_empty() {
+                        self.apply_created(TargetRecord {
+                            id: id.to_owned(),
+                            target_type: info
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            browser_context_id: info
+                                .get("browserContextId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            session_id: None,
+                            url: info.get("url").and_then(Value::as_str).map(str::to_owned),
+                            title: info.get("title").and_then(Value::as_str).map(str::to_owned),
+                            opener_id: info
+                                .get("openerId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            attached: false,
+                            generation: self.generation,
+                            revision: format!("generation:{}:target:{}", self.generation, id),
+                        });
+                    }
+                }
+            }
+            Some("Target.targetInfoChanged") => {
+                if let Some(info) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetInfo"))
+                {
+                    let id = info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !id.is_empty() {
+                        self.apply_changed(
+                            id,
+                            info.get("url").and_then(Value::as_str).map(str::to_owned),
+                            info.get("title").and_then(Value::as_str).map(str::to_owned),
+                        );
+                    }
+                }
+            }
+            Some("Target.targetDestroyed") => {
+                if let Some(id) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetId"))
+                    .and_then(Value::as_str)
+                {
+                    self.apply_destroyed(id);
+                }
+            }
+            Some("Target.attachedToTarget") => {
+                if let Some(params) = event.get("params") {
+                    let target_id = params
+                        .get("targetInfo")
+                        .and_then(|info| info.get("targetId"))
+                        .and_then(Value::as_str);
+                    let target_id =
+                        target_id.or_else(|| params.get("targetId").and_then(Value::as_str));
+                    if let (Some(target_id), Some(session_id)) =
+                        (target_id, params.get("sessionId").and_then(Value::as_str))
+                        && let Some(target) = self.targets.get_mut(target_id)
+                    {
+                        target.session_id = Some(session_id.to_owned());
+                        target.attached = true;
+                        target.generation = self.generation;
+                        target.revision =
+                            format!("generation:{}:target:{}", self.generation, target_id);
+                    }
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(params) = event.get("params") {
+                    let target_id = params.get("targetId").and_then(Value::as_str);
+                    if let Some(target) = target_id.and_then(|id| self.targets.get_mut(id)) {
+                        target.session_id = None;
+                        target.attached = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FrameRecord {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub target_id: String,
+    pub loader_id: Option<String>,
+    pub execution_context_ids: Vec<u64>,
+    pub generation: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct FrameGraph {
+    pub frames: BTreeMap<String, FrameRecord>,
+}
+
+impl FrameGraph {
+    pub fn upsert(&mut self, frame: FrameRecord) {
+        self.frames.insert(frame.id.clone(), frame);
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.frames
+            .retain(|frame_id, frame| frame_id != id && frame.parent_id.as_deref() != Some(id));
+    }
+
+    pub fn apply_event(&mut self, event: &Value) {
+        self.apply_event_at_generation(event, 0);
+    }
+
+    pub fn apply_event_at_generation(&mut self, event: &Value, generation: u64) {
+        match event.get("method").and_then(Value::as_str) {
+            Some("Page.frameAttached") => {
+                if let Some(params) = event.get("params")
+                    && let Some(id) = params.get("frameId").and_then(Value::as_str)
+                {
+                    self.upsert(FrameRecord {
+                        id: id.to_owned(),
+                        parent_id: params
+                            .get("parentFrameId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        target_id: params
+                            .get("targetId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        loader_id: None,
+                        execution_context_ids: Vec::new(),
+                        generation,
+                        revision: 0,
+                    });
+                }
+            }
+            Some("Page.frameNavigated") => {
+                if let Some(frame) = event
+                    .get("params")
+                    .and_then(|params| params.get("frame"))
+                    .and_then(|frame| frame.get("id").and_then(Value::as_str))
+                    .and_then(|id| self.frames.get_mut(id))
+                {
+                    let info = event.get("params").and_then(|params| params.get("frame"));
+                    frame.loader_id = info
+                        .and_then(|value| value.get("loaderId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    frame.generation = generation;
+                    frame.revision = frame.revision.saturating_add(1);
+                }
+            }
+            Some("Page.navigatedWithinDocument") => {
+                if let Some(frame_id) = event
+                    .get("params")
+                    .and_then(|params| params.get("frameId"))
+                    .and_then(Value::as_str)
+                    && let Some(frame) = self.frames.get_mut(frame_id)
+                {
+                    frame.generation = generation;
+                    frame.revision = frame.revision.saturating_add(1);
+                }
+            }
+            Some("Page.frameDetached") => {
+                if let Some(id) = event
+                    .get("params")
+                    .and_then(|params| params.get("frameId"))
+                    .and_then(Value::as_str)
+                {
+                    self.remove(id);
+                }
+            }
+            Some("Runtime.executionContextCreated") => {
+                if let Some(context) = event.get("params").and_then(|params| params.get("context"))
+                    && let (Some(frame_id), Some(context_id)) = (
+                        context
+                            .get("auxData")
+                            .and_then(|data| data.get("frameId"))
+                            .and_then(Value::as_str),
+                        context.get("id").and_then(Value::as_u64),
+                    )
+                    && let Some(frame) = self.frames.get_mut(frame_id)
+                    && !frame.execution_context_ids.contains(&context_id)
+                {
+                    frame.execution_context_ids.push(context_id);
+                    frame.generation = generation;
+                    frame.revision = frame.revision.saturating_add(1);
+                }
+            }
+            Some("Runtime.executionContextDestroyed") => {
+                if let Some(context_id) = event
+                    .get("params")
+                    .and_then(|params| params.get("executionContextId"))
+                    .and_then(Value::as_u64)
+                {
+                    for frame in self.frames.values_mut() {
+                        frame.execution_context_ids.retain(|id| *id != context_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BrowserCommand {
+    pub id: u64,
+    pub session_id: Option<String>,
+    pub method: String,
+    pub params: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+
+    fn target() -> TargetRecord {
+        TargetRecord {
+            id: "tab".to_owned(),
+            target_type: "page".to_owned(),
+            browser_context_id: Some("default".to_owned()),
+            session_id: Some("session".to_owned()),
+            url: Some("https://example.test".to_owned()),
+            title: Some("Example".to_owned()),
+            opener_id: None,
+            attached: true,
+            generation: 0,
+            revision: "generation:0:target:tab".to_owned(),
+        }
+    }
+
+    #[test]
+    fn upload_transaction_requires_ordered_evidence() {
+        let mut transaction = UploadTransaction::new("upload-1");
+        assert_eq!(transaction.stage, UploadStage::Selected);
+        assert!(transaction.advance(UploadStage::TransferCompleted).is_err());
+        transaction.advance(UploadStage::TransferStarted).unwrap();
+        transaction.advance(UploadStage::TransferCompleted).unwrap();
+        transaction
+            .advance(UploadStage::ApplicationAccepted)
+            .unwrap();
+        transaction.advance(UploadStage::Persisted).unwrap();
+        assert_eq!(transaction.stage, UploadStage::Persisted);
+    }
+
+    #[test]
+    fn upload_failure_is_terminal_and_cannot_be_overclaimed() {
+        let mut transaction = UploadTransaction::new("upload-2");
+        transaction.advance(UploadStage::Failed).unwrap();
+        assert!(transaction.advance(UploadStage::Persisted).is_err());
+        assert_eq!(transaction.stage, UploadStage::Failed);
+    }
+
+    #[test]
+    fn download_transaction_requires_browser_and_filesystem_evidence() {
+        let mut transaction = DownloadTransaction::new("download-1", "guid-1");
+        assert!(transaction.advance(DownloadStage::FileVerified).is_err());
+        transaction.advance(DownloadStage::InProgress).unwrap();
+        transaction
+            .advance(DownloadStage::BrowserCompleted)
+            .unwrap();
+        transaction.advance(DownloadStage::FileVerified).unwrap();
+        assert_eq!(transaction.stage, DownloadStage::FileVerified);
+    }
+
+    #[test]
+    fn wire_locators_are_typed_and_reject_empty_identity() {
+        assert_eq!(
+            Locator::from_value(&serde_json::json!({"selector": "#save"})).unwrap(),
+            Locator::Css("#save".to_owned())
+        );
+        assert_eq!(
+            Locator::from_value(&serde_json::json!({"role": "button", "name": "Save"})).unwrap(),
+            Locator::RoleName {
+                role: "button".to_owned(),
+                name: "Save".to_owned()
+            }
+        );
+        assert!(Locator::from_value(&serde_json::json!({"selector": " "})).is_err());
+        assert!(Locator::from_value(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn locators_and_actionability_require_safe_targets() {
+        assert!(Locator::Text("  ".to_owned()).validate().is_err());
+        assert!(Locator::Css("button.save".to_owned()).validate().is_ok());
+        assert!(Locator::BackendNodeId(0).validate().is_err());
+        let ready = Actionability {
+            attached: true,
+            visible: true,
+            stable: true,
+            enabled: true,
+            receives_events: true,
+            unobscured: true,
+        };
+        assert!(ready.click_ready());
+        assert!(ready.fill_ready());
+        assert!(
+            !Actionability {
+                unobscured: false,
+                ..ready
+            }
+            .click_ready()
+        );
+    }
+
+    #[test]
+    fn reconnect_invalidates_sessions_and_increments_generation() {
+        let mut graph = TargetGraph::default();
+        graph.apply_created(target());
+        graph.reconnect();
+        let target = graph.targets.get("tab").unwrap();
+        assert_eq!(graph.generation, 1);
+        assert_eq!(target.session_id, None);
+        assert!(!target.attached);
+        assert_eq!(target.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn target_command_rejects_stale_graph_reference_before_dispatch() {
+        let connection = BrowserConnection {
+            outgoing: tokio::sync::mpsc::channel(1).0,
+            targets: Arc::new(RwLock::new(TargetGraph::default())),
+            frames: Arc::new(RwLock::new(FrameGraph::default())),
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(0)),
+            cancellation: CancellationToken::new(),
+            events: broadcast::channel(8).0,
+            event_replay: Arc::new(Mutex::new(VecDeque::new())),
+            event_sequence: Arc::new(AtomicU64::new(0)),
+        };
+        connection.targets.write().await.apply_created(target());
+        let result = connection
+            .target_command("tab", 0, "wrong-revision", "Runtime.evaluate", Value::Null)
+            .await;
+        assert!(matches!(result, Err(BrowserError::StaleReference(_))));
+    }
+
+    #[tokio::test]
+    async fn frame_command_routes_oopif_context_over_flattened_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["sessionId"], "session-oopif");
+            assert_eq!(request["method"], "Runtime.evaluate");
+            assert_eq!(request["params"]["contextId"], 99);
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "sessionId":"session-oopif", "result":{"result":{"type":"string","value":"https://cross-origin.test/"}}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection
+            .targets
+            .write()
+            .await
+            .apply_created(TargetRecord {
+                id: "oopif-target".to_owned(),
+                target_type: "iframe".to_owned(),
+                browser_context_id: Some("default".to_owned()),
+                session_id: Some("session-oopif".to_owned()),
+                url: Some("https://cross-origin.test/".to_owned()),
+                title: None,
+                opener_id: None,
+                attached: true,
+                generation: 0,
+                revision: "target-revision".to_owned(),
+            });
+        connection.frames.write().await.upsert(FrameRecord {
+            id: "frame-oopif".to_owned(),
+            parent_id: Some("root".to_owned()),
+            target_id: "oopif-target".to_owned(),
+            loader_id: None,
+            execution_context_ids: vec![99],
+            generation: 0,
+            revision: 4,
+        });
+        let result = connection
+            .frame_command(
+                "frame-oopif",
+                0,
+                4,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":"location.href"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["value"], "https://cross-origin.test/");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_empty_endpoint_without_creating_state() {
+        let manager = BrowserManager::new();
+        let result = manager.connect("").await;
+        assert!(matches!(
+            result,
+            Err(BrowserError::Connection(message)) if message == "empty debugger endpoint"
+        ));
+        assert_eq!(manager.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn multiplexes_out_of_order_responses_on_one_socket() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    requests.push(serde_json::from_str::<Value>(&text).unwrap());
+                }
+            }
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"event-tab","type":"page","url":"https://event.test","title":"Event tab"}}}).to_string().into()
+            )).await.unwrap();
+            for request in requests.into_iter().rev() {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "result": {"method": request["method"]}}).to_string().into()
+                )).await.unwrap();
+            }
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let first = connection.command(Some("session-a".to_owned()), "Runtime.enable", Value::Null);
+        let second = connection.command(Some("session-b".to_owned()), "Page.enable", Value::Null);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap()["method"], "Runtime.enable");
+        assert_eq!(second.unwrap()["method"], "Page.enable");
+        let targets = connection.targets.read().await;
+        assert_eq!(
+            targets.targets["event-tab"].title.as_deref(),
+            Some("Event tab")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_enables_discovery_and_flattened_auto_attach() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while methods.len() < 2 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    methods.push(request["method"].as_str().unwrap().to_owned());
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            methods
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection.bootstrap().await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec!["Target.setDiscoverTargets", "Target.setAutoAttach"]
+        );
+    }
+
+    #[tokio::test]
+    async fn target_bootstrap_enables_required_domains_on_flattened_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while methods.len() < 5 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(request["sessionId"], "session-1");
+                    methods.push(request["method"].as_str().unwrap().to_owned());
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            methods
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection.bootstrap_target("session-1").await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "Page.enable",
+                "Runtime.enable",
+                "DOM.enable",
+                "Network.enable",
+                "Accessibility.enable"
+            ]
+        );
+    }
+
+    #[test]
+    fn applies_target_and_frame_lifecycle_events() {
+        let mut targets = TargetGraph::default();
+        targets.apply_event(&serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"tab-1","type":"page","url":"https://example.test","title":"Example"}}}));
+        assert_eq!(targets.targets["tab-1"].title.as_deref(), Some("Example"));
+        targets.apply_event(&serde_json::json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"tab-1","url":"https://example.test/next","title":"Next"}}}));
+        assert_eq!(
+            targets.targets["tab-1"].url.as_deref(),
+            Some("https://example.test/next")
+        );
+        targets.apply_event(&serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"session-1","targetInfo":{"targetId":"tab-1"}}}));
+        assert_eq!(
+            targets.targets["tab-1"].session_id.as_deref(),
+            Some("session-1")
+        );
+        assert!(targets.targets["tab-1"].attached);
+        targets.apply_event(&serde_json::json!({"method":"Target.detachedFromTarget","params":{"targetId":"tab-1","sessionId":"session-1"}}));
+        assert!(!targets.targets["tab-1"].attached);
+        assert!(targets.targets["tab-1"].session_id.is_none());
+
+        let mut frames = FrameGraph::default();
+        frames.apply_event(&serde_json::json!({"method":"Page.frameAttached","params":{"frameId":"frame-1","parentFrameId":"root","targetId":"tab-1"}}));
+        frames.apply_event(&serde_json::json!({"method":"Runtime.executionContextCreated","params":{"context":{"id":7,"auxData":{"frameId":"frame-1"}}}}));
+        assert_eq!(frames.frames["frame-1"].execution_context_ids, vec![7]);
+        frames.apply_event(
+            &serde_json::json!({"method":"Page.frameDetached","params":{"frameId":"frame-1"}}),
+        );
+        assert!(frames.frames.is_empty());
+    }
+}
