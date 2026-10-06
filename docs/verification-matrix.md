@@ -108,7 +108,7 @@ Evidence is fixture/local only. Capability route values are test inputs, not obs
 | `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
 | Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
 
-The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS and Ubuntu but exposed a Windows-only doctor expectation in hosted run 37461256280. Commit `94a4043` corrects the assertion; its push and hosted rerun are pending.
+The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS/Ubuntu but exposed a Windows-only doctor expectation in run 37461256280; `b159a3a` fixed it. Hosted run 37461823256 passed macOS/Ubuntu and failed Windows provenance hashes because text files checked out with CRLF; fix commit `63b74d5` pins LF line endings, pending hosted confirmation.
 
 ## Phase 1 hosted CI run 37460467645 — failed
 
@@ -136,3 +136,11 @@ The run remains recorded as failed historical evidence. The fixes are locally ve
 | Windows | fail | `doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated_health` expected a Healthy process probe, although the implementation correctly reports `Unknown` on unsupported OSes. The assertion now expects Healthy on Unix and Unknown elsewhere. |
 
 This failed run remains historical evidence. The Unix branch passes locally; the Windows `Unknown` expectation is source-updated but awaits hosted confirmation.
+
+## Phase 1 hosted CI run 37461823256 — failed
+
+| Runner | Result | Evidence |
+|---|---|---|
+| macOS | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
+| Ubuntu | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
+| Windows | fail | `check-provenance.mjs` hashed CRLF working-tree files against LF source digests. Added `.gitattributes` with `* text=auto eol=lf`; this correction still requires hosted confirmation. |
