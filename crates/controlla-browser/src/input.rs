@@ -283,8 +283,17 @@ impl super::BrowserConnection {
             serde_json::json!({"files":[path],"objectId":element_id}),
         )
         .await?;
-        let readback = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.callFunctionOn", serde_json::json!({"objectId":element_id,"functionDeclaration":"function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size,type:f.type}))}","returnByValue":true})).await?;
-        let files = readback["result"]["value"].as_array().ok_or_else(|| {
+        let readback_function = format!(
+            "function(){{const connected=this.isConnected;const r={resolve};return {{connected,same:connected&&r.ok&&r.e===this,files:Array.from(this.files||[]).map(f=>({{name:f.name,size:f.size,type:f.type}}))}}}}"
+        );
+        let readback = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.callFunctionOn", serde_json::json!({"objectId":element_id,"functionDeclaration":readback_function,"returnByValue":true})).await?;
+        let value = &readback["result"]["value"];
+        if value["connected"] != true || value["same"] != true {
+            return Err(super::BrowserError::StaleReference(
+                "file input was detached or replaced during selection".into(),
+            ));
+        }
+        let files = value["files"].as_array().ok_or_else(|| {
             super::BrowserError::InvalidResponse("file selection readback missing".into())
         })?;
         if files.len() != 1

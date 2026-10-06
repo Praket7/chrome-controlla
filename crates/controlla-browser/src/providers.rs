@@ -1627,7 +1627,7 @@ mod tests {
                     document: 1,
                 },
                 "Runtime.evaluate",
-                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=fileInput type=file style=display:none><input id=interference type=text value=before><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><canvas id=canvas width=200 height=100></canvas><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';document.querySelector('#interference').addEventListener('focus',e=>e.target.value='external');const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
+                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=fileInput type=file style=display:none><input id=replacedFile type=file style=display:none><input id=interference type=text value=before><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><canvas id=canvas width=200 height=100></canvas><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';document.querySelector('#replacedFile').addEventListener('change',e=>{e.target.replaceWith(e.target.cloneNode())});document.querySelector('#interference').addEventListener('focus',e=>e.target.value='external');const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
             )
             .await
             .unwrap();
@@ -1695,6 +1695,26 @@ mod tests {
             json!({"expression":"(()=>{const f=document.querySelector('#fileInput').files;return f.length===1&&f[0].name==='sample.txt'&&f[0].size===18})()","returnByValue":true}),
         ).await.unwrap();
         assert_eq!(file_readback["result"]["value"], true);
+        let replacement_locator = crate::input::SemanticLocator::Css("#replacedFile".into());
+        let replaced = session
+            .connection()
+            .select_file_input_artifact(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                revisions,
+                crate::input::GuardedFileSelection {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &replacement_locator,
+                    handle: &artifact.handle,
+                },
+            )
+            .await;
+        assert!(
+            replaced.is_err(),
+            "detached input was incorrectly reported selected: {replaced:?}"
+        );
         let native_before = crate::native::NativeSnapshot::capture().unwrap();
         let fill = crate::input::InputAction::Fill("héllo 👋".into());
         let filled = session

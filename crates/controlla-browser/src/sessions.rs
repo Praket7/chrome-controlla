@@ -128,7 +128,7 @@ pub struct ArtifactMetadata {
     pub size: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct StoredArtifact {
     metadata: ArtifactMetadata,
     path: std::path::PathBuf,
@@ -330,9 +330,12 @@ pub struct CleanupReceipt {
     pub closed: Vec<String>,
     pub preserved: Vec<PreservedTab>,
     pub remaining: Vec<RemainingTab>,
+    /// Opaque artifact handles whose private files or directories need retry.
+    #[serde(default)]
+    pub artifact_cleanup_pending: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SessionRegistry {
     grants: ProviderGrants,
     next_session_id: u64,
@@ -515,13 +518,32 @@ impl SessionRegistry {
             .ok_or(SessionError::ArtifactNotFound)
     }
 
-    fn clear_artifacts(&mut self, session_id: &str) {
-        if let Some(items) = self.artifacts.remove(session_id) {
-            for item in items.into_values() {
-                let _ = std::fs::remove_file(item.path);
-                let _ = std::fs::remove_dir(item.directory);
+    fn clear_artifacts(&mut self, session_id: &str) -> Vec<String> {
+        let Some(items) = self.artifacts.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut removed = Vec::new();
+        let mut pending = Vec::new();
+        for (key, item) in items.iter() {
+            let file_removed = matches!(std::fs::remove_file(&item.path), Ok(()))
+                || std::fs::metadata(&item.path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            let directory_removed = matches!(std::fs::remove_dir(&item.directory), Ok(()))
+                || std::fs::metadata(&item.directory)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            if file_removed && directory_removed {
+                removed.push(key.clone());
+            } else {
+                pending.push(item.metadata.handle.opaque_id().to_owned());
             }
         }
+        for key in removed {
+            items.remove(&key);
+        }
+        if items.is_empty() {
+            self.artifacts.remove(session_id);
+        }
+        pending
     }
 
     /// Store bounded plain text for this active session only. This buffer is
@@ -886,15 +908,22 @@ impl SessionRegistry {
         session_id: &str,
         mut close_tab: impl FnMut(&str) -> Result<(), String>,
     ) -> CleanupReceipt {
-        let mut receipt = CleanupReceipt::default();
-        self.clear_artifacts(session_id);
+        let mut receipt = CleanupReceipt {
+            artifact_cleanup_pending: self.clear_artifacts(session_id),
+            ..CleanupReceipt::default()
+        };
         let Some(tabs) = self.tabs.get(session_id).cloned() else {
             self.internal_clipboard_text.remove(session_id);
-            if self.sessions.remove(session_id).is_none() {
+            if !receipt.artifact_cleanup_pending.is_empty() {
+                self.inactive_sessions.insert(session_id.to_owned());
+            } else if self.sessions.remove(session_id).is_none() {
                 receipt.remaining.push(RemainingTab {
                     target_id: session_id.to_owned(),
                     reason: "unknown session; no cleanup was attempted".to_owned(),
                 });
+            } else {
+                self.inactive_sessions.remove(session_id);
+                self.browser_instances.remove(session_id);
             }
             return receipt;
         };
@@ -924,11 +953,14 @@ impl SessionRegistry {
                 });
             }
         }
-        if retry.is_empty() {
+        if retry.is_empty() && receipt.artifact_cleanup_pending.is_empty() {
             self.tabs.remove(session_id);
             self.sessions.remove(session_id);
             self.inactive_sessions.remove(session_id);
             self.browser_instances.remove(session_id);
+        } else if retry.is_empty() {
+            self.tabs.remove(session_id);
+            self.inactive_sessions.insert(session_id.to_owned());
         } else {
             self.tabs.insert(session_id.to_owned(), retry);
         }
@@ -1044,6 +1076,33 @@ impl SessionRegistry {
             return Err(StaleTarget::TargetChanged);
         }
         Self::resolve_target(expected, principal, current)
+    }
+}
+
+impl Clone for SessionRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            grants: self.grants,
+            next_session_id: self.next_session_id,
+            next_capability_revision: self.next_capability_revision,
+            sessions: self.sessions.clone(),
+            tabs: self.tabs.clone(),
+            browser_instances: self.browser_instances.clone(),
+            inactive_sessions: self.inactive_sessions.clone(),
+            internal_clipboard_text: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+        }
+    }
+}
+
+impl Drop for SessionRegistry {
+    fn drop(&mut self) {
+        for items in self.artifacts.values() {
+            for item in items.values() {
+                let _ = std::fs::remove_file(&item.path);
+                let _ = std::fs::remove_dir(&item.directory);
+            }
+        }
     }
 }
 
@@ -1201,6 +1260,120 @@ mod tests {
             registry.artifact_metadata(&alice, &artifact.handle),
             Err(SessionError::UnknownSession)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_cleanup_failure_is_reported_retained_and_retryable() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..Default::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: vec![],
+                },
+                "alice",
+            )
+            .unwrap();
+        let artifact = registry
+            .put_artifact_bytes(&session, "retry.txt", b"retry me")
+            .unwrap();
+        let path = registry
+            .artifact_path_for(&session.id, "alice", &artifact.handle)
+            .unwrap()
+            .to_path_buf();
+        let parent = path.parent().unwrap().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("blocker"), b"keep cleanup from succeeding").unwrap();
+
+        let failed = registry.release_session(&session.id, |_| Ok(()));
+        assert_eq!(
+            failed.artifact_cleanup_pending,
+            vec![artifact.handle.opaque_id().to_owned()]
+        );
+        assert!(
+            registry
+                .artifacts
+                .get(&session.id)
+                .unwrap()
+                .contains_key(artifact.handle.opaque_id().trim_start_matches("artifact_"))
+        );
+
+        std::fs::remove_file(path.join("blocker")).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"retry me").unwrap();
+        let retried = registry.release_session(&session.id, |_| Ok(()));
+        assert!(retried.artifact_cleanup_pending.is_empty());
+        assert!(
+            retried.remaining.is_empty(),
+            "artifact-only retry reported a missing session as a leftover tab"
+        );
+        assert!(!parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_registry_cleans_artifact_files() {
+        let path = {
+            let mut registry = SessionRegistry::new(ProviderGrants {
+                dedicated_headless: true,
+                ..Default::default()
+            });
+            let session = registry
+                .create_session(
+                    SessionSpec {
+                        mode: SessionMode::Headless,
+                        selected_target_ids: vec![],
+                    },
+                    "alice",
+                )
+                .unwrap();
+            let artifact = registry
+                .put_artifact_bytes(&session, "drop.txt", b"drop me")
+                .unwrap();
+            registry
+                .artifact_path_for(&session.id, "alice", &artifact.handle)
+                .unwrap()
+                .to_path_buf()
+        };
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloned_registry_does_not_own_or_delete_source_artifacts() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..Default::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: vec![],
+                },
+                "alice",
+            )
+            .unwrap();
+        let artifact = registry
+            .put_artifact_bytes(&session, "clone.txt", b"owned once")
+            .unwrap();
+        let path = registry
+            .artifact_path_for(&session.id, "alice", &artifact.handle)
+            .unwrap()
+            .to_path_buf();
+        let clone = registry.clone();
+        assert!(clone.artifacts.is_empty());
+        drop(clone);
+        assert!(path.exists());
+        let receipt = registry.release_session(&session.id, |_| Ok(()));
+        assert!(receipt.artifact_cleanup_pending.is_empty());
+        assert!(!path.exists());
     }
 
     fn add_owned_fixture(registry: &mut SessionRegistry, session_id: &str, target_id: &str) {
