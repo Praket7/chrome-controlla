@@ -35,4 +35,6 @@ The first Phase 1 Sol review was not approved; all reported findings were fixed 
 - [x] Implement owned/adopted/borrowed tab records, cleanup receipts, crash reconciliation, safe recovery handles, retryable pairing/cleanup, and focused cancellation/lifecycle tests.
 - [x] Pass Sol's independent code review on 2026-10-06. Review findings and fixes are summarized in the Phase 2 local acceptance entry in `verification-matrix.md`.
 - [ ] Qualify live MV3 extension attachment, headed Chrome, independent in-tab cleanup observation, and native focus/cursor/clipboard behavior. These are not claimed from fixtures or the headless provider smoke.
-- [ ] Commit and push the reviewed Phase 2 implementation; hosted CI result is recorded after the push.
+- [x] Commit and push the reviewed Phase 2 implementation; hosted CI run `37511048769` passed on Ubuntu, macOS, and Windows for final commit `928c3a8`.
+
+Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` made the 1/4/8 scheduler fixture deterministic and fixed a Windows-only Clippy warning. Hosted CI run `37511048769` passed on all three configured operating systems. The failed intermediate runs and their causes are recorded in `verification-matrix.md`. The local code gate is complete; live browser, app-identity, and native input qualification remain open.

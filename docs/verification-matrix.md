@@ -189,3 +189,12 @@ Sol independently approved the Phase 2 code diff after reviewing launch cancella
 | macOS | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
 | Ubuntu | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
 | Windows | fail | `check-provenance.mjs` hashed CRLF working-tree files against LF source digests. Added `.gitattributes` with `* text=auto eol=lf`; the correction passed Windows provenance checking in run 37465119376. |
+
+## Phase 2 hosted CI — initial failures and final pass
+
+| Run | Runner | Result | Evidence |
+|---|---|---|---|
+| [37510070079](https://github.com/Praket7/chrome-controlla/actions/runs/37510070079) | macOS | fail | Provenance check caught a stale digest after the Phase 2 build-plan status edit. Updated the recorded destination hash. |
+| [37510070079](https://github.com/Praket7/chrome-controlla/actions/runs/37510070079) | Ubuntu | fail | Scheduler concurrency fixture observed peak 3 instead of 4 because response timing varied. The fixture now holds responses until a full expected request wave arrives. |
+| [37510715198](https://github.com/Praket7/chrome-controlla/actions/runs/37510715198) | Windows | fail | Clippy found an unused `path` parameter in the non-Unix no-op permission helper; renamed it `_path` while retaining Unix use. Ubuntu and macOS passed this run. |
+| [37511048769](https://github.com/Praket7/chrome-controlla/actions/runs/37511048769) | Ubuntu, macOS, Windows | pass | All configured Rust, packaging, documentation, dependency, and provenance checks passed for final commit `928c3a8`. |
