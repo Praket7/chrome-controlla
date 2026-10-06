@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod doctor;
+pub mod jobs;
 
 #[cfg(test)]
 mod tests {

@@ -38,3 +38,14 @@ The first Phase 1 Sol review was not approved; all reported findings were fixed 
 - [x] Commit and push the reviewed Phase 2 implementation; hosted CI run `37511048769` passed on Ubuntu, macOS, and Windows for final commit `928c3a8`.
 
 Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` made the 1/4/8 scheduler fixture deterministic and fixed a Windows-only Clippy warning. Hosted CI run `37511048769` passed on all three configured operating systems. The failed intermediate runs and their causes are recorded in `verification-matrix.md`. The local code gate is complete; live browser, app-identity, and native input qualification remain open.
+
+### Phase 3 — durable jobs and idempotency
+
+- [x] Add SQLite journal admission keyed by authenticated-principal input, session, and idempotency key; bind replay to canonical JSON request digest.
+- [x] Add transactional concurrent admission, one-time dispatch claims, persisted bounded deadlines, principal/session scoped access, bounded cursor wait, and pre-dispatch cancellation.
+- [x] Unknown is terminal in this phase because no independent browser/app observer exists; the public journal has no promotion API.
+- [x] Delivery is a persisted field separate from status: a claim is `unknown`, only `acknowledge_dispatch` sets `sent`, confirmed pre-send failure/deadline is `failed/not_sent`, and dispatched deadline/recovery is `unknown/unknown`.
+- [x] Red-first focused tests observed the missing jobs module/Tokio compile failure; ten focused journal/lifecycle tests cover competing admissions/claims, crash windows, fixture endpoint send counting across replay, deadline recovery, and pre-send failure delivery status.
+- [x] Sol approved the local Phase 3 journal gate after corrective reviews; full local workspace tests pass (95 passed, 1 ignored) with format, Clippy, provenance and doc-link checks. This approval does not cover the missing MCP jobs tool or browser dispatch route.
+- [ ] Add the actual jobs MCP tool and route accepted work through CDP/extension handlers; these handlers and transport do not exist in the current repository. No live browser mutation or arbitrary Promise completion is claimed.
+- [ ] Inject process crashes at every journal boundary and verify exact 12-second resolve/reject cases through both browser routes.

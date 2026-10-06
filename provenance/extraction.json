@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "178c877d72ce2e94cb0520d4bfbaa3a9a16ba232c7e06784a24e1972815e3304",
-      "edits": "updated relative link and document placement; marked Phase 2 implementation and review evidence while recording remaining live qualification",
+      "destination_sha256": "aaaecea731b8c34397b1b73d9fddf42c9e9f16133c4e5758dc3bf6831c825ad3",
+      "edits": "updated relative link and document placement; recorded Phase 2 implementation/review evidence and Phase 3 local journal coverage while retaining open live qualification and dispatch gates",
       "license": "user-provided design document; no third-party license asserted"
     },
     {

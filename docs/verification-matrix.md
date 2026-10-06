@@ -28,9 +28,9 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-02 | fixture_verified | 1 | open-stdin help/no-state and invalid-flag CLI tests |
 | CC-03 | partial | 1 | doctor schema, local PID and loopback fixture probes; no live daemon or service |
 | CC-04 | fixture_verified | 1 | packed darwin/arm64 npm archive clean-prefix install, spaces and empty PATH; Ubuntu/macOS/Windows hosted package checks pass |
-| CC-05 | unimplemented | 3 | none |
+| CC-05 | fixture_verified | 3 | SQLite journal enforces principal/session/key uniqueness, canonical request conflict, concurrent admission and one-time dispatch claim; independent fixture endpoint count stays one across replay/lost reply; unknown stays terminal |
 | CC-06 | unimplemented | 3 | none |
-| CC-07 | unimplemented | 3 | none |
+| CC-07 | partial | 3 | bounded wait and durable state tested with local async fixture; no Promise/CDP/bridge worker route or reconnecting MCP client |
 | CC-08 | unimplemented | 5 | none |
 | CC-09 | partial | 2 | target/frame/browser revisions and stale-handle fixtures pass; application account/document revisions remain caller-supplied and unobserved |
 | CC-10 | unimplemented | 4 | none |
@@ -52,9 +52,9 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
 | B03 | fixture_verified | 1 | help exits with stdin held open; state path remains absent |
 | B04 | partial | 1 | stale/fresh heartbeat is separated from local PID and authenticated loopback mock-service probes; no production service is available |
-| B05 | unimplemented | 3 | none |
-| B06 | unimplemented | 3 | none |
-| B07 | unimplemented | 3 | none |
+| B05 | fixture_verified | 3 | same body after reopen returns original operation ID; replay dispatch gate refuses another send and independent fixture endpoint count stays one |
+| B06 | fixture_verified | 3 | changed request under same scoped key conflicts; principal scope is isolated |
+| B07 | fixture_verified | 3 | independent fixture endpoint effect remains one after lost reply; replay traverses dispatch gate and is refused; recovery preserves acknowledged delivery as sent, while claim-before-send crash remains unknown with zero effects |
 | B08 | fixture_verified | 2 | closed/reused target references rejected; fresh target identity required |
 | B09 | unimplemented | 4 | none |
 | B10 | unimplemented | 4 | none |
@@ -65,8 +65,8 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B15 | unimplemented | 5 | none |
 | B16 | unimplemented | 5 | none |
 | B17 | unimplemented | 5 | none |
-| B18 | unimplemented | 3 | none |
-| B19 | unimplemented | 3 | none |
+| B18 | partial | 3 | local async job finishes after short caller wait; exact 12-second Promise/CDP/bridge path is absent |
+| B19 | partial | 3 | persisted deadline survives reopen; queued expiry is failed/deadline_error/not_sent; dispatched expiry is unknown while preserving acknowledged sent or unacknowledged unknown delivery; real Promise and worker cancellation route remain absent |
 | B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
 | B21 | fixture_verified | 2 | concurrent mutations for the same shared document serialize |
 | B22 | unimplemented | 4 | none |
@@ -198,3 +198,13 @@ Sol independently approved the Phase 2 code diff after reviewing launch cancella
 | [37510070079](https://github.com/Praket7/chrome-controlla/actions/runs/37510070079) | Ubuntu | fail | Scheduler concurrency fixture observed peak 3 instead of 4 because response timing varied. The fixture now holds responses until a full expected request wave arrives. |
 | [37510715198](https://github.com/Praket7/chrome-controlla/actions/runs/37510715198) | Windows | fail | Clippy found an unused `path` parameter in the non-Unix no-op permission helper; renamed it `_path` while retaining Unix use. Ubuntu and macOS passed this run. |
 | [37511048769](https://github.com/Praket7/chrome-controlla/actions/runs/37511048769) | Ubuntu, macOS, Windows | pass | All configured Rust, packaging, documentation, dependency, and provenance checks passed for final commit `928c3a8`. |
+
+## Phase 3 local journal gate — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 95 passed, 1 ignored, 0 failed; includes ten journal tests |
+| `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | pass | macOS 26 / Darwin 25.6 arm64 | formatting and warning-free Clippy |
+| `node scripts/check-provenance.mjs`, `node scripts/check-doc-links.mjs`, `git diff --check` | pass | macOS 26 | 13 source digests and 22 retained tests; local Markdown links pass; no whitespace errors |
+
+Sol approved the local journal gate after reviewing two correction rounds. Tests cover owner-scoped durable replay, concurrent admission and one-time dispatch claims, fixture send counting, crash-before-send uncertainty, acknowledged-delivery preservation, pre-send failure, bounded wait, and persisted deadlines. This is not an MCP jobs tool or live browser execution: B18/B19 remain partial for real Promise, worker cancellation, and CDP/extension routes.

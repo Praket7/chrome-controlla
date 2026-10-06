@@ -37,7 +37,7 @@ The master guide is part of the product. Every usage path, error and mode must t
 
 ## Review focus
 
-1. Crash after remote effect but before journal completion: preserve unknown and reconcile without duplication. Owned by Phase 3.
+1. Crash after remote effect or dispatch claim but before journal completion: preserve unknown and refuse replay until an independent observer exists. Owned by Phase 3.
 2. Human/account change after validation but before dispatch: narrow and measure the race; refuse stale subsequent work. Owned by Phase 4.
 3. Apparently complete list with virtualized/hidden rows and stale counts: explicit partial coverage. Owned by Phase 5.
 4. Canva sync writes changes while being used as a read probe: separate freshness and mutation flow. Owned by Phase 8.
@@ -159,17 +159,17 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Files:** `journal.rs`, `jobs.rs`, `errors.rs`, jobs tool; `tests/e2e/{idempotency,jobs,crash_recovery}.rs`.
 
-**Interfaces:** `admit(principal, request_digest, key) -> Admission`; `record_dispatch(op, correlation) -> Result<()>`; `reconcile(op_id) -> OperationReceipt`; `wait(op_id, after_revision, max_wait_ms) -> OperationReceipt`.
+**Interfaces:** `admit(principal, session, request, key) -> Admission`; `record_dispatch(principal, session, op, correlation) -> DispatchClaim { acquired, operation }`; `reconcile(principal, session, op_id) -> Operation`; `wait(principal, session, op_id, after_revision, max_wait_ms) -> Operation`.
 
-- [ ] Implement B05–07/B18–19 with controlled fixture endpoints that count effects independently of the runtime.
-- [ ] Canonicalize semantic request identity including principal/session scope. Same key and body returns original operation; changed expression, target, outcome or grant conflicts.
-- [ ] Use transactional local admission with unique constraints. Test two clients submitting simultaneously and crash injection at every journal boundary.
-- [ ] Separate client response deadline from job lifetime. Apply proposed default limits from improvements.md and expose remaining budget.
-- [ ] Test resolve/reject/never-resolve promises and navigation during evaluation. Verify both CDP and bridge routes. A client disconnect cannot silently erase an operation.
-- [ ] Implement cancellation as prevention of future actions; reconcile already dispatched work. Preserve unknown if actual effect cannot be distinguished.
-- [ ] Commit `feat: persist browser jobs and reconcile uncertain effects`.
+- [x] Implement local journal contracts for B05–07/B18–19; controlled fixture counting covers duplicate prevention after an accepted effect. No live endpoint or dispatch route exists yet.
+- [x] Bind canonical JSON request identity to principal/session/key. Same key/body replays the original operation; changed body conflicts.
+- [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations. Process-kill injection at every journal boundary remains open.
+- [x] Separate bounded caller wait from durable operation state, persist a bounded 60-second default job deadline, and expose monotonic revisions. Broader execution limits remain unapplied because no worker route consumes them.
+- [ ] Test real resolve/reject/never-resolve promises and navigation during evaluation over both CDP and bridge routes. No jobs execution route exists yet; local async lifecycle fixtures cover only persisted states.
+- [x] Cancellation blocks queued dispatch; expiry before dispatch becomes `failed` with `deadline_error=deadline_exceeded` and `delivery=not_sent`. Expiry/recovery after dispatch becomes `unknown` while preserving delivery as `sent` only when transport acknowledgement was recorded, otherwise `unknown`.
+- [x] Commit reviewed local journal gate as `feat: persist browser jobs and reconcile uncertain effects`.
 
-**Gate:** no tested duplicate dispatch on exact local replay; remote exactly-once is not claimed. The 12-second promise case completes through jobs.
+**Gate:** local journal fixtures refuse duplicate dispatch on replay; remote exactly-once is not claimed. The exact 12-second Promise/CDP/bridge case remains untested because execution routes do not exist.
 
 ## Phase 4 — reliable input, guards and interference
 
