@@ -47,10 +47,10 @@ expect_archive_entry() {
 expect_archive_entry 'package/bin/controlla.cjs'
 expect_archive_entry 'package/LICENSE'
 expect_archive_entry 'package/NOTICE'
-if [ -f packages/chrome-controlla/dist/bin/controlla-core ]; then
-    expect_archive_entry 'package/bin/controlla-core'
-else
+if [ "$(node -p 'process.platform')" = win32 ]; then
     expect_archive_entry 'package/bin/controlla-core.exe'
+else
+    expect_archive_entry 'package/bin/controlla-core'
 fi
 printf '%s\n' 'package-check: validating packed target metadata and license'
 tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);if(p.os?.length!==1||p.os[0]!==process.platform||p.cpu?.length!==1||p.cpu[0]!==process.arch){console.error(`package target mismatch: ${p.os}/${p.cpu} != ${process.platform}/${process.arch}`);process.exit(1)}if(p.license!=="Apache-2.0"){console.error(`unexpected license: ${p.license}`);process.exit(1)}})'

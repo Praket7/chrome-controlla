@@ -153,9 +153,9 @@ After the failure, package-check stage labels localized the post-Cargo path, and
 |---|---|---|
 | macOS | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
 | Ubuntu | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
-| Windows | fail | `package-check.sh` reached `package-check: inspecting npm archive chrome-controlla-0.1.0.tgz` and exited before clean-prefix install. Commit `c2fce64` strips carriage returns from the archive listing and logs each required entry and metadata validation stage. Windows rerun is pending. |
+| Windows | fail | `package-check.sh` expected the Unix name `package/bin/controlla-core`, while the archive contains `package/bin/controlla-core.exe`. Commit `9c8adaf` selects the expected entry from `process.platform`; Windows rerun is pending. |
 
-After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim.
+After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim. Run 37464310787 passed macOS/Ubuntu but failed on Windows extension selection; the process-platform branch correction awaits hosted confirmation.
 
 ## Phase 1 hosted CI run 37461823256 — failed
 
