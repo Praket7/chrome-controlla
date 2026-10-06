@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phase 0 and Phase 1 are committed locally; Phase 0 is pushed and hosted CI passed. Phase 1 passed Sol review for local/fixture scope and is committed as `c6ad8d1`; its push and hosted CI are pending. Preserve failed and blocked evidence when resuming.
+Status: Phase 0 and Phase 1 are pushed. Phase 0 hosted CI passed. Phase 1 commit `23b7827` passed Sol's local/fixture review, but hosted run `37460467645` failed on Windows Clippy and the Ubuntu PID probe test. Fix commit `4af5cdc` passes local checks; its push and hosted rerun are pending.
 
 ## Phase 0 — source extraction and baseline
 
@@ -27,4 +27,4 @@ Status: Phase 0 and Phase 1 are committed locally; Phase 0 is pushed and hosted 
 - [x] Add direct-only, bridge-only, unconfigured, denied, revoked, bounded dispatch/revocation, global/subcommand open-stdin help, doctor health-separation and launcher tests.
 - [ ] Live transport/process/authentication round trip and client/browser dispatch remain unavailable: no service or browser runtime exists yet.
 
-The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Local checks pass with 35 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2–12 remain unstarted; no live browser capability is implied.
+The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. After the hosted CI fixes, local checks pass with 36 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2–12 remain unstarted; no live browser capability is implied.

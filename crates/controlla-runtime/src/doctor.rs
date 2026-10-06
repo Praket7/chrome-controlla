@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -272,36 +273,57 @@ fn health_probe(addr: SocketAddr, config: &Config) -> ProbeResult {
     result
 }
 
+#[cfg(unix)]
 fn process_probe(pid: u32) -> (State, Option<String>) {
-    #[cfg(unix)]
-    {
-        match Command::new("/bin/kill")
+    process_probe_with(pid, |safe_pid| {
+        Command::new("/bin/kill")
             .arg("-0")
-            .arg(pid.to_string())
+            .arg(safe_pid.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-        {
-            Ok(status) if status.success() => (State::Healthy, None),
-            Ok(_) => (
-                State::Failed,
-                Some("configured local process is not alive or not probeable".to_owned()),
-            ),
-            Err(error) => (
-                State::Unknown,
-                Some(format!("local process probe unavailable: {error}")),
-            ),
-        }
+            .map(|status| status.success())
+    })
+}
+
+#[cfg(unix)]
+fn process_probe_with(
+    pid: u32,
+    probe: impl FnOnce(i32) -> std::io::Result<bool>,
+) -> (State, Option<String>) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return (
+            State::Failed,
+            Some("configured process ID exceeds the supported positive pid_t range".to_owned()),
+        );
+    };
+    if pid <= 0 {
+        return (
+            State::Failed,
+            Some("configured process ID must be positive".to_owned()),
+        );
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        (
+    match probe(pid) {
+        Ok(true) => (State::Healthy, None),
+        Ok(false) => (
+            State::Failed,
+            Some("configured local process is not alive or not probeable".to_owned()),
+        ),
+        Err(error) => (
             State::Unknown,
-            Some("local process probe unavailable on this operating system".to_owned()),
-        )
+            Some(format!("local process probe unavailable: {error}")),
+        ),
     }
+}
+
+#[cfg(not(unix))]
+fn process_probe(pid: u32) -> (State, Option<String>) {
+    let _ = pid;
+    (
+        State::Unknown,
+        Some("local process probe unavailable on this operating system".to_owned()),
+    )
 }
 
 fn binary_hash(errors: &mut Vec<String>) -> Option<String> {
@@ -334,4 +356,22 @@ fn hex(bytes: impl Iterator<Item = u8>) -> String {
         result.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{State, process_probe_with};
+    use std::cell::Cell;
+
+    #[test]
+    fn oversized_pid_is_rejected_before_os_probe() {
+        let invoked = Cell::new(false);
+        let (state, error) = process_probe_with(i32::MAX as u32 + 1, |_| {
+            invoked.set(true);
+            Ok(true)
+        });
+        assert_eq!(state, State::Failed);
+        assert!(!invoked.get());
+        assert!(error.unwrap().contains("pid_t range"));
+    }
 }

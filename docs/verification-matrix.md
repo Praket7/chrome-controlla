@@ -108,4 +108,21 @@ Evidence is fixture/local only. Capability route values are test inputs, not obs
 | `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
 | Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
 
-The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; Linux and Windows package installs remain pending hosted Phase 1 CI. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 is committed as `c6ad8d1`; push and hosted CI are pending.
+The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; Linux and Windows package installs remain pending hosted Phase 1 CI. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Both local findings are corrected in commit `4af5cdc`; its push and hosted rerun are pending.
+
+## Phase 1 hosted CI run 37460467645 — failed
+
+| Runner | Result | Evidence |
+|---|---|---|
+| macOS | pass | Hosted workflow run [37460467645](https://github.com/Praket7/chrome-controlla/actions/runs/37460467645); package/runtime jobs passed. |
+| Windows | fail | Clippy reported `unused_imports` for Unix-only `Command` and `Stdio` imports in `doctor.rs`; imports are now gated with `#[cfg(unix)]`. |
+| Ubuntu | fail | `doctor_reports_fresh_heartbeat_but_dead_process_and_unreachable_loopback` treated PID `4294967295` as alive because it overflowed signed `pid_t`; process probing now rejects values above `i32::MAX` before invoking `/bin/kill`, with a unit test proving the probe is not called. |
+
+The run remains recorded as failed historical evidence. The fixes are locally verified below; hosted confirmation is pending.
+
+## Phase 1 review-fix local rerun — 2026-10-06
+
+| Command | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64 | formatting and Clippy clean; 36 tests passed (22 browser, 3 runtime unit, 8 CLI/doctor, 3 registry); no doc tests. Includes oversized PID rejection before the OS probe. |
+| `./scripts/package-build.sh && ./scripts/package-check.sh && git diff --check` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0, Node 26.7.0/npm 11.19.0 | Cargo archive packaged 14 files; npm archive verified as darwin/arm64 with attribution and clean-prefix install; whitespace clean. |
