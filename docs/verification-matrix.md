@@ -27,7 +27,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-01 | fixture_verified | 1 | `controlla-runtime` evaluator parity tests; no live routes |
 | CC-02 | fixture_verified | 1 | open-stdin help/no-state and invalid-flag CLI tests |
 | CC-03 | partial | 1 | doctor schema, local PID and loopback fixture probes; no live daemon or service |
-| CC-04 | fixture_verified | 1 | packed darwin/arm64 npm archive clean-prefix install, spaces and empty PATH; other OS package jobs pending |
+| CC-04 | fixture_verified | 1 | packed darwin/arm64 npm archive clean-prefix install, spaces and empty PATH; Ubuntu/macOS/Windows hosted package checks pass |
 | CC-05 | unimplemented | 3 | none |
 | CC-06 | unimplemented | 3 | none |
 | CC-07 | unimplemented | 3 | none |
@@ -108,7 +108,17 @@ Evidence is fixture/local only. Capability route values are test inputs, not obs
 | `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
 | Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
 
-The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS/Ubuntu but exposed a Windows-only doctor expectation in run 37461256280; `b159a3a` fixed it. Hosted run 37461823256 passed macOS/Ubuntu and failed Windows provenance hashes because text files checked out with CRLF; fix commit `63b74d5` pins LF line endings. Hosted run 37462361648 passed macOS/Ubuntu and failed Windows package-check after Cargo verification; fix commit `ec5982c` added diagnostics and uses `npm exec` for platform-correct shim execution. Commit `c2fce64` normalizes Windows tar-list CRLF and adds per-entry diagnostics; hosted confirmation is pending.
+The npm artifact built locally is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. Sol approved the Phase 1 local/fixture gate on 2026-10-06. After the historical failures recorded below, hosted CI run [37465119376](https://github.com/Praket7/chrome-controlla/actions/runs/37465119376) passed the complete configured matrix on Ubuntu, macOS, and Windows for commit `8dbf51d`.
+
+## Phase 1 hosted CI run 37465119376 — passed
+
+| Runner | Result | Evidence |
+|---|---|---|
+| Ubuntu | pass | Rust formatting, Clippy, tests, package build, docs, provenance, dependency, npm archive and clean-prefix install checks passed. |
+| macOS | pass | Rust formatting, Clippy, tests, package build, docs, provenance, dependency, npm archive and clean-prefix install checks passed. |
+| Windows | pass | Rust formatting, Clippy, tests, package build, docs, provenance, dependency, `.exe` archive selection, npm archive and clean-prefix install checks passed. |
+
+Workflow: [37465119376](https://github.com/Praket7/chrome-controlla/actions/runs/37465119376), commit `8dbf51dd5755932361d5bbbb3e56ca99862e76f3`.
 
 ## Phase 1 hosted CI run 37460467645 — failed
 
@@ -118,7 +128,7 @@ The npm artifact built here is specifically for darwin/arm64. The generated pack
 | Windows | fail | Clippy reported `unused_imports` for Unix-only `Command` and `Stdio` imports in `doctor.rs`; imports are now gated with `#[cfg(unix)]`. |
 | Ubuntu | fail | `doctor_reports_fresh_heartbeat_but_dead_process_and_unreachable_loopback` treated PID `4294967295` as alive because it overflowed signed `pid_t`; process probing now rejects values above `i32::MAX` before invoking `/bin/kill`, with a unit test proving the probe is not called. |
 
-The run remains recorded as failed historical evidence. The fixes are locally verified below; hosted confirmation is pending.
+The run remains recorded as failed historical evidence. Its fixes were subsequently verified by the passing three-platform run 37465119376.
 
 ## Phase 1 review-fix local rerun — 2026-10-06
 
@@ -135,7 +145,7 @@ The run remains recorded as failed historical evidence. The fixes are locally ve
 | Ubuntu | pass | Hosted workflow run [37461256280](https://github.com/Praket7/chrome-controlla/actions/runs/37461256280); includes the oversized-PID regression fix. |
 | Windows | fail | `doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated_health` expected a Healthy process probe, although the implementation correctly reports `Unknown` on unsupported OSes. The assertion now expects Healthy on Unix and Unknown elsewhere. |
 
-This failed run remains historical evidence. The Unix branch passes locally; the Windows `Unknown` expectation is source-updated but awaits hosted confirmation.
+This failed run remains historical evidence. The Unix branch passes locally; the Windows `Unknown` expectation was subsequently verified by the passing three-platform run 37465119376.
 
 ## Phase 1 hosted CI run 37462361648 — failed
 
@@ -143,7 +153,7 @@ This failed run remains historical evidence. The Unix branch passes locally; the
 |---|---|---|
 | macOS | pass | Hosted workflow run [37462361648](https://github.com/Praket7/chrome-controlla/actions/runs/37462361648); full CI passed. |
 | Ubuntu | pass | Hosted workflow run [37462361648](https://github.com/Praket7/chrome-controlla/actions/runs/37462361648); full CI passed. |
-| Windows | fail | `./scripts/package-check.sh` exited 1 after Cargo package verification. The hosted log did not expose the silent failing subcommand. Package check now emits stage labels and checks the installed command through `npm exec`, which selects the platform-appropriate shim under Git Bash. Fix commit `ec5982c` passes local package check; Windows rerun is pending. |
+| Windows | fail | `./scripts/package-check.sh` exited 1 after Cargo package verification. The hosted log did not expose the silent failing subcommand. Package check now emits stage labels and checks the installed command through `npm exec`, which selects the platform-appropriate shim under Git Bash. The Windows package path was subsequently verified by run 37465119376. |
 
 After the failure, package-check stage labels localized the post-Cargo path, and the installed consumer command check was changed to `npm exec`. `./scripts/package-check.sh` passes locally on macOS, including archive contents, target metadata, attribution, clean-prefix installation, direct package-local launcher, and npm command execution.
 
@@ -153,9 +163,9 @@ After the failure, package-check stage labels localized the post-Cargo path, and
 |---|---|---|
 | macOS | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
 | Ubuntu | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
-| Windows | fail | `package-check.sh` expected the Unix name `package/bin/controlla-core`, while the archive contains `package/bin/controlla-core.exe`. Commit `9c8adaf` selects the expected entry from `process.platform`; Windows rerun is pending. |
+| Windows | fail | `package-check.sh` expected the Unix name `package/bin/controlla-core`, while the archive contains `package/bin/controlla-core.exe`. Commit `8dbf51d` selects the expected entry from `process.platform`; the corrected check passed in run 37465119376. |
 
-After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim. Run 37464310787 passed macOS/Ubuntu but failed on Windows extension selection; the process-platform branch correction awaits hosted confirmation.
+After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim. Run 37464310787 passed macOS/Ubuntu but failed on Windows extension selection; the process-platform branch correction passed on all three runners in run 37465119376.
 
 ## Phase 1 hosted CI run 37461823256 — failed
 
@@ -163,4 +173,4 @@ After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all
 |---|---|---|
 | macOS | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
 | Ubuntu | pass | Hosted workflow run [37461823256](https://github.com/Praket7/chrome-controlla/actions/runs/37461823256); all Rust, package and provenance checks passed. |
-| Windows | fail | `check-provenance.mjs` hashed CRLF working-tree files against LF source digests. Added `.gitattributes` with `* text=auto eol=lf`; this correction still requires hosted confirmation. |
+| Windows | fail | `check-provenance.mjs` hashed CRLF working-tree files against LF source digests. Added `.gitattributes` with `* text=auto eol=lf`; the correction passed Windows provenance checking in run 37465119376. |
