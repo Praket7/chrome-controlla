@@ -153,6 +153,11 @@ fn replacement_value(before: &str, start: u64, end: u64, inserted: &str) -> Opti
     Some(format!("{prefix}{inserted}{suffix}"))
 }
 
+fn sequential_caret(value: &str, start: u64, end: u64) -> Option<u64> {
+    let end_of_value = value.encode_utf16().count() as u64;
+    (start == end && start == end_of_value).then_some(start)
+}
+
 impl super::BrowserConnection {
     /// Resolve one locator and dispatch supported text input through the guarded CDP target route.
     /// Page scripts can still mutate state between any validation and its remote effect.
@@ -262,6 +267,22 @@ impl super::BrowserConnection {
                 "sequential key events support ASCII only; use fill or insert for Unicode text",
             ));
         }
+        if matches!(action, InputAction::SequentialKeys(_)) {
+            let Some(before) = p["value"].as_str() else {
+                return Ok(InputOutcome::Unsupported("input value is unavailable"));
+            };
+            if sequential_caret(
+                before,
+                p["selectionStart"].as_u64().unwrap_or(u64::MAX),
+                p["selectionEnd"].as_u64().unwrap_or(u64::MAX),
+            )
+            .is_none()
+            {
+                return Ok(InputOutcome::Stale(
+                    "sequential typing requires a collapsed caret at the end of the field",
+                ));
+            }
+        }
         let valid_point = |x: f64, y: f64| x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0;
         if let Some((x, y)) = match action {
             InputAction::Click { x, y, .. } => Some((*x, *y)),
@@ -357,6 +378,7 @@ impl super::BrowserConnection {
                         revisions,
                         &resolve,
                         input.expected_value,
+                        None,
                     )
                     .await?
                 {
@@ -376,6 +398,7 @@ impl super::BrowserConnection {
             }
             InputAction::SequentialKeys(text) => {
                 let mut live_value = input.expected_value.to_owned();
+                let mut caret = live_value.encode_utf16().count() as u64;
                 for c in text.chars() {
                     if !self
                         .text_guard_matches(
@@ -385,6 +408,7 @@ impl super::BrowserConnection {
                             revisions,
                             &resolve,
                             &live_value,
+                            Some(caret),
                         )
                         .await?
                     {
@@ -392,16 +416,31 @@ impl super::BrowserConnection {
                             "field value or focus changed immediately before key event",
                         ));
                     }
-                    self.target_ref_command(
-                        sessions,
-                        reference,
-                        principal,
-                        revisions,
-                        "Input.dispatchKeyEvent",
-                        serde_json::json!({"type":"keyDown","key":c.to_string()}),
-                    )
-                    .await?;
-                    if !self
+                    let key_up = serde_json::json!({"type":"keyUp","key":c.to_string()});
+                    if let Err(error) = self
+                        .target_ref_command(
+                            sessions,
+                            reference,
+                            principal,
+                            revisions,
+                            "Input.dispatchKeyEvent",
+                            serde_json::json!({"type":"keyDown","key":c.to_string()}),
+                        )
+                        .await
+                    {
+                        let _ = self
+                            .target_ref_command(
+                                sessions,
+                                reference,
+                                principal,
+                                revisions,
+                                "Input.dispatchKeyEvent",
+                                key_up.clone(),
+                            )
+                            .await;
+                        return Err(error);
+                    }
+                    let after_key_down = self
                         .text_guard_matches(
                             sessions,
                             reference,
@@ -409,16 +448,34 @@ impl super::BrowserConnection {
                             revisions,
                             &resolve,
                             &live_value,
+                            Some(caret),
                         )
-                        .await?
-                    {
+                        .await;
+                    if !matches!(after_key_down, Ok(true)) {
+                        let _ = self
+                            .target_ref_command(
+                                sessions,
+                                reference,
+                                principal,
+                                revisions,
+                                "Input.dispatchKeyEvent",
+                                key_up.clone(),
+                            )
+                            .await;
+                        if let Err(error) = after_key_down {
+                            return Err(error);
+                        }
                         return Ok(InputOutcome::Stale(
-                            "field value or focus changed immediately before character event",
+                            "field value, focus, or caret changed before character event",
                         ));
                     }
-                    self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchKeyEvent",serde_json::json!({"type":"char","text":c.to_string(),"unmodifiedText":c.to_string()})).await?;
+                    if let Err(error) = self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchKeyEvent",serde_json::json!({"type":"char","text":c.to_string(),"unmodifiedText":c.to_string()})).await {
+                        let _ = self.target_ref_command(sessions, reference, principal, revisions, "Input.dispatchKeyEvent", key_up.clone()).await;
+                        return Err(error);
+                    }
                     live_value.push(c);
-                    if !self
+                    caret += c.len_utf16() as u64;
+                    let before_key_up = self
                         .text_guard_matches(
                             sessions,
                             reference,
@@ -426,22 +483,26 @@ impl super::BrowserConnection {
                             revisions,
                             &resolve,
                             &live_value,
+                            Some(caret),
                         )
-                        .await?
-                    {
-                        return Ok(InputOutcome::Stale(
-                            "field value or focus changed immediately before key release",
-                        ));
-                    }
+                        .await;
                     self.target_ref_command(
                         sessions,
                         reference,
                         principal,
                         revisions,
                         "Input.dispatchKeyEvent",
-                        serde_json::json!({"type":"keyUp","key":c.to_string()}),
+                        key_up,
                     )
                     .await?;
+                    if !matches!(before_key_up, Ok(true)) {
+                        if let Err(error) = before_key_up {
+                            return Err(error);
+                        }
+                        return Ok(InputOutcome::Stale(
+                            "field value, focus, or caret changed before key release",
+                        ));
+                    }
                 }
             }
             InputAction::Click {
@@ -537,11 +598,15 @@ impl super::BrowserConnection {
         revisions: super::sessions::IdentityRevisions,
         resolve: &str,
         expected_value: &str,
+        expected_caret: Option<u64>,
     ) -> Result<bool, super::BrowserError> {
         let expected = serde_json::to_string(expected_value)
             .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+        let caret = expected_caret.map_or_else(String::new, |n| {
+            format!("&&r.e.selectionStart==={n}&&r.e.selectionEnd==={n}")
+        });
         let expression = format!(
-            "(()=>{{const r={resolve};return r.ok&&r.e.value==={expected}&&document.activeElement===r.e;}})()"
+            "(()=>{{const r={resolve};return r.ok&&r.e.value==={expected}&&document.activeElement===r.e{caret};}})()"
         );
         let result = self
             .target_ref_command(
@@ -591,6 +656,13 @@ mod tests {
             strict_background: true,
             requires_native: false,
         }
+    }
+    #[test]
+    fn sequential_keys_require_collapsed_end_caret() {
+        assert_eq!(sequential_caret("hello", 5, 5), Some(5));
+        assert_eq!(sequential_caret("hello", 2, 2), None);
+        assert_eq!(sequential_caret("hello", 2, 4), None);
+        assert_eq!(sequential_caret("hé🙂", 4, 4), Some(4));
     }
     #[test]
     fn relevant_changes_yield_and_unrelated_changes_may_continue() {
