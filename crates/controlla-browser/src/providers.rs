@@ -412,11 +412,11 @@ fn chrome_command(executable: &Path, profile_directory: &Path, mode: SessionMode
     command
 }
 
-fn restrict_profile_permissions(path: &Path) -> Result<(), std::io::Error> {
+fn restrict_profile_permissions(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
