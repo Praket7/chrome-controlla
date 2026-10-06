@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0 and 1 are pushed and gated. Phase 1 hosted CI run `37465119376` passed on Ubuntu, macOS, and Windows for commit `8dbf51d`. Phase 2 implementation is in progress and has not passed review or its gate. Phase 1 still has no live browser or client dispatch.
+Status: Phases 0 and 1 are pushed and gated. Phase 1 hosted CI run `37465119376` passed on Ubuntu, macOS, and Windows for commit `8dbf51d`. Phase 2 code review and local fixture gate passed; its live browser and platform qualification gate remains open. Phase 1 still has no live browser or client dispatch.
 
 ## Phase 0 — source extraction and baseline
 
@@ -27,4 +27,12 @@ Status: Phases 0 and 1 are pushed and gated. Phase 1 hosted CI run `37465119376`
 - [x] Add direct-only, bridge-only, unconfigured, denied, revoked, bounded dispatch/revocation, global/subcommand open-stdin help, doctor health-separation and launcher tests.
 - [ ] Live transport/process/authentication round trip and client/browser dispatch remain unavailable: no service or browser runtime exists yet.
 
-The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Hosted CI run `37465119376` passed the full configured matrix for commit `8dbf51d`; local checks pass with 36 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2 implementation is now in progress; no live browser capability is implied by the Phase 1 gate.
+The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Hosted CI run `37465119376` passed the full configured matrix for commit `8dbf51d`; local checks pass with 36 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2 code now has independent approval and local evidence; the live extension, headed Chrome and native input observation qualifications remain open.
+
+### Phase 2 — persistent sessions, modes, identities and tabs
+
+- [x] Implement persistent target/frame tracking, revision-bound references, per-target scheduling, shared-document locks, and dedicated/shared provider fixtures.
+- [x] Implement owned/adopted/borrowed tab records, cleanup receipts, crash reconciliation, safe recovery handles, retryable pairing/cleanup, and focused cancellation/lifecycle tests.
+- [x] Pass Sol's independent code review on 2026-10-06. Review findings and fixes are summarized in the Phase 2 local acceptance entry in `verification-matrix.md`.
+- [ ] Qualify live MV3 extension attachment, headed Chrome, independent in-tab cleanup observation, and native focus/cursor/clipboard behavior. These are not claimed from fixtures or the headless provider smoke.
+- [ ] Commit and push the reviewed Phase 2 implementation; hosted CI result is recorded after the push.

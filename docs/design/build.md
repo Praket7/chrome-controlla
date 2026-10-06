@@ -143,15 +143,17 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 
 **Interfaces:** `create_session(spec, principal) -> SessionHandle`; `resolve_target(handle: &TargetRef) -> Result<ResolvedTarget, StaleTarget>`; `release_session(id, cleanup_policy) -> CleanupReceipt`.
 
-- [ ] Test target closure/reuse, browser reconnect, navigation epochs, same-process frames and OOPIF swaps before porting/reworking handlers.
-- [ ] Retain persistent connections and event-driven target tracking. Invalidate handles on the relevant generation change; never replace target ID with active-tab selection.
-- [ ] Implement dedicated headed/headless providers and explicit shared extension attachment. Enforce grants independently for each provider.
-- [ ] Add owned/borrowed/adopted tab ledger and cleanup receipts. Preserve user tabs and changed ownership, including after crashes.
-- [ ] Use per-target actors plus declared shared-resource locks. Run 1/4/8-tab fixture tests; prove a hung page does not stall all tabs.
+- [x] Test target closure/reuse, browser reconnect, navigation epochs, same-process frames and OOPIF swaps before porting/reworking handlers.
+- [x] Retain persistent connections and event-driven target tracking. Invalidate handles on the relevant generation change; never replace target ID with active-tab selection.
+- [x] Implement dedicated headed/headless providers and explicit shared extension attachment. Enforce grants independently for each provider. Live extension attachment remains unqualified.
+- [x] Add owned/borrowed/adopted tab ledger and cleanup receipts. Preserve user tabs and changed ownership, including after crashes.
+- [x] Use per-target actors plus declared shared-resource locks. Run 1/4/8-tab fixture tests; prove a hung page does not stall all tabs.
 - [ ] Qualify platform focus/cursor/clipboard behavior with an independent observer. Unsupported platform/mode cells remain unqualified.
 - [ ] Commit `feat: isolate Chrome sessions and track tab ownership`.
 
 **Gate:** correct target identity and cleanup, with honest platform boundaries. Headless Chrome availability is not headless Canva/CapCut qualification.
+
+The local/code review gate passed on 2026-10-06. Live extension attachment, independent in-tab cleanup observation, headed Chrome behavior, and native focus/cursor/clipboard observation remain unqualified; the target inventory check is a point-in-time snapshot.
 
 ## Phase 3 — jobs, durable idempotency and uncertain outcomes
 

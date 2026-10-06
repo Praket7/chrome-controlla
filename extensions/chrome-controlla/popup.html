@@ -1,0 +1,9 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Pair selected tabs</title><style>
+body{font:13px system-ui,sans-serif;width:340px;margin:14px;color:#202124}label{display:block;margin:8px 0}input[type=text],input[type=password]{box-sizing:border-box;width:100%;padding:7px}button{padding:7px 10px;margin-top:8px}#tabs{max-height:220px;overflow:auto}.status{color:#555;white-space:pre-wrap}
+</style></head><body>
+<strong>Choose tabs to share</strong><p>Only checked tabs receive a debugger attachment. Closing the provider detaches them; you can also release them here.</p><div id="tabs"></div>
+<label>Local provider WebSocket<input id="endpoint" type="text" placeholder="ws://127.0.0.1:PORT/"></label>
+<label>One-session pairing token<input id="token" type="password" autocomplete="off"></label>
+<button id="pair">Attach selected tabs</button> <button id="release">Release attached tabs</button><p class="status" id="status"></p>
+<script src="popup.js"></script></body></html>

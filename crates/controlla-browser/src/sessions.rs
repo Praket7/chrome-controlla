@@ -1,0 +1,1052 @@
+//! Logical browser session identities and tab ownership bookkeeping.
+//!
+//! This registry does not launch Chrome or establish extension/native-messaging
+//! connections. Providers must perform those effects before marking a session
+//! connected; this module enforces their mode-specific grants and identity.
+
+use crate::{FrameRecord, TargetRecord};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    Headed,
+    Headless,
+    Shared,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    DedicatedHeaded,
+    DedicatedHeadless,
+    SharedExtension,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderGrants {
+    pub dedicated_headed: bool,
+    pub dedicated_headless: bool,
+    pub shared_extension: bool,
+}
+
+impl ProviderGrants {
+    fn allows(self, provider: ProviderKind) -> bool {
+        match provider {
+            ProviderKind::DedicatedHeaded => self.dedicated_headed,
+            ProviderKind::DedicatedHeadless => self.dedicated_headless,
+            ProviderKind::SharedExtension => self.shared_extension,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSpec {
+    pub mode: SessionMode,
+    /// Required for shared-browser sessions; these targets are recorded as
+    /// adopted and are never candidates for cleanup.
+    #[serde(default)]
+    pub selected_target_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionHandle {
+    pub id: String,
+    pub principal: String,
+    pub mode: SessionMode,
+    pub provider: ProviderKind,
+    pub capability_revision: u64,
+}
+
+/// A target ID returned by a successful provider create call. Fields are
+/// private so callers cannot claim ownership by supplying an arbitrary ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedTargetReceipt {
+    session_id: String,
+    browser_instance_id: u128,
+    target_id: String,
+}
+
+impl CreatedTargetReceipt {
+    pub(crate) fn from_provider(
+        session_id: &str,
+        browser_instance_id: u128,
+        target_id: String,
+    ) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            browser_instance_id,
+            target_id,
+        }
+    }
+
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionError {
+    ProviderDenied(ProviderKind),
+    TargetSelectionRequired,
+    UnexpectedTargetSelection,
+    OwnedTabRequiresCreationReceipt,
+    UnknownSession,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TargetRef {
+    pub session_id: String,
+    pub principal: String,
+    pub capability_revision: u64,
+    pub browser_instance_id: u128,
+    pub browser_generation: u64,
+    pub target_id: String,
+    pub target_revision: String,
+    pub frame_id: String,
+    pub frame_revision: u64,
+    pub account_revision: u64,
+    pub document_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TargetIdentity {
+    pub session_id: String,
+    pub browser_instance_id: u128,
+    pub browser_generation: u64,
+    pub target_id: String,
+    pub target_revision: String,
+    pub frame_id: String,
+    pub frame_revision: u64,
+    pub account_revision: u64,
+    pub document_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityRevisions {
+    pub account: u64,
+    pub document: u64,
+}
+
+/// Current CDP identity passed to an independent browser UI observer before
+/// cleanup. The observer must inspect the tab's current in-page state; target
+/// metadata alone is not sufficient to authorize closure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupObservation {
+    pub session_id: String,
+    pub target_id: String,
+    pub browser_instance_id: u128,
+    pub browser_generation: u64,
+    pub target_revision: String,
+}
+
+/// Trusted application-supplied observer for current in-tab changes (for
+/// example an independent accessibility or screenshot observer). No observer
+/// ships in this crate, so cleanup preserves owned targets by default.
+pub trait IndependentTargetObserver: Send + Sync {
+    fn verify_unchanged(&self, observation: &CleanupObservation) -> Result<(), String>;
+}
+
+impl From<&TargetRef> for TargetIdentity {
+    fn from(reference: &TargetRef) -> Self {
+        Self {
+            session_id: reference.session_id.clone(),
+            browser_instance_id: reference.browser_instance_id,
+            browser_generation: reference.browser_generation,
+            target_id: reference.target_id.clone(),
+            target_revision: reference.target_revision.clone(),
+            frame_id: reference.frame_id.clone(),
+            frame_revision: reference.frame_revision,
+            account_revision: reference.account_revision,
+            document_revision: reference.document_revision,
+        }
+    }
+}
+
+impl TargetIdentity {
+    pub fn from_snapshot(
+        browser_instance_id: u128,
+        session_id: &str,
+        target: &TargetRecord,
+        frame: &FrameRecord,
+        account_revision: u64,
+        document_revision: u64,
+    ) -> Result<Self, StaleTarget> {
+        if !target.attached || target.session_id.is_none() {
+            return Err(StaleTarget::TargetChanged);
+        }
+        if target.generation != frame.generation || frame.target_id != target.id {
+            return Err(StaleTarget::FrameChanged);
+        }
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            browser_instance_id,
+            browser_generation: target.generation,
+            target_id: target.id.clone(),
+            target_revision: target.revision.clone(),
+            frame_id: frame.id.clone(),
+            frame_revision: frame.revision,
+            account_revision,
+            document_revision,
+        })
+    }
+}
+
+impl TargetRef {
+    pub fn capture(
+        registry: &SessionRegistry,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+        target: &TargetRecord,
+        frame: &FrameRecord,
+        account_revision: u64,
+        document_revision: u64,
+    ) -> Result<Self, StaleTarget> {
+        registry.verify_target_membership(session, browser_instance_id, &target.id)?;
+        let identity = TargetIdentity::from_snapshot(
+            browser_instance_id,
+            &session.id,
+            target,
+            frame,
+            account_revision,
+            document_revision,
+        )?;
+        Ok(Self {
+            session_id: session.id.clone(),
+            principal: session.principal.clone(),
+            capability_revision: session.capability_revision,
+            browser_instance_id: identity.browser_instance_id,
+            browser_generation: identity.browser_generation,
+            target_id: identity.target_id,
+            target_revision: identity.target_revision,
+            frame_id: identity.frame_id,
+            frame_revision: identity.frame_revision,
+            account_revision,
+            document_revision,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaleTarget {
+    PrincipalChanged,
+    SessionChanged,
+    SessionEnded,
+    CapabilityChanged,
+    GrantRevoked,
+    BrowserReconnected,
+    BrowserProfileChanged,
+    ProviderMismatch,
+    TargetChanged,
+    FrameChanged,
+    AccountChanged,
+    DocumentChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ownership {
+    Owned,
+    Borrowed,
+    Adopted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TabRecord {
+    target_id: String,
+    ownership: Ownership,
+    user_changed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PreservedTab {
+    pub target_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemainingTab {
+    pub target_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CleanupReceipt {
+    pub closed: Vec<String>,
+    pub preserved: Vec<PreservedTab>,
+    pub remaining: Vec<RemainingTab>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionRegistry {
+    grants: ProviderGrants,
+    next_session_id: u64,
+    next_capability_revision: u64,
+    sessions: BTreeMap<String, SessionHandle>,
+    tabs: BTreeMap<String, BTreeMap<String, TabRecord>>,
+    #[serde(default)]
+    browser_instances: BTreeMap<String, u128>,
+    #[serde(default)]
+    inactive_sessions: BTreeSet<String>,
+}
+
+impl SessionRegistry {
+    pub fn new(grants: ProviderGrants) -> Self {
+        Self {
+            grants,
+            next_session_id: 1,
+            next_capability_revision: 1,
+            sessions: BTreeMap::new(),
+            tabs: BTreeMap::new(),
+            browser_instances: BTreeMap::new(),
+            inactive_sessions: BTreeSet::new(),
+        }
+    }
+
+    pub fn create_session(
+        &mut self,
+        spec: SessionSpec,
+        principal: impl Into<String>,
+    ) -> Result<SessionHandle, SessionError> {
+        if spec.mode == SessionMode::Shared && spec.selected_target_ids.is_empty() {
+            return Err(SessionError::TargetSelectionRequired);
+        }
+        if spec.mode != SessionMode::Shared && !spec.selected_target_ids.is_empty() {
+            return Err(SessionError::UnexpectedTargetSelection);
+        }
+        let provider = match spec.mode {
+            SessionMode::Headed => ProviderKind::DedicatedHeaded,
+            SessionMode::Headless => ProviderKind::DedicatedHeadless,
+            SessionMode::Shared => ProviderKind::SharedExtension,
+        };
+        if !self.grants.allows(provider) {
+            return Err(SessionError::ProviderDenied(provider));
+        }
+        let handle = SessionHandle {
+            id: format!("session-{}", self.next_session_id),
+            principal: principal.into(),
+            mode: spec.mode,
+            provider,
+            capability_revision: self.next_capability_revision,
+        };
+        self.next_session_id = self.next_session_id.saturating_add(1);
+        self.next_capability_revision = self.next_capability_revision.saturating_add(1);
+        self.sessions.insert(handle.id.clone(), handle.clone());
+        let tabs = self.tabs.entry(handle.id.clone()).or_default();
+        if spec.mode == SessionMode::Shared {
+            for target_id in spec.selected_target_ids {
+                tabs.insert(
+                    target_id.clone(),
+                    TabRecord {
+                        target_id,
+                        ownership: Ownership::Adopted,
+                        user_changed: false,
+                    },
+                );
+            }
+        }
+        Ok(handle)
+    }
+
+    pub fn revoke_provider(&mut self, provider: ProviderKind) {
+        match provider {
+            ProviderKind::DedicatedHeaded => self.grants.dedicated_headed = false,
+            ProviderKind::DedicatedHeadless => self.grants.dedicated_headless = false,
+            ProviderKind::SharedExtension => self.grants.shared_extension = false,
+        }
+        self.next_capability_revision = self.next_capability_revision.saturating_add(1);
+    }
+
+    pub fn bind_session_to_browser(
+        &mut self,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+    ) -> Result<(), StaleTarget> {
+        self.bind_session_to_browser_if_unbound(session, browser_instance_id)
+            .map(|_| ())
+    }
+
+    pub(crate) fn validate_session_browser_binding(
+        &self,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+    ) -> Result<(), StaleTarget> {
+        let current = self
+            .sessions
+            .get(&session.id)
+            .ok_or(StaleTarget::SessionEnded)?;
+        if current != session || self.inactive_sessions.contains(&session.id) {
+            return Err(StaleTarget::SessionEnded);
+        }
+        if !self.grants.allows(session.provider) {
+            return Err(StaleTarget::GrantRevoked);
+        }
+        if self
+            .browser_instances
+            .get(&session.id)
+            .is_some_and(|bound| *bound != browser_instance_id)
+        {
+            return Err(StaleTarget::BrowserProfileChanged);
+        }
+        Ok(())
+    }
+
+    /// Bind the browser identity and report whether this call inserted it.
+    /// Callers that perform an asynchronous provider operation can roll back
+    /// only their own insertion if that operation fails.
+    pub(crate) fn bind_session_to_browser_if_unbound(
+        &mut self,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+    ) -> Result<bool, StaleTarget> {
+        self.validate_session_browser_binding(session, browser_instance_id)?;
+        match self.browser_instances.get(&session.id) {
+            Some(bound) if *bound != browser_instance_id => Err(StaleTarget::BrowserProfileChanged),
+            Some(_) => Ok(false),
+            None => {
+                self.browser_instances
+                    .insert(session.id.clone(), browser_instance_id);
+                Ok(true)
+            }
+        }
+    }
+
+    pub(crate) fn rollback_browser_binding_if_matches(
+        &mut self,
+        session_id: &str,
+        browser_instance_id: u128,
+    ) -> bool {
+        if self.browser_instances.get(session_id) == Some(&browser_instance_id) {
+            self.browser_instances.remove(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn session_bound_to_browser(
+        &self,
+        session_id: &str,
+        browser_instance_id: u128,
+    ) -> bool {
+        self.browser_instances.get(session_id) == Some(&browser_instance_id)
+    }
+
+    fn verify_target_membership(
+        &self,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+        target_id: &str,
+    ) -> Result<(), StaleTarget> {
+        let current = self
+            .sessions
+            .get(&session.id)
+            .ok_or(StaleTarget::SessionEnded)?;
+        if current != session || self.inactive_sessions.contains(&session.id) {
+            return Err(StaleTarget::SessionEnded);
+        }
+        if !self.grants.allows(session.provider) {
+            return Err(StaleTarget::GrantRevoked);
+        }
+        if self.browser_instances.get(&session.id) != Some(&browser_instance_id) {
+            return Err(StaleTarget::BrowserProfileChanged);
+        }
+        if !self
+            .tabs
+            .get(&session.id)
+            .is_some_and(|tabs| tabs.contains_key(target_id))
+        {
+            return Err(StaleTarget::TargetChanged);
+        }
+        Ok(())
+    }
+
+    pub fn authorize_direct_cdp(&self, session_id: &str) -> Result<(), StaleTarget> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(StaleTarget::SessionEnded)?;
+        if session.provider == ProviderKind::SharedExtension {
+            return Err(StaleTarget::ProviderMismatch);
+        }
+        if !self.grants.allows(session.provider) {
+            return Err(StaleTarget::GrantRevoked);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected_targets(&self, session_id: &str) -> Option<BTreeSet<String>> {
+        self.tabs
+            .get(session_id)
+            .map(|tabs| tabs.keys().cloned().collect())
+    }
+
+    pub(crate) fn authorize_target_creation(
+        &self,
+        session: &SessionHandle,
+    ) -> Result<(), SessionError> {
+        let Some(current) = self.sessions.get(&session.id) else {
+            return Err(SessionError::UnknownSession);
+        };
+        if current != session
+            || self.inactive_sessions.contains(&session.id)
+            || !self.grants.allows(session.provider)
+        {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        if session.provider == ProviderKind::SharedExtension {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_shared_extension(
+        &self,
+        session: &SessionHandle,
+    ) -> Result<(), SessionError> {
+        let Some(current) = self.sessions.get(&session.id) else {
+            return Err(SessionError::UnknownSession);
+        };
+        if current != session
+            || self.inactive_sessions.contains(&session.id)
+            || !self.grants.allows(ProviderKind::SharedExtension)
+            || session.provider != ProviderKind::SharedExtension
+        {
+            return Err(SessionError::ProviderDenied(ProviderKind::SharedExtension));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_shared_target(
+        &self,
+        session: &SessionHandle,
+        browser_instance_id: u128,
+        target_id: &str,
+    ) -> Result<(), StaleTarget> {
+        if session.provider != ProviderKind::SharedExtension {
+            return Err(StaleTarget::ProviderMismatch);
+        }
+        self.verify_target_membership(session, browser_instance_id, target_id)
+    }
+
+    pub fn register_tab(
+        &mut self,
+        session_id: &str,
+        target_id: impl Into<String>,
+        ownership: Ownership,
+    ) -> Result<(), SessionError> {
+        if ownership == Ownership::Owned {
+            return Err(SessionError::OwnedTabRequiresCreationReceipt);
+        }
+        let tabs = self
+            .tabs
+            .get_mut(session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        let target_id = target_id.into();
+        tabs.insert(
+            target_id.clone(),
+            TabRecord {
+                target_id,
+                ownership,
+                user_changed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record ownership from a provider-created target receipt.
+    pub fn record_created_tab(
+        &mut self,
+        receipt: CreatedTargetReceipt,
+    ) -> Result<(), SessionError> {
+        let session_id = receipt.session_id;
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        if self.inactive_sessions.contains(&session_id)
+            || !self.grants.allows(session.provider)
+            || self.browser_instances.get(&session_id) != Some(&receipt.browser_instance_id)
+        {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        let tabs = self
+            .tabs
+            .get_mut(&session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        let target_id = receipt.target_id;
+        tabs.insert(
+            target_id.clone(),
+            TabRecord {
+                target_id,
+                ownership: Ownership::Owned,
+                user_changed: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn mark_user_changed(
+        &mut self,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<(), SessionError> {
+        let record = self
+            .tabs
+            .get_mut(session_id)
+            .and_then(|tabs| tabs.get_mut(target_id))
+            .ok_or(SessionError::UnknownSession)?;
+        record.user_changed = true;
+        Ok(())
+    }
+
+    pub(crate) fn release_session(
+        &mut self,
+        session_id: &str,
+        mut close_tab: impl FnMut(&str) -> Result<(), String>,
+    ) -> CleanupReceipt {
+        let mut receipt = CleanupReceipt::default();
+        let Some(tabs) = self.tabs.get(session_id).cloned() else {
+            if self.sessions.remove(session_id).is_none() {
+                receipt.remaining.push(RemainingTab {
+                    target_id: session_id.to_owned(),
+                    reason: "unknown session; no cleanup was attempted".to_owned(),
+                });
+            }
+            return receipt;
+        };
+        self.inactive_sessions.insert(session_id.to_owned());
+        let mut retry = BTreeMap::new();
+        for record in tabs.into_values() {
+            if record.ownership == Ownership::Owned && !record.user_changed {
+                match close_tab(&record.target_id) {
+                    Ok(()) => receipt.closed.push(record.target_id),
+                    Err(reason) => {
+                        receipt.remaining.push(RemainingTab {
+                            target_id: record.target_id.clone(),
+                            reason,
+                        });
+                        retry.insert(record.target_id.clone(), record);
+                    }
+                }
+            } else {
+                receipt.preserved.push(PreservedTab {
+                    target_id: record.target_id,
+                    reason: if record.user_changed {
+                        "tab changed by the user; ownership no longer permits cleanup".to_owned()
+                    } else {
+                        format!("tab is {:?}, not owned by this session", record.ownership)
+                    },
+                });
+            }
+        }
+        if retry.is_empty() {
+            self.tabs.remove(session_id);
+            self.sessions.remove(session_id);
+            self.inactive_sessions.remove(session_id);
+            self.browser_instances.remove(session_id);
+        } else {
+            self.tabs.insert(session_id.to_owned(), retry);
+        }
+        receipt
+    }
+
+    pub(crate) fn owned_cleanup_candidates(&self, session_id: &str) -> Vec<String> {
+        self.tabs
+            .get(session_id)
+            .into_iter()
+            .flat_map(|tabs| tabs.values())
+            .filter(|record| record.ownership == Ownership::Owned && !record.user_changed)
+            .map(|record| record.target_id.clone())
+            .collect()
+    }
+
+    pub fn reconcile_after_crash(&self, live_target_ids: &[&str]) -> CleanupReceipt {
+        let live = live_target_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut receipt = CleanupReceipt::default();
+        for tabs in self.tabs.values() {
+            for record in tabs.values() {
+                if !live.contains(record.target_id.as_str()) {
+                    continue;
+                }
+                if record.ownership == Ownership::Owned && !record.user_changed {
+                    receipt.remaining.push(RemainingTab {
+                        target_id: record.target_id.clone(),
+                        reason: "owned tab survived process loss; explicit reconciliation required"
+                            .to_owned(),
+                    });
+                } else {
+                    receipt.preserved.push(PreservedTab {
+                        target_id: record.target_id.clone(),
+                        reason: "user-owned, adopted, borrowed, or user-changed tab preserved after process loss".to_owned(),
+                    });
+                }
+            }
+        }
+        receipt
+    }
+
+    pub fn resolve_target(
+        expected: &TargetRef,
+        principal: &str,
+        current: &TargetIdentity,
+    ) -> Result<TargetIdentity, StaleTarget> {
+        if principal != expected.principal {
+            return Err(StaleTarget::PrincipalChanged);
+        }
+        if expected.session_id != current.session_id {
+            return Err(StaleTarget::SessionChanged);
+        }
+        if expected.browser_generation != current.browser_generation {
+            return Err(StaleTarget::BrowserReconnected);
+        }
+        if expected.browser_instance_id != current.browser_instance_id {
+            return Err(StaleTarget::BrowserProfileChanged);
+        }
+        if expected.target_id != current.target_id
+            || expected.target_revision != current.target_revision
+        {
+            return Err(StaleTarget::TargetChanged);
+        }
+        if expected.frame_id != current.frame_id
+            || expected.frame_revision != current.frame_revision
+        {
+            return Err(StaleTarget::FrameChanged);
+        }
+        if expected.account_revision != current.account_revision {
+            return Err(StaleTarget::AccountChanged);
+        }
+        if expected.document_revision != current.document_revision {
+            return Err(StaleTarget::DocumentChanged);
+        }
+        Ok(current.clone())
+    }
+
+    /// Resolve against the registry's live session and provider grant before
+    /// accepting the caller's current target snapshot.
+    pub fn resolve_active_target(
+        &self,
+        expected: &TargetRef,
+        principal: &str,
+        current: &TargetIdentity,
+    ) -> Result<TargetIdentity, StaleTarget> {
+        let session = self
+            .sessions
+            .get(&expected.session_id)
+            .ok_or(StaleTarget::SessionEnded)?;
+        if self.inactive_sessions.contains(&expected.session_id) {
+            return Err(StaleTarget::SessionEnded);
+        }
+        if principal != session.principal || principal != expected.principal {
+            return Err(StaleTarget::PrincipalChanged);
+        }
+        if expected.capability_revision != session.capability_revision {
+            return Err(StaleTarget::CapabilityChanged);
+        }
+        if !self.grants.allows(session.provider) {
+            return Err(StaleTarget::GrantRevoked);
+        }
+        if self.browser_instances.get(&expected.session_id) != Some(&current.browser_instance_id) {
+            return Err(StaleTarget::BrowserProfileChanged);
+        }
+        if !self
+            .tabs
+            .get(&expected.session_id)
+            .is_some_and(|tabs| tabs.contains_key(&expected.target_id))
+        {
+            return Err(StaleTarget::TargetChanged);
+        }
+        Self::resolve_target(expected, principal, current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add_owned_fixture(registry: &mut SessionRegistry, session_id: &str, target_id: &str) {
+        registry
+            .tabs
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(
+                target_id.to_owned(),
+                TabRecord {
+                    target_id: target_id.to_owned(),
+                    ownership: Ownership::Owned,
+                    user_changed: false,
+                },
+            );
+    }
+
+    fn target(id: &str) -> TargetRecord {
+        TargetRecord {
+            id: id.to_owned(),
+            target_type: "page".to_owned(),
+            browser_context_id: Some("profile-context".to_owned()),
+            session_id: Some(format!("cdp-{id}")),
+            url: Some("https://fixture.test/".to_owned()),
+            title: None,
+            opener_id: None,
+            attached: true,
+            generation: 1,
+            revision: "target-r1".to_owned(),
+        }
+    }
+
+    fn frame(target_id: &str) -> FrameRecord {
+        FrameRecord {
+            id: format!("frame-{target_id}"),
+            parent_id: None,
+            target_id: target_id.to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+            execution_context_ids: vec![1],
+            generation: 1,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn capture_rejects_target_outside_session_membership() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        registry.bind_session_to_browser(&session, 10).unwrap();
+        assert_eq!(
+            TargetRef::capture(
+                &registry,
+                &session,
+                10,
+                &target("unlisted"),
+                &frame("unlisted"),
+                1,
+                1
+            ),
+            Err(StaleTarget::TargetChanged)
+        );
+    }
+
+    #[test]
+    fn browser_binding_rollback_removes_only_the_new_matching_insertion() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        assert!(
+            registry
+                .bind_session_to_browser_if_unbound(&session, 10)
+                .unwrap()
+        );
+        assert!(registry.rollback_browser_binding_if_matches(&session.id, 10));
+        assert!(!registry.session_bound_to_browser(&session.id, 10));
+
+        registry.bind_session_to_browser(&session, 11).unwrap();
+        assert!(
+            !registry
+                .bind_session_to_browser_if_unbound(&session, 11)
+                .unwrap()
+        );
+        assert!(!registry.rollback_browser_binding_if_matches(&session.id, 10));
+        assert!(registry.session_bound_to_browser(&session.id, 11));
+    }
+
+    #[test]
+    fn refs_are_bound_to_browser_instance_and_allowed_target() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        registry.bind_session_to_browser(&session, 10).unwrap();
+        registry
+            .register_tab(&session.id, "allowed", Ownership::Borrowed)
+            .unwrap();
+        let reference = TargetRef::capture(
+            &registry,
+            &session,
+            10,
+            &target("allowed"),
+            &frame("allowed"),
+            1,
+            1,
+        )
+        .unwrap();
+        let current = TargetIdentity::from_snapshot(
+            10,
+            &session.id,
+            &target("allowed"),
+            &frame("allowed"),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .resolve_active_target(&reference, "alice", &current)
+                .is_ok()
+        );
+        assert_eq!(
+            registry.resolve_active_target(
+                &reference,
+                "alice",
+                &TargetIdentity::from_snapshot(
+                    11,
+                    &session.id,
+                    &target("allowed"),
+                    &frame("allowed"),
+                    1,
+                    1
+                )
+                .unwrap()
+            ),
+            Err(StaleTarget::BrowserProfileChanged)
+        );
+    }
+
+    #[test]
+    fn persisted_browser_session_binding_rejects_new_instance() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        registry.bind_session_to_browser(&session, 10).unwrap();
+        let persisted = serde_json::to_vec(&registry).unwrap();
+        let mut recovered: SessionRegistry = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(
+            recovered.bind_session_to_browser(&session, 11),
+            Err(StaleTarget::BrowserProfileChanged)
+        );
+    }
+
+    #[test]
+    fn release_closes_only_unchanged_owned_tabs_and_preserves_user_tabs() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        add_owned_fixture(&mut registry, &session.id, "owned-1");
+        add_owned_fixture(&mut registry, &session.id, "owned-2");
+        registry
+            .register_tab(&session.id, "borrowed", Ownership::Borrowed)
+            .unwrap();
+        registry.mark_user_changed(&session.id, "owned-1").unwrap();
+        let mut closed = Vec::new();
+        let receipt = registry.release_session(&session.id, |target| {
+            closed.push(target.to_owned());
+            Ok::<_, String>(())
+        });
+        assert_eq!(closed, vec!["owned-2"]);
+        assert_eq!(receipt.preserved.len(), 2);
+        assert!(receipt.remaining.is_empty());
+    }
+
+    #[test]
+    fn crash_reconciliation_reports_owned_leftovers_and_preserves_user_tabs() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["adopted".into()],
+                },
+                "alice",
+            )
+            .unwrap();
+        add_owned_fixture(&mut registry, &session.id, "owned");
+        let serialized = serde_json::to_vec(&registry).unwrap();
+        let recovered: SessionRegistry = serde_json::from_slice(&serialized).unwrap();
+        let receipt = recovered.reconcile_after_crash(&["owned", "adopted"]);
+        assert_eq!(
+            receipt
+                .remaining
+                .iter()
+                .map(|item| item.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["owned"]
+        );
+        assert_eq!(
+            receipt
+                .preserved
+                .iter()
+                .map(|item| item.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["adopted"]
+        );
+    }
+
+    #[test]
+    fn failed_owned_close_remains_available_for_retry() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        add_owned_fixture(&mut registry, &session.id, "owned");
+        let failed =
+            registry.release_session(&session.id, |_| Err("provider disconnected".to_owned()));
+        assert_eq!(failed.remaining[0].target_id, "owned");
+        let retried = registry.release_session(&session.id, |_| Ok(()));
+        assert_eq!(retried.closed, vec!["owned"]);
+        assert!(retried.remaining.is_empty());
+    }
+}

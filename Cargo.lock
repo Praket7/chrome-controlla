@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "futures-util",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

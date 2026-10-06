@@ -2,7 +2,10 @@
 
 mod blocking;
 mod manager;
+pub mod providers;
+pub mod scheduler;
 mod session;
+pub mod sessions;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
 pub use manager::BrowserManager;
@@ -13,7 +16,7 @@ pub use session::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -256,6 +259,8 @@ pub struct BrowserEvent {
 #[derive(Clone)]
 pub struct BrowserConnection {
     outgoing: mpsc::Sender<OutgoingCommand>,
+    instance_id: u128,
+    scheduler: scheduler::TargetScheduler,
     pub targets: Arc<RwLock<TargetGraph>>,
     pub frames: Arc<RwLock<FrameGraph>>,
     next_command_id: Arc<AtomicU64>,
@@ -269,6 +274,7 @@ pub struct BrowserConnection {
 impl BrowserConnection {
     pub async fn connect(url: &str) -> Result<Self, BrowserError> {
         use futures_util::{SinkExt, StreamExt};
+        let instance_id = new_browser_instance_id()?;
         let (socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|error| BrowserError::Connection(error.to_string()))?;
@@ -340,12 +346,31 @@ impl BrowserConnection {
                         replay.pop_front();
                     }
                     replay.push_back(event);
+                    let frame_target_id =
+                        if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
+                            targets_for_reader
+                                .read()
+                                .await
+                                .target_id_for_session(session_id)
+                        } else {
+                            None
+                        };
                     targets_for_reader.write().await.apply_event(&value);
                     let generation = generation_for_disconnect.load(Ordering::Acquire);
-                    frames_for_reader
-                        .write()
-                        .await
-                        .apply_event_at_generation(&value, generation);
+                    let mut frames = frames_for_reader.write().await;
+                    if let Some(target_id) = frame_target_id {
+                        frames.apply_event_for_target(&value, generation, &target_id);
+                    } else {
+                        frames.apply_event_at_generation(&value, generation);
+                    }
+                    if value.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
+                        && let Some(target_id) = value
+                            .get("params")
+                            .and_then(|params| params.get("targetId"))
+                            .and_then(Value::as_str)
+                    {
+                        frames.remove_target(target_id);
+                    }
                     continue;
                 };
                 if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
@@ -368,6 +393,8 @@ impl BrowserConnection {
         });
         Ok(Self {
             outgoing: outgoing_tx,
+            instance_id,
+            scheduler: scheduler::TargetScheduler::default(),
             targets,
             frames,
             next_command_id: Arc::new(AtomicU64::new(1)),
@@ -401,6 +428,189 @@ impl BrowserConnection {
             .await
             .map_err(|_| BrowserError::Closed)?;
         response_rx.await.map_err(|_| BrowserError::Cancelled)?
+    }
+
+    /// Create one target through this direct CDP provider and persist ownership
+    /// only from the successful provider response. Shared-extension sessions
+    /// require their own provider and cannot call this method.
+    pub async fn create_owned_target(
+        &self,
+        registry: &mut crate::sessions::SessionRegistry,
+        session: &crate::sessions::SessionHandle,
+        url: &str,
+    ) -> Result<String, BrowserError> {
+        registry
+            .authorize_target_creation(session)
+            .map_err(|error| {
+                BrowserError::InvalidResponse(format!(
+                    "session cannot create a CDP target: {error:?}"
+                ))
+            })?;
+        registry
+            .validate_session_browser_binding(session, self.instance_id)
+            .map_err(|error| {
+                BrowserError::InvalidResponse(format!("session browser binding failed: {error:?}"))
+            })?;
+        let response = self
+            .command(None, "Target.createTarget", serde_json::json!({"url": url}))
+            .await?;
+        let target_id = response
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|target_id| !target_id.is_empty())
+            .ok_or_else(|| {
+                BrowserError::InvalidResponse(
+                    "Target.createTarget response omitted targetId".to_owned(),
+                )
+            })?
+            .to_owned();
+        let binding_inserted =
+            match registry.bind_session_to_browser_if_unbound(session, self.instance_id) {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    let _ = self
+                        .command(
+                            None,
+                            "Target.closeTarget",
+                            serde_json::json!({"targetId":target_id}),
+                        )
+                        .await;
+                    return Err(BrowserError::InvalidResponse(format!(
+                        "session browser binding failed after target creation: {error:?}"
+                    )));
+                }
+            };
+        let receipt = crate::sessions::CreatedTargetReceipt::from_provider(
+            &session.id,
+            self.instance_id,
+            target_id.clone(),
+        );
+        if let Err(error) = registry.record_created_tab(receipt) {
+            if binding_inserted {
+                registry.rollback_browser_binding_if_matches(&session.id, self.instance_id);
+            }
+            let _ = self
+                .command(
+                    None,
+                    "Target.closeTarget",
+                    serde_json::json!({"targetId":target_id}),
+                )
+                .await;
+            return Err(BrowserError::InvalidResponse(format!(
+                "created target could not be recorded: {error:?}"
+            )));
+        }
+        Ok(target_id)
+    }
+
+    /// Close only owned targets that a trusted independent in-tab observer
+    /// verifies immediately before dispatch. With no observer, all owned tabs
+    /// remain in the receipt for later reconciliation.
+    pub async fn release_owned_session(
+        &self,
+        registry: &mut crate::sessions::SessionRegistry,
+        session_id: &str,
+        observer: Option<&dyn crate::sessions::IndependentTargetObserver>,
+    ) -> crate::sessions::CleanupReceipt {
+        let mut outcomes = BTreeMap::new();
+        for target_id in registry.owned_cleanup_candidates(session_id) {
+            let Some(observer) = observer else {
+                outcomes.insert(
+                    target_id,
+                    Err("no independent observer is available; target remains open".to_owned()),
+                );
+                continue;
+            };
+            let (generation, current) = {
+                let graph = self.targets.read().await;
+                (graph.generation, graph.targets.get(&target_id).cloned())
+            };
+            let Some(current) =
+                current.filter(|target| target.attached && target.generation == generation)
+            else {
+                outcomes.insert(
+                    target_id,
+                    Err(
+                        "owned target is no longer attached in the current browser generation"
+                            .to_owned(),
+                    ),
+                );
+                continue;
+            };
+            if !registry.session_bound_to_browser(session_id, self.instance_id) {
+                outcomes.insert(
+                    target_id,
+                    Err("session/browser identity changed".to_owned()),
+                );
+                continue;
+            }
+            let observation = crate::sessions::CleanupObservation {
+                session_id: session_id.to_owned(),
+                target_id: target_id.clone(),
+                browser_instance_id: self.instance_id,
+                browser_generation: generation,
+                target_revision: current.revision.clone(),
+            };
+            if let Err(reason) = observer.verify_unchanged(&observation) {
+                outcomes.insert(
+                    target_id,
+                    Err(format!(
+                        "independent observer did not confirm unchanged state: {reason}"
+                    )),
+                );
+                continue;
+            }
+            // Revalidate the CDP snapshot after observation, then ask the
+            // independent observer again at the last synchronous boundary.
+            let still_current = {
+                let graph = self.targets.read().await;
+                graph.generation == generation
+                    && graph.targets.get(&target_id).is_some_and(|target| {
+                        target.attached
+                            && target.generation == generation
+                            && target.revision == current.revision
+                    })
+            } && registry
+                .session_bound_to_browser(session_id, self.instance_id);
+            if !still_current {
+                outcomes.insert(
+                    target_id,
+                    Err("target changed during cleanup observation".to_owned()),
+                );
+                continue;
+            }
+            if let Err(reason) = observer.verify_unchanged(&observation) {
+                outcomes.insert(
+                    target_id,
+                    Err(format!(
+                        "independent observer confirmation expired: {reason}"
+                    )),
+                );
+                continue;
+            }
+            let outcome = match self
+                .command(
+                    None,
+                    "Target.closeTarget",
+                    serde_json::json!({"targetId": target_id}),
+                )
+                .await
+            {
+                Ok(response) if response.get("success").and_then(Value::as_bool) == Some(true) => {
+                    Ok(())
+                }
+                Ok(response) => Err(format!(
+                    "Target.closeTarget did not confirm success: {response}"
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+            outcomes.insert(target_id, outcome);
+        }
+        registry.release_session(session_id, |target_id| {
+            outcomes
+                .remove(target_id)
+                .unwrap_or_else(|| Err("no provider close result was recorded".to_owned()))
+        })
     }
 
     /// Receive the next protocol event from the shared browser reader. This
@@ -474,17 +684,27 @@ impl BrowserConnection {
         session_id: impl Into<String>,
     ) -> Result<(), BrowserError> {
         let session_id = session_id.into();
-        for method in [
-            "Page.enable",
-            "Runtime.enable",
-            "DOM.enable",
-            "Network.enable",
-            "Accessibility.enable",
-        ] {
-            self.command(Some(session_id.clone()), method, Value::Null)
-                .await?;
-        }
-        Ok(())
+        let target_id = self
+            .targets
+            .read()
+            .await
+            .target_id_for_session(&session_id)
+            .ok_or_else(|| BrowserError::StaleReference(session_id.clone()))?;
+        self.scheduler
+            .run_target(&target_id, async {
+                for method in [
+                    "Page.enable",
+                    "Runtime.enable",
+                    "DOM.enable",
+                    "Network.enable",
+                    "Accessibility.enable",
+                ] {
+                    self.command(Some(session_id.clone()), method, Value::Null)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     /// Snapshot the current target graph generation and matching page records
@@ -537,6 +757,56 @@ impl BrowserConnection {
         method: impl Into<String>,
         params: Value,
     ) -> Result<Value, BrowserError> {
+        let method = method.into();
+        self.scheduler
+            .run_target(
+                target_id,
+                self.target_command_unlocked(
+                    target_id,
+                    expected_generation,
+                    expected_revision,
+                    method,
+                    params,
+                ),
+            )
+            .await
+    }
+
+    /// Serialize a mutation with other tabs that the caller has resolved to
+    /// the same application document. The document key must come from the
+    /// caller's identity observer.
+    pub async fn target_document_mutation(
+        &self,
+        target_id: &str,
+        expected_generation: u64,
+        expected_revision: &str,
+        document_id: &str,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        self.scheduler
+            .run_document_mutation(
+                target_id,
+                document_id,
+                self.target_command_unlocked(
+                    target_id,
+                    expected_generation,
+                    expected_revision,
+                    method.into(),
+                    params,
+                ),
+            )
+            .await
+    }
+
+    async fn target_command_unlocked(
+        &self,
+        target_id: &str,
+        expected_generation: u64,
+        expected_revision: &str,
+        method: String,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
         let session_id = {
             let graph = self.targets.read().await;
             let target = graph
@@ -560,6 +830,129 @@ impl BrowserConnection {
         self.command(Some(session_id), method, params).await
     }
 
+    /// Capture a target reference from this connection's event-maintained
+    /// target and frame graphs.
+    pub async fn capture_target_ref(
+        &self,
+        sessions: &crate::sessions::SessionRegistry,
+        session: &crate::sessions::SessionHandle,
+        target_id: &str,
+        frame_id: &str,
+        account_revision: u64,
+        document_revision: u64,
+    ) -> Result<crate::sessions::TargetRef, crate::sessions::StaleTarget> {
+        let target = self
+            .targets
+            .read()
+            .await
+            .targets
+            .get(target_id)
+            .cloned()
+            .ok_or(crate::sessions::StaleTarget::TargetChanged)?;
+        let frame = self
+            .frames
+            .read()
+            .await
+            .frames
+            .get(frame_id)
+            .cloned()
+            .ok_or(crate::sessions::StaleTarget::FrameChanged)?;
+        crate::sessions::TargetRef::capture(
+            sessions,
+            session,
+            self.instance_id,
+            &target,
+            &frame,
+            account_revision,
+            document_revision,
+        )
+    }
+
+    /// Resolve a saved reference against the current target/frame graph and
+    /// current session grant. Account/document revisions are supplied by the
+    /// caller's identity observer; this crate does not infer app identity.
+    pub async fn resolve_target_ref(
+        &self,
+        sessions: &crate::sessions::SessionRegistry,
+        reference: &crate::sessions::TargetRef,
+        principal: &str,
+        account_revision: u64,
+        document_revision: u64,
+    ) -> Result<ResolvedTarget, crate::sessions::StaleTarget> {
+        let target = self
+            .targets
+            .read()
+            .await
+            .targets
+            .get(&reference.target_id)
+            .cloned()
+            .ok_or(crate::sessions::StaleTarget::TargetChanged)?;
+        let frame = self
+            .frames
+            .read()
+            .await
+            .frames
+            .get(&reference.frame_id)
+            .cloned()
+            .ok_or(crate::sessions::StaleTarget::FrameChanged)?;
+        let identity = crate::sessions::TargetIdentity::from_snapshot(
+            self.instance_id,
+            &reference.session_id,
+            &target,
+            &frame,
+            account_revision,
+            document_revision,
+        )?;
+        sessions.resolve_active_target(reference, principal, &identity)?;
+        Ok(ResolvedTarget {
+            target,
+            frame,
+            identity,
+        })
+    }
+
+    /// Resolve and revalidate the identity immediately before dispatch through
+    /// the target's current flattened-session binding.
+    pub async fn target_ref_command(
+        &self,
+        sessions: &crate::sessions::SessionRegistry,
+        reference: &crate::sessions::TargetRef,
+        principal: &str,
+        identity_revisions: crate::sessions::IdentityRevisions,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        sessions
+            .authorize_direct_cdp(&reference.session_id)
+            .map_err(|stale| BrowserError::StaleReference(format!("{stale:?}")))?;
+        let resolved = self
+            .resolve_target_ref(
+                sessions,
+                reference,
+                principal,
+                identity_revisions.account,
+                identity_revisions.document,
+            )
+            .await
+            .map_err(|stale| BrowserError::StaleReference(format!("{stale:?}")))?;
+        let method = method.into();
+        let mut params = params;
+        if method == "Runtime.evaluate"
+            && let Some(context_id) = resolved.frame.execution_context_ids.last()
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert("contextId".to_owned(), Value::from(*context_id));
+        }
+        self.target_command(
+            &reference.target_id,
+            reference.browser_generation,
+            &reference.target_revision,
+            method,
+            params,
+        )
+        .await
+    }
+
     /// Send a Runtime command in the execution context owned by a specific
     /// frame. OOPIF events arrive on the browser socket with a flattened
     /// session id, so the frame graph is the authoritative session/context
@@ -573,46 +966,63 @@ impl BrowserConnection {
         mut params: Value,
     ) -> Result<Value, BrowserError> {
         let method = method.into();
-        let (target_id, context_id) = {
-            let frames = self.frames.read().await;
-            let frame = frames
-                .frames
-                .get(frame_id)
-                .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
-            if frame.generation != expected_generation || frame.revision != expected_revision {
-                return Err(BrowserError::StaleReference(format!(
-                    "frame {frame_id} generation/revision changed"
-                )));
-            }
-            (
-                frame.target_id.clone(),
-                frame.execution_context_ids.last().copied(),
-            )
-        };
-        let target = {
-            let targets = self.targets.read().await;
-            let target = targets
-                .targets
-                .get(&target_id)
-                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?;
-            if targets.generation != expected_generation
-                || target.generation != expected_generation
-                || !target.attached
-            {
-                return Err(BrowserError::StaleReference(target_id));
-            }
-            target
-                .session_id
-                .clone()
-                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?
-        };
-        if method == "Runtime.evaluate"
-            && let Some(context_id) = context_id
-            && let Some(object) = params.as_object_mut()
-        {
-            object.insert("contextId".to_owned(), Value::from(context_id));
-        }
-        self.command(Some(target), method, params).await
+        let target_id = self
+            .frames
+            .read()
+            .await
+            .frames
+            .get(frame_id)
+            .map(|frame| frame.target_id.clone())
+            .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
+        self.scheduler
+            .run_target(&target_id, async {
+                let (current_target_id, context_id) = {
+                    let frames = self.frames.read().await;
+                    let frame = frames
+                        .frames
+                        .get(frame_id)
+                        .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
+                    if frame.generation != expected_generation
+                        || frame.revision != expected_revision
+                    {
+                        return Err(BrowserError::StaleReference(format!(
+                            "frame {frame_id} generation/revision changed"
+                        )));
+                    }
+                    (
+                        frame.target_id.clone(),
+                        frame.execution_context_ids.last().copied(),
+                    )
+                };
+                if current_target_id != target_id {
+                    return Err(BrowserError::StaleReference(frame_id.to_owned()));
+                }
+                let target = {
+                    let targets = self.targets.read().await;
+                    let target = targets
+                        .targets
+                        .get(&target_id)
+                        .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?;
+                    if targets.generation != expected_generation
+                        || target.generation != expected_generation
+                        || !target.attached
+                    {
+                        return Err(BrowserError::StaleReference(target_id.clone()));
+                    }
+                    target
+                        .session_id
+                        .clone()
+                        .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?
+                };
+                if method == "Runtime.evaluate"
+                    && let Some(context_id) = context_id
+                    && let Some(object) = params.as_object_mut()
+                {
+                    object.insert("contextId".to_owned(), Value::from(context_id));
+                }
+                self.command(Some(target), method, params).await
+            })
+            .await
     }
 
     pub fn generation(&self) -> u64 {
@@ -629,6 +1039,14 @@ impl BrowserConnection {
     }
 }
 
+fn new_browser_instance_id() -> Result<u128, BrowserError> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        BrowserError::Connection(format!("OS random instance ID unavailable: {error}"))
+    })?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TargetRecord {
     pub id: String,
@@ -643,22 +1061,55 @@ pub struct TargetRecord {
     pub revision: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTarget {
+    pub target: TargetRecord,
+    pub frame: FrameRecord,
+    pub identity: crate::sessions::TargetIdentity,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct TargetGraph {
     pub generation: u64,
     pub targets: BTreeMap<String, TargetRecord>,
+    #[serde(default)]
+    revision_sequence: u64,
 }
 
 impl TargetGraph {
-    pub fn apply_created(&mut self, target: TargetRecord) {
+    fn next_revision(&mut self, id: &str) -> String {
+        self.revision_sequence = self.revision_sequence.saturating_add(1);
+        format!(
+            "generation:{}:target:{}:revision:{}",
+            self.generation, id, self.revision_sequence
+        )
+    }
+
+    pub fn apply_created(&mut self, mut target: TargetRecord) {
+        target.generation = self.generation;
+        target.revision = self.next_revision(&target.id);
         self.targets.insert(target.id.clone(), target);
     }
 
     pub fn apply_changed(&mut self, id: &str, url: Option<String>, title: Option<String>) {
-        if let Some(target) = self.targets.get_mut(id) {
-            target.url = url;
-            target.title = title;
-            target.revision = format!("generation:{}:target:{}", self.generation, id);
+        if self.targets.contains_key(id) {
+            let target = self.targets.get_mut(id).expect("target was checked above");
+            let url_changed = url
+                .as_ref()
+                .is_some_and(|value| target.url.as_ref() != Some(value));
+            if let Some(url) = url {
+                target.url = Some(url);
+            }
+            if let Some(title) = title {
+                target.title = Some(title);
+            }
+            if url_changed {
+                let revision = self.next_revision(id);
+                self.targets
+                    .get_mut(id)
+                    .expect("target was checked above")
+                    .revision = revision;
+            }
         }
     }
 
@@ -666,13 +1117,25 @@ impl TargetGraph {
         self.targets.remove(id);
     }
 
+    pub fn target_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.targets
+            .values()
+            .find(|target| target.session_id.as_deref() == Some(session_id))
+            .map(|target| target.id.clone())
+    }
+
     pub fn reconnect(&mut self) {
         self.generation = self.generation.saturating_add(1);
+        self.revision_sequence = self.revision_sequence.saturating_add(1);
+        let revision_sequence = self.revision_sequence;
         for target in self.targets.values_mut() {
             target.attached = false;
             target.session_id = None;
             target.generation = self.generation;
-            target.revision = format!("generation:{}:target:{}", self.generation, target.id);
+            target.revision = format!(
+                "generation:{}:target:{}:revision:{}",
+                self.generation, target.id, revision_sequence
+            );
         }
     }
 
@@ -708,7 +1171,7 @@ impl TargetGraph {
                                 .map(str::to_owned),
                             attached: false,
                             generation: self.generation,
-                            revision: format!("generation:{}:target:{}", self.generation, id),
+                            revision: String::new(),
                         });
                     }
                 }
@@ -750,22 +1213,34 @@ impl TargetGraph {
                         target_id.or_else(|| params.get("targetId").and_then(Value::as_str));
                     if let (Some(target_id), Some(session_id)) =
                         (target_id, params.get("sessionId").and_then(Value::as_str))
-                        && let Some(target) = self.targets.get_mut(target_id)
+                        && self.targets.contains_key(target_id)
                     {
+                        let revision = self.next_revision(target_id);
+                        let target = self
+                            .targets
+                            .get_mut(target_id)
+                            .expect("target was checked above");
                         target.session_id = Some(session_id.to_owned());
                         target.attached = true;
                         target.generation = self.generation;
-                        target.revision =
-                            format!("generation:{}:target:{}", self.generation, target_id);
+                        target.revision = revision;
                     }
                 }
             }
             Some("Target.detachedFromTarget") => {
                 if let Some(params) = event.get("params") {
                     let target_id = params.get("targetId").and_then(Value::as_str);
-                    if let Some(target) = target_id.and_then(|id| self.targets.get_mut(id)) {
+                    if let Some(target_id) = target_id
+                        && self.targets.contains_key(target_id)
+                    {
+                        let revision = self.next_revision(target_id);
+                        let target = self
+                            .targets
+                            .get_mut(target_id)
+                            .expect("target was checked above");
                         target.session_id = None;
                         target.attached = false;
+                        target.revision = revision;
                     }
                 }
             }
@@ -788,20 +1263,66 @@ pub struct FrameRecord {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct FrameGraph {
     pub frames: BTreeMap<String, FrameRecord>,
+    #[serde(default)]
+    revision_sequence: u64,
 }
 
 impl FrameGraph {
-    pub fn upsert(&mut self, frame: FrameRecord) {
+    fn next_revision(&mut self) -> u64 {
+        self.revision_sequence = self.revision_sequence.saturating_add(1);
+        self.revision_sequence
+    }
+
+    pub fn upsert(&mut self, mut frame: FrameRecord) {
+        frame.revision = self.next_revision();
         self.frames.insert(frame.id.clone(), frame);
     }
 
     pub fn remove(&mut self, id: &str) {
+        let mut removed = BTreeSet::from([id.to_owned()]);
+        loop {
+            let previous_len = removed.len();
+            for frame in self.frames.values() {
+                if frame
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent_id| removed.contains(parent_id))
+                {
+                    removed.insert(frame.id.clone());
+                }
+            }
+            if removed.len() == previous_len {
+                break;
+            }
+        }
         self.frames
-            .retain(|frame_id, frame| frame_id != id && frame.parent_id.as_deref() != Some(id));
+            .retain(|frame_id, _| !removed.contains(frame_id));
+    }
+
+    pub fn remove_target(&mut self, target_id: &str) {
+        let roots = self
+            .frames
+            .values()
+            .filter(|frame| frame.target_id == target_id)
+            .map(|frame| frame.id.clone())
+            .collect::<Vec<_>>();
+        for root in roots {
+            self.remove(&root);
+        }
     }
 
     pub fn apply_event(&mut self, event: &Value) {
         self.apply_event_at_generation(event, 0);
+    }
+
+    pub fn apply_event_for_target(&mut self, event: &Value, generation: u64, target_id: &str) {
+        let mut event = event.clone();
+        if let Some(params) = event.get_mut("params").and_then(Value::as_object_mut) {
+            params
+                .entry("targetId")
+                .or_insert_with(|| Value::String(target_id.to_owned()));
+        }
+        self.apply_event_at_generation(&event, generation);
     }
 
     pub fn apply_event_at_generation(&mut self, event: &Value, generation: u64) {
@@ -829,19 +1350,49 @@ impl FrameGraph {
                 }
             }
             Some("Page.frameNavigated") => {
-                if let Some(frame) = event
+                let frame_id = event
                     .get("params")
                     .and_then(|params| params.get("frame"))
                     .and_then(|frame| frame.get("id").and_then(Value::as_str))
-                    .and_then(|id| self.frames.get_mut(id))
-                {
+                    .map(str::to_owned);
+                if let Some(frame_id) = frame_id {
                     let info = event.get("params").and_then(|params| params.get("frame"));
-                    frame.loader_id = info
+                    let parent_id = info
+                        .and_then(|value| value.get("parentId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let target_id = event
+                        .get("params")
+                        .and_then(|params| params.get("targetId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let loader_id = info
                         .and_then(|value| value.get("loaderId"))
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    frame.generation = generation;
-                    frame.revision = frame.revision.saturating_add(1);
+                    if self.frames.contains_key(&frame_id) {
+                        let revision = self.next_revision();
+                        let frame = self
+                            .frames
+                            .get_mut(&frame_id)
+                            .expect("frame was checked above");
+                        frame.parent_id = parent_id;
+                        frame.target_id = target_id;
+                        frame.loader_id = loader_id;
+                        frame.generation = generation;
+                        frame.revision = revision;
+                    } else {
+                        self.upsert(FrameRecord {
+                            id: frame_id,
+                            parent_id,
+                            target_id,
+                            loader_id,
+                            execution_context_ids: Vec::new(),
+                            generation,
+                            revision: 0,
+                        });
+                    }
                 }
             }
             Some("Page.navigatedWithinDocument") => {
@@ -849,10 +1400,15 @@ impl FrameGraph {
                     .get("params")
                     .and_then(|params| params.get("frameId"))
                     .and_then(Value::as_str)
-                    && let Some(frame) = self.frames.get_mut(frame_id)
+                    && self.frames.contains_key(frame_id)
                 {
+                    let revision = self.next_revision();
+                    let frame = self
+                        .frames
+                        .get_mut(frame_id)
+                        .expect("frame was checked above");
                     frame.generation = generation;
-                    frame.revision = frame.revision.saturating_add(1);
+                    frame.revision = revision;
                 }
             }
             Some("Page.frameDetached") => {
@@ -873,12 +1429,21 @@ impl FrameGraph {
                             .and_then(Value::as_str),
                         context.get("id").and_then(Value::as_u64),
                     )
-                    && let Some(frame) = self.frames.get_mut(frame_id)
-                    && !frame.execution_context_ids.contains(&context_id)
+                    && self.frames.contains_key(frame_id)
                 {
-                    frame.execution_context_ids.push(context_id);
-                    frame.generation = generation;
-                    frame.revision = frame.revision.saturating_add(1);
+                    let should_add = !self.frames[frame_id]
+                        .execution_context_ids
+                        .contains(&context_id);
+                    if should_add {
+                        let revision = self.next_revision();
+                        let frame = self
+                            .frames
+                            .get_mut(frame_id)
+                            .expect("frame was checked above");
+                        frame.execution_context_ids.push(context_id);
+                        frame.generation = generation;
+                        frame.revision = revision;
+                    }
                 }
             }
             Some("Runtime.executionContextDestroyed") => {
@@ -887,8 +1452,21 @@ impl FrameGraph {
                     .and_then(|params| params.get("executionContextId"))
                     .and_then(Value::as_u64)
                 {
-                    for frame in self.frames.values_mut() {
+                    let affected = self
+                        .frames
+                        .values()
+                        .filter(|frame| frame.execution_context_ids.contains(&context_id))
+                        .map(|frame| frame.id.clone())
+                        .collect::<Vec<_>>();
+                    for frame_id in affected {
+                        let revision = self.next_revision();
+                        let frame = self
+                            .frames
+                            .get_mut(&frame_id)
+                            .expect("affected frame remains present");
                         frame.execution_context_ids.retain(|id| *id != context_id);
+                        frame.generation = generation;
+                        frame.revision = revision;
                     }
                 }
             }
@@ -910,6 +1488,130 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    struct FixtureIndependentObserver;
+
+    impl crate::sessions::IndependentTargetObserver for FixtureIndependentObserver {
+        fn verify_unchanged(
+            &self,
+            observation: &crate::sessions::CleanupObservation,
+        ) -> Result<(), String> {
+            assert_eq!(observation.target_id, "provider-owned-tab");
+            Ok(())
+        }
+    }
+
+    struct FixtureRevisionObserver {
+        revision: String,
+    }
+
+    impl crate::sessions::IndependentTargetObserver for FixtureRevisionObserver {
+        fn verify_unchanged(
+            &self,
+            observation: &crate::sessions::CleanupObservation,
+        ) -> Result<(), String> {
+            if observation.target_revision == self.revision {
+                Ok(())
+            } else {
+                Err("target revision changed".to_owned())
+            }
+        }
+    }
+
+    async fn direct_dispatch_peak(target_count: usize, shared_document: bool) -> usize {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..target_count {
+                let target_id = format!("dispatch-target-{index}");
+                let session_id = format!("dispatch-session-{index}");
+                for event in [
+                    serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":target_id,"type":"page","url":"https://fixture.test/"}}}),
+                    serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":session_id,"targetInfo":{"targetId":target_id,"type":"page"}}}),
+                ] {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            event.to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            let (writer, mut reader) = socket.split();
+            let writer = Arc::new(AsyncMutex::new(writer));
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut replies = Vec::new();
+            for _ in 0..target_count {
+                let request = reader.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+                let active_now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(active_now, Ordering::AcqRel);
+                let writer = Arc::clone(&writer);
+                let active = Arc::clone(&active);
+                replies.push(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    writer.lock().await.send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"id":request["id"],"result":{"result":{"type":"number","value":2}}}).to_string().into()
+                    )).await.unwrap();
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+            for reply in replies {
+                reply.await.unwrap();
+            }
+            peak.load(Ordering::Acquire)
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let targets = timeout(Duration::from_secs(1), async {
+            loop {
+                let (generation, targets) = connection.target_snapshot().await;
+                if targets.iter().filter(|target| target.attached).count() == target_count {
+                    break (generation, targets);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut commands = tokio::task::JoinSet::new();
+        for target in targets.1.into_iter().filter(|target| target.attached) {
+            let connection = connection.clone();
+            let generation = targets.0;
+            commands.spawn(async move {
+                let result = if shared_document {
+                    connection
+                        .target_document_mutation(
+                            &target.id,
+                            generation,
+                            &target.revision,
+                            "same-document",
+                            "Runtime.evaluate",
+                            serde_json::Value::Null,
+                        )
+                        .await
+                } else {
+                    connection
+                        .target_command(
+                            &target.id,
+                            generation,
+                            &target.revision,
+                            "Runtime.evaluate",
+                            serde_json::Value::Null,
+                        )
+                        .await
+                };
+                result.unwrap();
+            });
+        }
+        while commands.join_next().await.is_some() {}
+        server.await.unwrap()
+    }
 
     fn target() -> TargetRecord {
         TargetRecord {
@@ -1013,10 +1715,257 @@ mod tests {
         assert_eq!(target.generation, 1);
     }
 
+    #[test]
+    fn target_close_and_reuse_get_a_new_revision() {
+        let mut graph = TargetGraph::default();
+        graph.apply_created(target());
+        let first_revision = graph.targets["tab"].revision.clone();
+        graph.apply_destroyed("tab");
+        graph.apply_created(target());
+        assert_ne!(graph.targets["tab"].revision, first_revision);
+    }
+
+    #[test]
+    fn target_navigation_advances_the_stale_reference_revision() {
+        let mut graph = TargetGraph::default();
+        graph.apply_created(target());
+        let first_revision = graph.targets["tab"].revision.clone();
+        graph.apply_changed(
+            "tab",
+            Some("https://example.test/next".to_owned()),
+            Some("Next".to_owned()),
+        );
+        assert_ne!(graph.targets["tab"].revision, first_revision);
+    }
+
+    #[test]
+    fn title_only_target_change_preserves_target_identity_revision() {
+        let mut graph = TargetGraph::default();
+        graph.apply_created(target());
+        let revision = graph.targets["tab"].revision.clone();
+        graph.apply_changed("tab", None, Some("Renamed tab".to_owned()));
+        assert_eq!(graph.targets["tab"].revision, revision);
+        assert_eq!(graph.targets["tab"].title.as_deref(), Some("Renamed tab"));
+    }
+
+    #[test]
+    fn frame_detach_and_reuse_advance_revision() {
+        let mut graph = FrameGraph::default();
+        let frame = FrameRecord {
+            id: "frame".to_owned(),
+            parent_id: None,
+            target_id: "tab".to_owned(),
+            loader_id: Some("loader-1".to_owned()),
+            execution_context_ids: vec![1],
+            generation: 0,
+            revision: 0,
+        };
+        graph.upsert(frame.clone());
+        let first_revision = graph.frames["frame"].revision;
+        graph.remove("frame");
+        graph.upsert(FrameRecord {
+            loader_id: Some("loader-2".to_owned()),
+            ..frame
+        });
+        assert!(graph.frames["frame"].revision > first_revision);
+    }
+
+    #[test]
+    fn frame_detach_removes_all_descendants() {
+        let mut graph = FrameGraph::default();
+        for (id, parent_id) in [
+            ("root", None),
+            ("child", Some("root")),
+            ("grandchild", Some("child")),
+        ] {
+            graph.upsert(FrameRecord {
+                id: id.to_owned(),
+                parent_id: parent_id.map(str::to_owned),
+                target_id: "tab".to_owned(),
+                loader_id: None,
+                execution_context_ids: Vec::new(),
+                generation: 0,
+                revision: 0,
+            });
+        }
+        graph.remove("root");
+        assert!(graph.frames.is_empty());
+    }
+
+    #[test]
+    fn execution_context_destruction_invalidates_frame_revision() {
+        let mut graph = FrameGraph::default();
+        graph.upsert(FrameRecord {
+            id: "frame".to_owned(),
+            parent_id: None,
+            target_id: "tab".to_owned(),
+            loader_id: Some("loader".to_owned()),
+            execution_context_ids: vec![17],
+            generation: 0,
+            revision: 0,
+        });
+        let revision = graph.frames["frame"].revision;
+        graph.apply_event_at_generation(
+            &serde_json::json!({
+                "method": "Runtime.executionContextDestroyed",
+                "params": {"executionContextId": 17}
+            }),
+            0,
+        );
+        assert!(graph.frames["frame"].revision > revision);
+        assert!(graph.frames["frame"].execution_context_ids.is_empty());
+    }
+
+    #[test]
+    fn flattened_frame_event_uses_target_bound_to_session_id() {
+        let mut graph = FrameGraph::default();
+        graph.apply_event_for_target(
+            &serde_json::json!({
+                "method": "Page.frameAttached",
+                "params": {"frameId": "oopif-frame", "parentFrameId": "root"}
+            }),
+            2,
+            "oopif-target",
+        );
+        assert_eq!(graph.frames["oopif-frame"].target_id, "oopif-target");
+    }
+
+    #[test]
+    fn first_seen_main_frame_navigation_creates_capturable_frame() {
+        let mut graph = FrameGraph::default();
+        graph.apply_event_for_target(
+            &serde_json::json!({
+                "method":"Page.frameNavigated",
+                "params":{"frame":{"id":"first-main","loaderId":"loader-1","url":"https://fixture.test/"}}
+            }),
+            4,
+            "target-1",
+        );
+        let frame = graph.frames.get("first-main").expect("frame was created");
+        assert_eq!(frame.target_id, "target-1");
+        assert_eq!(frame.generation, 4);
+        assert_eq!(frame.loader_id.as_deref(), Some("loader-1"));
+    }
+
+    #[tokio::test]
+    async fn browser_dispatch_enforces_four_active_targets_for_one_four_and_eight() {
+        for count in [1, 4, 8] {
+            assert_eq!(direct_dispatch_peak(count, false).await, count.min(4));
+        }
+        assert_eq!(direct_dispatch_peak(4, true).await, 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_browser_target_does_not_block_healthy_target_dispatch() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for (target_id, session_id) in [
+                ("blocked", "session-blocked"),
+                ("healthy", "session-healthy"),
+            ] {
+                for event in [
+                    serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":target_id,"type":"page"}}}),
+                    serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":session_id,"targetInfo":{"targetId":target_id,"type":"page"}}}),
+                ] {
+                    socket
+                        .send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            }
+            let mut blocked_seen = false;
+            let mut healthy_seen = false;
+            for _ in 0..2 {
+                let message = socket.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&message.to_string()).unwrap();
+                match request["params"]["expression"].as_str().unwrap() {
+                    "blocked" => blocked_seen = true,
+                    "healthy" => {
+                        healthy_seen = true;
+                        socket
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "id":request["id"],
+                                    "result":{"result":{"type":"string","value":"healthy"}}
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    other => panic!("unexpected dispatch {other}"),
+                }
+            }
+            assert!(blocked_seen && healthy_seen);
+        });
+        let connection = Arc::new(
+            BrowserConnection::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let (generation, targets) = timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = connection.target_snapshot().await;
+                if snapshot.1.len() == 2 && snapshot.1.iter().all(|target| target.attached) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let blocked = targets
+            .iter()
+            .find(|target| target.id == "blocked")
+            .unwrap()
+            .clone();
+        let healthy = targets
+            .iter()
+            .find(|target| target.id == "healthy")
+            .unwrap()
+            .clone();
+        let blocked_connection = Arc::clone(&connection);
+        let blocked_task = tokio::spawn(async move {
+            blocked_connection
+                .target_command(
+                    &blocked.id,
+                    generation,
+                    &blocked.revision,
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":"blocked"}),
+                )
+                .await
+        });
+        let healthy_result = timeout(
+            Duration::from_secs(1),
+            connection.target_command(
+                &healthy.id,
+                generation,
+                &healthy.revision,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":"healthy"}),
+            ),
+        )
+        .await
+        .expect("healthy target was blocked")
+        .unwrap();
+        assert_eq!(healthy_result["result"]["value"], "healthy");
+        blocked_task.abort();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn target_command_rejects_stale_graph_reference_before_dispatch() {
         let connection = BrowserConnection {
             outgoing: tokio::sync::mpsc::channel(1).0,
+            instance_id: 1,
+            scheduler: scheduler::TargetScheduler::default(),
             targets: Arc::new(RwLock::new(TargetGraph::default())),
             frames: Arc::new(RwLock::new(FrameGraph::default())),
             next_command_id: Arc::new(AtomicU64::new(1)),
@@ -1034,12 +1983,369 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_create_target_receipt_is_the_owned_tab_source() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"provider-owned-tab","type":"page","url":"https://fixture.test/new"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"provider-owned-cdp","targetInfo":{"targetId":"provider-owned-tab","type":"page"}}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["method"], "Target.createTarget");
+            assert_eq!(request["params"]["url"], "https://fixture.test/new");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "result":{"targetId":"provider-owned-tab"}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let close = socket.next().await.unwrap().unwrap();
+            let close: Value = serde_json::from_str(&close.to_string()).unwrap();
+            assert_eq!(close["method"], "Target.closeTarget");
+            assert_eq!(close["params"]["targetId"], "provider-owned-tab");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": close["id"], "result":{"success":true}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            dedicated_headless: false,
+            shared_extension: false,
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        let created = connection
+            .create_owned_target(&mut registry, &session, "https://fixture.test/new")
+            .await
+            .unwrap();
+        assert_eq!(created, "provider-owned-tab");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.targets.read().await.targets["provider-owned-tab"].attached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let receipt = connection
+            .release_owned_session(
+                &mut registry,
+                &session.id,
+                Some(&FixtureIndependentObserver),
+            )
+            .await;
+        assert_eq!(receipt.closed, vec!["provider-owned-tab"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_target_creation_rolls_back_new_binding_for_fresh_connection_retry() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(first_stream).await.unwrap();
+            let failed = first.next().await.unwrap().unwrap();
+            let failed: Value = serde_json::from_str(&failed.to_string()).unwrap();
+            assert_eq!(failed["method"], "Target.createTarget");
+            first
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id":failed["id"], "error":{"code":-32000,"message":"fixture create failure"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let (retry_stream, _) = listener.accept().await.unwrap();
+            let mut retry = tokio_tungstenite::accept_async(retry_stream).await.unwrap();
+            let request = retry.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["method"], "Target.createTarget");
+            retry
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id":request["id"], "result":{"targetId":"retry-owned-target"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            ..crate::sessions::ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+
+        let first = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let first_instance = first.instance_id;
+        assert!(
+            first
+                .create_owned_target(&mut registry, &session, "about:blank")
+                .await
+                .is_err()
+        );
+        assert!(!registry.session_bound_to_browser(&session.id, first_instance));
+        drop(first);
+
+        let retry = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            retry
+                .create_owned_target(&mut registry, &session, "about:blank")
+                .await
+                .unwrap(),
+            "retry-owned-target"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceling_pending_target_creation_does_not_leave_browser_binding() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["method"], "Target.createTarget");
+            let _ = request_seen_tx.send(());
+            let _ = socket.next().await;
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            ..crate::sessions::ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        let instance_id = connection.instance_id;
+        {
+            let creation = connection.create_owned_target(&mut registry, &session, "about:blank");
+            tokio::pin!(creation);
+            tokio::select! {
+                _ = &mut creation => panic!("unanswered CDP create unexpectedly completed"),
+                _ = request_seen_rx => {},
+            }
+        }
+        assert!(!registry.session_bound_to_browser(&session.id, instance_id));
+        drop(connection);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn release_preserves_owned_target_without_independent_observer() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["method"], "Target.createTarget");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "result":{"targetId":"unobserved-tab"}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            dedicated_headless: false,
+            shared_extension: false,
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        connection
+            .create_owned_target(&mut registry, &session, "about:blank")
+            .await
+            .unwrap();
+        let receipt = connection
+            .release_owned_session(&mut registry, &session.id, None)
+            .await;
+        assert_eq!(receipt.remaining.len(), 1);
+        assert!(
+            receipt.remaining[0]
+                .reason
+                .contains("no independent observer")
+        );
+        assert!(receipt.closed.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_proof_from_stale_target_snapshot_never_closes_target() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"owned-target","type":"page","url":"about:blank"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"owned-cdp","targetInfo":{"targetId":"owned-target","type":"page"}}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let create = socket.next().await.unwrap().unwrap();
+            let create: Value = serde_json::from_str(&create.to_string()).unwrap();
+            assert_eq!(create["method"], "Target.createTarget");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id":create["id"],"result":{"targetId":"owned-target"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(150), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            ..crate::sessions::ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        connection
+            .create_owned_target(&mut registry, &session, "about:blank")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.targets.read().await.targets["owned-target"].attached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let revision = connection.targets.read().await.targets["owned-target"]
+            .revision
+            .clone();
+        connection.targets.write().await.apply_changed(
+            "owned-target",
+            Some("https://fixture.test/navigated".to_owned()),
+            None,
+        );
+        let receipt = connection
+            .release_owned_session(
+                &mut registry,
+                &session.id,
+                Some(&FixtureRevisionObserver { revision }),
+            )
+            .await;
+        assert!(receipt.closed.is_empty());
+        assert_eq!(receipt.remaining[0].target_id, "owned-target");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn frame_command_routes_oopif_context_over_flattened_session() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"oopif-target","type":"iframe","url":"https://cross-origin.test/"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"session-oopif","targetInfo":{"targetId":"oopif-target","type":"iframe"}}}),
+                serde_json::json!({"sessionId":"session-oopif","method":"Page.frameAttached","params":{"frameId":"frame-oopif","parentFrameId":"root"}}),
+                serde_json::json!({"sessionId":"session-oopif","method":"Runtime.executionContextCreated","params":{"context":{"id":99,"auxData":{"frameId":"frame-oopif"}}}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
             let request = socket.next().await.unwrap().unwrap();
             let request: Value = serde_json::from_str(&request.to_string()).unwrap();
             assert_eq!(request["sessionId"], "session-oopif");
@@ -1055,42 +2361,150 @@ mod tests {
         let connection = BrowserConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
-        connection
-            .targets
-            .write()
-            .await
-            .apply_created(TargetRecord {
-                id: "oopif-target".to_owned(),
-                target_type: "iframe".to_owned(),
-                browser_context_id: Some("default".to_owned()),
-                session_id: Some("session-oopif".to_owned()),
-                url: Some("https://cross-origin.test/".to_owned()),
-                title: None,
-                opener_id: None,
-                attached: true,
-                generation: 0,
-                revision: "target-revision".to_owned(),
-            });
-        connection.frames.write().await.upsert(FrameRecord {
-            id: "frame-oopif".to_owned(),
-            parent_id: Some("root".to_owned()),
-            target_id: "oopif-target".to_owned(),
-            loader_id: None,
-            execution_context_ids: vec![99],
-            generation: 0,
-            revision: 4,
+        let revision = timeout(Duration::from_secs(1), async {
+            loop {
+                let frames = connection.frames.read().await;
+                if let Some(frame) = frames.frames.get("frame-oopif")
+                    && frame.target_id == "oopif-target"
+                    && frame.execution_context_ids.contains(&99)
+                {
+                    break frame.revision;
+                }
+                drop(frames);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("OOPIF frame events were not bound to the flattened target");
+        assert_eq!(
+            revision,
+            connection.frames.read().await.frames["frame-oopif"].revision
+        );
+        let mut sessions = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            dedicated_headless: false,
+            shared_extension: false,
         });
+        let session = sessions
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        sessions
+            .bind_session_to_browser(&session, connection.instance_id)
+            .unwrap();
+        sessions
+            .register_tab(
+                &session.id,
+                "oopif-target",
+                crate::sessions::Ownership::Borrowed,
+            )
+            .unwrap();
+        let reference = connection
+            .capture_target_ref(&sessions, &session, "oopif-target", "frame-oopif", 1, 1)
+            .await
+            .unwrap();
         let result = connection
-            .frame_command(
-                "frame-oopif",
-                0,
-                4,
+            .target_ref_command(
+                &sessions,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
                 "Runtime.evaluate",
                 serde_json::json!({"expression":"location.href"}),
             )
             .await
             .unwrap();
         assert_eq!(result["result"]["value"], "https://cross-origin.test/");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_cdp_dispatch_rejects_shared_extension_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"shared-tab","type":"page","url":"https://fixture.test/"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"shared-cdp","targetInfo":{"targetId":"shared-tab","type":"page"}}}),
+                serde_json::json!({"sessionId":"shared-cdp","method":"Page.frameNavigated","params":{"frame":{"id":"shared-frame","loaderId":"load-1","url":"https://fixture.test/"}}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                timeout(Duration::from_millis(150), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            shared_extension: true,
+            ..crate::sessions::ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Shared,
+                    selected_target_ids: vec!["shared-tab".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        registry
+            .bind_session_to_browser(&session, connection.instance_id)
+            .unwrap();
+        let reference = timeout(Duration::from_secs(1), async {
+            loop {
+                if connection
+                    .frames
+                    .read()
+                    .await
+                    .frames
+                    .contains_key("shared-frame")
+                {
+                    break connection
+                        .capture_target_ref(&registry, &session, "shared-tab", "shared-frame", 1, 1)
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = connection
+            .target_ref_command(
+                &registry,
+                &reference,
+                "alice",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                serde_json::json!({"expression":"1+1"}),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::StaleReference(reason)) if reason.contains("ProviderMismatch"))
+        );
         server.await.unwrap();
     }
 
@@ -1211,6 +2625,15 @@ mod tests {
         let connection = BrowserConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
+        connection.targets.write().await.apply_created(target());
+        connection
+            .targets
+            .write()
+            .await
+            .apply_event(&serde_json::json!({
+                "method":"Target.attachedToTarget",
+                "params":{"sessionId":"session-1","targetInfo":{"targetId":"tab","type":"page"}}
+            }));
         connection.bootstrap_target("session-1").await.unwrap();
         assert_eq!(
             server.await.unwrap(),

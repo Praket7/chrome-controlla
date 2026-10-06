@@ -8,14 +8,14 @@
     "license": "Apache-2.0"
   },
   "extraction_date": "2026-10-06",
-  "scope": "Only the standalone browser crate, its inline tests, adapted manifest, and source license/notice were copied. No monolithic core, desktop automation crates, adapters, release assets, profiles, or credentials were copied.",
+  "scope": "The initial upstream extraction was limited to the standalone browser crate, its inline tests, adapted manifest, and source license/notice. Subsequent Phase 1/2 files and edits (including provider, registry, scheduler, runtime, and extension code) are original project implementation, not upstream extraction. No monolithic core, desktop automation crates, release assets, profiles, or credentials were copied.",
   "files": [
     {
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "edits": "none; byte-for-byte copy",
+      "destination_sha256": "3202f74df3d718364563c734c2f37eb07e6e88e49c85ca320588b05b5063d204",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and blocked-target dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -30,8 +30,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/session.rs",
       "destination_path": "crates/controlla-browser/src/session.rs",
       "source_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
-      "destination_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
-      "edits": "none; byte-for-byte copy",
+      "destination_sha256": "955fc3140681a38360a7a93911c4a94c445b5cce56885a9f1f90e5dce6d42a24",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -46,8 +46,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/Cargo.toml",
       "destination_path": "crates/controlla-browser/Cargo.toml",
       "source_sha256": "b6556bb46b66cb42d628602902d2e47667c1b83bc6b4636bff3306d47acc8cbc",
-      "destination_sha256": "4673a7f29a3f607c93f7458d101495c8072ab5745cc5713cc55e3224c5171f7d",
-      "edits": "renamed package, inherited workspace metadata, pinned direct dependency versions, and included package license file",
+      "destination_sha256": "39ce82dfd1dc2fbefbb6839781e1c6a728e849f79d7d72498d89392937ddfcf6",
+      "edits": "renamed package, inherited workspace metadata, pinned direct dependency versions including OS-random browser identity support, and included package license file",
       "license": "Apache-2.0"
     },
     {

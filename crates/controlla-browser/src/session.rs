@@ -431,10 +431,11 @@ mod tests {
     fn cache_returns_live_on_first_read_then_hits() {
         let mut cache = TargetStateCache::new();
         let graph = graph_with(record("t1", "rev-1"));
+        let current_revision = graph.targets["t1"].revision.clone();
         let first = cache.get(&graph, "t1").expect("present");
-        assert_eq!(first.revision, "rev-1");
+        assert_eq!(first.revision, current_revision);
         let second = cache.get(&graph, "t1").expect("cached");
-        assert_eq!(second.revision, "rev-1");
+        assert_eq!(second.revision, current_revision);
         assert_eq!(cache.entries["t1"].hits, 1);
     }
 

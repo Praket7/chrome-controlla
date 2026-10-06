@@ -32,11 +32,11 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-06 | unimplemented | 3 | none |
 | CC-07 | unimplemented | 3 | none |
 | CC-08 | unimplemented | 5 | none |
-| CC-09 | unimplemented | 2 | none |
+| CC-09 | partial | 2 | target/frame/browser revisions and stale-handle fixtures pass; application account/document revisions remain caller-supplied and unobserved |
 | CC-10 | unimplemented | 4 | none |
 | CC-11 | unimplemented | 4 | none |
 | CC-12 | unimplemented | 4 | none |
-| CC-13 | unimplemented | 2 | none |
+| CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
 | CC-14 | unimplemented | 6 | none |
 | CC-15 | unimplemented | 5 | none |
 | CC-16 | unimplemented | 7 | none |
@@ -55,25 +55,25 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B05 | unimplemented | 3 | none |
 | B06 | unimplemented | 3 | none |
 | B07 | unimplemented | 3 | none |
-| B08 | unimplemented | 2 | none |
+| B08 | fixture_verified | 2 | closed/reused target references rejected; fresh target identity required |
 | B09 | unimplemented | 4 | none |
 | B10 | unimplemented | 4 | none |
 | B11 | unimplemented | 4 | none |
 | B12 | unimplemented | 4 | none |
-| B13 | unimplemented | 2 | none |
+| B13 | fixture_verified | 2 | frame navigation/revision and OOPIF replacement fixtures |
 | B14 | unimplemented | 5 | none |
 | B15 | unimplemented | 5 | none |
 | B16 | unimplemented | 5 | none |
 | B17 | unimplemented | 5 | none |
 | B18 | unimplemented | 3 | none |
 | B19 | unimplemented | 3 | none |
-| B20 | unimplemented | 2 | none |
-| B21 | unimplemented | 2 | none |
+| B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
+| B21 | fixture_verified | 2 | concurrent mutations for the same shared document serialize |
 | B22 | unimplemented | 4 | none |
 | B23 | unimplemented | 4 | none |
 | B24 | unimplemented | 4 | none |
 | B25 | unimplemented | 4 | none |
-| B26 | unimplemented | 2 | none |
+| B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
 | B27 | unimplemented | 6 | none |
 | B28 | unimplemented | 7 | none |
 | B29 | unimplemented | 7 | none |
@@ -166,6 +166,21 @@ After the failure, package-check stage labels localized the post-Cargo path, and
 | Windows | fail | `package-check.sh` expected the Unix name `package/bin/controlla-core`, while the archive contains `package/bin/controlla-core.exe`. Commit `8dbf51d` selects the expected entry from `process.platform`; the corrected check passed in run 37465119376. |
 
 After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim. Run 37464310787 passed macOS/Ubuntu but failed on Windows extension selection; the process-platform branch correction passed on all three runners in run 37465119376.
+
+## Phase 2 local acceptance — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo fmt --all -- --check` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | clean formatting |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | no warnings |
+| `cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 85 passed, 1 ignored, 0 failed |
+| `cargo test -p controlla-browser real_chrome_headless_provider_launch_and_runtime_smoke --locked --offline -- --ignored --nocapture` | pass | macOS 26 / Google Chrome 154.0.8037.98, isolated temporary profile | CDP page count 1; `Runtime.evaluate` returned visible; the fixture observer authorized test-owned target close; `Browser.close` completed, child exited, and profile was absent after teardown |
+| `npm run check:provenance` | pass | Node 24.19.0, npm 11.17.0 | 13 destination digests and 22 retained tests verified |
+| `npm run check:docs` | pass | Node 24.19.0, npm 11.17.0 | 12 Markdown files checked |
+| `./scripts/package-check.sh` | pass | macOS 26 / Darwin 25.6 arm64 | host-bound npm archive, attribution, and clean-prefix install verified |
+| `node --check extensions/chrome-controlla/background.js && node --check extensions/chrome-controlla/popup.js && node extensions/chrome-controlla/test-background.cjs && git diff --check` | pass | Node 24.19.0 | extension syntax, pairing-generation cleanup fixture, and whitespace checks passed |
+
+Sol independently approved the Phase 2 code diff after reviewing launch cancellation, browser-binding rollback, retryable shared pairing, target cleanup, headless target inventory, headed-window preservation, and cleanup retry state. Hosted CI is recorded with the Phase 2 commit below. This is code/fixture evidence: the smoke test's observer is test-only. Live MV3 attachment/debugger consent, headed desktop behavior, app-level identity observation, and native focus/cursor/clipboard observation remain unqualified. The headless empty-target check is a snapshot; it cannot rule out a page opened immediately before `Browser.close`.
 
 ## Phase 1 hosted CI run 37461823256 — failed
 

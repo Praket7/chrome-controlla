@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Controlla Shared Tab Bridge",
+  "version": "0.1.0",
+  "description": "Pairs explicitly selected tabs with a local Chrome Controlla session.",
+  "permissions": ["tabs", "debugger"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "Pair selected tabs" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:*"
+  }
+}
