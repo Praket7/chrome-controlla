@@ -36,15 +36,23 @@ package="$PWD/packages/chrome-controlla/dist"
 archive_name=$(npm pack --silent --pack-destination "$temp" "$package")
 archive="$temp/$archive_name"
 printf 'package-check: inspecting npm archive %s\n' "$archive_name"
-archive_files=$(tar -tzf "$archive")
-printf '%s\n' "$archive_files" | grep -Fx 'package/bin/controlla.cjs' >/dev/null
-printf '%s\n' "$archive_files" | grep -Fx 'package/LICENSE' >/dev/null
-printf '%s\n' "$archive_files" | grep -Fx 'package/NOTICE' >/dev/null
+archive_files=$(tar -tzf "$archive" | tr -d '\r')
+expect_archive_entry() {
+    printf 'package-check: checking archive entry %s\n' "$1"
+    if ! printf '%s\n' "$archive_files" | grep -Fx "$1" >/dev/null; then
+        printf 'package-check: required archive entry missing: %s\n' "$1" >&2
+        exit 1
+    fi
+}
+expect_archive_entry 'package/bin/controlla.cjs'
+expect_archive_entry 'package/LICENSE'
+expect_archive_entry 'package/NOTICE'
 if [ -f packages/chrome-controlla/dist/bin/controlla-core ]; then
-    printf '%s\n' "$archive_files" | grep -Fx 'package/bin/controlla-core' >/dev/null
+    expect_archive_entry 'package/bin/controlla-core'
 else
-    printf '%s\n' "$archive_files" | grep -Fx 'package/bin/controlla-core.exe' >/dev/null
+    expect_archive_entry 'package/bin/controlla-core.exe'
 fi
+printf '%s\n' 'package-check: validating packed target metadata and license'
 tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);if(p.os?.length!==1||p.os[0]!==process.platform||p.cpu?.length!==1||p.cpu[0]!==process.arch){console.error(`package target mismatch: ${p.os}/${p.cpu} != ${process.platform}/${process.arch}`);process.exit(1)}if(p.license!=="Apache-2.0"){console.error(`unexpected license: ${p.license}`);process.exit(1)}})'
 prefix="$temp/clean prefix"
 printf '%s\n' 'package-check: installing packed archive into clean prefix'

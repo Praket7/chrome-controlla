@@ -108,7 +108,7 @@ Evidence is fixture/local only. Capability route values are test inputs, not obs
 | `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
 | Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
 
-The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS/Ubuntu but exposed a Windows-only doctor expectation in run 37461256280; `b159a3a` fixed it. Hosted run 37461823256 passed macOS/Ubuntu and failed Windows provenance hashes because text files checked out with CRLF; fix commit `63b74d5` pins LF line endings. Hosted run 37462361648 passed macOS/Ubuntu and failed Windows package-check after Cargo verification; fix commit `ec5982c` adds stage diagnostics and uses `npm exec` for platform-correct shim execution.
+The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS/Ubuntu but exposed a Windows-only doctor expectation in run 37461256280; `b159a3a` fixed it. Hosted run 37461823256 passed macOS/Ubuntu and failed Windows provenance hashes because text files checked out with CRLF; fix commit `63b74d5` pins LF line endings. Hosted run 37462361648 passed macOS/Ubuntu and failed Windows package-check after Cargo verification; fix commit `ec5982c` added diagnostics and uses `npm exec` for platform-correct shim execution. Commit `c2fce64` normalizes Windows tar-list CRLF and adds per-entry diagnostics; hosted confirmation is pending.
 
 ## Phase 1 hosted CI run 37460467645 — failed
 
@@ -146,6 +146,16 @@ This failed run remains historical evidence. The Unix branch passes locally; the
 | Windows | fail | `./scripts/package-check.sh` exited 1 after Cargo package verification. The hosted log did not expose the silent failing subcommand. Package check now emits stage labels and checks the installed command through `npm exec`, which selects the platform-appropriate shim under Git Bash. Fix commit `ec5982c` passes local package check; Windows rerun is pending. |
 
 After the failure, package-check stage labels localized the post-Cargo path, and the installed consumer command check was changed to `npm exec`. `./scripts/package-check.sh` passes locally on macOS, including archive contents, target metadata, attribution, clean-prefix installation, direct package-local launcher, and npm command execution.
+
+## Phase 1 hosted CI run 37463463416 — failed
+
+| Runner | Result | Evidence |
+|---|---|---|
+| macOS | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
+| Ubuntu | pass | Hosted workflow run [37463463416](https://github.com/Praket7/chrome-controlla/actions/runs/37463463416). |
+| Windows | fail | `package-check.sh` reached `package-check: inspecting npm archive chrome-controlla-0.1.0.tgz` and exited before clean-prefix install. Commit `c2fce64` strips carriage returns from the archive listing and logs each required entry and metadata validation stage. Windows rerun is pending. |
+
+After the failure, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `./scripts/package-build.sh`, `./scripts/package-check.sh`, and `git diff --check` all passed locally on macOS 26 / Darwin 25.6 arm64. All 36 workspace tests passed. The package check logged each archive entry, validated darwin/arm64 metadata and attribution, installed into a clean prefix, and launched both the package-local binary and npm command shim.
 
 ## Phase 1 hosted CI run 37461823256 — failed
 
