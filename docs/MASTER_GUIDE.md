@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: design draft 1, 2026-10-06. **Phases 1–5 currently provide the local capability evaluator/CLI/launcher and Rust browser primitives, including bounded DOM observation and extraction. No MCP browser tools are implemented, and extraction has not been qualified against a real DOM.** The implementation must generate exact argument schemas and executable examples from its capability registry before releasing this guide as operational documentation.
+Version: local Phase 5 preview, 2026-10-06. **The runtime now provides a local MCP stdio slice for session discovery/connection/target listing, bounded DOM observation, and multi-section extraction. Its CDP calls are verified with a mocked websocket fixture. A single separate synthetic Chrome extraction run exists; it is not a performance qualification. AX, screenshots, execute/jobs, client acceptance, and broad virtualized/hidden-section qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -8,23 +8,33 @@ Companion documents: [research](design/research.md), [improvement requirements](
 
 Use Chrome Controlla to accomplish a browser task through a named session and exact targets. Default to a dedicated browser profile and strict background behavior when that mode supports the task. Read only the guide sections needed for the current task. Do not load every capability/schema or request full-page screenshots after every action.
 
-**Operating sequence:** establish session → observe enough to identify the target → execute a bounded workflow with an outcome check → inspect the receipt → reconcile uncertain effects → release owned temporary resources. If session creation already returned the necessary exact target and state, do not repeat discovery merely to follow a ritual.
+**Current local sequence:** discover/configure a session → select explicit targets → observe → extract declared sections when needed. This slice does not execute browser mutations or create durable jobs.
 
 One tool call can perform several actions, but completion requires evidence. Never claim “saved,” “all items,” or “exported” from a dispatch acknowledgement.
 
-## 1. The five tools
+## 1. Available tools
 
 | Tool | Use it for | Avoid |
 |---|---|---|
-| `session` | Create/attach/list/status/release; mode, ownership, current capabilities | Guessing active tab or launching a browser during status checks |
-| `observe` | Targeted facts, DOM/AX, visual region, tab list, structured extraction | Full raw DOM unless specifically needed; inferring off-screen completeness |
-| `execute` | Typed workflow, registered recipe or constrained script; local waits and verification | Unbounded scripts, broad scope, blind batches over uncertain effects |
-| `jobs` | Status/wait/cancel/reconcile/artifacts for accepted work | Resubmitting because a client timed out |
-| `guide` | Version-matched recipe, schema, error recovery or capability explanation | Inventing flags or following old examples over live schemas |
+| `session` | Discover providers, inspect configured targets, connect with selected IDs, list references | Guessing the active tab, connecting without explicit target IDs |
+| `observe` | Bounded CSS/DOM fields from one explicit target | Full raw DOM; inferring off-screen completeness |
+| `extract` | Bounded extraction across caller-declared sections with stable IDs and completeness evidence | Treating absent account/count/terminal evidence as complete |
+| `execute`, `jobs`, `guide` | Not implemented in this local Phase 5 slice | Do not call these tools or infer mutation/job support |
 
-The session response includes the quickstart, schema version and canonical resource URI. A client that cannot read MCP resources can call `guide`. If documentation and the live schema disagree, stop that operation, report the mismatch, and request the current guide; do not improvise a mutation.
+`tools/list` carries the argument schemas for the three available tools. There is no guide resource in this slice.
 
 ## 2. First installation and connection
+
+Run `cargo run -p controlla-runtime -- mcp` from the repository during development, or configure the built `controlla` binary with `mcp` as the MCP client's stdio command. `help`, `doctor`, and `schema` remain separate CLI commands. Configure one connection route in the server process:
+
+- **Explicit endpoint:** set `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT=ws://127.0.0.1:<port>/devtools/browser/<id>`. The endpoint must be an explicitly configured loopback WebSocket. The server rejects credentials and non-loopback hosts. This enables only the Direct CDP provider; it does not enable the shared-extension provider.
+- **Chrome permissioned auto-connect:** set `COMPTROL_CHROME_AUTO_CONNECT=1`, then enable Remote Debugging in Chrome at `chrome://inspect/#remote-debugging`. Chrome may show its native Allow prompt on connection; the server does not bypass that prompt.
+
+The `session` tool uses `action="discover"` for provider status, `action="targets"` to connect and report exact current target IDs/revisions, `action="connect"` with the explicitly selected `target_ids`, and `action="list_targets"` with the returned `session_id` to receive revision-bound `target_ref` values. Connecting can trigger Chrome's native consent flow. Tool calls do not choose the first tab or infer a target from title/order. `observe` and `extract` require a returned target reference and revalidate it against the session and current browser graph.
+
+`extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. A global record, serialized-byte, and 30-second maximum deadline budget applies across sections. Sections skipped by those budgets are returned as partial with a missing-coverage reason. Completeness is complete only when every section independently satisfies the browser library's evidence rules. Cursors remain informational, not resumable.
+
+This preview does not implement the guide, execute, or jobs MCP tools. Do not use those names as if they were available.
 
 Use a pinned released package and client-specific generated configuration. During development, use the absolute path to the locally built entrypoint. Do not assume a package named `chrome-controlla` is already published or that `latest` is reproducible.
 

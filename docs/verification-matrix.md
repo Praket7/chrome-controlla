@@ -35,7 +35,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-09 | partial | 2/4 | target/frame/browser revisions and stale-handle fixtures pass; Phase 4 guard compares caller-supplied identity/dependency snapshots; no authoritative app identity observer |
 | CC-10 | partial | 4 | fill checks the live value in the same page evaluation that writes; insert and every sequential key event refresh value/focus before each CDP send; navigation race fixture withholds the fill. CDP/page handlers/server effects remain non-atomic |
 | CC-11 | partial | 4 | strict-background mouse input returns `NeedsForeground`; text uses page/CDP-only routes. No OS focus/cursor/clipboard observer, so native isolation remains unverified |
-| CC-12 | partial | 4 | revision-bound CDP fill/insert/sequential-key commands, exact locator matching, text readback, click and drag with declared predicates tested against websocket fixtures; installed Chrome 154 headless verifies ordinary input fill/insert/ASCII keys and value/caret readback; masks, IME/contenteditable, overlays, real drag/canvas remain unqualified |
+| CC-12 | partial | 4 | installed Chrome 154 headless verifies ordinary text input fill/insert/ASCII keys, masked and trusted-event-dependent markers fail closed, plain contenteditable is unsupported, overlay hit testing withholds click, and DOM drag verifies moved bounds; IME, app adapters, and canvas remain unqualified |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
 | CC-14 | unimplemented | 6 | none |
 | CC-15 | partial | 5 | revision-bound bounded DOM observation API and policy fixtures; no MCP observe tool, AX/crop route, or live DOM extraction qualification |
@@ -59,20 +59,20 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B09 | partial | 4 | caller account revision mismatch yields before fixture dispatch; no live account switch observer |
 | B10 | partial | 4 | account/dependency snapshot mismatch yields before CDP call; race fixture withholds next write after navigation event; no authoritative in-page user-edit observer |
 | B11 | partial | 4 | unchanged dependency snapshot permits continuation; no semantic DOM churn observer or sound unrelated-change exclusion evidence |
-| B12 | partial | 4 | click/drag check fresh element geometry and hit target at source/destination points; mock CDP fixture does not evaluate real overlay interception |
+| B12 | partial | 4 | installed Chrome overlay covers the requested click point; fresh hit testing returns stale and the covered button click handler remains untouched |
 | B13 | fixture_verified | 2 | frame navigation/revision and OOPIF replacement fixtures |
-| B14 | partial | 5 | fixture models 42 unique IDs across recycled 8-node batches; policy/dedup test passes, no real virtualized DOM run |
-| B15 | partial | 5 | blocked-expansion fixture requires partial; section traversal remains caller-directed and unqualified in Chrome |
+| B14 | partial | 5 | installed Chrome synthetic virtualized fixture extracts 42 IDs across recycled batches; policy/dedup test passes; one run only, not broad app qualification |
+| B15 | partial | 5 | caller-declared two-section MCP extraction passes against mock CDP; blocked-expansion fixture requires partial; hidden-section traversal remains unqualified in Chrome |
 | B16 | partial | 5 | stale-count fixture requires partial; count is metadata and never sufficient for complete |
 | B17 | partial | 5 | infinite-feed fixture without explicit terminal marker requires partial; bounded traversal implemented, not live-qualified |
 | B18 | partial | 3 | local async job finishes after short caller wait; exact 12-second Promise/CDP/bridge path is absent |
 | B19 | partial | 3 | persisted deadline survives reopen; queued expiry is failed/deadline_error/not_sent; dispatched expiry is unknown while preserving acknowledged sent or unacknowledged unknown delivery; real Promise and worker cancellation route remain absent |
 | B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
 | B21 | fixture_verified | 2 | concurrent mutations for the same shared document serialize |
-| B22 | partial | 4 | Unicode fill, insert and sequential-key routes pass mock CDP fixtures; installed Chrome ordinary text input verifies `héllo 👋λa` and caret position after fill/insert/ASCII typing; masks, contenteditable, IME, and event-dependent behavior remain unsupported/unverified |
-| B23 | partial | 4 | drag dispatch is gated on refreshed source/destination geometry and a declared final bounds predicate; fixture verifies command sequence/predicate response, not real DOM movement or canvas semantics |
+| B22 | partial | 4 | Chrome verifies Unicode text/caret; explicitly marked masked and trusted-event-dependent controls fail closed before mutation; plain contenteditable is unsupported; IME and unmarked app event semantics remain unqualified |
+| B23 | partial | 4 | installed Chrome drag fixture moves a DOM element from (20,100) to (140,160) and verifies final bounds; canvas semantics remain unqualified |
 | B24 | partial | 4 | no system clipboard route is called by input implementation; no independent OS clipboard observer, so unchanged state is unverified |
-| B25 | partial | 4 | strict-background mouse actions return `NeedsForeground`; text focus is page-level. OS focus/cursor remain unobserved |
+| B25 | partial | 4 | installed Chrome strict-background text route succeeds with `requires_native=false`; strict-background mouse routes return `NeedsForeground` in fixtures. OS focus/cursor remain unobserved |
 | B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
 | B27 | unimplemented | 6 | none |
 | B28 | unimplemented | 7 | none |
@@ -83,7 +83,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B33 | partial | 5 | fixture policy classifies wrong-account 404 unknown; mocked CDP preflight returns unknown and sends no scroll command; real 404/account UI remains unqualified |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
-| B36 | partial | 4 | unqualified mouse/native route reports `NeedsForeground`; no native-dialog fixture or platform observer |
+| B36 | partial | 4 | real Chrome strict-background text succeeds with no native requirement; strict-background mouse/native routes return `NeedsForeground` in fixtures; no native-dialog fixture or platform observer |
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 
@@ -233,6 +233,14 @@ Text dispatch supports ordinary input and textarea controls only; sequential typ
 
 | `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome 154.0.8037.98 | Isolated headless Chrome opened a local `data:` input fixture; guarded fill, insert, and sequential ASCII key dispatch all reported verified readback. Final DOM value `héllo 👋λa`; `selectionStart=10` UTF-16 code units. The ignored test disables preserve-on-drop for failure cleanup and shuts down the isolated profile explicitly on success. This covers ordinary `<input type=text>` only. |
 
+## Phase 4 real Chrome controls follow-up — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome 154.0.8037.98 | Same test-owned isolated profile verifies ordinary Unicode fill/insert/sequential keys; stale expected value returns before mutation; explicitly marked masked tel and trusted-event-dependent inputs return unsupported without mutation; contenteditable returns unsupported; password returns unsupported without exposing its value; actual overlay at the click point causes stale refusal with no click-handler effect; a DOM drag moves from (20,100) to (140,160) and passes its bounds predicate. Strict-background text uses the page/CDP route with no native requirement. Profile/process are removed by explicit shutdown on success and `Drop` cleanup on assertion failure. |
+
+The masked/event-dependent check uses app-provided `data-masked` and `data-requires-trusted` markers. Undeclared app semantics are not inferred from DOM shape. IME, canvas drag, app-specific identity/document semantics, and independent OS focus/cursor/clipboard observation remain unqualified.
+
 ## Phase 5 local library gate — 2026-10-06
 
 | Check | Result | Environment | Evidence |
@@ -241,7 +249,7 @@ Text dispatch supports ordinary input and textarea controls only; sequential typ
 | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Format and warning-free Clippy; 73 browser unit tests passed, 1 ignored; integration groups 7, 3, 8, 10, and 3 passed. |
 | `npm run check:provenance && node scripts/check-doc-links.mjs && npm run check:docs && ./scripts/check-dependencies.sh` | pass after digest update | macOS 26 / Node 24.19.0 / npm 11.17.0 | Phase 5 edits and `lib.rs` export are recorded in provenance; Markdown links checked. |
 
-No extraction call was run against Chrome. No payload/latency baseline, AX/screenshot observation, MCP observe tool, or resumable cursor is verified. Matrix rows CC-08/15 and B14–17 remain partial.
+At the time of the earlier Phase 5 review, no extraction call had run against Chrome and no MCP observe tool existed. The subsequent MCP and synthetic-fixture evidence is recorded below; AX/screenshot routes and resumable cursors remain unverified. Matrix rows CC-08/15 and B14–17 remain partial.
 
 ## Phase 5 review follow-up — 2026-10-06
 
@@ -252,3 +260,16 @@ No extraction call was run against Chrome. No payload/latency baseline, AX/scree
 | `npm run check:provenance && npm run check:docs && ./scripts/check-dependencies.sh && git diff --check` | pass | macOS 26 / Node 24.19.0 / npm 11.17.0 | 13 destination digests and 22 retained tests; 15 Markdown files; dependency and whitespace checks clean. |
 
 The page-script limit test inspects the generated script contract; the wrong-account/no-scroll test uses a mock CDP server. Neither is a live Chrome extraction result. Limits bound selected records, text, page response bytes, and final serialized response bytes; they do not bound native selector/text evaluation time.
+
+## Phase 5 MCP stdio slice — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| rmcp initialize, `tools/list`, discovery `tools/call` | pass | macOS 26 / Rust 1.99.0 | Required fields and object/type schema properties verified for session, observe, and extract. |
+| Session connect/list-targets, observe, and two-section extract through MCP against mocked CDP | pass | macOS 26 / Rust 1.99.0 | Real MCP request/response roundtrip; explicit target selection, reference capture/validation, and bounded browser library calls. |
+| Endpoint/grant checks | pass | Rust fixtures | Loopback-only parsing, credentials/DNS/non-loopback rejection, separate Direct CDP grant, shared-extension denial. |
+| Synthetic virtual-list extraction | pass | Installed Chrome 154.0.8037.98; commits `44041af` and current review follow-up | Latest single synthetic run: 42 extracted rows, 438.17 ms / 1,860 B versus 1.39 ms / 2,760 B full DOM; wrong-account preflight did not scroll. Diagnostic only; no performance claim. Blocked expansion is represented by the policy fixture, not the live run. |
+| Sol review follow-up | pass | Phase 4/5 current continuation | Independent Sol reviewer rechecked and approved four fixes: page-only target selection, release the global session-map lock before CDP awaits, validate sequential input before focus, and report every section skipped after timeout. MCP regression covers non-page rejection and timeout coverage. |
+| Final workspace gate | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 82 browser unit tests passed, 2 ignored; integrations 7, 8, 10, and 3 passed; 6 runtime unit tests passed. Formatting, Clippy, provenance (13 digests/22 retained tests), docs (15 files), dependency audit, and `git diff --check` passed. |
+
+MCP transport and extraction assertions use mocked CDP, not an external MCP client or real application account/list. The single installed-Chrome synthetic run is not a general virtualized/hidden-section qualification.

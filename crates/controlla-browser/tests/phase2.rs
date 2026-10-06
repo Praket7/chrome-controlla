@@ -13,6 +13,7 @@ fn all_test_grants() -> ProviderGrants {
         dedicated_headed: true,
         dedicated_headless: true,
         shared_extension: true,
+        direct_cdp: false,
     }
 }
 
@@ -22,6 +23,7 @@ fn session_modes_use_independent_provider_grants() {
         dedicated_headed: true,
         dedicated_headless: false,
         shared_extension: true,
+        direct_cdp: false,
     });
     let headed = registry
         .create_session(

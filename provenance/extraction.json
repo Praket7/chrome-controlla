@@ -14,16 +14,16 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "10674c69c04d61d21974cd2a8412e65bfcbb452274985b8aa2e02baaa963e4fd",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods",
+      "destination_sha256": "185ae43fd215d0aaf8c80b985a91eb50f3f57be496bceca10cbb722b4e1420e3",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
       "source_path": "../Comptrol/crates/comptrol-browser/src/manager.rs",
       "destination_path": "crates/controlla-browser/src/manager.rs",
       "source_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
-      "destination_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
-      "edits": "none; byte-for-byte copy",
+      "destination_sha256": "262c56a5b23e2a9a444592fc16acc1222b550405459a3aa106f5556eb9b61828",
+      "edits": "none; byte-for-byte copy before Phase 5; Phase 5 seeds the target graph from getTargets snapshots before immediate flattened attachment",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -102,16 +102,16 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "1e387f9cbc3d622cfe943e13de5a7055f5e0fbde9f95aef976be1ca4d63a8c27",
-      "edits": "updated relative link and document placement; recorded Phase 2 implementation/review evidence and Phase 3 local journal coverage while retaining open live qualification and dispatch gates",
+      "destination_sha256": "71f8f46133c459079754f4973707dd4fe099389277bfaf13ef2cbd8e6441650a",
+      "edits": "updated relative link and document placement; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, and Phase 4/5 implementation and verification while retaining open native/platform qualification gates",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "a00f5f7e6f2f6f8e35bf6f5a62fe40eae7f11def0ff75081416b47b185114580",
-      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows; Phase 5 documents bounded observation and extraction, authoritative expected-count and terminal evidence requirements, and live/MCP limitations",
+      "destination_sha256": "b7e18123465be3c5dfca9908e84909ef30c6afb72e12f81f3801b53ae546b548",
+      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows; Phase 5 documents bounded observation and extraction, authoritative expected-count and terminal evidence requirements, and live/MCP limitations; Phase 5 local stdio MCP setup and supported tool boundary",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],

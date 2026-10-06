@@ -266,17 +266,6 @@ impl super::BrowserConnection {
                 "only ordinary text inputs and textareas are qualified",
             ));
         }
-        let resolve = resolve_element_script(locator)?;
-        let focused = if value.is_some() {
-            self.target_ref_command(sessions,reference,principal,revisions,"Runtime.evaluate",serde_json::json!({"expression":format!("(()=>{{const r={resolve};if(!r.ok)return false;r.e.focus();return document.activeElement===r.e;}})()"),"returnByValue":true})).await?
-        } else {
-            serde_json::json!({"result":{"value":true}})
-        };
-        if focused["result"]["value"] != true {
-            return Err(super::BrowserError::StaleReference(
-                "target became ambiguous or could not be focused in page".into(),
-            ));
-        }
         if matches!(action, InputAction::SequentialKeys(s) if !s.chars().all(|c| c.is_ascii_graphic() || c == ' '))
         {
             return Ok(InputOutcome::Unsupported(
@@ -298,6 +287,17 @@ impl super::BrowserConnection {
                     "sequential typing requires a collapsed caret at the end of the field",
                 ));
             }
+        }
+        let resolve = resolve_element_script(locator)?;
+        let focused = if value.is_some() {
+            self.target_ref_command(sessions,reference,principal,revisions,"Runtime.evaluate",serde_json::json!({"expression":format!("(()=>{{const r={resolve};if(!r.ok)return false;r.e.focus();return document.activeElement===r.e;}})()"),"returnByValue":true})).await?
+        } else {
+            serde_json::json!({"result":{"value":true}})
+        };
+        if focused["result"]["value"] != true {
+            return Err(super::BrowserError::StaleReference(
+                "target became ambiguous or could not be focused in page".into(),
+            ));
         }
         let valid_point = |x: f64, y: f64| x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0;
         if let Some((x, y)) = match action {

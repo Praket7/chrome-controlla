@@ -178,12 +178,11 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 **Interfaces:** `validate_step(target, dependencies) -> GuardDecision`; `perform_input(target, InputAction) -> DispatchEvidence`; `on_external_change(event) -> InvalidationSet`.
 
 - [x] Add B09–13/B22–25/B36 local fixtures for account/dependency changes, navigation, Unicode, explicitly marked masked/event-dependent controls, contenteditable, overlay interception, DOM drag, strict-background text, and foreground-required mouse/native routes. Installed Chrome covers the DOM controls; native focus/clipboard observers remain unavailable.
-- [ ] Implement semantic locators and unambiguous matching. Add typed fill/insert/sequential keys/click/drag operations with postconditions.
-- [ ] Implement navigation/account/document guards, semantic dependency invalidation, geometry/hit checks, and conservative fallback when relevance cannot be proved.
-- [ ] Keep event handlers/remote effects in mind: DOM observations cannot guarantee atomic input. Inject a change between final validation and dispatch; measure the residual race and document stronger server revision paths where available.
+- [x] Implement fail-closed semantic locators, typed fill/insert/sequential keys/click/drag routes, value/caret postconditions, geometry/hit checks, and caller-supplied navigation/account/document/dependency revisions. Application identity and edit observers remain adapter work.
+- [x] Inject navigation between final validation and dispatch; verify the write is withheld. Record mock protocol timing and the remaining non-atomic CDP/page/server race; mock timing is not a real Chrome bound.
 - [ ] Implement internal clipboard and artifact insertion. No system clipboard mutation in strict background mode. No disabling human input to preserve a lease.
-- [ ] Run real-OS disruption tests where available and mark the rest unverified.
-- [ ] Commit `feat: guard input against stale targets and user interference`.
+- [x] Run an isolated installed-Chrome DOM fixture for ordinary inputs, fail-closed masked/event-dependent markers, contenteditable/password, overlay click interception, and DOM drag bounds. IME, canvas, native focus/cursor/clipboard and repeated disruption remain unqualified.
+- [x] Commit Phase 4 implementation and fixture work (`e1a8f10`).
 
 **Gate:** relevant detectable interference yields before subsequent mutation; input fixtures verify actual values/positions. No “interference-proof” claim.
 
@@ -193,12 +192,11 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `observe(target, selector, fields, budget) -> Observation`; `extract(target, ExtractionSpec) -> ExtractionResult`.
 
-- [ ] Create fixtures for 42 virtualized records, 21-item separate bucket, blocked expansion, recycled nodes, duplicate labels, stale count, infinite feed and wrong-account 404.
-- [ ] Implement bounded DOM/AX reads, semantic deltas and targeted screenshot crops with freshness, omissions and truncation fields.
-- [ ] Implement schema-guided extraction, stable-ID deduplication, pagination/section traversal, and explicit terminal evidence. Keep parsing near the page; output large results as artifacts.
-- [ ] Test `complete`, `partial`, and `unknown` classification against ground truth. Matching a count and repeated no-change scrolls alone must not certify completion.
-- [ ] Measure payload and latency against full DOM/snapshot baselines without dropping necessary facts.
-- [ ] Commit `feat: extract structured data with coverage evidence`.
+- [x] Create policy fixtures for 42 virtualized records, 21-item separate bucket, blocked expansion, recycled nodes, duplicate labels, stale count, infinite feed and wrong-account 404; add a real Chrome virtualized 42-record run.
+- [x] Implement bounded CSS/DOM observations and schema-guided extraction with stable-ID deduplication, caller-declared multi-section traversal, explicit terminal evidence, freshness, omissions, and truncation fields. AX, semantic deltas, targeted screenshot crops, resumable cursors, and artifact output remain open.
+- [x] Test `complete`, `partial`, and `unknown` against fixture evidence; count and repeated no-change alone do not certify completion.
+- [x] Record a single synthetic payload/latency comparison as a diagnostic only; repeated and representative performance qualification remains open.
+- [x] Commit Phase 5 implementation and live fixture work (`c656c1c`, `44041af`, and current continuation changes).
 
 **Gate:** all records or explicit missing coverage; never the tester’s visible-row-only false completeness.
 

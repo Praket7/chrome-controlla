@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Chrome Controlla capability decisions and local CLI"
 
 [dependencies]
+controlla-browser = { path = "../controlla-browser" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
@@ -14,6 +15,14 @@ rusqlite = { version = "=0.38.0", features = ["bundled"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 getrandom = "=0.3.4"
 thiserror = "=2.0.20"
+
+rmcp = { version = "=3.5.1", features = ["transport-io", "macros"] }
+schemars = "=1.2.2"
+
+[dev-dependencies]
+rmcp = { version = "=3.5.1", features = ["client"] }
+futures-util = "=0.3.34"
+tokio-tungstenite = "=0.28.0"
 
 [[bin]]
 name = "controlla"

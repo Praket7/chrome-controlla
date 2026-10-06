@@ -103,6 +103,13 @@ pub(crate) async fn attach_existing_targets(
         let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
             continue;
         };
+        // `Target.getTargets` can return a target before the asynchronous
+        // discovery event has reached our reader. Seed the graph from this
+        // authoritative snapshot so an immediate attach does not disappear.
+        connection.targets.write().await.apply_event(&json!({
+            "method": "Target.targetCreated",
+            "params": {"targetInfo": info}
+        }));
         let already_attached = {
             let graph = connection.targets.read().await;
             graph

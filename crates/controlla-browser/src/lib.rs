@@ -279,6 +279,9 @@ pub struct BrowserConnection {
 }
 
 impl BrowserConnection {
+    pub fn instance_id(&self) -> u128 {
+        self.instance_id
+    }
     pub async fn connect(url: &str) -> Result<Self, BrowserError> {
         use futures_util::{SinkExt, StreamExt};
         let instance_id = new_browser_instance_id()?;
@@ -2474,6 +2477,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = registry
             .create_session(
@@ -2658,6 +2662,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = registry
             .create_session(
@@ -2828,6 +2833,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = sessions
             .create_session(

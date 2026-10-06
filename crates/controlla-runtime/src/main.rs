@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 fn usage() {
     println!(
-        "Chrome Controlla\n\nUsage: controlla [--state-dir DIR] <command>\n\nCommands:\n  doctor       Report local configuration and health evidence\n  schema       Print the capability schema\n  help         Show this help"
+        "Chrome Controlla\n\nUsage: controlla [--state-dir DIR] <command>\n\nCommands:\n  doctor       Report local configuration and health evidence\n  schema       Print the capability schema\n  mcp          Run the local MCP stdio server\n  help         Show this help"
     );
 }
 
@@ -32,7 +32,7 @@ fn main() {
         break;
     }
     let command = args.next().unwrap_or_else(|| "help".to_owned());
-    if !matches!(command.as_str(), "help" | "doctor" | "schema") {
+    if !matches!(command.as_str(), "help" | "doctor" | "schema" | "mcp") {
         invalid(&format!("unknown command: {command}"));
     }
     if args
@@ -47,6 +47,12 @@ fn main() {
     }
     match command.as_str() {
         "help" => usage(),
+        "mcp" => {
+            if let Err(error) = controlla_runtime::mcp::run() {
+                eprintln!("MCP server failed: {error}");
+                std::process::exit(1);
+            }
+        }
         "schema" => println!("{}", include_str!("../schemas/capabilities.json")),
         "doctor" => {
             let state = state_override

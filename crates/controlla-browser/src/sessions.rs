@@ -14,6 +14,7 @@ pub enum SessionMode {
     Headed,
     Headless,
     Shared,
+    DirectCdp,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -22,6 +23,7 @@ pub enum ProviderKind {
     DedicatedHeaded,
     DedicatedHeadless,
     SharedExtension,
+    DirectCdp,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -29,6 +31,7 @@ pub struct ProviderGrants {
     pub dedicated_headed: bool,
     pub dedicated_headless: bool,
     pub shared_extension: bool,
+    pub direct_cdp: bool,
 }
 
 impl ProviderGrants {
@@ -37,6 +40,7 @@ impl ProviderGrants {
             ProviderKind::DedicatedHeaded => self.dedicated_headed,
             ProviderKind::DedicatedHeadless => self.dedicated_headless,
             ProviderKind::SharedExtension => self.shared_extension,
+            ProviderKind::DirectCdp => self.direct_cdp,
         }
     }
 }
@@ -100,6 +104,7 @@ pub struct TargetRef {
     pub session_id: String,
     pub principal: String,
     pub capability_revision: u64,
+    #[serde(with = "u128_string")]
     pub browser_instance_id: u128,
     pub browser_generation: u64,
     pub target_id: String,
@@ -113,6 +118,7 @@ pub struct TargetRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetIdentity {
     pub session_id: String,
+    #[serde(with = "u128_string")]
     pub browser_instance_id: u128,
     pub browser_generation: u64,
     pub target_id: String,
@@ -121,6 +127,18 @@ pub struct TargetIdentity {
     pub frame_revision: u64,
     pub account_revision: u64,
     pub document_revision: u64,
+}
+
+mod u128_string {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,16 +327,21 @@ impl SessionRegistry {
         spec: SessionSpec,
         principal: impl Into<String>,
     ) -> Result<SessionHandle, SessionError> {
-        if spec.mode == SessionMode::Shared && spec.selected_target_ids.is_empty() {
+        if matches!(spec.mode, SessionMode::Shared | SessionMode::DirectCdp)
+            && spec.selected_target_ids.is_empty()
+        {
             return Err(SessionError::TargetSelectionRequired);
         }
-        if spec.mode != SessionMode::Shared && !spec.selected_target_ids.is_empty() {
+        if !matches!(spec.mode, SessionMode::Shared | SessionMode::DirectCdp)
+            && !spec.selected_target_ids.is_empty()
+        {
             return Err(SessionError::UnexpectedTargetSelection);
         }
         let provider = match spec.mode {
             SessionMode::Headed => ProviderKind::DedicatedHeaded,
             SessionMode::Headless => ProviderKind::DedicatedHeadless,
             SessionMode::Shared => ProviderKind::SharedExtension,
+            SessionMode::DirectCdp => ProviderKind::DirectCdp,
         };
         if !self.grants.allows(provider) {
             return Err(SessionError::ProviderDenied(provider));
@@ -334,7 +357,7 @@ impl SessionRegistry {
         self.next_capability_revision = self.next_capability_revision.saturating_add(1);
         self.sessions.insert(handle.id.clone(), handle.clone());
         let tabs = self.tabs.entry(handle.id.clone()).or_default();
-        if spec.mode == SessionMode::Shared {
+        if matches!(spec.mode, SessionMode::Shared | SessionMode::DirectCdp) {
             for target_id in spec.selected_target_ids {
                 tabs.insert(
                     target_id.clone(),
@@ -354,6 +377,7 @@ impl SessionRegistry {
             ProviderKind::DedicatedHeaded => self.grants.dedicated_headed = false,
             ProviderKind::DedicatedHeadless => self.grants.dedicated_headless = false,
             ProviderKind::SharedExtension => self.grants.shared_extension = false,
+            ProviderKind::DirectCdp => self.grants.direct_cdp = false,
         }
         self.next_capability_revision = self.next_capability_revision.saturating_add(1);
     }
@@ -467,13 +491,21 @@ impl SessionRegistry {
             .sessions
             .get(session_id)
             .ok_or(StaleTarget::SessionEnded)?;
-        if session.provider == ProviderKind::SharedExtension {
+        if matches!(session.provider, ProviderKind::SharedExtension) {
             return Err(StaleTarget::ProviderMismatch);
         }
         if !self.grants.allows(session.provider) {
             return Err(StaleTarget::GrantRevoked);
         }
         Ok(())
+    }
+
+    pub fn contains_target(&self, session: &SessionHandle, target_id: &str) -> bool {
+        self.sessions.get(&session.id) == Some(session)
+            && self
+                .tabs
+                .get(&session.id)
+                .is_some_and(|tabs| tabs.contains_key(target_id))
     }
 
     pub(crate) fn selected_targets(&self, session_id: &str) -> Option<BTreeSet<String>> {
@@ -761,6 +793,48 @@ impl SessionRegistry {
             return Err(StaleTarget::TargetChanged);
         }
         Self::resolve_target(expected, principal, current)
+    }
+}
+
+#[cfg(test)]
+mod direct_cdp_grant_tests {
+    use super::*;
+
+    #[test]
+    fn direct_cdp_requires_opt_in_and_remains_distinct_from_shared_extension() {
+        let spec = SessionSpec {
+            mode: SessionMode::DirectCdp,
+            selected_target_ids: vec!["tab-1".into()],
+        };
+        let mut denied = SessionRegistry::new(ProviderGrants::default());
+        assert!(denied.create_session(spec.clone(), "local").is_err());
+
+        let mut allowed = SessionRegistry::new(ProviderGrants {
+            direct_cdp: true,
+            ..Default::default()
+        });
+        let handle = allowed.create_session(spec, "local").unwrap();
+        assert_eq!(handle.provider, ProviderKind::DirectCdp);
+        allowed.bind_session_to_browser(&handle, 17).unwrap();
+        assert!(allowed.authorize_direct_cdp(&handle.id).is_ok());
+
+        let mut extension = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..Default::default()
+        });
+        let ext = extension
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["tab-1".into()],
+                },
+                "local",
+            )
+            .unwrap();
+        assert_eq!(
+            extension.authorize_direct_cdp(&ext.id),
+            Err(StaleTarget::ProviderMismatch)
+        );
     }
 }
 
