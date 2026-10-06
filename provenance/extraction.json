@@ -110,8 +110,8 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "dea572a96afd88c3a27c24783be7d362e9d91d1d5e493f36a2a7bb91fb883252",
-      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows; Phase 5 documents the bounded Rust observation/extraction library and unqualified live/MCP boundaries",
+      "destination_sha256": "a00f5f7e6f2f6f8e35bf6f5a62fe40eae7f11def0ff75081416b47b185114580",
+      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows; Phase 5 documents bounded observation and extraction, authoritative expected-count and terminal evidence requirements, and live/MCP limitations",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],

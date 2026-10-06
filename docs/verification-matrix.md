@@ -80,7 +80,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B30 | unimplemented | 7 | none |
 | B31 | unimplemented | 6 | none |
 | B32 | unimplemented | 6 | none |
-| B33 | unimplemented | 5 | none |
+| B33 | partial | 5 | fixture policy classifies wrong-account 404 unknown; mocked CDP preflight returns unknown and sends no scroll command; real 404/account UI remains unqualified |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
 | B36 | partial | 4 | unqualified mouse/native route reports `NeedsForeground`; no native-dialog fixture or platform observer |
@@ -242,3 +242,13 @@ Text dispatch supports ordinary input and textarea controls only; sequential typ
 | `npm run check:provenance && node scripts/check-doc-links.mjs && npm run check:docs && ./scripts/check-dependencies.sh` | pass after digest update | macOS 26 / Node 24.19.0 / npm 11.17.0 | Phase 5 edits and `lib.rs` export are recorded in provenance; Markdown links checked. |
 
 No extraction call was run against Chrome. No payload/latency baseline, AX/screenshot observation, MCP observe tool, or resumable cursor is verified. Matrix rows CC-08/15 and B14–17 remain partial.
+
+## Phase 5 review follow-up — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --lib observe::tests --locked --offline -- --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Seven focused checks: wrong-account mock receives only the read-only preflight and no scroll command; account guard precedes page scroll assignment; no authoritative expected count remains partial; absent fields block completion; page script contains record/text/byte caps; final serialized objects obey the full byte budget or return an error. |
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 78 browser tests passed, 1 ignored; integration groups 7, 3, 8, 10, and 3 passed; warning-free Clippy and formatting. |
+| `npm run check:provenance && npm run check:docs && ./scripts/check-dependencies.sh && git diff --check` | pass | macOS 26 / Node 24.19.0 / npm 11.17.0 | 13 destination digests and 22 retained tests; 15 Markdown files; dependency and whitespace checks clean. |
+
+The page-script limit test inspects the generated script contract; the wrong-account/no-scroll test uses a mock CDP server. Neither is a live Chrome extraction result. Limits bound selected records, text, page response bytes, and final serialized response bytes; they do not bound native selector/text evaluation time.
