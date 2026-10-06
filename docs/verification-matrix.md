@@ -108,7 +108,7 @@ Evidence is fixture/local only. Capability route values are test inputs, not obs
 | `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
 | Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
 
-The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; Linux and Windows package installs remain pending hosted Phase 1 CI. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Both local findings are corrected in commit `4af5cdc`; its push and hosted rerun are pending.
+The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; current hosted results include successful macOS and Ubuntu package jobs. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 commit `23b7827` was pushed; hosted run 37460467645 failed on Windows Clippy and the Ubuntu oversized-PID test, while macOS passed. Fix commit `ed2beb2` passed macOS and Ubuntu but exposed a Windows-only doctor expectation in hosted run 37461256280. Commit `94a4043` corrects the assertion; its push and hosted rerun are pending.
 
 ## Phase 1 hosted CI run 37460467645 — failed
 
@@ -126,3 +126,13 @@ The run remains recorded as failed historical evidence. The fixes are locally ve
 |---|---|---|---|
 | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64 | formatting and Clippy clean; 36 tests passed (22 browser, 3 runtime unit, 8 CLI/doctor, 3 registry); no doc tests. Includes oversized PID rejection before the OS probe. |
 | `./scripts/package-build.sh && ./scripts/package-check.sh && git diff --check` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0, Node 26.7.0/npm 11.19.0 | Cargo archive packaged 14 files; npm archive verified as darwin/arm64 with attribution and clean-prefix install; whitespace clean. |
+
+## Phase 1 hosted CI run 37461256280 — failed
+
+| Runner | Result | Evidence |
+|---|---|---|
+| macOS | pass | Hosted workflow run [37461256280](https://github.com/Praket7/chrome-controlla/actions/runs/37461256280). |
+| Ubuntu | pass | Hosted workflow run [37461256280](https://github.com/Praket7/chrome-controlla/actions/runs/37461256280); includes the oversized-PID regression fix. |
+| Windows | fail | `doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated_health` expected a Healthy process probe, although the implementation correctly reports `Unknown` on unsupported OSes. The assertion now expects Healthy on Unix and Unknown elsewhere. |
+
+This failed run remains historical evidence. The Unix branch passes locally; the Windows `Unknown` expectation is source-updated but awaits hosted confirmation.

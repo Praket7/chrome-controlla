@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phase 0 and Phase 1 are pushed. Phase 0 hosted CI passed. Phase 1 commit `23b7827` passed Sol's local/fixture review, but hosted run `37460467645` failed on Windows Clippy and the Ubuntu PID probe test. Fix commit `4af5cdc` passes local checks; its push and hosted rerun are pending.
+Status: Phase 0 and Phase 1 are pushed. Phase 0 hosted CI passed. Phase 1 commit `23b7827` passed Sol's local/fixture review. Hosted run `37460467645` found Windows Clippy and Ubuntu PID issues; commit `ed2beb2` fixed them locally and its hosted run `37461256280` passed macOS and Ubuntu but exposed a Windows-only test expectation. Commit `94a4043` corrects that expectation; its push and hosted rerun are pending.
 
 ## Phase 0 — source extraction and baseline
 

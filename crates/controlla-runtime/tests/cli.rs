@@ -137,7 +137,12 @@ fn doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated
     write_doctor_config(&root, addr, std::process::id(), now - 900);
     let report = run_doctor(&root);
     assert_eq!(report["configured"], "Healthy");
+    // The current local-process probe is implemented on Unix. On other
+    // platforms, the doctor must report Unknown rather than imply liveness.
+    #[cfg(unix)]
     assert_eq!(report["process"], "Healthy");
+    #[cfg(not(unix))]
+    assert_eq!(report["process"], "Unknown");
     assert_eq!(report["transport"], "Healthy");
     assert_eq!(report["authentication"], "Healthy");
     assert_eq!(report["live_round_trip"], "Healthy");
