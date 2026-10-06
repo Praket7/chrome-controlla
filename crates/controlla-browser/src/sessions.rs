@@ -97,7 +97,10 @@ pub enum SessionError {
     UnexpectedTargetSelection,
     OwnedTabRequiresCreationReceipt,
     UnknownSession,
+    InternalClipboardTooLarge,
 }
+
+const MAX_INTERNAL_CLIPBOARD_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetRef {
@@ -307,6 +310,9 @@ pub struct SessionRegistry {
     browser_instances: BTreeMap<String, u128>,
     #[serde(default)]
     inactive_sessions: BTreeSet<String>,
+    /// Ephemeral task text; never serialized or copied to the OS pasteboard.
+    #[serde(skip)]
+    internal_clipboard_text: BTreeMap<String, String>,
 }
 
 impl SessionRegistry {
@@ -319,7 +325,67 @@ impl SessionRegistry {
             tabs: BTreeMap::new(),
             browser_instances: BTreeMap::new(),
             inactive_sessions: BTreeSet::new(),
+            internal_clipboard_text: BTreeMap::new(),
         }
+    }
+
+    fn validate_clipboard_session(&self, session: &SessionHandle) -> Result<(), SessionError> {
+        let Some(current) = self.sessions.get(&session.id) else {
+            return Err(SessionError::UnknownSession);
+        };
+        if current != session
+            || self.inactive_sessions.contains(&session.id)
+            || !self.grants.allows(session.provider)
+        {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        Ok(())
+    }
+
+    /// Store bounded plain text for this active session only. This buffer is
+    /// in-memory and deliberately omitted from registry serialization.
+    pub fn set_internal_clipboard_text(
+        &mut self,
+        session: &SessionHandle,
+        text: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        self.validate_clipboard_session(session)?;
+        let text = text.into();
+        if text.len() > MAX_INTERNAL_CLIPBOARD_BYTES {
+            return Err(SessionError::InternalClipboardTooLarge);
+        }
+        self.internal_clipboard_text
+            .insert(session.id.clone(), text);
+        Ok(())
+    }
+
+    pub fn internal_clipboard_text(
+        &self,
+        session: &SessionHandle,
+    ) -> Result<Option<&str>, SessionError> {
+        self.validate_clipboard_session(session)?;
+        Ok(self
+            .internal_clipboard_text
+            .get(&session.id)
+            .map(String::as_str))
+    }
+
+    pub(crate) fn internal_clipboard_text_for(
+        &self,
+        session_id: &str,
+        principal: &str,
+    ) -> Result<Option<&str>, SessionError> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Err(SessionError::UnknownSession);
+        };
+        if session.principal != principal {
+            return Err(SessionError::ProviderDenied(session.provider));
+        }
+        self.validate_clipboard_session(session)?;
+        Ok(self
+            .internal_clipboard_text
+            .get(session_id)
+            .map(String::as_str))
     }
 
     pub fn create_session(
@@ -640,6 +706,7 @@ impl SessionRegistry {
     ) -> CleanupReceipt {
         let mut receipt = CleanupReceipt::default();
         let Some(tabs) = self.tabs.get(session_id).cloned() else {
+            self.internal_clipboard_text.remove(session_id);
             if self.sessions.remove(session_id).is_none() {
                 receipt.remaining.push(RemainingTab {
                     target_id: session_id.to_owned(),
@@ -649,6 +716,7 @@ impl SessionRegistry {
             return receipt;
         };
         self.inactive_sessions.insert(session_id.to_owned());
+        self.internal_clipboard_text.remove(session_id);
         let mut retry = BTreeMap::new();
         for record in tabs.into_values() {
             if record.ownership == Ownership::Owned && !record.user_changed {
@@ -1097,6 +1165,65 @@ mod tests {
                 .map(|item| item.target_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["adopted"]
+        );
+    }
+
+    #[test]
+    fn internal_clipboard_is_plain_text_session_scoped_ephemeral_and_principal_bound() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let make_session = |registry: &mut SessionRegistry, principal| {
+            registry
+                .create_session(
+                    SessionSpec {
+                        mode: SessionMode::Headless,
+                        selected_target_ids: vec![],
+                    },
+                    principal,
+                )
+                .unwrap()
+        };
+        let first = make_session(&mut registry, "alice");
+        let second = make_session(&mut registry, "bob");
+        registry
+            .set_internal_clipboard_text(&first, "session-one text")
+            .unwrap();
+        registry
+            .set_internal_clipboard_text(&second, "session-two text")
+            .unwrap();
+        assert_eq!(
+            registry.internal_clipboard_text(&first).unwrap(),
+            Some("session-one text")
+        );
+        assert_eq!(
+            registry.internal_clipboard_text(&second).unwrap(),
+            Some("session-two text")
+        );
+        assert_eq!(
+            registry.set_internal_clipboard_text(&first, "x".repeat(1_048_577)),
+            Err(SessionError::InternalClipboardTooLarge)
+        );
+        assert_eq!(
+            registry.internal_clipboard_text(&first).unwrap(),
+            Some("session-one text")
+        );
+
+        let mut spoofed = first.clone();
+        spoofed.principal = "mallory".into();
+        assert!(registry.internal_clipboard_text(&spoofed).is_err());
+
+        let serialized = serde_json::to_string(&registry).unwrap();
+        assert!(!serialized.contains("session-one text"));
+        let recovered: SessionRegistry = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(recovered.internal_clipboard_text(&first).unwrap(), None);
+
+        registry.release_session(&first.id, |_| Ok(()));
+        assert!(registry.internal_clipboard_text(&first).is_err());
+        assert_eq!(
+            registry.internal_clipboard_text(&second).unwrap(),
+            Some("session-two text")
         );
     }
 

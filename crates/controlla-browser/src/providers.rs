@@ -2113,6 +2113,77 @@ mod tests {
             canvas_result,
             crate::input::InputOutcome::Unsupported(_)
         ));
+        let empty_paste = crate::input::InputAction::PasteInternalClipboard;
+        let empty_paste_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &empty_paste,
+                    expected_value: "héllo 👋λaあに",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            empty_paste_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        registry
+            .set_internal_clipboard_text(&handle, " clipboard text")
+            .unwrap();
+        let native_before_internal_paste = crate::native::NativeSnapshot::capture().unwrap();
+        let paste = crate::input::InputAction::PasteInternalClipboard;
+        let pasted = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &paste,
+                    expected_value: "héllo 👋λaあに",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            pasted,
+            crate::input::InputOutcome::Applied {
+                observed_value: Some(value),
+                postcondition_verified: true,
+                ..
+            } if value == "héllo 👋λaあに clipboard text"
+        ));
+        assert_eq!(
+            registry.internal_clipboard_text(&handle).unwrap(),
+            Some(" clipboard text")
+        );
+        let native_after_internal_paste = crate::native::NativeSnapshot::capture().unwrap();
+        assert_eq!(
+            native_before_internal_paste.frontmost_bundle_id,
+            native_after_internal_paste.frontmost_bundle_id
+        );
+        assert_eq!(
+            native_before_internal_paste.pasteboard_change_count,
+            native_after_internal_paste.pasteboard_change_count
+        );
         struct TestOwnedTargetObserver;
         impl IndependentTargetObserver for TestOwnedTargetObserver {
             fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {

@@ -8,6 +8,8 @@ pub type SemanticLocator = super::Locator;
 pub enum InputAction {
     Fill(String),
     Insert(String),
+    /// Insert per-session plain text through CDP; never reads the OS clipboard.
+    PasteInternalClipboard,
     /// Dispatch and commit a CDP composition sequence on a supported text control.
     ImeText(String),
     SequentialKeys(String),
@@ -217,34 +219,55 @@ impl super::BrowserConnection {
                 "input target is not actionable".into(),
             ));
         }
+        let clipboard_text = if matches!(action, InputAction::PasteInternalClipboard) {
+            match sessions.internal_clipboard_text_for(&reference.session_id, principal) {
+                Ok(Some(text)) => Some(text.to_owned()),
+                Ok(None) => {
+                    return Ok(InputOutcome::Unsupported(
+                        "this session has no internal clipboard text",
+                    ));
+                }
+                Err(_) => {
+                    return Err(super::BrowserError::StaleReference(
+                        "internal clipboard session or principal is no longer authorized".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let value = match action {
             InputAction::Fill(v)
             | InputAction::Insert(v)
             | InputAction::ImeText(v)
             | InputAction::SequentialKeys(v) => Some(v.as_str()),
+            InputAction::PasteInternalClipboard => clipboard_text.as_deref(),
             InputAction::Click { .. } | InputAction::Drag { .. } => None,
         };
-        let expected_value = match action {
-            InputAction::Fill(text) => Some(text.clone()),
-            InputAction::Insert(text)
-            | InputAction::ImeText(text)
-            | InputAction::SequentialKeys(text) => {
-                let (Some(before), Some(start), Some(end)) = (
-                    p["value"].as_str(),
-                    p["selectionStart"].as_u64(),
-                    p["selectionEnd"].as_u64(),
-                ) else {
-                    return Ok(InputOutcome::Unsupported(
-                        "input selection range is unavailable",
-                    ));
-                };
-                let Some(result) = replacement_value(before, start, end, text) else {
-                    return Ok(InputOutcome::Unsupported(
-                        "insertion splits an unsupported UTF-16 selection boundary",
-                    ));
-                };
-                Some(result)
-            }
+        let expected_value = if let InputAction::Fill(text) = action {
+            Some(text.clone())
+        } else if let Some(text) = value {
+            let (Some(before), Some(start), Some(end)) = (
+                p["value"].as_str(),
+                p["selectionStart"].as_u64(),
+                p["selectionEnd"].as_u64(),
+            ) else {
+                return Ok(InputOutcome::Unsupported(
+                    "input selection range is unavailable",
+                ));
+            };
+            let Some(result) = replacement_value(before, start, end, text) else {
+                return Ok(InputOutcome::Unsupported(
+                    "insertion splits an unsupported UTF-16 selection boundary",
+                ));
+            };
+            Some(result)
+        } else {
+            None
+        };
+        let insertion_text = match action {
+            InputAction::Insert(text) => Some(text.as_str()),
+            InputAction::PasteInternalClipboard => clipboard_text.as_deref(),
             _ => None,
         };
         let tag = p["tag"].as_str().unwrap_or_default();
@@ -415,7 +438,12 @@ impl super::BrowserConnection {
                     return Ok(InputOutcome::Stale("fill target could not be resolved"));
                 }
             }
-            InputAction::Insert(text) => {
+            InputAction::Insert(_) | InputAction::PasteInternalClipboard => {
+                let Some(text) = insertion_text else {
+                    return Ok(InputOutcome::Unsupported(
+                        "this session has no internal clipboard text",
+                    ));
+                };
                 if !self
                     .text_guard_matches(
                         sessions,
