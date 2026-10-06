@@ -98,6 +98,29 @@ fn serialized_len(value: &impl Serialize) -> Result<usize, BrowserError> {
         .map_err(|error| BrowserError::InvalidResponse(error.to_string()))
 }
 
+fn evaluate_value(response: &Value) -> Result<&Value, BrowserError> {
+    if response.get("exceptionDetails").is_some() {
+        return Err(BrowserError::InvalidResponse(format!(
+            "Runtime.evaluate threw: {}",
+            response["exceptionDetails"]
+        )));
+    }
+    response
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .ok_or_else(|| BrowserError::InvalidResponse("malformed Runtime.evaluate result".into()))
+}
+
+fn evaluate_object(response: &Value) -> Result<&Value, BrowserError> {
+    let value = evaluate_value(response)?;
+    if !value.is_object() {
+        return Err(BrowserError::InvalidResponse(
+            "Runtime.evaluate returned a non-object value".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn fit_observation(mut result: Observation, max_bytes: usize) -> Result<Observation, BrowserError> {
     let mut omitted = 0;
     while serialized_len(&result)? > max_bytes && !result.items.is_empty() {
@@ -226,22 +249,36 @@ impl BrowserConnection {
                 json!({"expression":script,"returnByValue":true,"awaitPromise":false}),
             )
             .await?;
-        if value["result"]["value"]["budgetError"] == true {
+        let value = evaluate_object(&value)?;
+        if value["budgetError"] == true {
             return Err(BrowserError::InvalidResponse(
                 "byte budget is too small for page observation metadata".into(),
             ));
         }
-        let items = value["result"]["value"]["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let total = value["result"]["value"]["count"].as_u64().unwrap_or(0) as usize;
+        let items = value["items"].as_array().cloned().ok_or_else(|| {
+            BrowserError::InvalidResponse("observation omitted items array".into())
+        })?;
+        if items.iter().any(|item| !item.is_object()) {
+            return Err(BrowserError::InvalidResponse(
+                "observation returned a non-object item".into(),
+            ));
+        }
+        let total = value["count"]
+            .as_u64()
+            .ok_or_else(|| BrowserError::InvalidResponse("observation omitted count".into()))?
+            as usize;
         let mut omissions = Vec::new();
-        let missing_fields = value["result"]["value"]["missing"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let clipped_fields = value["result"]["value"]["clipped"].as_u64().unwrap_or(0);
+        let missing_fields = value["missing"].as_array().cloned().ok_or_else(|| {
+            BrowserError::InvalidResponse("observation omitted missing array".into())
+        })?;
+        if missing_fields.iter().any(|field| !field.is_string()) {
+            return Err(BrowserError::InvalidResponse(
+                "observation returned a malformed missing field".into(),
+            ));
+        }
+        let clipped_fields = value["clipped"].as_u64().ok_or_else(|| {
+            BrowserError::InvalidResponse("observation omitted clipped count".into())
+        })?;
         if !missing_fields.is_empty() {
             omissions.push(format!(
                 "selected fields absent: {}",
@@ -257,7 +294,9 @@ impl BrowserConnection {
                 "{clipped_fields} field values were clipped to the text budget"
             ));
         }
-        let page_limited = value["result"]["value"]["limited"] == true;
+        let page_limited = value["limited"].as_bool().ok_or_else(|| {
+            BrowserError::InvalidResponse("observation omitted limited flag".into())
+        })?;
         if page_limited {
             omissions.push(
                 "observation stopped at a scan or byte limit; additional matches may be omitted"
@@ -335,7 +374,9 @@ impl BrowserConnection {
             sessions, reference, principal, revisions, "Runtime.evaluate",
             json!({"expression":account_marker_script(&spec.account_marker),"returnByValue":true,"awaitPromise":false}),
         ).await?;
-        let mut account_ok = account["result"]["value"] == true;
+        let mut account_ok = evaluate_value(&account)?.as_bool().ok_or_else(|| {
+            BrowserError::InvalidResponse("account evaluation was not boolean".into())
+        })?;
         if !account_ok {
             missing.insert(
                 "account marker absent or mismatched; destination identity is not verified".into(),
@@ -382,35 +423,63 @@ impl BrowserConnection {
                     json!({"expression":script,"returnByValue":true,"awaitPromise":false}),
                 )
                 .await?;
-            if response["result"]["value"]["budgetError"] == true {
+            let v = evaluate_object(&response)?;
+            if v["budgetError"] == true {
                 return Err(BrowserError::InvalidResponse(
                     "byte budget is too small for page extraction metadata".into(),
                 ));
             }
-            let v = &response["result"]["value"];
+            if let Some(error) = v.get("error")
+                && (!error.is_string() || v["account"].as_bool().is_none())
+            {
+                return Err(BrowserError::InvalidResponse(
+                    "extraction returned a malformed error result".into(),
+                ));
+            }
             if v["error"].as_str() == Some("container_missing") {
                 missing.insert("list container missing".into());
                 break;
             }
-            account_ok &= v["account"] == true;
+            let page_account_ok = v["account"].as_bool().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted account status".into())
+            })?;
+            account_ok &= page_account_ok;
             if !account_ok {
                 break;
             }
-            if let Some(fields) = v["missingFields"].as_array() {
-                for field in fields.iter().filter_map(Value::as_str) {
-                    missing.insert(format!("field missing: {field}"));
-                }
+            let fields = v["missingFields"].as_array().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted missingFields array".into())
+            })?;
+            if fields.iter().any(|field| !field.is_string()) {
+                return Err(BrowserError::InvalidResponse(
+                    "extraction returned a malformed missing field".into(),
+                ));
             }
-            if v["clipped"] == true {
+            for field in fields.iter().filter_map(Value::as_str) {
+                missing.insert(format!("field missing: {field}"));
+            }
+            if v["clipped"].as_bool().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted clipped flag".into())
+            })? {
                 missing.insert("one or more fields clipped by text budget".into());
                 truncated = true;
             }
-            if v["limited"] == true {
+            if v["limited"].as_bool().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted limited flag".into())
+            })? {
                 missing.insert("page result limited by record or byte budget".into());
                 truncated = true;
             }
             let before = rows.len();
-            for item in v["items"].as_array().into_iter().flatten() {
+            let items = v["items"].as_array().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted items array".into())
+            })?;
+            for item in items {
+                if !item.is_object() {
+                    return Err(BrowserError::InvalidResponse(
+                        "extraction returned a non-object record".into(),
+                    ));
+                }
                 let mut row = BTreeMap::new();
                 for key in spec.fields.keys() {
                     if let Some(value) = item[key].as_str() {
@@ -425,7 +494,9 @@ impl BrowserConnection {
                 rows.entry(id).or_insert(row);
             }
             let added = rows.len() > before;
-            let end = v["end"] == true;
+            let end = v["end"].as_bool().ok_or_else(|| {
+                BrowserError::InvalidResponse("extraction omitted terminal status".into())
+            })?;
             let expected_covered = spec.expected_count.is_some_and(|count| count == rows.len());
             stable_end = if end && !added && expected_covered {
                 stable_end + 1
@@ -512,6 +583,221 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mock_page_response(
+        evaluate_response: Value,
+    ) -> (
+        BrowserConnection,
+        SessionRegistry,
+        TargetRef,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"observe-tab","type":"page","url":"https://fixture.test/"}}}),
+                json!({"method":"Target.attachedToTarget","params":{"sessionId":"observe-session","targetInfo":{"targetId":"observe-tab","type":"page"}}}),
+                json!({"sessionId":"observe-session","method":"Page.frameNavigated","params":{"frame":{"id":"observe-frame","loaderId":"observe-load","url":"https://fixture.test/"}}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let message = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let request: Value = serde_json::from_str(&message.to_string()).unwrap();
+            socket.send(Message::Text(json!({"id":request["id"],"sessionId":"observe-session","result":evaluate_response}).to_string().into())).await.unwrap();
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut sessions = SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            ..Default::default()
+        });
+        let session = sessions
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: vec![],
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        sessions
+            .bind_session_to_browser(&session, connection.instance_id)
+            .unwrap();
+        let reference = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if connection
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .contains_key("observe-tab")
+                    && connection
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .contains_key("observe-frame")
+                {
+                    sessions
+                        .register_tab(
+                            &session.id,
+                            "observe-tab",
+                            crate::sessions::Ownership::Borrowed,
+                        )
+                        .unwrap();
+                    break connection
+                        .capture_target_ref(
+                            &sessions,
+                            &session,
+                            "observe-tab",
+                            "observe-frame",
+                            1,
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        (connection, sessions, reference, server)
+    }
+
+    fn observe_spec(selector: &str) -> ObserveSpec {
+        ObserveSpec {
+            selector: selector.into(),
+            fields: BTreeMap::from([("id".into(), ".id".into())]),
+            max_items: 10,
+            max_text_chars: 64,
+            max_bytes: 4096,
+            cursor: None,
+        }
+    }
+
+    fn extraction_spec() -> ExtractionSpec {
+        ExtractionSpec {
+            container: "#list".into(),
+            record: ".row".into(),
+            fields: BTreeMap::from([("id".into(), ".id".into())]),
+            id_field: "id".into(),
+            max_steps: 1,
+            max_records: 10,
+            max_text_chars: 64,
+            max_bytes: 4096,
+            expected_count: Some(0),
+            account_marker: Some(("#account".into(), "right".into())),
+            terminal_selector: Some("[data-end]".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_rejects_runtime_selector_exception() {
+        let (connection, sessions, reference, server) = mock_page_response(json!({
+            "exceptionDetails":{"text":"SyntaxError: Failed to execute 'querySelectorAll'"},
+            "result":{"type":"undefined"}
+        }))
+        .await;
+        let result = connection
+            .observe(
+                &sessions,
+                &reference,
+                "fixture-principal",
+                IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                &observe_spec("["),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::InvalidResponse(message)) if message.contains("Runtime.evaluate threw"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_rejects_malformed_value_but_accepts_empty_items() {
+        let (connection, sessions, reference, server) = mock_page_response(json!({
+            "result":{"type":"object","value":[]}
+        }))
+        .await;
+        let result = connection
+            .observe(
+                &sessions,
+                &reference,
+                "fixture-principal",
+                IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                &observe_spec(".row"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::InvalidResponse(message)) if message.contains("non-object"))
+        );
+        server.await.unwrap();
+
+        let (connection, sessions, reference, server) = mock_page_response(json!({
+            "result":{"type":"object","value":{"items":[],"count":0,"missing":[],"clipped":0,"limited":false}}
+        })).await;
+        let result = connection
+            .observe(
+                &sessions,
+                &reference,
+                "fixture-principal",
+                IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                &observe_spec(".row"),
+            )
+            .await
+            .unwrap();
+        assert!(result.items.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extraction_rejects_malformed_account_preflight_value() {
+        let (connection, sessions, reference, server) = mock_page_response(json!({
+            "result":{"type":"object","value":null}
+        }))
+        .await;
+        let result = connection
+            .extract(
+                &sessions,
+                &reference,
+                "fixture-principal",
+                IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                &extraction_spec(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::InvalidResponse(message)) if message.contains("not boolean"))
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn phase5_fixtures_require_identity_and_positive_terminal_evidence() {
