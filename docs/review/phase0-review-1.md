@@ -27,3 +27,16 @@ The initial review failed as recorded above. Focused corrective verification is 
 - Pass: `./scripts/check-dependencies.sh` — no banned Comptrol dependencies found.
 - Pass: `git diff --check` — no whitespace errors.
 - Node/npm checks ran on macOS 26 / Darwin 25.6 arm64 with Rust 1.99.0 available. These are local source/package checks only; no live Chrome qualification is implied.
+
+### Corrective rerun details
+
+Ran at 2026-10-06 11:25–11:26 UTC on macOS 26 / Darwin 25.6 arm64:
+
+- `/Users/pcg/.cargo/bin/cargo fmt --all -- --check && /Users/pcg/.cargo/bin/cargo clippy --workspace --all-targets --locked -- -D warnings && /Users/pcg/.cargo/bin/cargo test --workspace --locked` — exit 0; 22 tests passed, no failures or doc tests.
+- With Node 24.19.0 and npm 11.17.0 on PATH: `npm ci --ignore-scripts && npm run check:docs && npm ls --package-lock-only --depth=0` — exit 0; 2 packages installed, 0 audit vulnerabilities, 11 Markdown files checked, Playwright 1.63.0 resolved.
+- With pinned Node 24.19.0: `npm run check:provenance` — exit 0; all 13 destination digests and all 22 retained test names matched the manifest; upstream digests were also verified because the sibling source checkout is available.
+- `./scripts/check-dependencies.sh && ./scripts/package-check.sh && git diff --check && git diff --cached --check` — exit 0; no prohibited dependency, package contents include LICENSE and NOTICE plus only the browser crate, and no whitespace errors.
+
+The initial docs-link run exited 1 because the review report referenced its own file before it existed; creating the report made the check pass. The initial package-list run exited 101 because the working tree was uncommitted; the package check now passes with `--allow-dirty` and still checks exact package contents. Both failures and their corrections are retained here.
+
+No Rust CI job or Windows/macOS/Linux hosted CI run has been triggered. The local Rust/package tests are not live Chrome qualification. The build commit remains intentionally pending until scoped review passes.

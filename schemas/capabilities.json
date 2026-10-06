@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Chrome Controlla capability decision",
+  "type": "object",
+  "required": ["action", "supported", "configured", "reachable", "authorized", "qualified", "reason", "policy_revision", "capability_revision", "provider_source"],
+  "properties": {
+    "action": {"type": "string"},
+    "supported": {"type": "boolean"},
+    "configured": {"type": "boolean"},
+    "reachable": {"type": "boolean"},
+    "authorized": {"type": "boolean"},
+    "qualified": {"type": "boolean"},
+    "reason": {"enum": ["Ready", "UnsupportedAction", "NotConfigured", "Unreachable", "AuthenticationRequired", "StaleHeartbeat", "PolicyDenied", "GrantRevoked"]},
+    "route": {"enum": ["Direct", "Bridge", null]},
+    "policy_revision": {"type": "integer", "minimum": 0},
+    "capability_revision": {"type": "integer", "minimum": 0},
+    "provider_source": {"enum": ["Fixture"]}
+  }
+}

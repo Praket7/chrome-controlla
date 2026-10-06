@@ -20,14 +20,14 @@ Evidence labels: `source_observed`, `fixture_verified`, `live_verified`, `benchm
 
 ## Requirement status
 
-Phase 0 establishes the repository only. Every CC/B item remains unimplemented until its owning phase supplies evidence. Corrective docs/package/dependency checks pass on pinned Node 24.19.0/npm 11.17.0; Sol approved the corrective review and final CI npm pin. Node 26.7.0/npm 11.19.0 were observed in the login shell but were not used to claim pinned-runtime verification. Hosted three-OS CI remains pending the first push.
+Phase 0 establishes the repository only. CC/B statuses below reflect evidence from their owning phases. Corrective docs/package/dependency checks pass on pinned Node 24.19.0/npm 11.17.0; Sol approved the corrective review and final CI npm pin. Hosted CI run [37456380443](https://github.com/Praket7/chrome-controlla/actions/runs/37456380443) passed on macOS, Linux, and Windows for commit `10f1aa7`.
 
 | ID | Status | Owning phase | Evidence |
 |---|---|---:|---|
-| CC-01 | unimplemented | 1 | none |
-| CC-02 | unimplemented | 1 | none |
-| CC-03 | unimplemented | 1 | none |
-| CC-04 | unimplemented | 1 | none |
+| CC-01 | fixture_verified | 1 | `controlla-runtime` evaluator parity tests; no live routes |
+| CC-02 | fixture_verified | 1 | open-stdin help/no-state and invalid-flag CLI tests |
+| CC-03 | partial | 1 | doctor schema, local PID and loopback fixture probes; no live daemon or service |
+| CC-04 | fixture_verified | 1 | packed darwin/arm64 npm archive clean-prefix install, spaces and empty PATH; other OS package jobs pending |
 | CC-05 | unimplemented | 3 | none |
 | CC-06 | unimplemented | 3 | none |
 | CC-07 | unimplemented | 3 | none |
@@ -48,10 +48,10 @@ Phase 0 establishes the repository only. Every CC/B item remains unimplemented u
 | CC-22 | unimplemented | 11 | none |
 | CC-23 | unimplemented | 6 | none |
 | CC-24 | unimplemented | 12 | none |
-| B01 | unimplemented | 1 | none |
-| B02 | unimplemented | 1 | none |
-| B03 | unimplemented | 1 | none |
-| B04 | unimplemented | 1 | none |
+| B01 | fixture_verified | 1 | direct-only/bridge-only evaluator fixture, catalog and dispatch decisions match |
+| B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
+| B03 | fixture_verified | 1 | help exits with stdin held open; state path remains absent |
+| B04 | partial | 1 | stale/fresh heartbeat is separated from local PID and authenticated loopback mock-service probes; no production service is available |
 | B05 | unimplemented | 3 | none |
 | B06 | unimplemented | 3 | none |
 | B07 | unimplemented | 3 | none |
@@ -84,3 +84,28 @@ Phase 0 establishes the repository only. Every CC/B item remains unimplemented u
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
 | B36 | unimplemented | 4 | none |
+
+## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
+
+| Command | Result | Environment | Evidence |
+|---|---|---|---|
+| `/Users/pcg/.cargo/bin/cargo fmt --all -- --check && /Users/pcg/.cargo/bin/cargo clippy --workspace --all-targets --locked -- -D warnings && /Users/pcg/.cargo/bin/cargo test --workspace --locked` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 22 unit tests passed; 0 failed; 0 doc tests; `docs/review/phase0-review-1.md` |
+| `PATH=/Users/pcg/.nvm/versions/node/v24.19.0/bin:$PATH node --version && ... npm --version && ... npm ci --ignore-scripts && ... npm run check:docs && ... npm ls --package-lock-only --depth=0` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Node 24.19.0, npm 11.17.0 | versions matched pins; 2 packages installed; 0 vulnerabilities; 11 Markdown files checked; Playwright 1.63.0 locked; `docs/review/phase0-review-1.md` |
+| `npm run check:provenance` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Node 24.19.0 | 13 destination digests and 22 retained tests verified; optional upstream source hashes checked because source checkout is present; `docs/review/phase0-review-1.md` |
+| `./scripts/check-dependencies.sh && ./scripts/package-check.sh && git diff --check && git diff --cached --check` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | package list has LICENSE/NOTICE and four browser source files; banned dependency paths absent; no whitespace errors; `docs/review/phase0-review-1.md` |
+
+The first package-list attempt before adding `--allow-dirty` exited 101 because Cargo refuses packaging an uncommitted tree. The corrected check passes without requiring a commit and keeps that earlier failure visible. CI runs both scripts on all configured runners, including Windows via Bash. Hosted CI run [37456380443](https://github.com/Praket7/chrome-controlla/actions/runs/37456380443) passed on all three configured operating systems for Phase 0 commit `10f1aa7`.
+
+## Phase 1 local acceptance
+
+Evidence is fixture/local only. Capability route values are test inputs, not observed browser connections. No daemon, MCP transport, authenticated principal, browser effect, or live client is implemented in this phase.
+
+| Command | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 35 tests passed (22 browser, 2 runtime unit, 8 CLI/doctor, 3 registry); no Clippy warnings; formatting clean |
+| `./scripts/check-dependencies.sh && ./scripts/package-build.sh && ./scripts/package-check.sh` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0, Node 26.7.0/npm 11.19.0 | no prohibited dependencies; Cargo runtime package contains 14 files including LICENSE/NOTICE; npm archive is labeled darwin/arm64, includes LICENSE/NOTICE, installs in a clean prefix with spaces, and runs with empty PATH through its package-local binary |
+| `npm run check:docs && npm run check:provenance && git diff --check` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Node 26.7.0/npm 11.19.0 | 11 Markdown files checked; 13 provenance digests and 22 retained tests verified; whitespace clean |
+| `cargo test -p controlla-runtime --locked --offline` | pass (exit 0) | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | doctor distinguishes invalid config, live local PID, dead PID and loopback fixture health; open-stdin help is bounded at 1s; Windows unsupported PID probe expects `Unknown` |
+| Red-first test evidence | not recorded | Phase 1 implementation history | No pre-implementation failing run is claimed; the current tests verify the resulting behaviors only |
+
+The npm artifact built here is specifically for darwin/arm64. The generated package metadata constrains OS and CPU so npm rejects installation on unsupported hosts; Linux and Windows package installs remain pending hosted Phase 1 CI. Doctor transport/authentication uses loopback fixture services; no live daemon, browser, client, or production dispatch handler exists. The first Sol Phase 1 review was not approved; findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Phase 1 is committed as `c6ad8d1`; push and hosted CI are pending.

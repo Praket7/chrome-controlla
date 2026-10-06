@@ -1,8 +1,8 @@
 # Chrome Controlla
 
-Chrome Controlla is a separate Chrome-only project derived selectively from Comptrol. This repository is at **Phase 0: source extraction and build baseline**. It is not yet a usable browser MCP, and no client, app, mode, or performance claim has been qualified.
+Chrome Controlla is a separate Chrome-only project derived selectively from Comptrol. Phase 1 adds a shared capability-decision library, a side-effect-free CLI, a diagnostic report, and a package-relative launcher. It is **not yet a browser MCP**: no Chrome dispatch service, client, app, mode, or live transport has been qualified.
 
-The initial workspace contains only the upstream browser crate, renamed `controlla-browser`, plus the four controlling design documents. Source provenance and exact imported paths are recorded in [`provenance/extraction.json`](provenance/extraction.json). See [`docs/progress.md`](docs/progress.md) for phase status.
+The initial extraction retained the upstream browser crate, renamed `controlla-browser`, plus the four controlling design documents. Phase 1 adds the independent `controlla-runtime` crate and package launcher. Source provenance and exact imported paths are recorded in [`provenance/extraction.json`](provenance/extraction.json). See [`docs/progress.md`](docs/progress.md) for phase status.
 
 ## Build
 
@@ -17,4 +17,8 @@ cargo test --workspace --locked
 npm run check:docs
 ```
 
-These checks cover the extracted crate only; they do not establish live Chrome behavior.
+Build the local executable with `./scripts/package-build.sh`; `./scripts/package-check.sh` packs it, installs the archive into a clean temporary prefix whose path contains spaces, and runs the installed command. The npm launcher resolves only its package-sibling platform binary and does not invoke global Comptrol. This package contains a CLI and capability decision layer, not an MCP/browser controller.
+
+Each staged npm archive is restricted to its build host's OS and CPU architecture. Build and verify a separate archive on every release-matrix cell; there is no universal or cross-compiled archive. The current local package evidence covers macOS arm64 only.
+
+Doctor reads the strict configuration shape in [`schemas/doctor-config.json`](schemas/doctor-config.json) from `<state-dir>/runtime.json` (default: `~/.chrome-controlla/runtime.json`; override with `--state-dir DIR` or `CONTROLLA_STATE_DIR`). It probes the configured local PID and loopback-only authenticated `/health` endpoint; heartbeat state, process liveness, transport, authentication and round-trip are separate. The bearer token is never printed, and the returned principal is shown only as a short SHA-256 correlation. Health fixture tests use a local mock service; this repository does not yet ship that service or qualify a live browser route. On operating systems without the local PID probe, doctor reports process state as unknown.

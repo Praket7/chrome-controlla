@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+package_dir=$(CDPATH= cd -- "${0%/*}/.." && pwd -P)
+exec "$package_dir/bin/controlla-core" "$@"

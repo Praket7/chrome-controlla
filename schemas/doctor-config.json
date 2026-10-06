@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Chrome Controlla local doctor configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "service_pid", "loopback_addr", "bearer_token", "principal_id", "heartbeat_unix_seconds", "heartbeat_max_age_seconds", "policy_revision"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "service_pid": {"type": "integer", "minimum": 1},
+    "loopback_addr": {"type": "string", "description": "Socket address whose IP must be 127.0.0.1 or ::1."},
+    "bearer_token": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._~+/-]+=*$"},
+    "principal_id": {"type": "string", "minLength": 1},
+    "heartbeat_unix_seconds": {"type": "integer", "minimum": 0},
+    "heartbeat_max_age_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    "policy_revision": {"type": "integer", "minimum": 0}
+  }
+}

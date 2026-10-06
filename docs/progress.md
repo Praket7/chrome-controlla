@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phase 0 gate approved and ready for its focused commit; implementation phases remain open. This file is append/update oriented: preserve failed and blocked evidence when resuming.
+Status: Phase 0 and Phase 1 are committed locally; Phase 0 is pushed and hosted CI passed. Phase 1 passed Sol review for local/fixture scope and is committed as `c6ad8d1`; its push and hosted CI are pending. Preserve failed and blocked evidence when resuming.
 
 ## Phase 0 — source extraction and baseline
 
@@ -15,8 +15,16 @@ Status: Phase 0 gate approved and ready for its focused commit; implementation p
 
 ## Review record
 
-- Review 1: not approved; corrections and pinned-toolchain checks are recorded in [Phase 0 review 1](review/phase0-review-1.md). Sol re-review approved Phase 0 on 2026-10-06 after independently checking package, docs, dependency, provenance, and Rust gates. The final npm pin in CI was re-reviewed and approved; three-OS CI will run after push.
+- Review 1: not approved; corrections and pinned-toolchain checks are recorded in [Phase 0 review 1](review/phase0-review-1.md). Sol re-review approved Phase 0 on 2026-10-06 after independently checking package, docs, dependency, provenance, and Rust gates. The final npm pin in CI was re-reviewed and approved. Commit `10f1aa7` is pushed to the private repository; hosted CI run `37456380443` passed on macOS, Linux, and Windows.
 
 ## Remaining phases
 
-Phases 1–12 are not started. Completion status is tracked by CC-01–CC-24 and B01–B36 in `verification-matrix.md`; no later-phase work is implied by this extraction.
+### Phase 1 — capability evaluator, CLI and package launcher
+
+- [x] Add a single evaluator consumed by capability listing and dispatch authorization; include policy and capability revisions.
+- [x] Add side-effect-free Rust CLI parsing/help/schema, invalid-flag exit code 2, and conservative JSON doctor report.
+- [x] Add a package-relative launcher and host/architecture-bound npm archive with Apache license and NOTICE; clean-prefix install with spaces and restricted PATH verified on macOS arm64.
+- [x] Add direct-only, bridge-only, unconfigured, denied, revoked, bounded dispatch/revocation, global/subcommand open-stdin help, doctor health-separation and launcher tests.
+- [ ] Live transport/process/authentication round trip and client/browser dispatch remain unavailable: no service or browser runtime exists yet.
+
+The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Local checks pass with 35 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2–12 remain unstarted; no live browser capability is implied.

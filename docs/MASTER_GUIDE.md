@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: design draft 1, 2026-10-06. **This is the guide to implement and ship. Chrome Controlla and the tool examples below are proposed, not currently installed or live-tested.** The implementation must generate exact argument schemas and executable examples from its capability registry before releasing this guide as operational documentation.
+Version: design draft 1, 2026-10-06. **Phase 1 now ships a local capability evaluator, CLI and launcher only. The MCP/browser workflows below remain proposed, not implemented or live-tested.** The implementation must generate exact argument schemas and executable examples from its capability registry before releasing this guide as operational documentation.
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
