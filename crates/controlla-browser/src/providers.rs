@@ -1728,6 +1728,253 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
+    async fn real_chrome_extracts_virtualized_phase5_fixture_and_guards_wrong_account() {
+        use crate::{
+            observe::{Completeness, ExtractionSpec},
+            sessions::{CleanupObservation, IndependentTargetObserver, ProviderGrants},
+        };
+        use std::collections::BTreeMap;
+
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let html = r#"<!doctype html><meta charset="utf-8">
+<div id="account">fixture-account</div>
+<div id="list"><div id="spacer"></div><div id="rows"></div></div>
+<script>
+const list=document.querySelector('#list'),rows=document.querySelector('#rows');
+list.style.cssText='height:240px;overflow:auto;position:relative';
+document.querySelector('#spacer').style.height='1680px';
+const render=()=>{const first=Math.min(34,Math.floor(list.scrollTop/40));rows.replaceChildren();
+for(let i=first;i<Math.min(42,first+8);i++){const r=document.createElement('div');r.className='record';
+r.style.cssText='position:absolute;top:'+(i*40)+'px;height:40px';
+r.innerHTML='<span class="id">item-'+String(i+1).padStart(2,'0')+'</span><span class="label">record '+(i+1)+'</span>';rows.append(r)}
+list.querySelector('.terminal')?.remove();
+if(list.scrollTop+list.clientHeight>=list.scrollHeight-2){const end=document.createElement('span');end.className='terminal';end.style.cssText='position:absolute;bottom:0';end.textContent='end';list.append(end)}};
+list.addEventListener('scroll',render);render();
+</script>"#;
+        let encoded = html
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect::<String>();
+        let provider = DedicatedChromeProvider::new(executable);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "real-chrome-phase5-fixture",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(&mut registry, &handle, &format!("data:text/html,{encoded}"))
+            .await
+            .unwrap();
+        // Drop always kills the isolated child and removes its profile after a failed assertion.
+        session.process.preserve_on_drop = false;
+        let (_, targets) = session.connection().target_snapshot().await;
+        let target = targets
+            .iter()
+            .find(|target| target.id == session.target_id())
+            .unwrap();
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let target_now = session
+                    .connection()
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .get(&target.id)
+                    .cloned();
+                if let Some(target_now) = target_now
+                    && let Ok(ready) = session
+                        .connection()
+                        .target_command(
+                            &target.id,
+                            target_now.generation,
+                            &target_now.revision,
+                            "Runtime.evaluate",
+                            json!({"expression":"!!document.querySelector('#list .record')","returnByValue":true}),
+                        )
+                        .await
+                    && ready["result"]["value"] == true
+                    && let Some(frame) = session
+                        .connection()
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .values()
+                        .find(|frame| frame.target_id == target.id)
+                {
+                    break frame.id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("virtualized fixture did not load");
+        let reference = session
+            .connection()
+            .capture_target_ref(&registry, &handle, &target.id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+        let revisions = crate::sessions::IdentityRevisions {
+            account: 1,
+            document: 1,
+        };
+        let spec = ExtractionSpec {
+            container: "#list".into(),
+            record: ".record".into(),
+            fields: BTreeMap::from([
+                ("id".into(), ".id".into()),
+                ("label".into(), ".label".into()),
+            ]),
+            id_field: "id".into(),
+            max_steps: 40,
+            max_records: 100,
+            max_text_chars: 100,
+            max_bytes: 64 * 1024,
+            expected_count: Some(42),
+            account_marker: Some(("#account".into(), "fixture-account".into())),
+            terminal_selector: Some(".terminal".into()),
+        };
+        let extraction_started = std::time::Instant::now();
+        let result = session
+            .connection()
+            .extract(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                &spec,
+            )
+            .await;
+        let extraction_elapsed = extraction_started.elapsed();
+        let result = result.unwrap();
+        assert_eq!(result.unique_count, 42, "{result:?}");
+        assert_eq!(result.records.len(), 42);
+        assert_eq!(result.completeness, Completeness::Complete, "{result:?}");
+        assert_eq!(result.expected_count, Some(42));
+        assert!(!result.terminal_evidence.is_empty());
+        let ids = result
+            .records
+            .iter()
+            .map(|record| record["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 42);
+
+        let baseline_started = std::time::Instant::now();
+        let baseline = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"({html:document.documentElement.outerHTML,text:document.body.innerText})","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        let baseline_elapsed = baseline_started.elapsed();
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+        let extraction_bytes = serde_json::to_vec(&result).unwrap().len();
+        println!(
+            "synthetic Chrome extraction diagnostic: extraction_elapsed_ms={} extraction_result_bytes={} full_dom_snapshot_elapsed_ms={} full_dom_snapshot_response_bytes={baseline_bytes}",
+            extraction_elapsed.as_secs_f64() * 1000.0,
+            extraction_bytes,
+            baseline_elapsed.as_secs_f64() * 1000.0
+        );
+
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"(()=>{const l=document.querySelector('#list');l.scrollTop=80;document.querySelector('#account').textContent='wrong-account';return new Promise(r=>requestAnimationFrame(()=>r(l.scrollTop)))})()","returnByValue":true,"awaitPromise":true}),
+            )
+            .await
+            .unwrap();
+        let before = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"document.querySelector('#list').scrollTop","returnByValue":true}),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .as_f64()
+            .unwrap();
+        let wrong_account = session
+            .connection()
+            .extract(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                &spec,
+            )
+            .await
+            .unwrap();
+        let after = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"document.querySelector('#list').scrollTop","returnByValue":true}),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(wrong_account.completeness, Completeness::Unknown);
+        assert_eq!(wrong_account.unique_count, 0);
+        assert_eq!(before, after, "wrong-account extraction scrolled the list");
+
+        struct OwnedTargetObserver;
+        impl IndependentTargetObserver for OwnedTargetObserver {
+            fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let profile = session.profile_directory().to_owned();
+        let outcome = session
+            .shutdown(&mut registry, Some(&OwnedTargetObserver))
+            .await;
+        assert!(
+            outcome.cleanup_error.is_none(),
+            "{:?}",
+            outcome.cleanup_error
+        );
+        assert!(outcome.recovery.is_none());
+        assert!(!profile.exists(), "isolated profile remained: {profile:?}");
+    }
+
     #[tokio::test]
     async fn dedicated_provider_rejects_shared_extension_session_before_launch() {
         let mut registry = SessionRegistry::new(crate::sessions::ProviderGrants {
