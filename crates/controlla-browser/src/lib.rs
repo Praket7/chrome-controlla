@@ -3,6 +3,7 @@
 mod blocking;
 mod input;
 mod manager;
+pub mod native;
 mod observe;
 pub mod providers;
 pub mod scheduler;

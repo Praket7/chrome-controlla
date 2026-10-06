@@ -1640,6 +1640,7 @@ mod tests {
             requires_native: false,
         };
         let locator = crate::input::SemanticLocator::Css("#field".into());
+        let native_before = crate::native::NativeSnapshot::capture().unwrap();
         let fill = crate::input::InputAction::Fill("héllo 👋".into());
         let filled = session
             .connection()
@@ -1664,6 +1665,17 @@ mod tests {
         assert!(
             matches!(filled,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋")
         );
+        let native_after = crate::native::NativeSnapshot::capture().unwrap();
+        assert_eq!(
+            native_before.frontmost_bundle_id,
+            native_after.frontmost_bundle_id
+        );
+        assert_eq!(
+            native_before.pasteboard_change_count,
+            native_after.pasteboard_change_count
+        );
+        assert_eq!(native_before.cursor_x, native_after.cursor_x);
+        assert_eq!(native_before.cursor_y, native_after.cursor_y);
         session.connection().target_ref_command(&registry,&reference,"real-chrome-fixture",crate::sessions::IdentityRevisions{account:1,document:1},"Runtime.evaluate",json!({"expression":"(()=>{const e=document.querySelector('#field');e.setSelectionRange(e.value.length,e.value.length);return e.selectionStart})()","returnByValue":true})).await.unwrap();
         let insert = crate::input::InputAction::Insert("λ".into());
         let inserted = session
