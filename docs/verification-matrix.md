@@ -31,14 +31,14 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-05 | fixture_verified | 3 | SQLite journal enforces principal/session/key uniqueness, canonical request conflict, concurrent admission and one-time dispatch claim; independent fixture endpoint count stays one across replay/lost reply; unknown stays terminal |
 | CC-06 | unimplemented | 3 | none |
 | CC-07 | partial | 3 | bounded wait and durable state tested with local async fixture; no Promise/CDP/bridge worker route or reconnecting MCP client |
-| CC-08 | unimplemented | 5 | none |
+| CC-08 | partial | 5 | stable-ID dedup/completeness policy fixture only; no Chrome extraction result |
 | CC-09 | partial | 2/4 | target/frame/browser revisions and stale-handle fixtures pass; Phase 4 guard compares caller-supplied identity/dependency snapshots; no authoritative app identity observer |
 | CC-10 | partial | 4 | fill checks the live value in the same page evaluation that writes; insert and every sequential key event refresh value/focus before each CDP send; navigation race fixture withholds the fill. CDP/page handlers/server effects remain non-atomic |
 | CC-11 | partial | 4 | strict-background mouse input returns `NeedsForeground`; text uses page/CDP-only routes. No OS focus/cursor/clipboard observer, so native isolation remains unverified |
 | CC-12 | partial | 4 | revision-bound CDP fill/insert/sequential-key commands, exact locator matching, text readback, click and drag with declared predicates tested against websocket fixtures; installed Chrome 154 headless verifies ordinary input fill/insert/ASCII keys and value/caret readback; masks, IME/contenteditable, overlays, real drag/canvas remain unqualified |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
 | CC-14 | unimplemented | 6 | none |
-| CC-15 | unimplemented | 5 | none |
+| CC-15 | partial | 5 | revision-bound bounded DOM observation API and policy fixtures; no MCP observe tool, AX/crop route, or live DOM extraction qualification |
 | CC-16 | unimplemented | 7 | none |
 | CC-17 | unimplemented | 9 | none |
 | CC-18 | unimplemented | 9 | none |
@@ -61,10 +61,10 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B11 | partial | 4 | unchanged dependency snapshot permits continuation; no semantic DOM churn observer or sound unrelated-change exclusion evidence |
 | B12 | partial | 4 | click/drag check fresh element geometry and hit target at source/destination points; mock CDP fixture does not evaluate real overlay interception |
 | B13 | fixture_verified | 2 | frame navigation/revision and OOPIF replacement fixtures |
-| B14 | unimplemented | 5 | none |
-| B15 | unimplemented | 5 | none |
-| B16 | unimplemented | 5 | none |
-| B17 | unimplemented | 5 | none |
+| B14 | partial | 5 | fixture models 42 unique IDs across recycled 8-node batches; policy/dedup test passes, no real virtualized DOM run |
+| B15 | partial | 5 | blocked-expansion fixture requires partial; section traversal remains caller-directed and unqualified in Chrome |
+| B16 | partial | 5 | stale-count fixture requires partial; count is metadata and never sufficient for complete |
+| B17 | partial | 5 | infinite-feed fixture without explicit terminal marker requires partial; bounded traversal implemented, not live-qualified |
 | B18 | partial | 3 | local async job finishes after short caller wait; exact 12-second Promise/CDP/bridge path is absent |
 | B19 | partial | 3 | persisted deadline survives reopen; queued expiry is failed/deadline_error/not_sent; dispatched expiry is unknown while preserving acknowledged sent or unacknowledged unknown delivery; real Promise and worker cancellation route remain absent |
 | B20 | fixture_verified | 2 | a blocked target does not prevent independent target scheduling |
@@ -232,3 +232,13 @@ This entry records the initial guard-only commit and is superseded by the Phase 
 Text dispatch supports ordinary input and textarea controls only; sequential typing is printable ASCII only. IME and masked/contenteditable/event-dependent inputs remain unqualified. Click/drag require explicit predicates; drag verifies final DOM bounding-box coordinates only. Canvas object movement is unqualified. Check and remote effect are still non-atomic: navigation is observed in the fixture before the mutation request, but a page-side event or remote state change can happen after the last local reference check and before/while Chrome processes the request. Native OS focus/cursor/clipboard isolation is not claimed.
 
 | `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome 154.0.8037.98 | Isolated headless Chrome opened a local `data:` input fixture; guarded fill, insert, and sequential ASCII key dispatch all reported verified readback. Final DOM value `héllo 👋λa`; `selectionStart=10` UTF-16 code units. The ignored test disables preserve-on-drop for failure cleanup and shuts down the isolated profile explicitly on success. This covers ordinary `<input type=text>` only. |
+
+## Phase 5 local library gate — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --lib observe::tests --locked --offline` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Two tests pass: policy fixture table for virtualized 42/recycled 8 nodes, separate bucket, blocked expansion, duplicate labels, stale count, infinite feed and wrong-account 404; overlapping recycled-ID batches deduplicate to 42. These are model/policy fixtures, not browser DOM runs. |
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Format and warning-free Clippy; 73 browser unit tests passed, 1 ignored; integration groups 7, 3, 8, 10, and 3 passed. |
+| `npm run check:provenance && node scripts/check-doc-links.mjs && npm run check:docs && ./scripts/check-dependencies.sh` | pass after digest update | macOS 26 / Node 24.19.0 / npm 11.17.0 | Phase 5 edits and `lib.rs` export are recorded in provenance; Markdown links checked. |
+
+No extraction call was run against Chrome. No payload/latency baseline, AX/screenshot observation, MCP observe tool, or resumable cursor is verified. Matrix rows CC-08/15 and B14–17 remain partial.

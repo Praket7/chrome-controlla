@@ -3,6 +3,7 @@
 mod blocking;
 mod input;
 mod manager;
+mod observe;
 pub mod providers;
 pub mod scheduler;
 mod session;
@@ -14,6 +15,7 @@ pub use input::{
     SemanticLocator, on_external_change, validate_step,
 };
 pub use manager::BrowserManager;
+pub use observe::{Completeness, ExtractionResult, ExtractionSpec, Observation, ObserveSpec};
 pub use session::{
     BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,
     connect_permissioned_auto_connect, list_sessions, select_provider,

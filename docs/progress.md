@@ -63,3 +63,13 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [ ] Qualify native focus/cursor/clipboard behavior with an independent observer.
 
 The supported-control code path includes the final fill-side value comparison and per-CDP-send value/focus checks for insert and sequential keys. These narrow the race window; page handlers, Chrome processing, and server effects are not atomic. Focused mock coverage passes; the real Chrome DOM readback predates this follow-up. The broader Phase 4 acceptance gate remains partial: application identity/edit observers, qualified masks/contenteditable/IME/event-dependent controls, real overlay/drag/canvas outcomes, repeated adversarial interference, and native focus/cursor/clipboard observation remain open.
+
+### Phase 5 — compact observations and bounded extraction
+
+- [x] Add revision-bound `BrowserConnection::observe` with selected CSS fields, item/text/byte limits, freshness timestamp/epoch, explicit missing-field/item omissions, truncation, and informational non-resumable cursor metadata.
+- [x] Add bounded scroll-container extraction with selected field schema, stable-ID deduplication, step/record/text/byte limits, progress cursor, missing coverage and terminal evidence. Completion requires a matching account marker and a positive site terminal marker observed at scroll end twice without new IDs. Count matches and repeated no-change scrolling alone cannot certify completion.
+- [x] Add policy fixtures for 42 records across recycled eight-node batches, a separate 21-item bucket, blocked expansion, duplicate labels with distinct IDs, stale count, infinite feed without terminal marker, and wrong-account 404. Fixture policy and dedup tests pass.
+- [ ] Run the extraction API against real Chrome virtualized and hidden-section DOM fixtures; current Phase 5 fixtures model expected evidence and ID recycling but do not exercise CDP/DOM traversal.
+- [ ] Add the MCP `observe` tool and adapter-level pagination/section traversal, AX and visual crop routes. Current extraction takes one caller-selected container per call; cursors are explicitly not resumable.
+
+Local verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.99.0: focused observation tests pass (2); `cargo fmt --all -- --check`, workspace Clippy with warnings denied, and full workspace tests pass (73 browser unit tests passed, 1 ignored; integration groups 7, 3, 8, 10, and 3 passed). No live extraction, payload/latency baseline, MCP tool, or complete Phase 5 gate is claimed.

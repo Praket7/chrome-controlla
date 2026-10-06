@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: design draft 1, 2026-10-06. **Phase 1 now ships a local capability evaluator, CLI and launcher only. The MCP/browser workflows below remain proposed, not implemented or live-tested.** The implementation must generate exact argument schemas and executable examples from its capability registry before releasing this guide as operational documentation.
+Version: design draft 1, 2026-10-06. **Phases 1–5 currently provide the local capability evaluator/CLI/launcher and Rust browser primitives, including bounded DOM observation and extraction. No MCP browser tools are implemented, and extraction has not been qualified against a real DOM.** The implementation must generate exact argument schemas and executable examples from its capability registry before releasing this guide as operational documentation.
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -109,6 +109,10 @@ The internal clipboard is isolated task data. It is not the operating-system cli
 Ask for named fields and a schema. Keep intermediate parsing/deduplication inside the runtime and use artifact output for large results. Every collection reports source, filters, unique records, expected count if meaningful, terminal cursor/end condition, missing sections and completeness.
 
 For a virtualized page, collect stable IDs while expanding and scrolling the correct container. Recycled DOM rows are not new item identities. A bucket count of 42 and eight rendered rows means only eight rows have been observed. Do not claim all 42 until traversal and coverage evidence support that claim.
+
+The current Rust library has revision-bound `BrowserConnection::observe` and `BrowserConnection::extract` methods; there is not yet an MCP `observe` tool. `observe` accepts a selected CSS subtree/field map and reports the target/frame freshness epoch, observation time, missing fields, item/byte truncation, and an informational cursor. `extract` takes one caller-selected scroll container and a schema whose ID field must be stable across recycled rows. It applies fixed step, record, text and byte limits. Cursors are not resumable, and sibling sections must be selected and traversed by the caller.
+
+An extraction is `complete` only when the expected account marker matches and the caller-supplied site's terminal marker remains present at the scroll end across two observations with no new stable IDs. A matching count, scrollbar bottom, or repeated rows without that explicit terminal signal is insufficient. Missing or mismatched account identity is `unknown`; blocked expansion, stale count, or exhausted limits are partial when records were found. Current fixtures test these classification rules and deduplication, not a real Chrome DOM traversal. The MCP tool, AX/screenshot observation, live virtualized fixtures, and resumable pagination remain unimplemented.
 
 If expansion is blocked or the deadline arrives, return the rows obtained with `partial`, not an empty success or a guessed full list. If the site offers no reliable end condition, say coverage is unknown.
 

@@ -14,8 +14,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "21c57248875544cae53a0e27c6e8d787e5620ea7a40e51c0fb077e8714380ba1",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates",
+      "destination_sha256": "10674c69c04d61d21974cd2a8412e65bfcbb452274985b8aa2e02baaa963e4fd",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -110,8 +110,8 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "d3459d8bca0e1f5ef2425edc3ebbe41f2b7a9887f4088dd1669022b2e9a2783c",
-      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows",
+      "destination_sha256": "dea572a96afd88c3a27c24783be7d362e9d91d1d5e493f36a2a7bb91fb883252",
+      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows; Phase 5 documents the bounded Rust observation/extraction library and unqualified live/MCP boundaries",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],
