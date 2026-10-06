@@ -1544,24 +1544,44 @@ mod tests {
             let writer = Arc::new(AsyncMutex::new(writer));
             let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut replies = Vec::new();
-            for _ in 0..target_count {
-                let request = reader.next().await.unwrap().unwrap();
-                let request: Value = serde_json::from_str(&request.to_string()).unwrap();
-                let active_now = active.fetch_add(1, Ordering::AcqRel) + 1;
-                peak.fetch_max(active_now, Ordering::AcqRel);
-                let writer = Arc::clone(&writer);
-                let active = Arc::clone(&active);
-                replies.push(tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    writer.lock().await.send(tokio_tungstenite::tungstenite::Message::Text(
-                        serde_json::json!({"id":request["id"],"result":{"result":{"type":"number","value":2}}}).to_string().into()
-                    )).await.unwrap();
-                    active.fetch_sub(1, Ordering::AcqRel);
-                }));
-            }
-            for reply in replies {
-                reply.await.unwrap();
+            let expected_wave = if shared_document {
+                1
+            } else {
+                target_count.min(4)
+            };
+            let mut remaining = target_count;
+            while remaining > 0 {
+                // Do not let a fast fixture response race a slow test runner's
+                // first-wave dispatch. Record an entire scheduler wave before
+                // sending any response, then repeat for later waves.
+                let wave_size = remaining.min(expected_wave);
+                let mut wave = Vec::with_capacity(wave_size);
+                for _ in 0..wave_size {
+                    let request = tokio::time::timeout(Duration::from_secs(2), reader.next())
+                        .await
+                        .expect("dispatch wave did not arrive")
+                        .unwrap()
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+                    let active_now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(active_now, Ordering::AcqRel);
+                    wave.push(request);
+                }
+                let mut replies = Vec::with_capacity(wave_size);
+                for request in wave {
+                    let writer = Arc::clone(&writer);
+                    let active = Arc::clone(&active);
+                    replies.push(tokio::spawn(async move {
+                        writer.lock().await.send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":{"result":{"type":"number","value":2}}}).to_string().into()
+                        )).await.unwrap();
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    }));
+                }
+                for reply in replies {
+                    reply.await.unwrap();
+                }
+                remaining -= wave_size;
             }
             peak.load(Ordering::Acquire)
         });

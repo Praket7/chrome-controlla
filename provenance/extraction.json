@@ -14,8 +14,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "3202f74df3d718364563c734c2f37eb07e6e88e49c85ca320588b05b5063d204",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and blocked-target dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.",
+      "destination_sha256": "47a07e53f6a03818b317b9a7b99d19352d91110461dfc85e7e95cc021abaf3a3",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "3f5316ebcb02bd31cf67cf732a8b1cab5c5528cd8fef7411828dba0f84fca077",
-      "edits": "updated relative link to relocated master guide and clarified document placement",
+      "destination_sha256": "178c877d72ce2e94cb0520d4bfbaa3a9a16ba232c7e06784a24e1972815e3304",
+      "edits": "updated relative link and document placement; marked Phase 2 implementation and review evidence while recording remaining live qualification",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
