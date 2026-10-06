@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phase 0 and Phase 1 are pushed. Phase 0 hosted CI passed. Phase 1 commit `23b7827` passed Sol's local/fixture review. Hosted run `37460467645` found Windows Clippy and Ubuntu PID issues; `ed2beb2` fixed those, and run `37461256280` found one Windows-only test expectation. Commit `b159a3a` fixed that; hosted run `37461823256` passed macOS/Ubuntu and failed Windows provenance digests due to CRLF checkout. Fix commit `63b74d5` pins LF for text files; its push and hosted rerun are pending.
+Status: Phase 0 and Phase 1 are pushed. Phase 0 hosted CI passed. Phase 1 commit `23b7827` passed Sol's local/fixture review. Hosted run `37460467645` found Windows Clippy and Ubuntu PID issues; `ed2beb2` fixed those, and run `37461256280` found one Windows-only test expectation. Commit `b159a3a` fixed that; hosted run `37461823256` passed macOS/Ubuntu and failed Windows provenance digests due to CRLF checkout. Fix commit `63b74d5` pins LF for text files. Hosted run `37462361648` passed macOS and Ubuntu but failed Windows `package-check.sh` after Cargo package verification; commit `ec5982c` adds step diagnostics and checks the installed command through `npm exec` for platform-appropriate shim handling. Local checks pass; push and hosted confirmation remain pending.
 
 ## Phase 0 — source extraction and baseline
 
