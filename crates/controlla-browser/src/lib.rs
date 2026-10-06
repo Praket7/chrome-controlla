@@ -16,7 +16,10 @@ pub use input::{
     SemanticLocator, on_external_change, validate_step,
 };
 pub use manager::BrowserManager;
-pub use observe::{Completeness, ExtractionResult, ExtractionSpec, Observation, ObserveSpec};
+pub use observe::{
+    AccessibilityObservation, Completeness, ExpansionControl, ExtractionResult, ExtractionSpec,
+    Observation, ObserveSpec, ScreenshotCrop, ScreenshotObservation,
+};
 pub use session::{
     BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,
     connect_permissioned_auto_connect, list_sessions, select_provider,
@@ -277,6 +280,7 @@ pub struct BrowserConnection {
     events: broadcast::Sender<BrowserEvent>,
     event_replay: Arc<Mutex<VecDeque<BrowserEvent>>>,
     event_sequence: Arc<AtomicU64>,
+    pub(crate) extraction_cursors: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl BrowserConnection {
@@ -414,6 +418,7 @@ impl BrowserConnection {
             events,
             event_replay,
             event_sequence,
+            extraction_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2422,6 +2427,7 @@ mod tests {
             events: broadcast::channel(8).0,
             event_replay: Arc::new(Mutex::new(VecDeque::new())),
             event_sequence: Arc::new(AtomicU64::new(0)),
+            extraction_cursors: Arc::new(Mutex::new(HashMap::new())),
         };
         connection.targets.write().await.apply_created(target());
         let result = connection

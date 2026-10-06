@@ -1,5 +1,5 @@
 use controlla_browser::{
-    BrowserManager, ExtractionSpec, ObserveSpec, SessionProvider,
+    BrowserManager, ExpansionControl, ExtractionSpec, ObserveSpec, ScreenshotCrop, SessionProvider,
     connect_permissioned_auto_connect, list_sessions,
     sessions::{
         IdentityRevisions, ProviderGrants, SessionMode, SessionRegistry, SessionSpec, TargetRef,
@@ -58,6 +58,14 @@ struct ExtractionInput {
     expected_count: Option<usize>,
     account_marker: Option<(String, String)>,
     terminal_selector: Option<String>,
+    #[serde(default)]
+    expand: Vec<ExpansionInput>,
+    cursor: Option<String>,
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ExpansionInput {
+    selector: String,
+    content_selector: String,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ObserveArgs {
@@ -74,6 +82,24 @@ struct ExtractArgs {
     max_bytes: usize,
     timeout_ms: Option<u64>,
 }
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct AccessibilityArgs {
+    session_id: String,
+    target_ref: TargetRefInput,
+    selector: String,
+    max_bytes: usize,
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ScreenshotArgs {
+    session_id: String,
+    target_ref: TargetRefInput,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+    max_bytes: usize,
+}
 
 struct LiveSession {
     connection: Arc<controlla_browser::BrowserConnection>,
@@ -89,6 +115,104 @@ struct App {
 
 #[tool_router(server_handler)]
 impl App {
+    #[tool(
+        name = "accessibility",
+        description = "Return a bounded Chrome accessibility tree for an explicit target reference."
+    )]
+    async fn accessibility(
+        &self,
+        Parameters(args): Parameters<AccessibilityArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let session_id = args.session_id.as_str();
+        let reference: TargetRef = serde_json::from_value(
+            serde_json::to_value(args.target_ref).map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|_| invalid("target_ref must be a complete current TargetRef"))?;
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        if reference.session_id != session_id
+            || reference.principal != s.handle.principal
+            || !s.registry.contains_target(&s.handle, &reference.target_id)
+        {
+            return Err(invalid("target_ref is not bound to this session"));
+        }
+        let result = s
+            .connection
+            .observe_accessibility(
+                &s.registry,
+                &reference,
+                &s.handle.principal,
+                IdentityRevisions {
+                    account: reference.account_revision,
+                    document: reference.document_revision,
+                },
+                &args.selector,
+                args.max_bytes,
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(rmcp::handler::server::wrapper::Json(
+            serde_json::to_value(result).map_err(|e| invalid(e.to_string()))?,
+        ))
+    }
+
+    #[tool(
+        name = "screenshot_crop",
+        description = "Capture a bounded PNG crop from an explicit Chrome target reference."
+    )]
+    async fn screenshot_crop(
+        &self,
+        Parameters(args): Parameters<ScreenshotArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let session_id = args.session_id.as_str();
+        let reference: TargetRef = serde_json::from_value(
+            serde_json::to_value(args.target_ref).map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|_| invalid("target_ref must be a complete current TargetRef"))?;
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        if reference.session_id != session_id
+            || reference.principal != s.handle.principal
+            || !s.registry.contains_target(&s.handle, &reference.target_id)
+        {
+            return Err(invalid("target_ref is not bound to this session"));
+        }
+        let result = s
+            .connection
+            .observe_screenshot(
+                &s.registry,
+                &reference,
+                &s.handle.principal,
+                IdentityRevisions {
+                    account: reference.account_revision,
+                    document: reference.document_revision,
+                },
+                ScreenshotCrop {
+                    x: args.x,
+                    y: args.y,
+                    width: args.width,
+                    height: args.height,
+                    scale: args.scale,
+                },
+                args.max_bytes,
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(rmcp::handler::server::wrapper::Json(
+            serde_json::to_value(result).map_err(|e| invalid(e.to_string()))?,
+        ))
+    }
+
     #[tool(
         name = "session",
         description = "Discover/connect to configured Chrome and list explicit targets."
@@ -335,12 +459,14 @@ impl App {
         }
         let mut records = BTreeMap::new();
         let mut results = Vec::new();
-        let mut remaining = global_records;
-        let mut remaining_bytes = global_bytes;
+        let section_count = sections.len();
+        let base_record_budget = global_records / section_count;
+        let record_remainder = global_records % section_count;
+        let section_byte_budget = global_bytes / section_count;
         let mut all_complete = true;
         let mut any_unknown = false;
         let started = tokio::time::Instant::now();
-        for section in &sections {
+        for (section_index, section) in sections.iter().enumerate() {
             let name = section.section_id.as_str();
             if name.is_empty() {
                 return Err(invalid("each section requires section_id"));
@@ -357,23 +483,36 @@ impl App {
                 expected_count: section.spec.expected_count,
                 account_marker: section.spec.account_marker.clone(),
                 terminal_selector: section.spec.terminal_selector.clone(),
+                expand: section
+                    .spec
+                    .expand
+                    .iter()
+                    .map(|e| ExpansionControl {
+                        selector: e.selector.clone(),
+                        content_selector: e.content_selector.clone(),
+                    })
+                    .collect(),
+                cursor: section.spec.cursor.clone(),
             };
             let left_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
-            if remaining == 0 || left_ms == 0 || remaining_bytes < 4608 {
-                let reason = if remaining == 0 {
-                    "global record budget exhausted"
+            let section_records =
+                base_record_budget + usize::from(section_index < record_remainder);
+            let section_bytes = section_byte_budget.saturating_sub(512);
+            if section_records == 0 || left_ms == 0 || section_bytes < 4096 {
+                let reason = if section_records == 0 {
+                    "fixed per-section record share is zero"
                 } else if left_ms == 0 {
                     "global extraction deadline exhausted"
                 } else {
-                    "global byte budget cannot fit this section's minimum 4096-byte page budget and response metadata"
+                    "fixed per-section byte share cannot fit the 4096-byte page minimum and response metadata"
                 };
                 results
                     .push(json!({"section_id":name,"completeness":"partial","missing":[reason]}));
                 all_complete = false;
                 continue;
             }
-            spec.max_records = spec.max_records.min(remaining);
-            spec.max_bytes = spec.max_bytes.min(remaining_bytes - 512);
+            spec.max_records = spec.max_records.min(section_records);
+            spec.max_bytes = spec.max_bytes.min(section_bytes);
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(left_ms),
                 s.connection.extract(
@@ -409,19 +548,16 @@ impl App {
                     break;
                 }
             };
-            let response_bytes = serde_json::to_vec(&result)
-                .map(|v| v.len())
-                .unwrap_or(remaining_bytes);
-            remaining_bytes = remaining_bytes.saturating_sub(response_bytes + 512);
             all_complete &= result.completeness == controlla_browser::Completeness::Complete;
             any_unknown |= result.completeness == controlla_browser::Completeness::Unknown;
             for record in &result.records {
                 if let Some(id) = record.get(&spec.id_field) {
-                    records.entry(id.clone()).or_insert_with(|| record.clone());
+                    records
+                        .entry((name.to_owned(), id.clone()))
+                        .or_insert_with(|| json!({"section_id":name,"fields":record}));
                 }
             }
-            remaining = global_records.saturating_sub(records.len());
-            results.push(json!({"section_id":name,"completeness":result.completeness,"unique_count":result.unique_count,"expected_count":result.expected_count,"terminal_evidence":result.terminal_evidence,"missing":result.missing,"truncated":result.truncated,"navigation_epoch":result.navigation_epoch}));
+            results.push(json!({"section_id":name,"completeness":result.completeness,"unique_count":result.unique_count,"expected_count":result.expected_count,"cursor":result.cursor,"cursor_is_resumable":result.cursor_is_resumable,"terminal_evidence":result.terminal_evidence,"missing":result.missing,"truncated":result.truncated,"navigation_epoch":result.navigation_epoch}));
         }
         let unique_count = records.len();
         let overall = if all_complete {
@@ -431,67 +567,49 @@ impl App {
         } else {
             "partial"
         };
-        let mut output = json!({"records":records.into_values().collect::<Vec<_>>(),"unique_count":unique_count,"completeness":overall,"sections":results,"global_record_limit":global_records,"global_byte_limit":global_bytes,"timeout_ms":timeout_ms});
-        let mut byte_truncated = false;
-        while serde_json::to_vec(&output)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
-            > global_bytes
-        {
-            let Some(rows) = output["records"].as_array_mut() else {
-                break;
-            };
-            if rows.pop().is_none() {
-                break;
-            }
-            output["unique_count"] = json!(rows.len());
-            output["completeness"] = json!("partial");
-            byte_truncated = true;
-        }
-        if serde_json::to_vec(&output)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
-            > global_bytes
-        {
-            return Err(invalid(
-                "global byte budget is too small for section coverage metadata",
-            ));
-        }
-        if byte_truncated
-            && let Some(first) = output["sections"]
-                .as_array_mut()
-                .and_then(|sections| sections.first_mut())
-            && let Some(missing) = first["missing"].as_array_mut()
-        {
-            missing.push(json!(
-                "global aggregate byte budget limited the returned records"
-            ));
-        }
-        while serde_json::to_vec(&output)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
-            > global_bytes
-        {
-            let Some(rows) = output["records"].as_array_mut() else {
-                break;
-            };
-            if rows.pop().is_none() {
-                break;
-            }
-            output["unique_count"] = json!(rows.len());
-            output["completeness"] = json!("partial");
-        }
-        if serde_json::to_vec(&output)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
-            > global_bytes
-        {
-            return Err(invalid(
-                "global byte budget is too small for explicit coverage metadata",
-            ));
-        }
+        let output = json!({"records":records.into_values().collect::<Vec<_>>(),"unique_count":unique_count,"completeness":overall,"sections":results,"global_record_limit":global_records,"global_byte_limit":global_bytes,"timeout_ms":timeout_ms});
+        let output = fit_aggregate(output, global_bytes).map_err(invalid)?;
         Ok(rmcp::handler::server::wrapper::Json(output))
     }
+}
+
+fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
+    while serde_json::to_vec(&output)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+        > max_bytes
+    {
+        let Some(rows) = output["records"].as_array_mut() else {
+            break;
+        };
+        let Some(removed) = rows.pop() else { break };
+        let section_id = removed["section_id"].as_str().map(str::to_owned);
+        output["unique_count"] = json!(rows.len());
+        output["completeness"] = json!("partial");
+        if let Some(section_id) = section_id
+            && let Some(section) = output["sections"]
+                .as_array_mut()
+                .and_then(|all| all.iter_mut().find(|s| s["section_id"] == section_id))
+        {
+            section["completeness"] = json!("partial");
+            section["truncated"] = json!(true);
+            if let Some(missing) = section["missing"].as_array_mut() && !missing.iter().any(|m| {
+                m == "global aggregate byte budget omitted one or more records from this section"
+            }) {
+                missing.push(json!(
+                    "global aggregate byte budget omitted one or more records from this section"
+                ));
+            }
+        }
+    }
+    if serde_json::to_vec(&output)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+        > max_bytes
+    {
+        return Err("global byte budget is too small for explicit coverage metadata".into());
+    }
+    Ok(output)
 }
 
 fn invalid(message: impl Into<String>) -> rmcp::ErrorData {
@@ -588,6 +706,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_byte_truncation_marks_the_removed_record_section_partial() {
+        let output = json!({
+            "records":[{"section_id":"alpha","fields":{"value":"x".repeat(10_000)}}],
+            "unique_count":1,"completeness":"complete",
+            "sections":[
+                {"section_id":"alpha","completeness":"complete","truncated":false,"missing":[]},
+                {"section_id":"beta","completeness":"complete","truncated":false,"missing":[]}
+            ]
+        });
+        let fitted = super::fit_aggregate(output, 4096).unwrap();
+        assert_eq!(fitted["completeness"], "partial");
+        assert_eq!(fitted["sections"][0]["completeness"], "partial");
+        assert_eq!(fitted["sections"][0]["truncated"], true);
+        assert_eq!(fitted["sections"][1]["completeness"], "complete");
+        assert!(
+            fitted["sections"][0]["missing"][0]
+                .as_str()
+                .unwrap()
+                .contains("omitted")
+        );
+        assert!(serde_json::to_vec(&fitted).unwrap().len() <= 4096);
+    }
+
     #[tokio::test]
     async fn stdio_server_handler_roundtrips_initialize_list_and_discovery_call() {
         let (server_io, client_io) = tokio::io::duplex(16_384);
@@ -603,7 +745,15 @@ mod tests {
         assert!(names.contains(&"session"));
         assert!(names.contains(&"observe"));
         assert!(names.contains(&"extract"));
-        for name in ["session", "observe", "extract"] {
+        assert!(names.contains(&"accessibility"));
+        assert!(names.contains(&"screenshot_crop"));
+        for name in [
+            "session",
+            "observe",
+            "extract",
+            "accessibility",
+            "screenshot_crop",
+        ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
             assert_eq!(schema["type"], "object", "{name} schema root");
@@ -639,6 +789,10 @@ mod tests {
     #[tokio::test]
     async fn observe_and_multisection_extract_calls_reach_mock_cdp() {
         use futures_util::{SinkExt, StreamExt};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         use tokio::net::TcpListener;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
         static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -646,6 +800,12 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let endpoint = format!("ws://{address}/devtools/browser/mock");
+        let full_ax_calls = Arc::new(AtomicUsize::new(0));
+        let screenshot_calls = Arc::new(AtomicUsize::new(0));
+        let ax_calls_for_server = full_ax_calls.clone();
+        let screenshot_calls_for_server = screenshot_calls.clone();
+        let earlier_calls = Arc::new(AtomicUsize::new(0));
+        let earlier_calls_for_server = earlier_calls.clone();
         let cdp = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
@@ -668,11 +828,45 @@ mod tests {
                         let value = if expr.contains("const m=") {
                             json!(true)
                         } else if expr.contains("missingFields") {
-                            json!({"items":[],"end":true,"before":0,"after":0,"account":true,"limited":false,"missingFields":[],"clipped":false})
+                            let items = if expr.contains("#bucket-left")
+                                || expr.contains("#bucket-right")
+                                || expr.contains("#later")
+                            {
+                                vec![json!({"id":"duplicate"})]
+                            } else if expr.contains("#earlier")
+                                && earlier_calls_for_server.fetch_add(1, Ordering::SeqCst) > 0
+                            {
+                                vec![json!({"id":"changed-earlier"})]
+                            } else {
+                                vec![]
+                            };
+                            json!({"items":items,"end":true,"before":0,"after":0,"account":true,"limited":false,"missingFields":[],"clipped":false})
                         } else {
                             json!({"items":[],"count":0,"missing":[],"clipped":0,"limited":false})
                         };
                         json!({"result":{"type":"object","value":value}})
+                    }
+                    "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+                    "DOM.querySelector" => {
+                        assert_eq!(request["params"]["selector"], "#fixture");
+                        json!({"nodeId":2})
+                    }
+                    "Accessibility.getPartialAXTree" => {
+                        assert!(
+                            request["params"]["nodeId"]
+                                .as_i64()
+                                .is_some_and(|id| id > 0)
+                        );
+                        assert_eq!(request["params"]["fetchRelatives"], false);
+                        json!({"nodes":[{"nodeId":"1","role":{"value":"button"}}]})
+                    }
+                    "Accessibility.getFullAXTree" => {
+                        ax_calls_for_server.fetch_add(1, Ordering::SeqCst);
+                        json!({"nodes":[{"nodeId":"1","role":{"value":"RootWebArea"}}]})
+                    }
+                    "Page.captureScreenshot" => {
+                        screenshot_calls_for_server.fetch_add(1, Ordering::SeqCst);
+                        json!({"data":"aGVsbG8="})
                     }
                     _ => json!({}),
                 };
@@ -726,6 +920,37 @@ mod tests {
             listed.structured_content.as_ref().unwrap()["targets"][0]["target_ref"].clone();
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
         assert!(!observed.is_error.unwrap_or(false), "{observed:?}");
+        let ax = client.call_tool(CallToolRequestParams::new("accessibility").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"selector":"#fixture","max_bytes":8192})))).await.unwrap();
+        assert!(!ax.is_error.unwrap_or(false), "{ax:?}");
+        assert_eq!(
+            ax.structured_content.as_ref().unwrap()["nodes"][0]["nodeId"],
+            "1"
+        );
+        assert_eq!(
+            full_ax_calls.load(Ordering::SeqCst),
+            0,
+            "AX request must use a per-node command"
+        );
+        let crop = client.call_tool(CallToolRequestParams::new("screenshot_crop").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"x":0.0,"y":0.0,"width":8.0,"height":8.0,"scale":1.0,"max_bytes":8192})))).await.unwrap();
+        assert!(!crop.is_error.unwrap_or(false), "{crop:?}");
+        assert_eq!(
+            crop.structured_content.as_ref().unwrap()["data_base64"],
+            "aGVsbG8="
+        );
+        let before_oversized_crop = screenshot_calls.load(Ordering::SeqCst);
+        let oversized_crop = client.call_tool(CallToolRequestParams::new("screenshot_crop").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"x":0.0,"y":0.0,"width":32.0,"height":32.0,"scale":1.0,"max_bytes":4096})))).await;
+        assert!(
+            oversized_crop.is_err()
+                || oversized_crop
+                    .as_ref()
+                    .is_ok_and(|r| r.is_error.unwrap_or(false)),
+            "oversized crop was accepted: {oversized_crop:?}"
+        );
+        assert_eq!(
+            screenshot_calls.load(Ordering::SeqCst),
+            before_oversized_crop,
+            "oversized crop reached CDP"
+        );
         let extracted = client.call_tool(CallToolRequestParams::new("extract").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"sections":[{"section_id":"primary","spec":{"container":"main","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":10,"max_text_chars":100,"max_bytes":8192,"expected_count":0,"account_marker":["#account","me"],"terminal_selector":".end"}},{"section_id":"secondary","spec":{"container":"aside","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":10,"max_text_chars":100,"max_bytes":8192,"expected_count":0,"account_marker":["#account","me"],"terminal_selector":".end"}}],"max_records":20,"max_bytes":32768,"timeout_ms":5000})))).await.unwrap();
         assert!(!extracted.is_error.unwrap_or(false), "{extracted:?}");
         assert_eq!(
@@ -738,6 +963,51 @@ mod tests {
         assert_eq!(
             extracted.structured_content.as_ref().unwrap()["completeness"],
             "complete"
+        );
+        let overlapping = client.call_tool(CallToolRequestParams::new("extract").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"sections":[{"section_id":"left","spec":{"container":"#bucket-left","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":4,"max_text_chars":100,"max_bytes":8192,"expected_count":1,"account_marker":["#account","me"],"terminal_selector":".end"}},{"section_id":"right","spec":{"container":"#bucket-right","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":4,"max_text_chars":100,"max_bytes":8192,"expected_count":1,"account_marker":["#account","me"],"terminal_selector":".end"}}],"max_records":8,"max_bytes":32768,"timeout_ms":5000})))).await.unwrap();
+        let overlapping = overlapping.structured_content.as_ref().unwrap();
+        assert_eq!(
+            overlapping["unique_count"], 2,
+            "same IDs in different sections must remain distinct"
+        );
+        let overlapping_rows = overlapping["records"].as_array().unwrap();
+        assert_eq!(overlapping_rows.len(), 2);
+        assert!(
+            overlapping_rows
+                .iter()
+                .any(|row| row["section_id"] == "left")
+        );
+        assert!(
+            overlapping_rows
+                .iter()
+                .any(|row| row["section_id"] == "right")
+        );
+
+        let later_args = |later_cursor: Option<String>| json!({"session_id":session_id,"target_ref":target_ref,"sections":[{"section_id":"earlier","spec":{"container":"#earlier","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":1,"max_records":20,"max_text_chars":100,"max_bytes":8192,"expected_count":1,"account_marker":["#account","me"],"terminal_selector":".end"}},{"section_id":"later","spec":{"container":"#later","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":1,"max_records":20,"max_text_chars":100,"max_bytes":8192,"expected_count":2,"account_marker":["#account","me"],"terminal_selector":".end","cursor":later_cursor}}],"max_records":20,"max_bytes":32768,"timeout_ms":5000});
+        let first_sections = client
+            .call_tool(CallToolRequestParams::new("extract").with_arguments(args(later_args(None))))
+            .await
+            .unwrap();
+        let first_later =
+            first_sections.structured_content.as_ref().unwrap()["sections"][1]["cursor"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        assert!(
+            first_sections.structured_content.as_ref().unwrap()["sections"][1]["cursor_is_resumable"]
+                == true
+        );
+        let resumed_sections = client
+            .call_tool(
+                CallToolRequestParams::new("extract")
+                    .with_arguments(args(later_args(Some(first_later)))),
+            )
+            .await
+            .unwrap();
+        let resumed_later = &resumed_sections.structured_content.as_ref().unwrap()["sections"][1];
+        assert_ne!(
+            resumed_later["completeness"], "unknown",
+            "later section cursor must survive an earlier section returning a different record count: {resumed_later}"
         );
         let too_small = client.call_tool(CallToolRequestParams::new("extract").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"sections":[{"section_id":"primary","spec":{"container":"main","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":10,"max_text_chars":100,"max_bytes":8192,"expected_count":0,"account_marker":["#account","me"],"terminal_selector":".end"}},{"section_id":"secondary","spec":{"container":"aside","record":"article","fields":{"id":".id"},"id_field":"id","max_steps":3,"max_records":10,"max_text_chars":100,"max_bytes":8192,"expected_count":0,"account_marker":["#account","me"],"terminal_selector":".end"}}],"max_records":20,"max_bytes":4096,"timeout_ms":5000})))).await.unwrap();
         let partial = too_small.structured_content.as_ref().unwrap();

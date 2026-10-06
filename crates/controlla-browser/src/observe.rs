@@ -75,6 +75,45 @@ pub struct ExtractionSpec {
     pub account_marker: Option<(String, String)>,
     /// Site-specific explicit terminal marker. A scroll position alone is insufficient.
     pub terminal_selector: Option<String>,
+    /// Caller-declared expansion controls; each must become expanded before its section is read.
+    #[serde(default)]
+    pub expand: Vec<ExpansionControl>,
+    /// Opaque, single-use continuation token returned by an earlier bounded pass.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExpansionControl {
+    pub selector: String,
+    pub content_selector: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScreenshotCrop {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccessibilityObservation {
+    pub target_id: String,
+    pub navigation_epoch: u64,
+    pub nodes: Vec<Value>,
+    pub truncated: bool,
+    pub missing: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScreenshotObservation {
+    pub target_id: String,
+    pub navigation_epoch: u64,
+    pub format: String,
+    pub crop: ScreenshotCrop,
+    pub data_base64: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -186,9 +225,99 @@ fn validate_field_name(s: &str) -> Result<(), BrowserError> {
     Ok(())
 }
 
+fn validate_ax_limits(max_bytes: usize) -> Result<(), BrowserError> {
+    if !(4096..=262_144).contains(&max_bytes) {
+        return Err(BrowserError::InvalidResponse(
+            "AX byte budget must be 4096..=262144".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_crop(crop: &ScreenshotCrop, max_bytes: usize) -> Result<(), BrowserError> {
+    let max_pixels = max_bytes / 64;
+    if !(4096..=262_144).contains(&max_bytes)
+        || ![crop.x, crop.y, crop.width, crop.height, crop.scale]
+            .into_iter()
+            .all(f64::is_finite)
+        || crop.x < 0.0
+        || crop.y < 0.0
+        || crop.width <= 0.0
+        || crop.height <= 0.0
+        || crop.width > 2048.0
+        || crop.height > 2048.0
+        || crop.width * crop.height * crop.scale * crop.scale > max_pixels as f64
+        || !(0.25..=2.0).contains(&crop.scale)
+    {
+        return Err(BrowserError::InvalidResponse(
+            "screenshot crop or byte budget is out of range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resume_binding(
+    reference: &crate::sessions::TargetRef,
+    revisions: IdentityRevisions,
+    spec: &ExtractionSpec,
+) -> Result<String, BrowserError> {
+    let mut spec = spec.clone();
+    spec.cursor = None;
+    serde_json::to_string(&(reference, revisions.account, revisions.document, spec))
+        .map_err(|e| BrowserError::InvalidResponse(e.to_string()))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct CursorState {
+    binding: String,
+    rows: BTreeMap<String, BTreeMap<String, String>>,
+    step: usize,
+    stable_end: usize,
+    evidence: Vec<String>,
+    missing: BTreeSet<String>,
+    truncated: bool,
+    updated_ms: u128,
+}
+
+async fn issue_cursor(
+    connection: &BrowserConnection,
+    state: CursorState,
+) -> Result<String, BrowserError> {
+    let retained_bytes = serde_json::to_vec(&state.rows)
+        .map_err(|e| BrowserError::InvalidResponse(e.to_string()))?
+        .len()
+        .saturating_add(state.binding.len());
+    if retained_bytes > 1_000_000 {
+        return Ok(String::new());
+    }
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes).map_err(|e| BrowserError::InvalidResponse(e.to_string()))?;
+    let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut cursors = connection.extraction_cursors.lock().await;
+    let now = now_ms();
+    cursors.retain(|_, value| {
+        value["updated_ms"]
+            .as_u64()
+            .is_some_and(|updated| now.saturating_sub(updated as u128) < 600_000)
+    });
+    if cursors.len() >= 32
+        && let Some(oldest) = cursors
+            .iter()
+            .min_by_key(|(_, v)| v["updated_ms"].as_u64().unwrap_or(0))
+            .map(|(k, _)| k.clone())
+    {
+        cursors.remove(&oldest);
+    }
+    cursors.insert(
+        token.clone(),
+        serde_json::to_value(state).map_err(|e| BrowserError::InvalidResponse(e.to_string()))?,
+    );
+    Ok(token)
+}
+
 fn extraction_page_script(config: &str) -> String {
     format!(
-        r#"(()=>{{const q={config};let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop;c.scrollTop=Math.min(c.scrollTop+c.clientHeight,c.scrollHeight);const result={{items,end,before,after:c.scrollTop,account,limited,missingFields:[...missingFields],clipped}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};return result}})()"#,
+        r#"(()=>{{const q={config};let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false,blocked:[]}};const blocked=[];for(const x of q.expand||[]){{const e=document.querySelector(x.selector);if(!e){{blocked.push(x.selector);continue}}let content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'&&(!content||content.getClientRects().length===0))e.click();content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'||!content||content.getClientRects().length===0)blocked.push(x.selector)}}if(blocked.length)return {{account:true,blocked,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop;c.scrollTop=Math.min(c.scrollTop+c.clientHeight,c.scrollHeight);const result={{items,end,before,after:c.scrollTop,account,limited,missingFields:[...missingFields],clipped}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};return result}})()"#,
         config = config
     )
 }
@@ -208,6 +337,122 @@ fn account_marker_script(marker: &Option<(String, String)>) -> String {
 }
 
 impl BrowserConnection {
+    pub async fn observe_accessibility(
+        &self,
+        sessions: &SessionRegistry,
+        reference: &TargetRef,
+        principal: &str,
+        revisions: IdentityRevisions,
+        selector: &str,
+        max_bytes: usize,
+    ) -> Result<AccessibilityObservation, BrowserError> {
+        validate_selector(selector)?;
+        validate_ax_limits(max_bytes)?;
+        let document = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "DOM.getDocument",
+                json!({"depth":0,"pierce":false}),
+            )
+            .await?;
+        let document_node = document
+            .get("root")
+            .and_then(|v| v["nodeId"].as_u64())
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                BrowserError::InvalidResponse("DOM.getDocument omitted root nodeId".into())
+            })?;
+        let selected = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "DOM.querySelector",
+                json!({"nodeId":document_node,"selector":selector}),
+            )
+            .await?;
+        let node_id = selected
+            .get("nodeId")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                BrowserError::InvalidResponse("AX selector matched no DOM node".into())
+            })?;
+        let response = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "Accessibility.getPartialAXTree",
+                json!({"nodeId":node_id,"fetchRelatives":false}),
+            )
+            .await?;
+        let nodes = response
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BrowserError::InvalidResponse("AX response omitted nodes".into()))?;
+        let truncated = nodes.len() > 1;
+        let mut output = AccessibilityObservation {
+            target_id: reference.target_id.clone(),
+            navigation_epoch: reference.frame_revision,
+            nodes: nodes.iter().take(1).cloned().collect(),
+            truncated,
+            missing: if truncated {
+                vec!["AX response exceeded the selected-node bound and was truncated".into()]
+            } else {
+                vec![]
+            },
+        };
+        while serialized_len(&output)? > max_bytes && !output.nodes.is_empty() {
+            output.nodes.pop();
+            output.truncated = true;
+            output.missing = vec!["AX tree truncated at serialized byte limit".into()];
+        }
+        if serialized_len(&output)? > max_bytes {
+            return Err(BrowserError::InvalidResponse(
+                "AX byte budget cannot fit metadata".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    pub async fn observe_screenshot(
+        &self,
+        sessions: &SessionRegistry,
+        reference: &TargetRef,
+        principal: &str,
+        revisions: IdentityRevisions,
+        crop: ScreenshotCrop,
+        max_bytes: usize,
+    ) -> Result<ScreenshotObservation, BrowserError> {
+        validate_crop(&crop, max_bytes)?;
+        let response = self.target_ref_command(sessions, reference, principal, revisions, "Page.captureScreenshot", json!({"format":"png","fromSurface":true,"captureBeyondViewport":false,"clip":{"x":crop.x,"y":crop.y,"width":crop.width,"height":crop.height,"scale":crop.scale}})).await?;
+        let data = response
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::InvalidResponse("screenshot response omitted base64 data".into())
+            })?;
+        let output = ScreenshotObservation {
+            target_id: reference.target_id.clone(),
+            navigation_epoch: reference.frame_revision,
+            format: "png".into(),
+            crop,
+            data_base64: data.to_owned(),
+        };
+        if serialized_len(&output)? > max_bytes {
+            return Err(BrowserError::InvalidResponse(
+                "screenshot exceeded the requested serialized byte budget".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     pub async fn observe(
         &self,
         sessions: &SessionRegistry,
@@ -226,7 +471,7 @@ impl BrowserConnection {
                 .cursor
                 .as_ref()
                 .is_some_and(|cursor| cursor.len() > 256)
-            || spec.max_bytes < 4096
+            || !(4096..=1_000_000).contains(&spec.max_bytes)
         {
             return Err(BrowserError::InvalidResponse(
                 "observation limits must be 1..=500 items and positive text/byte budgets".into(),
@@ -343,7 +588,7 @@ impl BrowserConnection {
             || spec.max_text_chars == 0
             || spec.max_text_chars > 10_000
             || spec.fields.len() > 32
-            || spec.max_bytes < 4096
+            || !(4096..=1_000_000).contains(&spec.max_bytes)
         {
             return Err(BrowserError::InvalidResponse(
                 "extraction limits out of range".into(),
@@ -358,12 +603,55 @@ impl BrowserConnection {
             validate_field_name(name)?;
             validate_selector(selector)?;
         }
-        let mut rows: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        let mut evidence = Vec::new();
-        let mut missing = BTreeSet::new();
+        if spec.cursor.as_ref().is_some_and(|c| c.len() > 128) || spec.expand.len() > 16 {
+            return Err(BrowserError::InvalidResponse(
+                "cursor or expansion list exceeds limits".into(),
+            ));
+        }
+        for expansion in &spec.expand {
+            validate_selector(&expansion.selector)?;
+            validate_selector(&expansion.content_selector)?;
+        }
+        let binding = resume_binding(reference, revisions, spec)?;
+        let resumed = if let Some(token) = &spec.cursor {
+            let mut store = self.extraction_cursors.lock().await;
+            let now = now_ms();
+            store.retain(|_, value| {
+                value["updated_ms"]
+                    .as_u64()
+                    .is_some_and(|updated| now.saturating_sub(updated as u128) < 600_000)
+            });
+            let state: CursorState =
+                serde_json::from_value(store.get(token).cloned().ok_or_else(|| {
+                    BrowserError::StaleReference("unknown or expired extraction cursor".into())
+                })?)
+                .map_err(|_| {
+                    BrowserError::StaleReference("malformed extraction cursor state".into())
+                })?;
+            if state.binding != binding {
+                return Err(BrowserError::StaleReference(
+                    "extraction cursor is bound to another target, revision, or spec".into(),
+                ));
+            }
+            store.remove(token);
+            Some(state)
+        } else {
+            None
+        };
+        let mut rows: BTreeMap<String, BTreeMap<String, String>> =
+            resumed.as_ref().map(|s| s.rows.clone()).unwrap_or_default();
+        let mut evidence = resumed
+            .as_ref()
+            .map(|s| s.evidence.clone())
+            .unwrap_or_default();
+        let mut missing = resumed
+            .as_ref()
+            .map(|s| s.missing.clone())
+            .unwrap_or_default();
         let mut cursor = None;
-        let mut stable_end = 0;
-        let mut truncated = false;
+        let mut stable_end = resumed.as_ref().map(|s| s.stable_end).unwrap_or_default();
+        let mut truncated = resumed.as_ref().map(|s| s.truncated).unwrap_or_default();
+        let start_step = resumed.as_ref().map(|s| s.step).unwrap_or_default();
         if let Some((selector, _)) = &spec.account_marker {
             validate_selector(selector)?;
         }
@@ -398,7 +686,7 @@ impl BrowserConnection {
             );
         }
         for step in 0..spec.max_steps {
-            if step > 0 {
+            if step > 0 || start_step > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             if rows.len() >= spec.max_records {
@@ -411,7 +699,7 @@ impl BrowserConnection {
                 .saturating_sub(rows.len())
                 .saturating_mul(64)
                 .clamp(64, 65_536);
-            let config = json!({"container":spec.container,"record":spec.record,"fields":spec.fields,"account":spec.account_marker,"terminal":spec.terminal_selector,"maxRecords":spec.max_records-rows.len(),"maxScanNodes":max_scan_nodes,"maxTextChars":spec.max_text_chars,"maxBytes":spec.max_bytes}).to_string();
+            let config = json!({"container":spec.container,"record":spec.record,"fields":spec.fields,"account":spec.account_marker,"terminal":spec.terminal_selector,"expand":spec.expand,"maxRecords":spec.max_records-rows.len(),"maxScanNodes":max_scan_nodes,"maxTextChars":spec.max_text_chars,"maxBytes":spec.max_bytes}).to_string();
             let script = extraction_page_script(&config);
             let response = self
                 .target_ref_command(
@@ -439,6 +727,16 @@ impl BrowserConnection {
             if v["error"].as_str() == Some("container_missing") {
                 missing.insert("list container missing".into());
                 break;
+            }
+            if let Some(blocked) = v["blocked"].as_array() {
+                for selector in blocked.iter().filter_map(Value::as_str) {
+                    missing.insert(format!(
+                        "section expansion blocked or unverified: {selector}"
+                    ));
+                }
+                if !blocked.is_empty() {
+                    break;
+                }
             }
             let page_account_ok = v["account"].as_bool().ok_or_else(|| {
                 BrowserError::InvalidResponse("extraction omitted account status".into())
@@ -503,13 +801,57 @@ impl BrowserConnection {
             } else {
                 0
             };
-            cursor = Some(format!("step:{};unique:{}", step + 1, rows.len()));
+            cursor = Some(format!(
+                "step:{};unique:{}",
+                start_step + step + 1,
+                rows.len()
+            ));
             if stable_end >= 2 {
                 evidence.push("explicit site terminal marker present at scroll end on two successive observations with no new stable IDs".into());
                 break;
             }
             if truncated {
                 break;
+            }
+        }
+        let exhausted_steps = cursor.is_some()
+            && evidence.is_empty()
+            && !truncated
+            && rows.len() < spec.max_records
+            && !missing
+                .iter()
+                .any(|m| m.starts_with("section expansion blocked"));
+        let mut resumable = false;
+        cursor = None;
+        if exhausted_steps
+            && account_ok
+            && !missing
+                .iter()
+                .any(|m| m.starts_with("section expansion blocked"))
+        {
+            let token = issue_cursor(
+                self,
+                CursorState {
+                    binding,
+                    rows: rows.clone(),
+                    step: start_step + spec.max_steps,
+                    stable_end,
+                    evidence: evidence.clone(),
+                    missing: missing.clone(),
+                    truncated,
+                    updated_ms: now_ms(),
+                },
+            )
+            .await?;
+            if token.is_empty() {
+                missing.insert(
+                    "cursor state exceeds the 1 MiB resume limit; coverage remains partial".into(),
+                );
+            } else {
+                cursor = Some(token);
+                resumable = true;
+                missing
+                    .insert("more records may remain; resume with this single-use cursor".into());
             }
         }
         let records: Vec<_> = rows.into_values().collect();
@@ -537,7 +879,7 @@ impl BrowserConnection {
                     expected_count: spec.expected_count,
                     completeness: Completeness::Unknown,
                     cursor,
-                    cursor_is_resumable: false,
+                    cursor_is_resumable: resumable,
                     terminal_evidence: evidence,
                     missing,
                     truncated,
@@ -562,7 +904,7 @@ impl BrowserConnection {
                 expected_count: spec.expected_count,
                 completeness: state,
                 cursor,
-                cursor_is_resumable: false,
+                cursor_is_resumable: resumable,
                 terminal_evidence: evidence,
                 missing,
                 truncated,
@@ -704,6 +1046,8 @@ mod tests {
             expected_count: Some(0),
             account_marker: Some(("#account".into(), "right".into())),
             terminal_selector: Some("[data-end]".into()),
+            expand: vec![],
+            cursor: None,
         }
     }
 
@@ -923,6 +1267,76 @@ mod tests {
         assert!(observation.contains("budgetError:true"));
     }
 
+    #[test]
+    fn accessibility_and_crop_limits_reject_unbounded_requests() {
+        assert!(validate_ax_limits(4096).is_ok());
+        assert!(validate_ax_limits(4095).is_err());
+        assert!(
+            validate_crop(
+                &ScreenshotCrop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4096.0,
+                    height: 4096.0,
+                    scale: 1.0
+                },
+                65536
+            )
+            .is_err()
+        );
+        assert!(
+            validate_crop(
+                &ScreenshotCrop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 32.0,
+                    height: 32.0,
+                    scale: 1.0
+                },
+                65536
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn resume_binding_changes_with_target_revision_or_spec() {
+        let mut spec = extraction_spec();
+        let reference = crate::sessions::TargetRef {
+            session_id: "s".into(),
+            principal: "p".into(),
+            capability_revision: 1,
+            browser_instance_id: 1,
+            browser_generation: 1,
+            target_id: "target".into(),
+            target_revision: "target-r1".into(),
+            frame_id: "frame".into(),
+            frame_revision: 4,
+            account_revision: 5,
+            document_revision: 6,
+        };
+        let revisions = IdentityRevisions {
+            account: 5,
+            document: 6,
+        };
+        let original = resume_binding(&reference, revisions, &spec).unwrap();
+        assert_eq!(
+            original,
+            resume_binding(&reference, revisions, &spec).unwrap()
+        );
+        let mut changed = reference.clone();
+        changed.target_revision = "target-r2".into();
+        assert_ne!(
+            original,
+            resume_binding(&changed, revisions, &spec).unwrap()
+        );
+        spec.record = ".other".into();
+        assert_ne!(
+            original,
+            resume_binding(&reference, revisions, &spec).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn wrong_account_preflight_sends_no_scroll_command() {
         use futures_util::{SinkExt, StreamExt};
@@ -1031,6 +1445,8 @@ mod tests {
             expected_count: Some(1),
             account_marker: Some(("#account".into(), "right".into())),
             terminal_selector: Some("[data-end]".into()),
+            expand: vec![],
+            cursor: None,
         };
         let result = connection
             .extract(
