@@ -1627,7 +1627,7 @@ mod tests {
                     document: 1,
                 },
                 "Runtime.evaluate",
-                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
+                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=interference type=text value=before><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><canvas id=canvas width=200 height=100></canvas><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';document.querySelector('#interference').addEventListener('focus',e=>e.target.value='external');const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
             )
             .await
             .unwrap();
@@ -1740,6 +1740,174 @@ mod tests {
             )
             .await;
         assert!(matches!(stale, Err(crate::BrowserError::StaleReference(_))));
+
+        // Real Chrome event ordering: focusing the field changes it after the
+        // initial probe, so the final guarded fill must yield without overwrite.
+        let interference_locator = crate::input::SemanticLocator::Css("#interference".into());
+        let interference_fill = crate::input::InputAction::Fill("requested".into());
+        let interference = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &interference_locator,
+                    action: &interference_fill,
+                    expected_value: "before",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(interference, crate::input::InputOutcome::Stale(_)));
+        let interference_value = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"document.querySelector('#interference').value","returnByValue":true}),
+        ).await.unwrap();
+        assert_eq!(interference_value["result"]["value"], "external");
+
+        // The browser's IME protocol emits a real composition event sequence;
+        // this probes Chrome protocol support, not a product-level input action.
+        session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents=[];const e=document.querySelector('#field');for(const name of ['compositionstart','compositionupdate','compositionend'])e.addEventListener(name,event=>window.compositionEvents.push({type:event.type,data:event.data}));e.addEventListener('input',event=>window.compositionEvents.push({type:'input',isComposing:event.isComposing}));e.focus();true","returnByValue":true}),
+        ).await.unwrap();
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Input.imeSetComposition",
+                json!({"text":"あ","selectionStart":1,"selectionEnd":1}),
+            )
+            .await
+            .unwrap();
+        let composing = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"({events:window.compositionEvents.map(event=>event.type),composingInput:window.compositionEvents.some(event=>event.type==='input'&&event.isComposing),value:document.querySelector('#field').value})","returnByValue":true}),
+        ).await.unwrap();
+        assert!(
+            composing["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionstart"))
+        );
+        assert!(
+            composing["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionupdate"))
+        );
+        assert_eq!(composing["result"]["value"]["composingInput"], true);
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Input.insertText",
+                json!({"text":"あ"}),
+            )
+            .await
+            .unwrap();
+        let ended = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"({events:window.compositionEvents.map(event=>event.type),value:document.querySelector('#field').value})","returnByValue":true}),
+        ).await.unwrap();
+        assert!(
+            ended["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionend"))
+        );
+        assert_eq!(ended["result"]["value"]["value"], "héllo 👋λaあ");
+
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                json!({"expression":"window.compositionEvents=[];true","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        let ime = crate::input::InputAction::ImeText("に".into());
+        let ime_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &ime,
+                    expected_value: "héllo 👋λaあ",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ime_result,
+            crate::input::InputOutcome::Applied {
+                observed_value: Some(value),
+                postcondition_verified: true,
+                ..
+            } if value == "héllo 👋λaあに"
+        ));
+        let ime_events = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents.map(event=>event.type)","returnByValue":true}),
+        ).await.unwrap();
+        let event_types = ime_events["result"]["value"].as_array().unwrap();
+        assert!(event_types.contains(&json!("compositionstart")));
+        assert!(event_types.contains(&json!("compositionupdate")));
+        assert!(event_types.contains(&json!("compositionend")));
+        let composing_input = session.connection().target_ref_command(
+            &registry,
+            &reference,
+            "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents.some(event=>event.type==='input'&&event.isComposing)","returnByValue":true}),
+        ).await.unwrap();
+        assert_eq!(composing_input["result"]["value"], true);
 
         let masked_locator = crate::input::SemanticLocator::Css("#masked".into());
         let masked_fill = crate::input::InputAction::Fill("2125550100".into());
@@ -1900,6 +2068,39 @@ mod tests {
                 ..
             }
         ));
+        let canvas_drag = crate::input::InputAction::Drag {
+            from: (10.0, 10.0),
+            to: (80.0, 60.0),
+            postcondition: crate::input::DragPostcondition {
+                left: 0.0,
+                top: 0.0,
+                tolerance: 0.0,
+            },
+        };
+        let canvas_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &crate::input::SemanticLocator::Css("#canvas".into()),
+                    action: &canvas_drag,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            canvas_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
         struct TestOwnedTargetObserver;
         impl IndependentTargetObserver for TestOwnedTargetObserver {
             fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {
@@ -2048,6 +2249,8 @@ list.addEventListener('scroll',render);render();
             expected_count: Some(42),
             account_marker: Some(("#account".into(), "fixture-account".into())),
             terminal_selector: Some(".terminal".into()),
+            expand: vec![],
+            cursor: None,
         };
         let extraction_started = std::time::Instant::now();
         let result = session

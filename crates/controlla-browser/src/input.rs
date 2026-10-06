@@ -8,6 +8,8 @@ pub type SemanticLocator = super::Locator;
 pub enum InputAction {
     Fill(String),
     Insert(String),
+    /// Dispatch and commit a CDP composition sequence on a supported text control.
+    ImeText(String),
     SequentialKeys(String),
     Click {
         x: f64,
@@ -216,14 +218,17 @@ impl super::BrowserConnection {
             ));
         }
         let value = match action {
-            InputAction::Fill(v) | InputAction::Insert(v) | InputAction::SequentialKeys(v) => {
-                Some(v.as_str())
-            }
+            InputAction::Fill(v)
+            | InputAction::Insert(v)
+            | InputAction::ImeText(v)
+            | InputAction::SequentialKeys(v) => Some(v.as_str()),
             InputAction::Click { .. } | InputAction::Drag { .. } => None,
         };
         let expected_value = match action {
             InputAction::Fill(text) => Some(text.clone()),
-            InputAction::Insert(text) | InputAction::SequentialKeys(text) => {
+            InputAction::Insert(text)
+            | InputAction::ImeText(text)
+            | InputAction::SequentialKeys(text) => {
                 let (Some(before), Some(start), Some(end)) = (
                     p["value"].as_str(),
                     p["selectionStart"].as_u64(),
@@ -245,6 +250,11 @@ impl super::BrowserConnection {
         let tag = p["tag"].as_str().unwrap_or_default();
         let typ = p["type"].as_str().unwrap_or_default();
         let contenteditable = p["editable"] == true;
+        if tag == "CANVAS" && matches!(action, InputAction::Drag { .. }) {
+            return Ok(InputOutcome::Unsupported(
+                "canvas drag outcomes require an app-specific verifier",
+            ));
+        }
         if value.is_some() && p["masked"] == true {
             return Ok(InputOutcome::Unsupported(
                 "masked controls require an app-specific input adapter",
@@ -285,6 +295,25 @@ impl super::BrowserConnection {
             {
                 return Ok(InputOutcome::Stale(
                     "sequential typing requires a collapsed caret at the end of the field",
+                ));
+            }
+        }
+        if matches!(action, InputAction::ImeText(text) if text.is_empty()) {
+            return Ok(InputOutcome::Unsupported("IME text must not be empty"));
+        }
+        if matches!(action, InputAction::ImeText(_)) {
+            let Some(before) = p["value"].as_str() else {
+                return Ok(InputOutcome::Unsupported("input value is unavailable"));
+            };
+            if sequential_caret(
+                before,
+                p["selectionStart"].as_u64().unwrap_or(u64::MAX),
+                p["selectionEnd"].as_u64().unwrap_or(u64::MAX),
+            )
+            .is_none()
+            {
+                return Ok(InputOutcome::Stale(
+                    "IME text requires a collapsed caret at the end of the field",
                 ));
             }
         }
@@ -411,6 +440,95 @@ impl super::BrowserConnection {
                     serde_json::json!({"text":text}),
                 )
                 .await?;
+            }
+            InputAction::ImeText(text) => {
+                let original = input.expected_value;
+                let original_caret = original.encode_utf16().count() as u64;
+                if !self
+                    .text_guard_matches(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        &resolve,
+                        (original, Some(original_caret)),
+                    )
+                    .await?
+                {
+                    return Ok(InputOutcome::Stale(
+                        "field value, focus, or caret changed immediately before IME composition",
+                    ));
+                }
+                let composition_len = text.encode_utf16().count() as u64;
+                if let Err(error) = self
+                    .target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Input.imeSetComposition",
+                        serde_json::json!({"text":text,"selectionStart":composition_len,"selectionEnd":composition_len}),
+                    )
+                    .await
+                {
+                    return match self
+                        .cancel_ime_composition(sessions, reference, principal, revisions)
+                        .await
+                    {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(super::BrowserError::InvalidResponse(format!(
+                            "IME composition failed: {error}; cancellation failed: {cleanup_error}"
+                        ))),
+                    };
+                }
+                let Some(composed_value) = expected_value.as_deref() else {
+                    return Ok(InputOutcome::Unsupported(
+                        "IME composition requires a readable expected value",
+                    ));
+                };
+                let composed_caret = composed_value.encode_utf16().count() as u64;
+                let composed = self
+                    .text_guard_matches(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        &resolve,
+                        (composed_value, Some(composed_caret)),
+                    )
+                    .await;
+                if !matches!(composed, Ok(true)) {
+                    self.cancel_ime_composition(sessions, reference, principal, revisions)
+                        .await?;
+                    return match composed {
+                        Ok(false) => Ok(InputOutcome::Stale(
+                            "field value or focus changed during IME composition",
+                        )),
+                        Err(error) => Err(error),
+                        Ok(true) => unreachable!(),
+                    };
+                }
+                if let Err(error) = self
+                    .target_ref_command(
+                        sessions,
+                        reference,
+                        principal,
+                        revisions,
+                        "Input.insertText",
+                        serde_json::json!({"text":text}),
+                    )
+                    .await
+                {
+                    return match self
+                        .cancel_ime_composition(sessions, reference, principal, revisions)
+                        .await
+                    {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(super::BrowserError::InvalidResponse(format!(
+                            "IME commit failed: {error}; cancellation failed: {cleanup_error}"
+                        ))),
+                    };
+                }
             }
             InputAction::SequentialKeys(text) => {
                 let mut live_value = input.expected_value.to_owned();
@@ -593,6 +711,20 @@ impl super::BrowserConnection {
                 "input postcondition did not match requested value".into(),
             ));
         }
+        if matches!(action, InputAction::ImeText(_)) {
+            let caret = observed
+                .as_deref()
+                .unwrap_or_default()
+                .encode_utf16()
+                .count() as u64;
+            if readback["result"]["value"]["selectionStart"].as_u64() != Some(caret)
+                || readback["result"]["value"]["selectionEnd"].as_u64() != Some(caret)
+            {
+                return Err(super::BrowserError::InvalidResponse(
+                    "IME text caret postcondition did not match committed value".into(),
+                ));
+            }
+        }
         Ok(InputOutcome::Applied {
             observed_value: observed,
             postcondition_verified: true,
@@ -629,6 +761,25 @@ impl super::BrowserConnection {
             )
             .await?;
         Ok(result["result"]["value"] == true)
+    }
+
+    async fn cancel_ime_composition(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+    ) -> Result<(), super::BrowserError> {
+        self.target_ref_command(
+            sessions,
+            reference,
+            principal,
+            revisions,
+            "Input.imeSetComposition",
+            serde_json::json!({"text":"","selectionStart":0,"selectionEnd":0}),
+        )
+        .await?;
+        Ok(())
     }
 }
 
