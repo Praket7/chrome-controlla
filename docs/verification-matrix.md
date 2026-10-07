@@ -342,7 +342,8 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | Shared `shared_input` route | pass | macOS 26 / Rust 1.99.0 | Duplex extension-protocol fixture covers event-handler-changed fill readback, stale/ambiguous refusal, click-coordinate refresh, inherited-disabled/offscreen/overlay script guards, uncertain press with release attempt, uncertain release error, and post-action identity reads. This is fixture evidence, not live Chrome extension/app acceptance. |
 | Parse fenced JSON in `docs/clients.md` and `git diff --check` | pass | Python 3 / working tree | Three client JSON config examples parse; whitespace check clean. |
 | Client acceptance | open | Not run | No Freebuff, OpenCode, Claude Code, or ChatGPT client was launched. Documentation/source schema review is not external client acceptance. |
-| Remote transport/authentication | open | Not implemented | No HTTP listener, auth, tunnel, or paired outbound bridge is present. |
+| Authenticated loopback HTTP MCP route | pass (in-process) | macOS / Rust 1.99.0 / rmcp 3.5.1 | Focused tests reject missing/duplicate bearer, wrong principal, Host, and Origin, then initialize MCP, list tools, and call the read-only guide. No listener process or external client was launched. |
+| Live HTTP service/external-client acceptance | open | Not run | The listener is explicit opt-in and binds loopback only. No real service was started, and no Freebuff/OpenCode/Claude/ChatGPT client was connected. |
 | Current discovery lifecycle over packaged stdio | pass | macOS / Rust / rmcp 3.5.1 | A child process negotiated the SDK's latest protocol without `initialize`, then listed tools and versioned guide resources. This covers only the current lifecycle over local stdio, not other revisions/transports or real clients. |
 | Every rmcp-advertised initialize revision over packaged stdio | pass | macOS / Rust / rmcp 3.5.1 | `cargo test -p controlla-runtime --test stdio_conformance --locked --offline -- --nocapture` passed. Child processes negotiated 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25 and listed tools. This verifies the pinned SDK/server's initialize revisions over local stdio only; no alternate transport or external client acceptance is claimed. |
 
@@ -357,6 +358,14 @@ The client guide schema references were checked on 2026-10-06. Client binary ver
 | `cargo clippy -p controlla-runtime --all-targets --locked --offline -- -D warnings`; `cargo fmt --all -- --check`; `node tests/guide/check-master-example.mjs`; `npm run check:docs`; `git diff --check` | pass | macOS / Rust 1.99.0 / Node.js local | Runtime Clippy, workspace format/whitespace, guide sample shape, and all 23 Markdown files passed. |
 
 This is a short registry-derived bootstrap, not generated documentation or B35 usability evidence.
+
+## Phase 9 authenticated loopback transport — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| `cargo test -p controlla-runtime http_server::tests --locked --offline -- --nocapture` | pass (4/4) | macOS / Rust 1.99.0 / rmcp 3.5.1 | Exercises endpoint-audience binding, app/credential principal match, duplicate/missing bearer rejection, strict Host/Origin rejection, authenticated initialize, `tools/list`, and read-only `guide` over an in-process Axum/RMCP service. The HTTP listener was not bound or launched. |
+| HTTP security review | pass | Independent GPT-6 Sol review, pre-live | No actionable findings in auth/routing/principal/body/protocol/state-lock/CLI code. Static review only; no listener, browser, or external MCP client was used. |
+| Full integrated verification | pass | macOS / Rust 1.99.0 / Node.js 24.19.0 | `cargo test --workspace --locked --offline --quiet`: 183 passed, 0 failed, 3 ignored (installed-Chrome-only); workspace Clippy and format passed. Client, app-brief, benchmark, and docs checks passed. Provenance was rerun after refreshing the build-plan digest. |
 
 ## Pre-live integration checks — 2026-10-06
 

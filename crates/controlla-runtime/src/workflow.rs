@@ -433,13 +433,26 @@ mod tests {
         Arc::new(|input| Box::pin(async move { Ok(format!("{{\"received\":{input}}}")) }))
     }
 
+    fn rejecting_broker() -> MockBroker {
+        Arc::new(|_| Box::pin(async { Err("broker rejected".to_owned()) }))
+    }
+
+    fn delayed_broker() -> MockBroker {
+        Arc::new(|input| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(format!("{{\"received\":{input}}}"))
+            })
+        })
+    }
+
     #[tokio::test]
     async fn js_worker_awaits_only_the_async_broker_api() {
         let output = run_script(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null});",
             1000,
             8 * 1024 * 1024,
-            broker(),
+            delayed_broker(),
         )
         .await
         .unwrap();
@@ -447,6 +460,41 @@ mod tests {
             output,
             "{\"received\":{\"selector\":\"p\",\"fields\":{\"text\":\"p\"},\"max_items\":2,\"max_text_chars\":40,\"max_bytes\":4096,\"cursor\":null}}"
         );
+    }
+
+    #[tokio::test]
+    async fn js_worker_returns_fulfilled_async_promise_from_broker() {
+        let output = run_script(
+            "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).then(value=>value.received.selector);",
+            1000,
+            8 * 1024 * 1024,
+            broker(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "\"p\"");
+    }
+
+    #[tokio::test]
+    async fn js_worker_propagates_rejected_async_promise_from_broker() {
+        let caught = run_script(
+            "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).catch(error=>error.message);",
+            1000,
+            8 * 1024 * 1024,
+            rejecting_broker(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(caught, "\"broker rejected\"");
+
+        let uncaught = run_script(
+            "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null});",
+            1000,
+            8 * 1024 * 1024,
+            rejecting_broker(),
+        )
+        .await;
+        assert!(uncaught.is_err());
     }
 
     #[tokio::test]

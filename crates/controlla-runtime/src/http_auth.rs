@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 
 /// A configured credential is bound to one principal and one endpoint audience.
 /// The token itself is never retained after construction.
+#[derive(Clone)]
 pub struct Credential {
     token_digest: [u8; 32],
     pub principal: String,

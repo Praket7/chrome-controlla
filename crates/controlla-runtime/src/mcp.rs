@@ -237,13 +237,13 @@ struct CanvaIdentityArgs {
     design_id: String,
 }
 
-impl From<CanvaIdentityArgs> for crate::canva::CanvaIdentity {
-    fn from(args: CanvaIdentityArgs) -> Self {
-        Self {
-            principal: LOCAL_STDIO_PRINCIPAL.into(),
-            account_id: args.account_id,
-            workspace_id: args.workspace_id,
-            design_id: args.design_id,
+impl CanvaIdentityArgs {
+    fn into_identity(self, principal: &str) -> crate::canva::CanvaIdentity {
+        crate::canva::CanvaIdentity {
+            principal: principal.into(),
+            account_id: self.account_id,
+            workspace_id: self.workspace_id,
+            design_id: self.design_id,
         }
     }
 }
@@ -320,8 +320,9 @@ struct SharedLiveSession {
 }
 
 #[derive(Clone)]
-struct App {
+pub(crate) struct App {
     manager: BrowserManager,
+    principal: Arc<str>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<LiveSession>>>>,
     shared_sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<SharedLiveSession>>>>>,
     jobs: crate::jobs::Journal,
@@ -335,12 +336,28 @@ impl Default for App {
 
 impl App {
     fn with_journal(jobs: crate::jobs::Journal) -> Self {
+        Self::with_principal_and_journal(LOCAL_STDIO_PRINCIPAL, jobs)
+    }
+
+    pub(crate) fn with_principal_and_journal(
+        principal: impl Into<Arc<str>>,
+        jobs: crate::jobs::Journal,
+    ) -> Self {
         Self {
             manager: BrowserManager::default(),
+            principal: principal.into(),
             sessions: Arc::default(),
             shared_sessions: Arc::default(),
             jobs,
         }
+    }
+
+    pub(crate) fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    fn owns_session(&self, session: &LiveSession) -> bool {
+        session.handle.principal == self.principal.as_ref()
     }
 }
 
@@ -367,21 +384,22 @@ fn workflow_receipt(
 
 async fn run_workflow_job(
     jobs: crate::jobs::Journal,
+    principal: Arc<str>,
     session: Arc<LiveSession>,
     session_id: String,
     operation_id: String,
     reference: TargetRef,
     graph: crate::workflow::WorkflowGraph,
 ) {
-    const PRINCIPAL: &str = LOCAL_STDIO_PRINCIPAL;
+    let principal_ref = principal.clone();
     if !jobs
-        .start(PRINCIPAL, &session_id, &operation_id)
+        .start(principal_ref.as_ref(), &session_id, &operation_id)
         .unwrap_or(false)
     {
         return;
     }
     let Some(admitted) = jobs
-        .get(PRINCIPAL, &session_id, &operation_id)
+        .get(principal_ref.as_ref(), &session_id, &operation_id)
         .ok()
         .flatten()
     else {
@@ -414,6 +432,7 @@ async fn run_workflow_job(
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let callback_count = call_count.clone();
         let callback_deadline = deadline;
+        let callback_principal = principal_ref.clone();
         let broker: crate::workflow::ScriptBroker = Arc::new(move |raw| {
             let jobs = callback_jobs.clone();
             let session = callback_session.clone();
@@ -423,6 +442,7 @@ async fn run_workflow_job(
             let completed = callback_completed.clone();
             let call_count = callback_count.clone();
             let deadline = callback_deadline;
+            let principal = callback_principal.clone();
             Box::pin(async move {
                 if call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     >= crate::workflow::MAX_OBSERVE_CALLS
@@ -445,12 +465,7 @@ async fn run_workflow_job(
                 let index = completed.lock().await.len();
                 let correlation = format!("{operation_id}:script:{index}");
                 let claim = jobs
-                    .record_dispatch(
-                        LOCAL_STDIO_PRINCIPAL,
-                        &session_id,
-                        &operation_id,
-                        &correlation,
-                    )
+                    .record_dispatch(principal.as_ref(), &session_id, &operation_id, &correlation)
                     .map_err(|e| e.to_string())?;
                 if !claim.acquired {
                     return Err("operation dispatch could not be claimed".into());
@@ -464,7 +479,7 @@ async fn run_workflow_job(
                     &completed.lock().await,
                     None,
                 );
-                jobs.checkpoint(LOCAL_STDIO_PRINCIPAL, &session_id, &operation_id, pending)
+                jobs.checkpoint(principal.as_ref(), &session_id, &operation_id, pending)
                     .map_err(|e| e.to_string())?;
                 let step_deadline = deadline
                     .min(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
@@ -485,7 +500,7 @@ async fn run_workflow_job(
                 {
                     Ok(Ok(observation)) => {
                         jobs.acknowledge_dispatch(
-                            LOCAL_STDIO_PRINCIPAL,
+                            principal.as_ref(),
                             &session_id,
                             &operation_id,
                             &correlation,
@@ -503,7 +518,7 @@ async fn run_workflow_job(
                             &done,
                             None,
                         );
-                        jobs.checkpoint(LOCAL_STDIO_PRINCIPAL, &session_id, &operation_id, receipt)
+                        jobs.checkpoint(principal.as_ref(), &session_id, &operation_id, receipt)
                             .map_err(|e| e.to_string())?;
                         serde_json::to_string(&observation).map_err(|e| e.to_string())
                     }
@@ -518,7 +533,7 @@ async fn run_workflow_job(
                             Some(&error.to_string()),
                         );
                         let _ = jobs.mark_unknown(
-                            LOCAL_STDIO_PRINCIPAL,
+                            principal.as_ref(),
                             &session_id,
                             &operation_id,
                             receipt,
@@ -536,7 +551,7 @@ async fn run_workflow_job(
                             Some("step outcome unknown after timeout"),
                         );
                         let _ = jobs.mark_unknown(
-                            LOCAL_STDIO_PRINCIPAL,
+                            principal.as_ref(),
                             &session_id,
                             &operation_id,
                             receipt,
@@ -563,14 +578,18 @@ async fn run_workflow_job(
                 let artifact = match crate::workflow::validate_script_artifact(
                     &output,
                     &script_operation_id,
-                    PRINCIPAL,
+                    principal_ref.as_ref(),
                     &script_session_id,
                 ) {
                     Ok(artifact) => artifact,
                     Err(error) => {
                         let steps = script_completed.lock().await;
                         let count = script_jobs
-                            .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                            .get(
+                                principal_ref.as_ref(),
+                                &script_session_id,
+                                &script_operation_id,
+                            )
                             .ok()
                             .flatten()
                             .map_or(0, |op| op.dispatch_count);
@@ -584,7 +603,7 @@ async fn run_workflow_job(
                             Some(&error),
                         );
                         let _ = script_jobs.fail(
-                            PRINCIPAL,
+                            principal_ref.as_ref(),
                             &script_session_id,
                             &script_operation_id,
                             receipt,
@@ -599,7 +618,11 @@ async fn run_workflow_job(
                 );
                 steps.push(json!({"kind":"script","output":script_output}));
                 let count = script_jobs
-                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .get(
+                        principal_ref.as_ref(),
+                        &script_session_id,
+                        &script_operation_id,
+                    )
                     .ok()
                     .flatten()
                     .map_or(0, |op| op.dispatch_count);
@@ -614,7 +637,7 @@ async fn run_workflow_job(
                 );
                 receipt["artifacts"] = json!(artifact.into_iter().collect::<Vec<_>>());
                 let _ = script_jobs.complete(
-                    PRINCIPAL,
+                    principal_ref.as_ref(),
                     &script_session_id,
                     &script_operation_id,
                     receipt,
@@ -622,14 +645,22 @@ async fn run_workflow_job(
             }
             Ok(Err(error)) => {
                 if script_jobs
-                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .get(
+                        principal_ref.as_ref(),
+                        &script_session_id,
+                        &script_operation_id,
+                    )
                     .ok()
                     .flatten()
                     .is_some_and(|op| op.delivery == crate::jobs::Delivery::Unknown)
                 {
                     let steps = script_completed.lock().await;
                     let count = script_jobs
-                        .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                        .get(
+                            principal_ref.as_ref(),
+                            &script_session_id,
+                            &script_operation_id,
+                        )
                         .ok()
                         .flatten()
                         .map_or(0, |op| op.dispatch_count);
@@ -643,7 +674,7 @@ async fn run_workflow_job(
                         Some("script stopped while browser delivery remained unknown"),
                     );
                     let _ = script_jobs.mark_unknown(
-                        PRINCIPAL,
+                        principal_ref.as_ref(),
                         &script_session_id,
                         &script_operation_id,
                         receipt,
@@ -652,7 +683,11 @@ async fn run_workflow_job(
                 }
                 let steps = script_completed.lock().await;
                 let count = script_jobs
-                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .get(
+                        principal_ref.as_ref(),
+                        &script_session_id,
+                        &script_operation_id,
+                    )
                     .ok()
                     .flatten()
                     .map_or(0, |op| op.dispatch_count);
@@ -665,12 +700,16 @@ async fn run_workflow_job(
                     &steps,
                     Some(&error),
                 );
-                let _ =
-                    script_jobs.fail(PRINCIPAL, &script_session_id, &script_operation_id, receipt);
+                let _ = script_jobs.fail(
+                    principal_ref.as_ref(),
+                    &script_session_id,
+                    &script_operation_id,
+                    receipt,
+                );
             }
             Err(error) => {
                 let _ = script_jobs.fail(
-                    PRINCIPAL,
+                    principal_ref.as_ref(),
                     &script_session_id,
                     &script_operation_id,
                     json!({"status":"failed","error":error.to_string()}),
@@ -708,7 +747,7 @@ async fn run_workflow_job(
                 } else {
                     let correlation = format!("{operation_id}:step:{index}");
                     let claim = match jobs.record_dispatch(
-                        PRINCIPAL,
+                        principal_ref.as_ref(),
                         &session_id,
                         &operation_id,
                         &correlation,
@@ -726,7 +765,7 @@ async fn run_workflow_job(
                         None,
                     );
                     if jobs
-                        .checkpoint(PRINCIPAL, &session_id, &operation_id, pending)
+                        .checkpoint(principal_ref.as_ref(), &session_id, &operation_id, pending)
                         .is_err()
                     {
                         return;
@@ -752,7 +791,7 @@ async fn run_workflow_job(
                         Ok(Ok(observation)) => {
                             if !jobs
                                 .acknowledge_dispatch(
-                                    PRINCIPAL,
+                                    principal_ref.as_ref(),
                                     &session_id,
                                     &operation_id,
                                     &correlation,
@@ -773,8 +812,12 @@ async fn run_workflow_job(
                                 &completed,
                                 Some(&error.to_string()),
                             );
-                            let _ =
-                                jobs.mark_unknown(PRINCIPAL, &session_id, &operation_id, receipt);
+                            let _ = jobs.mark_unknown(
+                                principal_ref.as_ref(),
+                                &session_id,
+                                &operation_id,
+                                receipt,
+                            );
                             return;
                         }
                         Err(_) => {
@@ -787,8 +830,12 @@ async fn run_workflow_job(
                                 &completed,
                                 Some("step outcome unknown after timeout"),
                             );
-                            let _ =
-                                jobs.mark_unknown(PRINCIPAL, &session_id, &operation_id, receipt);
+                            let _ = jobs.mark_unknown(
+                                principal_ref.as_ref(),
+                                &session_id,
+                                &operation_id,
+                                receipt,
+                            );
                             return;
                         }
                     }
@@ -803,14 +850,14 @@ async fn run_workflow_job(
                     "failed",
                     &session_id,
                     &reference,
-                    jobs.get(PRINCIPAL, &session_id, &operation_id)
+                    jobs.get(principal_ref.as_ref(), &session_id, &operation_id)
                         .ok()
                         .flatten()
                         .map_or(0, |op| op.dispatch_count),
                     &completed,
                     Some(&error),
                 );
-                let _ = jobs.fail(PRINCIPAL, &session_id, &operation_id, receipt);
+                let _ = jobs.fail(principal_ref.as_ref(), &session_id, &operation_id, receipt);
                 return;
             }
         }
@@ -819,7 +866,7 @@ async fn run_workflow_job(
             "running",
             &session_id,
             &reference,
-            jobs.get(PRINCIPAL, &session_id, &operation_id)
+            jobs.get(principal_ref.as_ref(), &session_id, &operation_id)
                 .ok()
                 .flatten()
                 .map_or(0, |op| op.dispatch_count),
@@ -827,7 +874,7 @@ async fn run_workflow_job(
             None,
         );
         if jobs
-            .checkpoint(PRINCIPAL, &session_id, &operation_id, receipt)
+            .checkpoint(principal_ref.as_ref(), &session_id, &operation_id, receipt)
             .is_err()
         {
             return;
@@ -838,14 +885,14 @@ async fn run_workflow_job(
         "completed",
         &session_id,
         &reference,
-        jobs.get(PRINCIPAL, &session_id, &operation_id)
+        jobs.get(principal_ref.as_ref(), &session_id, &operation_id)
             .ok()
             .flatten()
             .map_or(0, |op| op.dispatch_count),
         &completed,
         None,
     );
-    let _ = jobs.complete(PRINCIPAL, &session_id, &operation_id, receipt);
+    let _ = jobs.complete(principal_ref.as_ref(), &session_id, &operation_id, receipt);
 }
 
 fn operation_response(operation: crate::jobs::Operation, replayed: bool) -> Result<Value, String> {
@@ -859,14 +906,21 @@ fn operation_response(operation: crate::jobs::Operation, replayed: bool) -> Resu
     }))
 }
 
-async fn run_file_select(s: Arc<LiveSession>, args: FileSelectArgs) -> Result<Value, String> {
+async fn run_file_select(
+    s: Arc<LiveSession>,
+    principal: &str,
+    args: FileSelectArgs,
+) -> Result<Value, String> {
     let reference: TargetRef =
         serde_json::from_value(serde_json::to_value(args.target_ref).map_err(|e| e.to_string())?)
             .map_err(|_| "target_ref must be a complete current TargetRef".to_owned())?;
     if reference.session_id != args.session_id {
         return Err("target_ref session does not match session_id".into());
     }
-    if s.handle.mode != SessionMode::DirectCdp || reference.principal != s.handle.principal {
+    if s.handle.mode != SessionMode::DirectCdp
+        || s.handle.principal != principal
+        || reference.principal != principal
+    {
         return Err("file selection requires the matching direct CDP session".into());
     }
     let locator_value = serde_json::to_value(args.locator).map_err(|e| e.to_string())?;
@@ -1035,18 +1089,21 @@ impl App {
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         crate::workflow::validate_binding(
             &args.session_id,
             &reference.session_id,
             &reference.principal,
-            &s.handle.principal,
+            &self.principal,
         )
         .map_err(invalid)?;
         let request = json!({"target_ref":reference,"steps":graph.steps});
         let admission = self
             .jobs
             .admit_with_deadline(
-                &s.handle.principal,
+                &self.principal,
                 &args.session_id,
                 &args.idempotency_key,
                 &request,
@@ -1056,6 +1113,7 @@ impl App {
         if !admission.replayed || admission.operation.status == crate::jobs::JobStatus::Accepted {
             tokio::spawn(run_workflow_job(
                 self.jobs.clone(),
+                self.principal.clone(),
                 s,
                 args.session_id,
                 admission.operation.id.clone(),
@@ -1078,7 +1136,7 @@ impl App {
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let operation = self
             .jobs
-            .get(LOCAL_STDIO_PRINCIPAL, &args.session_id, &args.operation_id)
+            .get(&self.principal, &args.session_id, &args.operation_id)
             .map_err(|error| invalid(error.to_string()))?
             .ok_or_else(|| invalid("unknown operation_id for this session"))?;
         Ok(rmcp::handler::server::wrapper::Json(
@@ -1106,6 +1164,9 @@ impl App {
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         if s.handle.mode != SessionMode::DirectCdp {
             return Err(invalid(
                 "artifact registration is currently available only for direct CDP sessions",
@@ -1138,8 +1199,13 @@ impl App {
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         Ok(rmcp::handler::server::wrapper::Json(
-            run_file_select(s, args).await.map_err(invalid)?,
+            run_file_select(s, &self.principal, args)
+                .await
+                .map_err(invalid)?,
         ))
     }
 
@@ -1163,6 +1229,9 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
@@ -1210,6 +1279,9 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
@@ -1282,7 +1354,7 @@ impl App {
                             mode: SessionMode::Shared,
                             selected_target_ids: target_ids.clone(),
                         },
-                        LOCAL_STDIO_PRINCIPAL,
+                        self.principal.to_string(),
                     )
                     .map_err(|e| invalid(format!("shared session denied: {e:?}")))?;
                 let provider = controlla_browser::providers::SharedExtensionProvider::bind(
@@ -1322,6 +1394,9 @@ impl App {
                     .cloned()
                     .ok_or_else(|| invalid("unknown shared session_id"))?;
                 let mut shared = shared.lock().await;
+                if shared.handle.principal != self.principal.as_ref() {
+                    return Err(invalid("session is not owned by this server principal"));
+                }
                 if shared.connection.is_some() {
                     return Err(invalid("shared extension session is already accepted"));
                 }
@@ -1356,6 +1431,9 @@ impl App {
                     .cloned()
                     .ok_or_else(|| invalid("unknown shared session_id"))?;
                 let shared = shared.lock().await;
+                if shared.handle.principal != self.principal.as_ref() {
+                    return Err(invalid("session is not owned by this server principal"));
+                }
                 let connection = shared
                     .connection
                     .as_ref()
@@ -1392,6 +1470,9 @@ impl App {
                     .cloned()
                     .ok_or_else(|| invalid("unknown shared session_id"))?;
                 let mut shared = shared.lock().await;
+                if shared.handle.principal != self.principal.as_ref() {
+                    return Err(invalid("session is not owned by this server principal"));
+                }
                 if let Some(connection) = shared.connection.as_mut() {
                     connection
                         .release()
@@ -1484,7 +1565,7 @@ impl App {
                             mode: SessionMode::DirectCdp,
                             selected_target_ids: target_ids.clone(),
                         },
-                        LOCAL_STDIO_PRINCIPAL,
+                        self.principal.to_string(),
                     )
                     .map_err(|e| invalid(format!("session denied: {e:?}")))?;
                 registry
@@ -1515,6 +1596,9 @@ impl App {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| invalid("unknown session_id"))?;
+                if !self.owns_session(&s) {
+                    return Err(invalid("session is not owned by this server principal"));
+                }
                 let (_, targets) = s.connection.target_snapshot().await;
                 let frames = s.connection.frames.read().await;
                 let registry = s.registry.lock().await;
@@ -1573,6 +1657,9 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
@@ -1623,6 +1710,9 @@ impl App {
             .cloned()
             .ok_or_else(|| invalid("unknown shared session_id"))?;
         let shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let connection = shared
             .connection
             .as_ref()
@@ -1721,6 +1811,9 @@ impl App {
         let shared = tokio::time::timeout_at(deadline, shared.lock())
             .await
             .map_err(|_| invalid("shared input deadline exceeded waiting for session"))?;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let connection = shared
             .connection
             .as_ref()
@@ -2004,6 +2097,9 @@ impl App {
             .get(session_id)
             .cloned()
             .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
         let registry = s.registry.lock().await;
         if reference.session_id != session_id
             || reference.principal != s.handle.principal
@@ -2190,7 +2286,7 @@ impl App {
         Parameters(args): Parameters<SlidesPlanArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let binding = crate::apps::SlidesBinding {
-            principal: LOCAL_STDIO_PRINCIPAL.into(),
+            principal: self.principal.to_string(),
             account_id: args.account_id,
             presentation_id: args.presentation_id,
             required_revision_id: args.required_revision_id,
@@ -2257,7 +2353,7 @@ impl App {
             .map_err(|error| invalid(error.to_string()))?
             .as_millis() as u64;
         let snapshot = crate::apps::CanvaSessionSnapshot {
-            principal: LOCAL_STDIO_PRINCIPAL.into(),
+            principal: self.principal.to_string(),
             account_id: args.account_id,
             design_id: args.design_id,
             page_id: args.page_id,
@@ -2301,7 +2397,7 @@ impl App {
         Parameters(args): Parameters<SlidesDeckPlanArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let binding = crate::apps::SlidesBinding {
-            principal: LOCAL_STDIO_PRINCIPAL.into(),
+            principal: self.principal.to_string(),
             account_id: args.account_id,
             presentation_id: args.presentation_id,
             required_revision_id: args.required_revision_id,
@@ -2334,12 +2430,12 @@ impl App {
             .map_err(|error| invalid(error.to_string()))?
             .as_millis() as u64;
         let binding = crate::canva::CanvaPlanBinding {
-            identity: args.binding.identity.into(),
+            identity: args.binding.identity.into_identity(&self.principal),
             session_id: args.binding.session_id,
             expected_version: args.binding.expected_version,
         };
         let session = crate::canva::CanvaSession {
-            identity: args.session.identity.into(),
+            identity: args.session.identity.into_identity(&self.principal),
             session_id: args.session.session_id,
             current_version: args.session.current_version,
             opened_at_ms: args.session.opened_at_ms,
@@ -2581,7 +2677,7 @@ fn validate_loopback_ws(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_state_directory_lock(
+pub(crate) fn acquire_state_directory_lock(
     state_dir: &std::path::Path,
 ) -> Result<std::fs::File, std::io::Error> {
     let lock_path = state_dir.join("server.lock");
@@ -2611,13 +2707,7 @@ fn acquire_state_directory_lock(
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let state_dir = std::env::var_os("CONTROLLA_STATE_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".chrome-controlla"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from(".chrome-controlla"));
+    let state_dir = state_directory();
     std::fs::create_dir_all(&state_dir)?;
     let _state_lock = acquire_state_directory_lock(&state_dir)?;
     let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))?;
@@ -2635,6 +2725,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+pub(crate) fn state_directory() -> std::path::PathBuf {
+    std::env::var_os("CONTROLLA_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".chrome-controlla"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".chrome-controlla"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{App, LOCAL_STDIO_PRINCIPAL, validate_loopback_ws};
@@ -2643,6 +2743,57 @@ mod tests {
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn configured_principal_scopes_planners_and_journal_reads() {
+        let jobs = crate::jobs::Journal::open(":memory:").unwrap();
+        let owned = jobs
+            .admit("server-principal", "session", "key", &json!({"op":"x"}))
+            .unwrap()
+            .operation;
+        let outsider = jobs
+            .admit("other-principal", "session", "key", &json!({"op":"x"}))
+            .unwrap()
+            .operation;
+        let app = App::with_principal_and_journal("server-principal", jobs);
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = serve_directly::<RoleServer, _, _, _, _>(app, server_io, None);
+        let client = ().serve(client_io).await.unwrap();
+        let plan = client
+            .call_tool(CallToolRequestParams::new("slides_plan_text_edit").with_arguments(
+                json!({"account_id":"a","presentation_id":"d","required_revision_id":"r","operation":"replace_range","object_id":"shape1","start_index":1,"end_index":2,"expected_text":"x","new_text":"y"})
+                    .as_object().unwrap().clone(),
+            ))
+            .await.unwrap().structured_content.unwrap();
+        assert_eq!(plan["plan"]["principal"], "server-principal");
+        let owned_status = client
+            .call_tool(
+                CallToolRequestParams::new("workflow_status").with_arguments(
+                    json!({"session_id":"session","operation_id":owned.id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(owned_status["status"], "accepted");
+        let status = client
+            .call_tool(
+                CallToolRequestParams::new("workflow_status").with_arguments(
+                    json!({"session_id":"session","operation_id":outsider.id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+        assert!(status.is_err());
+        client.cancel().await.unwrap();
+        server.waiting().await.unwrap();
+    }
 
     #[test]
     fn bootstrap_instructions_include_the_runtime_tool_registry() {
