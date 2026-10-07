@@ -34,6 +34,14 @@ const packageJson = JSON.parse(await readFile(path.join(packageDir, 'package.jso
 const extensionManifest = JSON.parse(await readFile(path.join(root, 'extensions/chrome-controlla/manifest.json'), 'utf8'));
 if (extensionManifest.version !== packageJson.version) throw new Error('MCP package and Chrome extension versions must match');
 const target = `${process.platform}-${process.arch}`;
+const rustTarget = {
+  'darwin-arm64': 'aarch64-apple-darwin',
+  'darwin-x64': 'x86_64-apple-darwin',
+  'linux-arm64': 'aarch64-unknown-linux-gnu',
+  'linux-x64': 'x86_64-unknown-linux-gnu',
+  'win32-x64': 'x86_64-pc-windows-msvc',
+}[target];
+if (!rustTarget) throw new Error(`No Rust target mapping for release host ${target}`);
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
 const isolatedNpmConfig = path.join(out, '.empty.npmrc');
@@ -49,7 +57,7 @@ if (!packageArchive) throw new Error('npm pack did not produce an archive');
 const extensionArchive = `chrome-controlla-extension-${packageJson.version}.tar.gz`;
 run('tar', ['-czf', path.join(out, extensionArchive), '-C', path.join(root, 'extensions/chrome-controlla'), 'manifest.json', 'background.js', 'popup.html', 'popup.js', 'README.md']);
 
-const metadata = JSON.parse(run('cargo', ['metadata', '--locked', '--format-version', '1'], { stdio: 'pipe' }));
+const metadata = JSON.parse(run('cargo', ['metadata', '--locked', '--format-version', '1', '--filter-platform', rustTarget], { stdio: 'pipe' }));
 if (!metadata.resolve) throw new Error('cargo metadata did not resolve the Controlla CLI dependency graph');
 const binary = metadata.packages.find((item) => item.name === 'controlla-runtime' && item.targets.some((entry) => entry.name === 'controlla' && entry.kind.includes('bin')));
 const nodes = new Map(metadata.resolve.nodes.map((node) => [node.id, node]));
@@ -82,6 +90,8 @@ const sbom = {
     component: { type: 'application', name: 'chrome-controlla', version: packageJson.version, 'bom-ref': runtimeRootRef },
     properties: [
       { name: 'controlla.host', value: target },
+      { name: 'controlla.rust-target', value: rustTarget },
+      { name: 'controlla.dependency-scope', value: 'Host-filtered Cargo normal dependency graph; does not inventory dynamic OS libraries' },
       { name: 'controlla.release-status', value: 'local-candidate-not-published' },
     ],
   },
@@ -121,6 +131,7 @@ await writeFile(path.join(out, 'release-manifest.json'), `${JSON.stringify({
   artifacts: [...files, 'SHA256SUMS'],
   verification: ['host-native package build', 'package archive install/lifecycle checks'],
   live_acceptance: 'not run; requires explicit Chrome profile and app/client connection',
+  runtime_dependency_scope: 'host-filtered Cargo normal dependency graph; dynamic OS libraries are not inventoried',
   runtime_dependencies: runtimePackages.map((item) => `${item.name}@${item.version}`),
 }, null, 2)}\n`);
 console.log(`Prepared local release candidate ${packageJson.version} for ${target}: ${out}`);
