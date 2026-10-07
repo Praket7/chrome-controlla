@@ -1,12 +1,16 @@
-use controlla_runtime::{artifacts::ArtifactExpectation, cache::*, verifier::*};
+use controlla_runtime::{artifacts::ArtifactExpectation, verifier::*};
 use serde_json::json;
 
 fn evidence(predicate: &Predicate) -> Evidence {
     Evidence {
+        operation_id: "op-1".into(),
+        provenance_id: "observer-proof-1".into(),
         principal: "alice".into(),
         session: "session-1".into(),
         target: "tab-1".into(),
         revision: "rev-7".into(),
+        app_signature: "fixture-app-v3".into(),
+        account_id: "account-alice".into(),
         observer: "independent-readback".into(),
         observed_at_ms: 1_000,
         predicate_hash: predicate.fingerprint(),
@@ -24,10 +28,14 @@ fn verify_for(
 ) -> Verification {
     verify(
         &EvidenceBinding {
+            operation_id: "op-1".into(),
+            provenance_id: "observer-proof-1".into(),
             principal: "alice".into(),
             session: "session-1".into(),
             target: target.into(),
             revision: revision.into(),
+            app_signature: "fixture-app-v3".into(),
+            account_id: "account-alice".into(),
         },
         now_ms,
         500,
@@ -66,12 +74,26 @@ fn rejects_fake_success_and_stale_or_unbound_evidence() {
     );
     assert_eq!(
         verify_for("tab-1", "rev-7", 1_100, &altered, &evidence(&altered)),
-        Verification::Failed
+        Verification::Inconclusive
     );
 }
 
 #[test]
-fn verifies_field_object_and_exact_state_but_not_visual_criteria() {
+fn caller_cannot_relabel_page_evidence_or_omit_operation_provenance() {
+    let predicate = Predicate::field_eq("document.title", json!("Saved"));
+    let mut forged = evidence(&predicate);
+    forged.scope = EvidenceScope::IndependentState;
+    assert_eq!(
+        verify_for("tab-1", "rev-7", 1_100, &predicate, &forged),
+        Verification::Inconclusive
+    );
+    let serialized = serde_json::to_value(&forged).unwrap();
+    assert!(serialized.get("operation_id").is_some());
+    assert!(serialized.get("provenance_id").is_some());
+}
+
+#[test]
+fn caller_supplied_state_never_claims_verified_success() {
     for predicate in [
         Predicate::field_eq("document.title", json!("Saved")),
         Predicate::object_exists("objects", "id", json!("shape-1")),
@@ -79,7 +101,7 @@ fn verifies_field_object_and_exact_state_but_not_visual_criteria() {
     ] {
         assert_eq!(
             verify_for("tab-1", "rev-7", 1_100, &predicate, &evidence(&predicate)),
-            Verification::Passed
+            Verification::Inconclusive
         );
     }
     let visual = Predicate::Visual;
@@ -90,103 +112,16 @@ fn verifies_field_object_and_exact_state_but_not_visual_criteria() {
 }
 
 #[test]
-fn workflow_cache_is_bound_to_authority_target_revision_time_and_provenance() {
-    let mut cache = WorkflowCache::default();
-    let workflow = qualified_workflow();
-    assert!(cache.insert(workflow.clone()));
-    let context = LookupContext {
-        principal: "alice".into(),
-        session: "session-1".into(),
-        target: "tab-1".into(),
-        revision: "rev-7".into(),
-        environment: "chrome-154/linux".into(),
-        authority: "edit:fixture.test".into(),
-        predicate_hash: "predicate-hash".into(),
-        now_ms: 1_500,
-    };
-    assert!(matches!(
-        cache.lookup(&workflow.signature, &context),
-        CacheLookup::Hit(_)
-    ));
-
-    for drift in [
-        LookupContext {
-            target: "tab-2".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            revision: "rev-8".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            principal: "bob".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            authority: "read:fixture.test".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            session: "session-2".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            environment: "chrome-155/linux".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            predicate_hash: "changed-control-semantics".into(),
-            ..context.clone()
-        },
-        LookupContext {
-            now_ms: 2_001,
-            ..context.clone()
-        },
-    ] {
-        assert!(matches!(
-            cache.lookup(&workflow.signature, &drift),
-            CacheLookup::Miss(_)
-        ));
-    }
-    cache.quarantine(&workflow.signature, "false success");
-    assert!(matches!(
-        cache.lookup(&workflow.signature, &context),
-        CacheLookup::Quarantined(_)
-    ));
-    assert!(!cache.insert(QualifiedWorkflow {
-        schema_version: 2,
-        ..workflow
-    }));
-    let mut missing_provenance = qualified_workflow();
-    missing_provenance.provenance.validation = None;
-    assert!(!cache.insert(missing_provenance));
-}
-
-#[test]
 fn artifact_validation_rejects_truncated_download() {
+    let correct = ArtifactExpectation {
+        byte_length: 7,
+        sha256: "15a596e3c98c407e043751ff3b21ff0358a1bdfdf3fe948b1523893a8e5de2e8".into(),
+    };
+    assert!(correct.matches(b"correct"));
+    assert!(!correct.matches(b"corrupt"));
     let expected = ArtifactExpectation {
         byte_length: 8,
         sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
     };
     assert!(!expected.matches(b"short"));
-}
-
-fn qualified_workflow() -> QualifiedWorkflow {
-    QualifiedWorkflow {
-        signature: "sig-v1".into(),
-        schema_version: 1,
-        principal: "alice".into(),
-        session: "session-1".into(),
-        target: "tab-1".into(),
-        revision: "rev-7".into(),
-        environment: "chrome-154/linux".into(),
-        authority: "edit:fixture.test".into(),
-        predicate_hash: "predicate-hash".into(),
-        qualified_at_ms: 1_000,
-        expires_at_ms: 2_000,
-        provenance: Provenance {
-            training: Some("train-fixture-1".into()),
-            validation: Some("heldout-fixture-1".into()),
-        },
-    }
 }

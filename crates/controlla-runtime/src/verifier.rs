@@ -62,10 +62,14 @@ pub enum EvidenceScope {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Evidence {
+    pub operation_id: String,
+    pub provenance_id: String,
     pub principal: String,
     pub session: String,
     pub target: String,
     pub revision: String,
+    pub app_signature: String,
+    pub account_id: String,
     pub observer: String,
     pub observed_at_ms: u64,
     pub predicate_hash: String,
@@ -75,10 +79,14 @@ pub struct Evidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceBinding {
+    pub operation_id: String,
+    pub provenance_id: String,
     pub principal: String,
     pub session: String,
     pub target: String,
     pub revision: String,
+    pub app_signature: String,
+    pub account_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,44 +104,23 @@ pub fn verify(
     predicate: &Predicate,
     evidence: &Evidence,
 ) -> Verification {
-    if evidence.principal != binding.principal
+    if evidence.operation_id != binding.operation_id
+        || evidence.provenance_id != binding.provenance_id
+        || evidence.principal != binding.principal
         || evidence.session != binding.session
         || evidence.target != binding.target
         || evidence.revision != binding.revision
+        || evidence.app_signature != binding.app_signature
+        || evidence.account_id != binding.account_id
         || evidence.scope != EvidenceScope::IndependentState
         || evidence.observer.is_empty()
         || evidence.observed_at_ms > now_ms
         || now_ms.saturating_sub(evidence.observed_at_ms) > max_age_ms
         || evidence.predicate_hash != predicate.fingerprint()
-        || matches!(predicate, Predicate::Visual)
     {
         return Verification::Inconclusive;
     }
-
-    let matched = match predicate {
-        Predicate::FieldEq { path, expected } => {
-            path_value(&evidence.state, path) == Some(expected)
-        }
-        Predicate::ObjectExists {
-            path,
-            field,
-            expected,
-        } => path_value(&evidence.state, path)
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| item.get(field) == Some(expected))),
-        Predicate::StateEq { expected } => &evidence.state == expected,
-        Predicate::Visual => return Verification::Inconclusive,
-    };
-    if matched {
-        Verification::Passed
-    } else {
-        Verification::Failed
-    }
-}
-
-fn path_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    if path.is_empty() {
-        return None;
-    }
-    path.split('.').try_fold(value, |node, part| node.get(part))
+    // No runtime-controlled app observer exists yet. A caller-provided scope or observer label
+    // cannot establish that evidence is independent, so no external receipt may pass here.
+    Verification::Inconclusive
 }

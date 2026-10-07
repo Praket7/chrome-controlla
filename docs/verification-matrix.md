@@ -1,16 +1,16 @@
 # Verification matrix
 
-## Phase 7 local verifier/cache slice — 2026-10-06
+## Phase 7 review-fix verification — 2026-10-06
 
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
-| Red-first focused tests | pass after expected missing-module compile failure | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | `cargo test -p controlla-runtime --test phase7`; covers page-claim refusal, identity/revision/time/predicate binding, field/object/state predicates, visual inconclusive, truncated artifact, scoped/expired cache, provenance presence and quarantine. |
-| Independent evidence contract | local fixture pass | Rust unit library | Deterministic only when caller supplies independent state evidence; struct does not establish observer independence or app persistence. |
-| Artifact validator | local fixture pass | Rust unit library | Verifies exact byte length and SHA-256; no browser download capture/fixture exercised. |
-| Workflow cache | local fixture pass | Rust unit library | In-memory schema v1; exact principal/session/target/revision/environment/authority and time bounds; training and validation provenance required; expired/drifted entries miss and quarantine is terminal. No execution integration, persistent cache, or cost result. |
-| Workspace tests and Clippy | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | `cargo test --workspace`: 132 passed, 3 ignored (installed-Chrome-only); `cargo clippy --workspace --all-targets -- -D warnings`: pass. |
+| Red-first review reproduction | failed as expected before fix | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Forged `IndependentState` returned `passed`; target drift left the original cache entry usable. These are now regression tests. |
+| Public evidence verifier | fail-closed | Rust runtime | Evidence includes operation/provenance and principal/session/target/app/account/revision/time/predicate bindings, but caller-set observer/scope is untrusted and always yields `inconclusive`; no production observer exists. |
+| Artifact validator | local fixture pass | Rust unit library | Known-good SHA-256 passes; truncated and same-length altered bytes fail. Browser download capture is not exercised. |
+| Qualification/cache mechanics | internal unit pass | Rust runtime unit tests | Canonical signature varies with site/app/schema/content/permissions/identity/footprint/verifier/versions/authority/failure policy. Only opaque successful training+validation receipts mint a token; drift, expiry and failed/inconclusive verification quarantine; restore requires a new token. Test-only receipts do not qualify a live workflow. |
+| Workspace tests and Clippy | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | `cargo test --workspace`: 135 passed, 3 ignored (installed-Chrome-only); `cargo clippy --workspace --all-targets -- -D warnings`: pass. |
 | Provenance and docs links | pass | Node.js 24.19.0 | `node scripts/check-provenance.mjs`: 13 destination digests and 22 retained tests; `node scripts/check-doc-links.mjs`: 13 Markdown files. |
-| Live app, visual and persistence qualification | not run | none | Visual predicates stay inconclusive. No MCP workflow integration, independent app observer, live persisted-state evidence, or B28–B30 release suite is claimed. |
+| Live app, visual and persistence qualification | not run | none | CC-16 is not passed. No production observer/suite runner can issue qualification tokens; no MCP workflow integration, live persisted-state evidence, or B28–B30 release suite is claimed. |
 
 Evidence labels: `source_observed`, `fixture_verified`, `live_verified`, `benchmark_verified`. A result is limited to the stated environment. Phase 0 does not qualify live browser behavior.
 

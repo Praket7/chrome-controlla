@@ -82,12 +82,12 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 ## Phase 7 local implementation record — 2026-10-06
 
-- [x] Added red-first tests for page-claim fake success, wrong target/revision, old evidence, predicate mismatch, field/object/state predicates, truncated artifact bytes, workflow scope/expiry/provenance and quarantine.
-- [x] Added deterministic JSON field equality, array-object existence and exact-state verifiers; evidence must be independent, fresh, and bound to principal/session/target/revision/predicate. Visual-only predicates return `inconclusive`.
-- [x] Added byte-length plus SHA-256 artifact validation and an in-memory cache schema v1 with training/validation provenance, environment/authority preconditions, expiry and quarantine.
-- [ ] B28–B30 independent-ground-truth fixtures, cold/warm cost study, live app persistence, artifact download capture and user-visible workflow/MCP integration remain open.
+- [x] Red-first review-fix tests reproduced forged `IndependentState` claims passing and cache target drift failing to quarantine. Added checks for operation/provenance fields and positive, truncated, and same-length-corrupt artifacts.
+- [x] Evidence declarations bind operation/provenance ID, principal/session/target/app/account/revision, observer label, time and predicate hash. Because no runtime-controlled app observer exists, all caller-supplied evidence now returns `inconclusive`.
+- [x] Added canonical cache signatures over workflow/site/app/schema/content/permission/identity/footprint/verifier/version/authority/failure-policy fields; drift and non-pass verification quarantine. Admission and unquarantine require an opaque successful training/validation token.
+- [ ] No production suite runner can mint qualification tokens, so production cache admission is not available. B28–B30 independent-ground-truth fixtures, CC-16, cold/warm cost study, live app persistence, artifact download capture and workflow/MCP integration remain open.
 
-This is a local deterministic library slice. Phase 6's workflow compiler is not present, and the cache is not wired to execution. Callers must reauthorize each mutation. Evidence structs do not create an independent observer: only actual independent readback supplied by a qualified observer can support a pass. No app persistence, visual quality or live cache qualification is claimed.
+This is a local contract and fail-closed cache-mechanics slice. Phase 6's workflow compiler is not present; cache is not wired to execution; and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
 
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 

@@ -125,6 +125,8 @@ Compile supported SDK calls to a typed graph, with dynamic branches retained as 
 
 A cached workflow includes input schema, content hash, site scope, app signature, expected permissions, identity requirements, read/write footprint, verifier, training/validation provenance, versions, last qualification, and failure policy. Cache data is not authority. Retire on wrong target, false success, navigation mismatch, changed control semantics or failed outcome. Relearn only in a sandbox or authorized test account.
 
+Phase 7 adds canonical signatures over these cache preconditions and requires an opaque successful training/validation token for admission or recovery from quarantine. There is no production observer or suite runner to mint that token yet. Caller-provided evidence can declare an observer label, but verification remains `inconclusive`; CC-16 is not passed. Cache admission, app persistence, and cold/warm benefit are unqualified.
+
 Use selective observation with a retained local state graph. The model receives relevant deltas; the runtime maintains full identity and safety metadata. If context was compacted or the page changed, do not let the model reconstruct exact targets from memory.
 
 ## 8. App support matrix to fill during implementation

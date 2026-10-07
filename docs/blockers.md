@@ -2,9 +2,9 @@
 
 ## Phase 7 boundary
 
-- The deterministic verifier and in-memory cache are not connected to MCP execution or Phase 6's unimplemented workflow compiler. Each mutation still requires fresh authorization in its execution path.
-- Independent evidence is an input contract only; no app-specific observer, persisted-state readback, visual reviewer, or browser download capture is implemented here. Visual predicates return inconclusive.
-- B28–B30 adversarial fixtures with ground truth outside the agent-visible page, cache cold/warm cost accounting, live app qualification, and the release-suite false-completion gate remain open. Do not infer Phase 7 release qualification from the focused unit tests.
+- CC-16 is not passed: no runtime-controlled observer exists. Caller-set scope/observer labels are untrusted, so public verification always returns `inconclusive`; evidence includes operation/provenance and app/account bindings but does not establish observed or persisted success.
+- The cache has canonical precondition signatures and fail-closed quarantine mechanics, but there is no production suite runner to mint its opaque qualification token. Its unit-only qualification receipts are not live qualification. Cache is in-memory and not connected to Phase 6/MCP execution.
+- B28–B30 independent-ground-truth fixtures, cache cold/warm cost accounting, live app persistence, artifact download capture, visual review, and the release-suite false-completion gate remain open.
 
 ## Phase 0
 
