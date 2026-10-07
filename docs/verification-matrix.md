@@ -102,7 +102,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 | Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
 |---|---|---|---|---|
-| Google Slides | Generic guarded shared fill/click only; no live app route | Planning-only revision-bound text request; OAuth/API dispatch absent | Generic browser tools plus `app_capabilities` and `slides_plan_text_edit` | `unqualified` |
+| Google Slides | Generic guarded shared fill/click only; no live app route | Fixture-tested revision-bound request descriptor (POST URL, JSON body, OAuth scope); token injection/API dispatch absent | Generic browser tools plus `app_capabilities` and `slides_plan_text_edit` | `unqualified` |
 | Canva | Generic guarded shared fill/click only; no live app route | Planning-only one-minute session/locked-page preflight; Apps SDK connection absent | Generic browser tools plus `app_capabilities` and `canva_sync_preflight` | `unqualified` |
 | CapCut Web | No qualified controls or verifier | No official general timeline API route established | Generic browser tools plus `app_capabilities`; `capcut_web_plan` returns unsupported | `unqualified` |
 

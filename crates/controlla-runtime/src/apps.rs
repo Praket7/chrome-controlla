@@ -89,6 +89,10 @@ pub struct SlidesPlan {
     pub presentation_id: String,
     pub required_revision_id: String,
     pub method: String,
+    pub http_method: String,
+    pub url: String,
+    pub content_type: String,
+    pub required_oauth_scopes: Vec<String>,
     pub request_body: Value,
     pub precondition: Value,
     pub qualification: Qualification,
@@ -160,6 +164,13 @@ pub fn plan_slides_text_edit(
         presentation_id: binding.presentation_id.clone(),
         required_revision_id: binding.required_revision_id.clone(),
         method: "presentations.batchUpdate".into(),
+        http_method: "POST".into(),
+        url: format!(
+            "https://slides.googleapis.com/v1/presentations/{}:batchUpdate",
+            encode_path_segment(&binding.presentation_id)
+        ),
+        content_type: "application/json".into(),
+        required_oauth_scopes: vec!["https://www.googleapis.com/auth/presentations".into()],
         request_body: json!({
             "requests": requests,
             "writeControl": {"requiredRevisionId": binding.required_revision_id}
@@ -167,6 +178,19 @@ pub fn plan_slides_text_edit(
         precondition,
         qualification: Qualification::RequiresConnection,
     })
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 fn valid_object_id(value: &str) -> bool {
@@ -300,6 +324,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.presentation_id, "presentation-1");
+        assert_eq!(plan.http_method, "POST");
+        assert_eq!(
+            plan.url,
+            "https://slides.googleapis.com/v1/presentations/presentation-1:batchUpdate"
+        );
+        assert_eq!(plan.content_type, "application/json");
+        assert_eq!(
+            plan.required_oauth_scopes,
+            ["https://www.googleapis.com/auth/presentations"]
+        );
         assert_eq!(
             plan.request_body["writeControl"]["requiredRevisionId"],
             "revision-7"
@@ -315,6 +349,22 @@ mod tests {
         );
         assert_eq!(plan.precondition["expected_text"], "Draft");
         assert_eq!(plan.qualification, Qualification::RequiresConnection);
+    }
+
+    #[test]
+    fn slides_endpoint_encodes_presentation_id_as_one_path_segment() {
+        let mut binding = slides_binding();
+        binding.presentation_id = "a/b?c".into();
+        let plan = plan_slides_text_edit(
+            &binding,
+            SlidesTextEdit::InsertIntoObject {
+                object_id: "shape_1".into(),
+                text: "x".into(),
+                insertion_index: 0,
+            },
+        )
+        .unwrap();
+        assert!(plan.url.ends_with("/a%2Fb%3Fc:batchUpdate"));
     }
 
     #[test]
