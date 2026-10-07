@@ -453,5 +453,6 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | `cargo fmt --all -- --check`, workspace Clippy, `cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Rust 1.99.0 | 92 browser tests passed, 2 ignored; integration/runtime groups 7, 55, 8, 17, 4, 3, and 3 passed; Clippy and formatting clean. |
 | Provenance, Markdown links, `git diff --check` | pass | Node.js / local workspace | 13 destination digests and 22 retained tests verified; local links checked in 29 files. |
 | Current MCP process guide | stale | Codex desktop | Returns `master-2026-10-06-v3`; current source expects `master-2026-10-07-v4`. Restart is required before live shared-tab qualification. |
+| OpenCode stdio connection to current candidate | pass, connection only | OpenCode 1.18.5; local candidate SHA-256 `c88a29cb183524b32a66181e0612938314b73e3a3f1c7813d1d3c71962c60878` | An isolated generated v1 config connected to the release binary; auto-connect was omitted to avoid opening remote debugging. No tool action was called. Existing OpenCode config was not changed. |
 
 The current guide distinguishes Direct CDP AX/crop/extraction from the paired extension's `shared_observe` and `shared_input` routes. No extension source changed in this follow-up.
