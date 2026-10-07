@@ -103,11 +103,13 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 | Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
 |---|---|---|---|---|
-| Google Slides | Generic guarded shared fill/click only; no live app route | Fixture-tested revision-bound request descriptor (POST URL, JSON body, OAuth scope); token injection/API dispatch absent | Generic browser tools plus `app_capabilities` and `slides_plan_text_edit` | `unqualified` |
-| Canva | Generic guarded shared fill/click only; no live app route | Planning-only one-minute session/locked-page preflight; Apps SDK connection absent | Generic browser tools plus `app_capabilities` and `canva_sync_preflight` | `unqualified` |
-| CapCut Web | No qualified controls or verifier | No official general timeline API route established | Generic browser tools plus `app_capabilities`; `capcut_web_plan` returns unsupported | `unqualified` |
+| Google Slides | Generic guarded shared fill/click only; no live app route | Offline 10-slide request compiler; fixture-tested per-edit revision-bound request; no token injection/API dispatch | Generic browser tools plus `app_capabilities`, `slides_plan_text_edit`, and `slides_deck_plan` | `unqualified` |
+| Canva | Generic guarded shared fill/click only; no live app route | Offline five-page design plan and caller-snapshot expiry/lock preflight; Apps SDK connection absent | Generic browser tools plus `app_capabilities`, `canva_sync_preflight`, and `canva_design_plan` | `unqualified` |
+| CapCut Web | No qualified controls or verifier | Offline asset/timing recipe validation only; no official general timeline API route established | Generic browser tools plus `app_capabilities`, unsupported `capcut_web_plan`, and `capcut_recipe_plan` | `unqualified` |
 
 These rows describe available code paths, not app validation. Planning/preflight tools do not dispatch. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
+
+The offline Slides, Canva, and CapCut planning tools each passed focused unit tests and the local stdio roundtrip. See [Phase 8 offline planner evidence](review/phase8-offline-planners.md). This adds deterministic preparation only; it does not change any app's `unqualified` status or close the Phase 8 execution, persistence, export, and quality gates.
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 

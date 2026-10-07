@@ -236,7 +236,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Gate:** no release-suite false completion; visual/aesthetic uncertainty is preserved, not coerced into pass.
 
-**Pre-live app contracts (2026-10-06):** typed Slides revision-bound text-request planning, Canva exact-identity/session-age/locked-page sync preflight, and explicit unsupported CapCut planning are exposed through read-only MCP tools. They do not connect to vendor APIs or mutate a browser. Acceptance briefs and separate correctness/visual rubrics are present under `apps/`; all live evidence remains pending.
+**Pre-live app planning slice (2026-10-06):** read-only MCP tools compile a 10-slide revision-bound Slides request, a five-page identity/session/version-bound Canva design plan, and a CapCut timeline recipe validated against caller-supplied licensed-asset metadata. The fixed proposals are unit- and stdio-tested, but none connects to vendor APIs or mutates a browser. They do not provide authoritative identity/session observation, OAuth, edit dispatch, app readback, persistence, export, or quality review. Acceptance briefs and separate correctness/visual rubrics are present under `apps/`; all live evidence remains pending. See `docs/review/phase8-offline-planners.md`.
 
 ## Phase 8 — qualify professional web-app workflows
 

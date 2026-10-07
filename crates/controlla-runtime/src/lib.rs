@@ -1,10 +1,13 @@
 pub mod apps;
 pub mod artifacts;
 pub mod cache;
+pub mod canva;
 pub mod capability;
+pub mod capcut_recipe;
 pub mod doctor;
 pub mod jobs;
 pub mod mcp;
+pub mod slides_deck;
 pub mod verifier;
 pub mod workflow;
 

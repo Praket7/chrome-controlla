@@ -211,6 +211,25 @@ struct AppCapabilitiesArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SlidesDeckPlanArgs {
+    principal: String,
+    account_id: String,
+    presentation_id: String,
+    required_revision_id: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CanvaDesignPlanArgs {
+    binding: crate::canva::CanvaPlanBinding,
+    session: crate::canva::CanvaSession,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CapCutRecipePlanArgs {
+    recipe: crate::capcut_recipe::CapCutRecipe,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SlidesPlanArgs {
     principal: String,
     account_id: String,
@@ -2215,6 +2234,68 @@ impl App {
             "side_effects":false
         }))
     }
+
+    #[tool(
+        name = "slides_deck_plan",
+        description = "Compile the checked-in 10-slide acceptance brief into a revision-bound editable Google Slides API request. Planning only: it performs no OAuth, network request, write, readback, or export."
+    )]
+    async fn slides_deck_plan(
+        &self,
+        Parameters(args): Parameters<SlidesDeckPlanArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let binding = crate::apps::SlidesBinding {
+            principal: args.principal,
+            account_id: args.account_id,
+            presentation_id: args.presentation_id,
+            required_revision_id: args.required_revision_id,
+        };
+        let plan = crate::slides_deck::compile_urban_heat_deck(&binding).map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"planned_not_dispatched",
+            "plan":plan,
+            "side_effects":false,
+            "app_acceptance":"not_established"
+        })))
+    }
+
+    #[tool(
+        name = "canva_design_plan",
+        description = "Compile the five-page Heat-Ready Canva brief after checking caller-provided exact identity, session, version, expiry, and page state. Planning only; no Canva SDK/OAuth call or sync."
+    )]
+    async fn canva_design_plan(
+        &self,
+        Parameters(args): Parameters<CanvaDesignPlanArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid(error.to_string()))?
+            .as_millis() as u64;
+        let plan = crate::canva::plan_heat_ready_design(&args.binding, &args.session, now_ms)
+            .map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"planned_not_dispatched",
+            "plan":plan,
+            "side_effects":false,
+            "app_acceptance":"not_established"
+        })))
+    }
+
+    #[tool(
+        name = "capcut_recipe_plan",
+        description = "Validate owned/licensed asset metadata and compile a bounded captioned-video timeline description. Offline planning only; no CapCut selectors, media transfer, or editor action."
+    )]
+    async fn capcut_recipe_plan(
+        &self,
+        Parameters(args): Parameters<CapCutRecipePlanArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let plan = crate::capcut_recipe::compile_capcut_recipe(&args.recipe).map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"offline_plan_only",
+            "plan":plan,
+            "side_effects":false,
+            "app_acceptance":"not_established"
+        })))
+    }
 }
 
 #[tool_handler]
@@ -2591,6 +2672,9 @@ mod tests {
         assert!(names.contains(&"slides_plan_text_edit"));
         assert!(names.contains(&"canva_sync_preflight"));
         assert!(names.contains(&"capcut_web_plan"));
+        assert!(names.contains(&"slides_deck_plan"));
+        assert!(names.contains(&"canva_design_plan"));
+        assert!(names.contains(&"capcut_recipe_plan"));
         let guide = client
             .call_tool(
                 CallToolRequestParams::new("guide").with_arguments(
@@ -2634,6 +2718,9 @@ mod tests {
             "slides_plan_text_edit",
             "canva_sync_preflight",
             "capcut_web_plan",
+            "slides_deck_plan",
+            "canva_design_plan",
+            "capcut_recipe_plan",
         ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -2656,6 +2743,69 @@ mod tests {
         let app_caps = app_caps.structured_content.unwrap();
         assert_eq!(app_caps["live_qualified"], false);
         assert_eq!(app_caps["side_effects"], false);
+        let deck = client
+            .call_tool(
+                CallToolRequestParams::new("slides_deck_plan").with_arguments(
+                    json!({"principal":"p","account_id":"a","presentation_id":"deck-1","required_revision_id":"rev-1"})
+                        .as_object().unwrap().clone(),
+                ),
+            )
+            .await.unwrap().structured_content.unwrap();
+        assert_eq!(deck["status"], "planned_not_dispatched");
+        assert_eq!(deck["plan"]["slide_titles"].as_array().unwrap().len(), 10);
+        assert_eq!(deck["side_effects"], false);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let canva_identity =
+            json!({"principal":"p","account_id":"a","workspace_id":"w","design_id":"d"});
+        let canva = client.call_tool(CallToolRequestParams::new("canva_design_plan").with_arguments(
+            json!({
+                "binding":{"identity":canva_identity,"session_id":"s","expected_version":"v"},
+                "session":{"identity":{"principal":"p","account_id":"a","workspace_id":"w","design_id":"d"},"session_id":"s","current_version":"v","opened_at_ms":now_ms-1000,"expires_at_ms":now_ms+30_000,"page_type":"absolute","locked":false}
+            }).as_object().unwrap().clone(),
+        )).await.unwrap().structured_content.unwrap();
+        assert_eq!(canva["status"], "planned_not_dispatched");
+        assert_eq!(canva["plan"]["pages"].as_array().unwrap().len(), 5);
+        let roles = [
+            "shade_shot",
+            "water_rest_shot",
+            "neighbor_shot",
+            "narration",
+            "music",
+        ];
+        let assets = roles.iter().enumerate().map(|(index, role)| json!({
+            "asset_id":format!("asset-{index}"),"source_and_rights":"owned test media; rights recorded",
+            "sha256":format!("{:064x}",index+1),"duration_ms":30_000,"frame_rate_milli":30_000,
+            "width":1920,"height":1080,"audio_tracks":if index >= 3 {1} else {0},"expected_use":role
+        })).collect::<Vec<_>>();
+        let recipe = json!({
+            "assets":assets,
+            "clips":[
+                {"asset_id":"asset-0","source_in_ms":0,"source_out_ms":7000,"timeline_start_ms":0},
+                {"asset_id":"asset-1","source_in_ms":1000,"source_out_ms":9000,"timeline_start_ms":7000},
+                {"asset_id":"asset-2","source_in_ms":0,"source_out_ms":8000,"timeline_start_ms":15000}
+            ],
+            "captions":[
+                {"text":"Find shade during peak heat.","start_ms":500,"end_ms":6500},
+                {"text":"Drink water and take a cool break.","start_ms":7200,"end_ms":14500},
+                {"text":"Check on a neighbor.","start_ms":15200,"end_ms":21500},
+                {"text":"Plan ahead. Look out for each other.","start_ms":22000,"end_ms":23000}
+            ],
+            "narration_asset_id":"asset-3","music_asset_id":"asset-4","width":1920,"height":1080
+        });
+        let capcut = client
+            .call_tool(
+                CallToolRequestParams::new("capcut_recipe_plan")
+                    .with_arguments(json!({"recipe":recipe}).as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(capcut["status"], "offline_plan_only");
+        assert_eq!(capcut["plan"]["duration_ms"], 23_000);
         let plan = client
             .call_tool(
                 CallToolRequestParams::new("slides_plan_text_edit").with_arguments(

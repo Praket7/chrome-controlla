@@ -213,7 +213,7 @@ This preview has no download or export tool. `artifact_register` plus `file_sele
 
 ## 13. Design-app recipes
 
-**Current availability:** `app_capabilities`, `slides_plan_text_edit`, and `canva_sync_preflight` are planning/preflight only; they make no app connection or mutation. `capcut_web_plan` returns unsupported until its controls and verifier are qualified. There is no Slides, Canva, or CapCut edit/execute/verify route. The recipes below describe qualification requirements only; they are not runnable integrations. Generic observation or file selection does not establish an app edit, save, or export. Check the per-app rows in `docs/verification-matrix.md`; if a requested change needs an app mutation, report it unsupported until a route and its evidence gates are qualified.
+**Current availability:** `app_capabilities`, `slides_plan_text_edit`, `slides_deck_plan`, `canva_sync_preflight`, and `canva_design_plan` are planning/preflight only; they make no app connection or mutation. `capcut_web_plan` returns unsupported until its controls and verifier are qualified; `capcut_recipe_plan` only validates supplied assets/timing and emits a local timeline description. No Slides, Canva, or CapCut edit/execute/verify route is connected. Planning tools do not prove caller-supplied identity, entitlement, current session state, saved output, or export. Generic observation or file selection does not establish an app edit, save, or export. Check the per-app rows in `docs/verification-matrix.md`; if a requested change needs an app mutation, report it unsupported until a route and its evidence gates are qualified.
 
 ### Google Slides
 
@@ -221,7 +221,7 @@ Identify presentation/account; obtain current object/revision data; choose quali
 
 ### Canva
 
-Identify design/page and supported operation. The current `canva_sync_preflight` validates a caller-supplied snapshot; it does not connect to Canva or independently verify session age/page lock. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. `sync` can write as well as refresh. In this preview, do not call `sync`; no edit/persist/export route exists.
+Identify design/page and supported operation. `canva_sync_preflight` and `canva_design_plan` validate caller-supplied snapshots; they do not connect to Canva or independently verify session age/page lock. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. `sync` can write as well as refresh. In this preview, do not call `sync`; no edit/persist/export route exists.
 
 ### CapCut Web
 
