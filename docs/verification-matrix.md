@@ -442,3 +442,16 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Save or app persistence | not run | Same live session | No content write or save command was sent. |
 | External MCP client connection | pass, scoped | macOS arm64; OpenCode 1.18.5; local `controlla` 0.1.0 binary SHA-256 `f860acd5388a94b84312798e3b78e0b3ceaffcc1cd4b740cc7932e3c1a2e68cc` | In a temporary isolated working directory, `opencode mcp list` reported `chrome-controlla connected` against the generated OpenCode v1 stdio config. The generated v2 shape was rejected by this installed v1 client. This verifies connection/discovery only; no tool call was made and no saved client config was changed. |
 | Other external-client acceptance | open | Freebuff, Claude Code, ChatGPT and HTTP clients | No tool-call, workflow, artifact or cleanup behavior was tested through those clients. |
+
+## Phase 3–5 focused follow-up — 2026-10-07
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-runtime --test jobs --locked --offline` | pass | macOS 26 / Rust 1.99.0 | 17 passed. Subprocess restart/replay coverage spans seven durable fixture cut points; Sol approved the atomic readiness marker and claim-before-effect boundary. |
+| `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / installed Chrome | 1 passed. Repeats the focus-handler interference path three times; all guarded writes yield and preserve the external value. Sol approved the test and its narrow claims. |
+| `cargo test -p controlla-browser --test phase5_advanced --locked --offline -- --ignored --nocapture` | pass | macOS 26 / installed Chrome | 1 passed. Rechecked selected-node AX, bounded crop, resumable cursor/stale rejection, and successful/blocked expansion. Sol approved the Phase 5 local evidence and corrected extraction-count semantics. |
+| `cargo fmt --all -- --check`, workspace Clippy, `cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Rust 1.99.0 | 92 browser tests passed, 2 ignored; integration/runtime groups 7, 55, 8, 17, 4, 3, and 3 passed; Clippy and formatting clean. |
+| Provenance, Markdown links, `git diff --check` | pass | Node.js / local workspace | 13 destination digests and 22 retained tests verified; local links checked in 29 files. |
+| Current MCP process guide | stale | Codex desktop | Returns `master-2026-10-06-v3`; current source expects `master-2026-10-07-v4`. Restart is required before live shared-tab qualification. |
+
+The current guide distinguishes Direct CDP AX/crop/extraction from the paired extension's `shared_observe` and `shared_input` routes. No extension source changed in this follow-up.

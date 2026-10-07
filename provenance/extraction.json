@@ -110,7 +110,7 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "79e9a8f6f83076482d6445fb32d1becda97e342c8bbebb1a1200ecf201bda33e",
+      "destination_sha256": "7b91135c7504efcab6dea2d1d50ba5223b2ef0e2596e48ff56fe8db83dbe2ab0",
       "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3",
       "license": "user-provided design document; no third-party license asserted"
     }

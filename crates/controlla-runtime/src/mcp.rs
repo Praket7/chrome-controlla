@@ -2567,7 +2567,7 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
             include_str!("../../../docs/clients.md"),
         )),
         "master" => Some((
-            "master-2026-10-06-v3",
+            "master-2026-10-07-v4",
             include_str!("../../../docs/MASTER_GUIDE.md"),
         )),
         _ => None,
@@ -2964,12 +2964,12 @@ mod tests {
             .unwrap()
             .structured_content
             .unwrap();
-        assert_eq!(master_guide["guide_version"], "master-2026-10-06-v3");
+        assert_eq!(master_guide["guide_version"], "master-2026-10-07-v4");
         assert!(
             master_guide["content"]
                 .as_str()
                 .unwrap()
-                .contains("master-2026-10-06-v3")
+                .contains("master-2026-10-07-v4")
         );
         let stale_guide = client
             .call_tool(
