@@ -52,8 +52,8 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-14 | partial | 6 | Deterministic bounded graph and fail-closed limits are fixture-verified through MCP; arbitrary JS, CPU/memory worker bounds and durable cancellation are blocked |
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
 | CC-16 | unimplemented | 7 | none |
-| CC-17 | unimplemented | 9 | none |
-| CC-18 | unimplemented | 9 | none |
+| CC-17 | partial | 9 | `docs/clients.md` records dated local config shapes; no external client or live workflow acceptance |
+| CC-18 | partial | 9 | Read-only `guide` tool serves version-matched client/master docs; canonical resource, generated examples, and B35 remain open |
 | CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
 | CC-20 | unimplemented | 10 | none |
 | CC-21 | unimplemented | 7 | none |
@@ -94,7 +94,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B32 | partial | 6 | Workflow step count, per-step/aggregate waits, observe limits and aggregate declared bytes are rejected above bounds; infinite-loop and memory-flood worker termination remain blocked with scripting |
 | B33 | partial | 5 | fixture policy classifies wrong-account 404 unknown; mocked CDP preflight returns unknown and sends no scroll command; real 404/account UI remains unqualified |
 | B34 | unimplemented | 8 | none |
-| B35 | unimplemented | 9 | none |
+| B35 | unimplemented | 9 | none; fresh-agent usability suite not run |
 | B36 | partial | 4 | real Chrome strict-background text succeeds with no native requirement; strict-background mouse/native routes return `NeedsForeground` in fixtures; no native-dialog fixture or platform observer |
 
 ### Phase 8 app qualification matrix — 2026-10-06
@@ -321,3 +321,17 @@ The local Phase 4/5 gates are complete. File insertion proves Chrome selected th
 | `cargo fmt --all && cargo test --workspace --locked --offline` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | Browser 91 passed/2 ignored; runtime unit 16 passed; CLI 8, job 12, registry 3 passed; phase2 7 passed; phase5 advanced 1 ignored; doc tests pass. |
 
 The selected JavaScript candidate is pinned `rquickjs 0.14.0`, verified with a runnable probe and worker tests. Wasmtime is a WebAssembly runtime, not a JavaScript engine. The in-process worker is opt-in and trusted-local-only; QuickJS limits are not an OS/process security boundary. Untrusted/production scripts, process isolation, hard OS CPU/RSS controls, arbitrary mutations, generated artifacts, dependency invalidation, effect-aware splitting, and benchmark comparison remain blocked or unimplemented. No `node:vm` boundary is used.
+
+## Phase 9 local client setup preview — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| Red-first MCP guide contract | pass | macOS 26 / Rust 1.99.0 | Before implementation, the stdio handler test failed because `tools/list` did not include `guide`; after implementation, the same test confirms listing, version-matched content, and rejection of a stale server version. |
+| `cargo fmt --all -- --check && cargo clippy -p controlla-runtime --all-targets --locked --offline -- -D warnings` | pass | macOS 26 / Rust 1.99.0 | Formatting and runtime-target Clippy clean. |
+| `cargo test -p controlla-runtime --locked --offline --quiet` | pass | macOS 26 / Rust 1.99.0 | 30 runtime/unit/integration tests passed across 4 test groups; no failures. MCP guide call used the in-process rmcp duplex harness, not an external client. |
+| `npm run check:docs` | pass | Node.js local | Checked local Markdown links in 15 files. |
+| Parse fenced JSON in `docs/clients.md` and `git diff --check` | pass | Python 3 / working tree | Three client JSON config examples parse; whitespace check clean. |
+| Client acceptance | open | Not run | No Freebuff, OpenCode, Claude Code, or ChatGPT client was launched. Documentation/source schema review is not external client acceptance. |
+| Remote transport/authentication | open | Not implemented | No HTTP listener, auth, tunnel, or paired outbound bridge is present. |
+
+The client guide schema references were checked on 2026-10-06. Client binary versions were not recorded; examples are version/schema-labeled where formats differ and are not an advertised live support matrix.

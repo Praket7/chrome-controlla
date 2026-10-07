@@ -256,6 +256,8 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** identical operation/result semantics across supported transports; `guide(topic, server_version) -> GuideSection`; versioned client config generators.
 
+**Current local slice (2026-10-06):** `docs/clients.md` records local stdio examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code, plus ChatGPT's local-stdio limitation. A read-only `guide` tool serves `clients` and `master` Markdown for exact server version `0.1.0`. These are documentation/configuration checks only. No authenticated remote endpoint, canonical resource, generated config installer, external client acceptance, or B35 usability result exists; keep those gates open.
+
 - [ ] Implement supported MCP protocol negotiation and transport behavior against pinned SDK conformance tests. Do not mix “latest” protocol semantics with legacy initialization assumptions.
 - [ ] Add authenticated remote endpoint, principal/audience-bound authorization and optional paired outbound local bridge. No public unauthenticated browser control; validate tenant and target binding.
 - [ ] Generate Freebuff, OpenCode v1/v2 as supported, Claude Code and ChatGPT setup instructions for actual versions. Do not assume every platform has the same config nesting or local process support.

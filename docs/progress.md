@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. Phase 7 provides fail-closed verifier/cache mechanics without a production observer or workflow integration. Phase 8 app routes remain unimplemented; Phase 9 has local stdio setup and a version-matched guide tool only. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. Phase 7 provides fail-closed verifier/cache mechanics without a production observer or workflow integration. Phase 8 app routes remain unimplemented; Phase 9 has local stdio setup and a version-matched read-only guide tool only. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -104,7 +104,7 @@ This Phase 8 slice records honest gates only. It does not implement professional
 
 | Check | Result | Environment | Evidence |
 |---|---|---|---|
-| MCP initialize, `tools/list`, and session discovery `tools/call` over rmcp duplex transport | pass | macOS 26 / Rust 1.99.0 | Lists session/observe/extract plus accessibility, screenshot crop, artifact register/file select, and shared observe tools with schemas; discovery call succeeds. |
+| MCP initialize, `tools/list`, and session discovery/guide `tools/call` over rmcp duplex transport | pass | macOS 26 / Rust 1.99.0 | Lists session/observe/extract, guide, accessibility, screenshot crop, artifact register/file select, and shared observe tools with schemas; discovery call succeeds and guide rejects a mismatched server version. |
 | MCP session connect/list-targets, observe, and two-section extract `tools/call` against mocked CDP websocket | pass | macOS 26 / Rust 1.99.0 | Exercises manager bootstrap, explicit target selection, target-ref serialization/resolution, bounded observation, and per-section completeness through actual MCP calls. |
 | Loopback endpoint policy and Direct CDP grants | pass | Rust fixtures | Rejects DNS/non-loopback, credential-bearing, malformed, and non-WebSocket endpoints. Direct CDP requires a distinct grant; shared-extension sessions remain rejected by direct CDP. |
 | Phase 5 synthetic virtualized-list extraction | pass | Installed Chrome 154.0.8037.98; commits `44041af`, `1fd49f9`, and advanced-fixture follow-up | Latest single run extracted 42 rows; 438.17 ms / 1,860 B versus 1.39 ms / 2,760 B for full DOM. This is a diagnostic, not a performance claim. Wrong-account preflight returned unknown without scrolling; successful and blocked expansion are also covered by a synthetic Chrome fixture. |
@@ -113,7 +113,7 @@ This Phase 8 slice records honest gates only. It does not implement professional
 
 - The stdio adapter is local-only. Explicit CDP requires `COMPTROL_ALLOW_DIRECT_CDP=1` plus `COMPTROL_CDP_ENDPOINT`; only loopback IP literals are accepted. Permissioned auto-connect requires `COMPTROL_CHROME_AUTO_CONNECT=1` and preserves Chrome's native consent prompt.
 - Synthetic list and hidden-section fixtures do not qualify representative app account markers, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
-- `execute`, `jobs`, guide resource, durable MCP identity, artifact output/download, and shared-extension input/extraction are outside this slice.
+- At the Phase 5 commit, `workflow`, `workflow_status`, and the `guide` tool did not exist; they were added in later phases. Durable identity, artifact output/download, and shared-extension input/extraction remain outside the current slice.
 
 ## Phase 6 deterministic workflow slice — 2026-10-06
 
@@ -123,3 +123,11 @@ This Phase 8 slice records honest gates only. It does not implement professional
 - [x] Add asynchronous MCP job admission, persisted 60-second deadline/status/checkpoints, resumable partial receipts, per-dispatch claims/counts, unknown delivery after timeout, exclusive state-directory lifetime lock, and startup recovery that preserves running checkpoints as unknown without replay. Concurrent clients need separate `CONTROLLA_STATE_DIR` values. Client disconnect does not cancel an accepted job; no workflow-cancel tool is exposed.
 - [x] Add an opt-in local-trust JavaScript worker with only an async read broker. Each call rechecks principal/session/target and claims browser dispatch before execution.
 - [ ] OS process isolation, untrusted/production script qualification, mutation programs, effect-aware splitting, generated artifacts, and representative app/platform qualification remain blocked.
+
+### Phase 9 — local client setup preview
+
+- [x] Add dated local stdio config examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code; mark ChatGPT local stdio unavailable: [clients.md](clients.md).
+- [x] Add read-only `guide` MCP tool for `clients` and `master` topics, requiring exact server version `0.1.0`.
+- [ ] Add and qualify authenticated remote transport; do not expose unauthenticated HTTP or raw CDP.
+- [ ] Run real-client setup/workflow/cleanup acceptance for each available client and record installed version and server SHA.
+- [ ] Add canonical MCP guide resource, generated config installer, B35, and the 20-task fresh-agent usability suite.

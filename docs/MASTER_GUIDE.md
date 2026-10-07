@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: local Phase 5 preview, 2026-10-06. **Phase 4/5 local gates now include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. MCP/CDP fixtures and an isolated synthetic Chrome page pass; representative app behavior, external MCP client acceptance, and production-wide platform qualification remain open.**
+Version: local Phase 9 setup preview `master-2026-10-06-v1`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -19,9 +19,10 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | `session` | Discover providers, inspect configured targets, connect with selected IDs, list references | Guessing the active tab, connecting without explicit target IDs |
 | `observe` | Bounded CSS/DOM fields, selected-node AX, or a pixel-budgeted PNG crop from one explicit target | Full raw DOM/tree/image; inferring off-screen completeness |
 | `extract` | Bounded extraction across caller-declared sections with stable IDs, verified expansion controls, completeness evidence, and resumable cursors | Treating absent account/count/terminal evidence as complete |
-| `execute`, `jobs`, `guide` | Not implemented in this local Phase 5 slice | Do not call these tools or infer mutation/job support |
+| `guide` | Read the version-matched `clients` or `master` documentation | Assuming examples prove a client is qualified |
+| `execute`, `jobs` | Not implemented in this local slice | Do not call these tools or infer mutation/job support |
 
-`tools/list` carries the argument schemas for the three available tools. There is no guide resource in this slice.
+`tools/list` carries the argument schemas. The read-only `guide` tool accepts `topic` (`clients` or `master`) and exact `server_version` (`0.1.0`); unsupported versions/topics fail clearly. It returns static Markdown, not live health or browser state. There is no canonical MCP resource in this slice.
 
 Guarded text and file-selection methods are available in the Rust browser library, but are not exposed as MCP tools in this preview. File selection accepts an opaque session-scoped artifact handle created from bounded bytes; it never accepts a caller host path. A successful result means Chrome selected the file and read back its name and size, not that the application accepted or saved it.
 
@@ -36,18 +37,13 @@ The `session` tool uses `action="discover"` for provider status, `action="target
 
 `extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
 
-This preview does not implement the guide, execute, or jobs MCP tools. Do not use those names as if they were available.
+This preview does not implement `execute` or `jobs`. Do not use those names as if they were available.
 
-Use a pinned released package and client-specific generated configuration. During development, use the absolute path to the locally built entrypoint. Do not assume a package named `chrome-controlla` is already published or that `latest` is reproducible.
+This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
 
 The release installer must show: package/server version, Chrome version, transport, effective state directory, session modes, and guide version. Run the packaged doctor once when setup fails. A health result distinguishes configuration, process reachability, authenticated extension round trip, authorization and qualified operation support.
 
-Client rules:
-
-- Freebuff: use the configuration format supported by the installed version; verify with a browser fixture, not just tool discovery.
-- OpenCode: v1 and v2 use different nesting; the installer must detect or explicitly request the installed major version.
-- Claude Code: configure local stdio or the supported remote transport; client permission decisions remain in force.
-- ChatGPT: use a supported authenticated remote MCP surface for web access. Local Chrome requires an explicitly paired bridge or a separately qualified desktop-local integration. A local stdio config is not a web endpoint.
+Client-specific local config snippets and their checked schema variants are in [clients.md](clients.md). Config examples were compared to current docs/source on 2026-10-06; no installed client was live-tested. ChatGPT local stdio is unavailable, and this repository has no authenticated remote route.
 
 Do not copy auth cookies from the user’s regular Chrome profile. For a dedicated profile, let the user sign in normally. Pause for CAPTCHA, MFA or a site permission requirement, preserving session identity.
 

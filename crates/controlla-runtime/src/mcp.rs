@@ -139,6 +139,12 @@ struct FileSelectArgs {
     account_marker: (String, String),
 }
 
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct GuideArgs {
+    topic: String,
+    server_version: String,
+}
+
 struct LiveSession {
     connection: Arc<controlla_browser::BrowserConnection>,
     registry: Mutex<SessionRegistry>,
@@ -1621,6 +1627,39 @@ impl App {
         let output = fit_aggregate(output, global_bytes).map_err(invalid)?;
         Ok(rmcp::handler::server::wrapper::Json(output))
     }
+
+    #[tool(
+        name = "guide",
+        description = "Return the version-matched local setup guide. This read-only preview supports clients and master topics."
+    )]
+    async fn guide(
+        &self,
+        Parameters(args): Parameters<GuideArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        if args.server_version != env!("CARGO_PKG_VERSION") {
+            return Err(invalid(format!(
+                "guide is available for server version {} only",
+                env!("CARGO_PKG_VERSION")
+            )));
+        }
+        let (guide_version, content) = match args.topic.as_str() {
+            "clients" => (
+                "clients-2026-10-06-v1",
+                include_str!("../../../docs/clients.md"),
+            ),
+            "master" => (
+                "master-2026-10-06-v1",
+                include_str!("../../../docs/MASTER_GUIDE.md"),
+            ),
+            _ => return Err(invalid("topic must be clients or master")),
+        };
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "server_version":env!("CARGO_PKG_VERSION"),
+            "guide_version":guide_version,
+            "topic":args.topic,
+            "content":content
+        })))
+    }
 }
 
 fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
@@ -1863,6 +1902,35 @@ mod tests {
         assert!(names.contains(&"artifact_register"));
         assert!(names.contains(&"file_select"));
         assert!(names.contains(&"shared_observe"));
+        assert!(names.contains(&"guide"));
+        let guide = client
+            .call_tool(
+                CallToolRequestParams::new("guide").with_arguments(
+                    json!({
+                        "topic":"clients",
+                        "server_version":env!("CARGO_PKG_VERSION")
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let guide = guide.structured_content.unwrap();
+        assert_eq!(guide["server_version"], env!("CARGO_PKG_VERSION"));
+        assert!(guide["content"].as_str().unwrap().contains("OpenCode v2"));
+        let stale_guide = client
+            .call_tool(
+                CallToolRequestParams::new("guide").with_arguments(
+                    json!({"topic":"clients","server_version":"9.9.9"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+        assert!(stale_guide.is_err());
         for name in [
             "session",
             "observe",
@@ -1873,6 +1941,7 @@ mod tests {
             "file_select",
             "shared_observe",
             "workflow",
+            "guide",
         ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
