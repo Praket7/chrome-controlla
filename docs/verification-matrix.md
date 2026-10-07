@@ -380,3 +380,10 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
 | Distinct-binary package lifecycle | pass | macOS arm64; old source `2f4fb06`, candidate source `b0a7c7c` | Separate binaries were packed as package `0.1.0` and `0.1.1`; install, upgrade, rollback, uninstall and user-data preservation passed with installed executable digest assertions. Full hashes and command: [lifecycle evidence](review/phase12-binary-lifecycle.md). Not an MCP client/server compatibility test. |
+
+## Phase 12 final pushed candidate — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Rust/package CI | pass | Windows, macOS, Ubuntu; source `48994fc` | [GitHub Actions run 37571371772](https://github.com/Praket7/chrome-controlla/actions/runs/37571371772) passed all build, test, dependency, docs, provenance, and package jobs. |
+| Local unpublished candidate | pass | macOS arm64; source `48994fc` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
