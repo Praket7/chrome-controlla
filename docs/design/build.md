@@ -217,7 +217,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [x] Add a deterministic fixture comparison for fixed batching, bounded code, and compiler boundaries. It reports operation/recovery counts only; browser overhead and wall-clock profiling remain open.
 - [x] Commit the Phase 6 implementation and review fixes (`3271bb6`, bounded deterministic workflows; `5ce2100`, async receipts; `dc16a0d`, aggregate output and restart recovery; `1831f9a`, journal ownership lock).
 
-**Gate:** a useful deterministic read graph and gated trusted-local JavaScript path are implemented through the stdio MCP server. The in-process QuickJS worker is not qualified as an OS security boundary, so untrusted/production script execution remains blocked. Arbitrary writes, mutation batching, workflow-generated artifacts, dependency-scoped invalidation, effect-aware splitting, and cross-platform process isolation are not claimed.
+**Gate:** a useful deterministic read graph, dependency-scoped invalidation/effect-aware planning rules, count-only fixture comparison, and gated trusted-local JavaScript path are implemented through the stdio MCP server. The in-process QuickJS worker is not qualified as an OS security boundary, so untrusted/production script execution remains blocked. Arbitrary writes, mutation batching, workflow-generated artifacts, measured browser overhead, and cross-platform process isolation are not claimed.
 
 ## Phase 7 — outcome verification and workflow cache
 
@@ -265,6 +265,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [ ] Add authenticated remote endpoint, principal/audience-bound authorization and optional paired outbound local bridge. No public unauthenticated browser control; validate tenant and target binding.
 - [x] Record dated local stdio setup examples for Freebuff/Codebuff, OpenCode v1/v2, Claude Code, and ChatGPT's local-process limitation in `docs/clients.md`; examples are schema-checked but installed client versions and client acceptance remain open.
 - [x] Generate dated client-specific configuration examples with per-client state isolation and validate their shapes against the checked-in schemas. Installed versions and client acceptance remain open; do not assume every platform has the same config nesting or local process support.
+- [x] Add a safe installer for JSON-based Freebuff/OpenCode configuration files; it preserves unrelated entries and refuses ambiguous or conflicting edits. Claude's CLI command remains a human-reviewed output, and no live client config was changed.
 - [ ] In each available real client, run session setup, observation, guarded edit, long job, reconnect/reconcile, structured result/artifact and cleanup. Record client version and server SHA. A raw JSON-RPC smoke alone does not qualify a client.
 - [ ] Turn the companion master-guide draft into exact runnable documentation and generate shared facts from registry/schema. Version-bound `guide` tool and `controlla://guide/{topic}/{server_version}` resources serve `clients` and `master`; generated facts and short bootstrap instructions in session/tool responses remain open.
 - [ ] Run B35 and the 20-task fresh-agent usability suite. Fix tool ambiguity, missing recovery instructions and invented flags rather than adding a larger wall of prose.
@@ -308,7 +309,8 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [ ] Run necessary full integration/security/package/docs checks on the release commit. Use actual platform runners for cross-platform claims.
 - [x] Test clean-prefix installation, package-version upgrade/rollback, uninstall, and unrelated user-data preservation on the current host. This is npm lifecycle mechanics only, using one binary copied under two package version labels.
 - [x] Prepare the local release-candidate bundle path: host package and extension archives, runtime dependency SBOM, artifact checksums, support matrix, release notes, and rollback instructions. The bundle remains unpublished and must be generated from a clean release commit.
-- [ ] Test distinct release-binary upgrade/rollback, stale daemon/extension mismatch, Windows/Linux installation, and compatibility. No credential/browser-profile deletion on uninstall without explicit request.
+- [x] Reject stale or missing shared-extension versions during pairing and verify the extension releases its debugger attachment on mismatch. This local fixture does not qualify release-binary upgrade compatibility.
+- [ ] Test distinct release-binary upgrade/rollback, Windows/Linux installation, and compatibility. No credential/browser-profile deletion on uninstall without explicit request.
 - [ ] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims.
 - [ ] Prepare a release candidate with reproducible artifacts. Create/push to the authorized new repository; never push Chrome Controlla changes into Comptrol by accident.
 - [ ] Publish/deploy only within actual authorization. If final approval is required, present exact version, diff, test report, visibility, costs and artifact destinations so approval is the last step.

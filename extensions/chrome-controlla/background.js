@@ -67,12 +67,16 @@ async function pair(endpoint, token, selectedTabIds) {
       next.onclose = () => reject(new Error("Loopback pairing was closed."));
     });
     if (generation !== pairingGeneration) throw new Error("Pairing was replaced.");
-    next.send(JSON.stringify({ type: "hello", token, targets: [...attachedTabs].map(String).sort() }));
+    const extensionVersion = chrome.runtime.getManifest().version;
+    next.send(JSON.stringify({
+      type: "hello", token, extension_version: extensionVersion,
+      targets: [...attachedTabs].map(String).sort()
+    }));
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Provider did not confirm pairing.")), 5000);
       next.onmessage = event => {
         const reply = JSON.parse(event.data);
-        if (reply.type === "ready") { clearTimeout(timer); resolve(); }
+        if (reply.type === "ready" && reply.server_version === extensionVersion) { clearTimeout(timer); resolve(); }
         else { clearTimeout(timer); reject(new Error(reply.error || "Pairing rejected.")); }
       };
     });

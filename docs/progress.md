@@ -137,16 +137,18 @@ This Phase 8 slice adds only generic browser fill/click. It does not implement p
 - [x] Add a checked versioned client-config generator with unique state directories; generated configs are still examples, not client acceptance.
 - [x] Add `controlla://guide/{topic}/{server_version}` resources and a child-process RMCP test for initialize negotiation, resource list/read, all tool schemas, and stale/invalid request errors.
 - [x] Add a child-process RMCP stdio check for the current no-initialize discovery lifecycle; it discovers the latest advertised protocol and exercises tool/resource listing over per-request metadata.
+- [x] Add a safe JSON config installer for Freebuff and OpenCode that preserves unrelated entries and refuses links, invalid JSON, conflicting entries, and detected concurrent edits. Claude Code prints a command for explicit human review; no client config outside temp fixtures was changed.
 - [x] Run release-prep app, client, benchmark, docs, provenance, extension-command, package, and full Rust checks; 91 tests passed and 2 Chrome-required tests remained ignored in this environment.
 - [ ] Add and qualify authenticated remote transport; do not expose unauthenticated HTTP or raw CDP.
 - [ ] Run real-client setup/workflow/cleanup acceptance for each available client and record installed version and server SHA.
-- [ ] Cover every advertised protocol revision/transport, add a generated config installer and schema-derived guide facts/bootstrap instructions, and run B35 plus the 20-task fresh-agent usability suite.
+- [ ] Cover every advertised protocol revision/transport, derive guide facts/bootstrap instructions from runtime schemas, and run B35 plus the 20-task fresh-agent usability suite.
 
 ### Phase 10 — controlled comparison and optimization
 
 - [x] Preregister 30 pilot templates (six each for generic, extraction, interference, multi-tab, and design), three planned repetitions, reset/predicate rules, seeded order randomization, outcomes, analysis, and a strict no-results status; validate with the Node built-in test runner and manifest checker.
 - [x] Freeze a disjoint 100-template held-out split (20/category, 20 critical), preregister 5/10 repetition counts and task-clustered analysis, validate split and baseline-lock digests, and reject incomplete/unverified result rows. No results are present.
-- [ ] Build the browser task harness and deterministic reset fixtures; resolve supported model/baseline configurations and independently read-back predicates before running the pilot.
+- [x] Add a deterministic offline task-harness contract with clone-based resets, bounded state edits, and independent predicate readback; its ten fixture tests pass.
+- [ ] Bind per-task reset/predicate fixtures to the pilot templates; freeze supported model and baseline configurations before running the pilot. The offline harness does not execute Chrome or measure task outcomes.
 - [ ] Execute the pilot and estimate variance against the already frozen held-out split. No benchmark task has been run and no comparison result is claimed; the held-out set cannot be changed after results are observed.
 - [ ] Complete the 100 held-out templates × 5 resets, 20 critical workflows × 10 resets, and AGWC ablations; publish all failures and task-clustered results.
 
@@ -157,7 +159,8 @@ This Phase 8 slice adds only generic browser fill/click. It does not implement p
 - [x] Add and run local package-manager lifecycle smoke for install, package-version upgrade, rollback, uninstall, and preservation of an unrelated user-data sentinel.
 - [x] Add a clean-commit release-candidate assembly path for host package and extension archives, runtime dependency SBOM, checksums, support matrix, release notes, and rollback instructions.
 - [x] Extend its gate to run app-brief, client-config, pilot/held-out analysis, and Phase 6 comparison checks.
-- [ ] Verify a genuine release-to-release binary upgrade/rollback, stale daemon/extension mismatch behavior, Windows/Linux fresh installs, signed artifacts/SBOM, and consumer install from GitHub.
+- [x] Add and fixture-test strict shared-extension/server version matching; pairing rejects missing/stale extension versions and the extension releases selected-tab debugger attachments on server mismatch.
+- [ ] Verify a genuine release-to-release binary upgrade/rollback, stale server/client compatibility beyond the extension handshake, Windows/Linux fresh installs, signed artifacts/SBOM, and consumer install from GitHub.
 - [ ] Run final review, commit all integrated changes, and push the authorized feature branch.
 
 The lifecycle smoke uses the same local binary copied into package archives relabeled `0.1.0` and `0.1.1`; it verifies npm install/rollback mechanics and user-data preservation, not compatibility between distinct server binaries. No registry publication was performed.

@@ -341,3 +341,12 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | Current discovery lifecycle over packaged stdio | pass | macOS / Rust / rmcp 3.5.1 | A child process negotiated the SDK's latest protocol without `initialize`, then listed tools and versioned guide resources. This covers only the current lifecycle over local stdio, not other revisions/transports or real clients. |
 
 The client guide schema references were checked on 2026-10-06. Client binary versions were not recorded; examples are version/schema-labeled where formats differ and are not an advertised live support matrix.
+
+## Pre-live integration checks — 2026-10-06
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Shared extension/server version handshake | pass | Rust 1.99.0 unit fixtures and Node 24 extension harness | Extension reports its manifest version; the local server rejects missing or stale versions with a reload instruction; the extension refuses a server version mismatch and releases attached tabs. No live extension pairing was performed. |
+| Full workspace tests | pass | macOS 26 / Rust 1.99.0 | 157 passed, 3 ignored (installed-Chrome-only); all configured unit and integration tests pass. |
+| Workspace Clippy and formatting | pass | macOS 26 / Rust 1.99.0 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` and `cargo fmt --all -- --check`. |
+| Offline Phase 10 fixture contract | pass | Node.js 24.19.0 | Ten tests cover clone-based resets, bounded state changes, independent predicates, invalid result rejection, and frozen split binding. This is fixture contract validation, not browser/model benchmark evidence. |

@@ -2727,20 +2727,6 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let artifact = client
-            .call_tool(
-                CallToolRequestParams::new("artifact_register").with_arguments(args(
-                    json!({"session_id":session_id,"filename":"fixture.txt","bytes":[104,105]}),
-                )),
-            )
-            .await
-            .unwrap();
-        assert!(!artifact.is_error.unwrap_or(false), "{artifact:?}");
-        assert_eq!(artifact.structured_content.as_ref().unwrap()["size"], 2);
-        assert_eq!(
-            artifact.structured_content.as_ref().unwrap()["filename"],
-            "fixture.txt"
-        );
         let listed = client
             .call_tool(CallToolRequestParams::new("session").with_arguments(args(
                 json!({"action":"list_targets","session_id":session_id}),
@@ -2750,38 +2736,69 @@ mod tests {
         assert!(!listed.is_error.unwrap_or(false), "{listed:?}");
         let target_ref =
             listed.structured_content.as_ref().unwrap()["targets"][0]["target_ref"].clone();
-        let artifact_handle = artifact.structured_content.as_ref().unwrap()["handle"].clone();
-        let before_missing_marker = client
-            .call_tool(
-                CallToolRequestParams::new("file_select").with_arguments(args(json!({
-                    "session_id":session_id,
-                    "target_ref":target_ref,
-                    "locator":{"selector":"input[type=file]"},
-                    "artifact_handle":artifact_handle
-                }))),
-            )
-            .await;
-        assert!(
-            before_missing_marker.is_err()
-                || before_missing_marker.unwrap().is_error.unwrap_or(false)
-        );
-        let mismatched_marker = client
-            .call_tool(
-                CallToolRequestParams::new("file_select").with_arguments(args(json!({
-                    "session_id":session_id,
-                    "target_ref":target_ref,
-                    "locator":{"selector":"input[type=file]"},
-                    "artifact_handle":artifact_handle,
-                    "account_marker":["#account","missing-marker"]
-                }))),
-            )
-            .await;
-        assert!(mismatched_marker.is_err() || mismatched_marker.unwrap().is_error.unwrap_or(false));
-        assert_eq!(
-            file_select_calls.load(Ordering::SeqCst),
-            0,
-            "a mismatched marker must withhold DOM.setFileInputFiles"
-        );
+        if cfg!(unix) {
+            let artifact = client
+                .call_tool(
+                    CallToolRequestParams::new("artifact_register").with_arguments(args(
+                        json!({"session_id":session_id,"filename":"fixture.txt","bytes":[104,105]}),
+                    )),
+                )
+                .await
+                .unwrap();
+            assert!(!artifact.is_error.unwrap_or(false), "{artifact:?}");
+            assert_eq!(artifact.structured_content.as_ref().unwrap()["size"], 2);
+            assert_eq!(
+                artifact.structured_content.as_ref().unwrap()["filename"],
+                "fixture.txt"
+            );
+            let artifact_handle = artifact.structured_content.as_ref().unwrap()["handle"].clone();
+            let before_missing_marker = client
+                .call_tool(
+                    CallToolRequestParams::new("file_select").with_arguments(args(json!({
+                        "session_id":session_id,
+                        "target_ref":target_ref,
+                        "locator":{"selector":"input[type=file]"},
+                        "artifact_handle":artifact_handle
+                    }))),
+                )
+                .await;
+            assert!(
+                before_missing_marker.is_err()
+                    || before_missing_marker.unwrap().is_error.unwrap_or(false)
+            );
+            let mismatched_marker = client
+                .call_tool(
+                    CallToolRequestParams::new("file_select").with_arguments(args(json!({
+                        "session_id":session_id,
+                        "target_ref":target_ref,
+                        "locator":{"selector":"input[type=file]"},
+                        "artifact_handle":artifact_handle,
+                        "account_marker":["#account","missing-marker"]
+                    }))),
+                )
+                .await;
+            assert!(
+                mismatched_marker.is_err() || mismatched_marker.unwrap().is_error.unwrap_or(false)
+            );
+            assert_eq!(
+                file_select_calls.load(Ordering::SeqCst),
+                0,
+                "a mismatched marker must withhold DOM.setFileInputFiles"
+            );
+        } else {
+            let artifact = client
+                .call_tool(
+                    CallToolRequestParams::new("artifact_register").with_arguments(args(
+                        json!({"session_id":session_id,"filename":"fixture.txt","bytes":[104,105]}),
+                    )),
+                )
+                .await
+                .unwrap();
+            assert!(
+                artifact.is_error.unwrap_or(false),
+                "Windows must fail closed for artifacts: {artifact:?}"
+            );
+        }
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
         assert!(!observed.is_error.unwrap_or(false), "{observed:?}");
         let workflow = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
@@ -2995,16 +3012,19 @@ mod tests {
             let (mut peer, _) = connect_async(endpoint).await.unwrap();
             peer.send(Message::Text(
                 json!({
-                    "type":"hello","token":token,"targets":["123"]
+                    "type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"targets":["123"]
                 })
                 .to_string()
                 .into(),
             ))
             .await
             .unwrap();
+            let ready: Value =
+                serde_json::from_str(peer.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(
-                peer.next().await.unwrap().unwrap().to_text().unwrap(),
-                "{\"type\":\"ready\"}"
+                ready,
+                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
             );
             peer
         };
@@ -3128,15 +3148,18 @@ mod tests {
         let extension = async move {
             let (mut peer, _) = connect_async(endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello","token":token,"targets":["123"]})
+                json!({"type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"targets":["123"]})
                     .to_string()
                     .into(),
             ))
             .await
             .unwrap();
+            let ready: Value =
+                serde_json::from_str(peer.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(
-                peer.next().await.unwrap().unwrap().to_text().unwrap(),
-                "{\"type\":\"ready\"}"
+                ready,
+                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
             );
             peer
         };

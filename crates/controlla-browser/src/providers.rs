@@ -586,8 +586,28 @@ impl SharedExtensionProvider {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             }
+            let extension_version = hello["extension_version"].as_str();
+            if extension_version != Some(env!("CARGO_PKG_VERSION")) {
+                let observed = extension_version.unwrap_or("unknown");
+                let _ = socket
+                    .send(Message::Text(
+                        json!({"type":"error","error":"extension/server version mismatch; reload the matching unpacked extension"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return Err(ProviderError::Extension(format!(
+                    "extension version {observed} does not match server version {}",
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
             if let Err(error) = socket
-                .send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .send(Message::Text(
+                    json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
+                        .to_string()
+                        .into(),
+                ))
                 .await
             {
                 return Err(ProviderError::Extension(error.to_string()));
@@ -2583,7 +2603,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17", "18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17", "18"]})
                         .to_string()
                         .into(),
                 ))
@@ -2638,6 +2658,68 @@ list.addEventListener('scroll',render);render();
     }
 
     #[tokio::test]
+    async fn shared_extension_rejects_stale_extension_version() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (accepted, response) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut invalid, _) = connect_async(&pairing.endpoint).await.unwrap();
+            invalid
+                .send(Message::Text(
+                    json!({"type":"hello","token":"wrong","extension_version":"0.0.9","targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                invalid.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello","token":pairing.token,"extension_version":"0.0.9","targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let response = socket.next().await.unwrap().unwrap();
+            serde_json::from_str::<Value>(response.to_text().unwrap()).unwrap()
+        });
+        assert!(matches!(
+            accepted,
+            Err(ProviderError::Extension(message)) if message.contains("does not match server version")
+        ));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("reload the matching unpacked extension")
+        );
+    }
+
+    #[tokio::test]
     async fn shared_extension_rejects_wrong_selection_and_token() {
         use crate::sessions::ProviderGrants;
         use serde_json::json;
@@ -2664,7 +2746,7 @@ list.addEventListener('scroll',render);render();
             let (mut bad_socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             bad_socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":"wrong", "targets":["18"]})
+                    json!({"type":"hello", "token":"wrong", "extension_version":env!("CARGO_PKG_VERSION"), "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -2677,7 +2759,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -2745,7 +2827,7 @@ list.addEventListener('scroll',render);render();
             tokio::join!(failed.accept(&mut registry), async {
                 let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
                 peer.send(Message::Text(
-                    json!({"type":"hello", "token":"bad", "targets":["17"]})
+                    json!({"type":"hello", "token":"bad", "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -2769,7 +2851,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, _) = tokio::join!(retry.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -2808,7 +2890,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -2856,7 +2938,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -2906,7 +2988,7 @@ list.addEventListener('scroll',render);render();
             let (mut rejected, _) = connect_async(&pairing.endpoint).await.unwrap();
             rejected
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -2919,7 +3001,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
