@@ -163,15 +163,16 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 - [x] Implement local journal contracts for B05–07/B18–19; controlled fixture counting covers duplicate prevention after an accepted effect. Workflow dispatch is exercised through local MCP fixtures; no live browser or external HTTP-client effect is claimed.
 - [x] Bind canonical JSON request identity to principal/session/key. Same key/body replays the original operation; changed body conflicts.
-- [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations. Process-kill injection at every journal boundary remains open.
+- [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations.
 - [x] Separate bounded caller wait from durable operation state, persist a bounded 60-second default job deadline, and expose monotonic revisions. The workflow worker consumes declared step, time, observation, and output bounds.
 - [x] Exercise fulfilled, rejected, delayed, and never-settling JavaScript promises through the pinned QuickJS async broker, including rejection propagation to scripts. This is local worker evidence only.
 - [x] Verify a broker-backed QuickJS Promise resolving after exactly 12 seconds through the local worker wrapper. This does not qualify browser routes.
-- [ ] Qualify the exact 12-second Promise case and navigation during evaluation through live CDP and extension-bridge browser routes; inject process kills at every journal/dispatch boundary.
+- [x] Kill/reopen subprocesses at seven durable journal fixture cut points (admitted, running/not-sent, claim-before-effect, effect-before-ack, acknowledged, checkpointed, completed); confirm recovered state and replay refusal. This is journal-fixture evidence, not live Chrome dispatch or every runtime boundary.
+- [ ] Qualify exact 12-second resolve/reject and navigation during evaluation through live CDP and extension-bridge browser routes; inject kills at remaining runtime/browser dispatch boundaries.
 - [x] Cancellation blocks queued dispatch; expiry before dispatch becomes `failed` with `deadline_error=deadline_exceeded` and `delivery=not_sent`. Expiry/recovery after dispatch becomes `unknown` while preserving delivery as `sent` only when transport acknowledgement was recorded, otherwise `unknown`.
 - [x] Commit reviewed local journal gate as `feat: persist browser jobs and reconcile uncertain effects`.
 
-**Gate:** local journal fixtures refuse duplicate dispatch on replay and the QuickJS worker exercises async Promise outcomes. Remote exactly-once, live browser Promise parity, navigation invalidation during evaluation, and process-kill coverage remain unqualified.
+**Gate:** local journal fixtures refuse duplicate dispatch on replay, including seven tested durable cut points, and the QuickJS worker exercises async Promise outcomes. Remote exactly-once, live browser Promise parity, navigation invalidation during evaluation, and untested runtime/browser process-kill boundaries remain unqualified.
 
 ## Phase 4 — reliable input, guards and interference
 
@@ -185,6 +186,8 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [x] Implement a bounded per-session in-memory text clipboard and guarded insertion through CDP; strict-background mode never reads/writes the OS clipboard. Never disable human input to preserve a lease.
 - [x] Add bounded artifact-byte registration and opaque session/principal-scoped handles; select a verified `input[type=file]` through guarded CDP using private temporary files. Return `Selected` evidence only. Caller host paths are never accepted, and app acceptance/persistence is not claimed.
 - [x] Run isolated installed-Chrome fixtures for ordinary inputs, fail-closed masked/event-dependent markers, contenteditable/password, overlay interception, DOM drag bounds, stale-value interference, and guarded IME composition. A native snapshot around strict-background text confirms unchanged foreground app, cursor, and clipboard change count on this macOS host.
+- [x] Repeat the installed-Chrome focus-handler interference fixture three times; each guarded write yields and preserves the externally changed value. This remains controlled fixture evidence.
+- [ ] Measure the real Chrome check-to-dispatch window and qualify repeated live-user interference; the websocket fixture measures only its mock protocol window.
 - [x] Commit Phase 4 implementation and fixture work (`e1a8f10`, `197b8a6`, `8784f1b`, `d211c50`, `e69674b`, `a50d088`).
 
 **Gate:** relevant detectable interference yields before subsequent mutation; input fixtures verify actual values/positions. No “interference-proof” claim.

@@ -2575,6 +2575,8 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
 }
 
 fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
+    // Top-level unique_count describes records returned; each section's count
+    // retains unique rows observed by that section before aggregate truncation.
     while serde_json::to_vec(&output)
         .map(|v| v.len())
         .unwrap_or(usize::MAX)
@@ -2873,13 +2875,21 @@ mod tests {
             "records":[{"section_id":"alpha","fields":{"value":"x".repeat(10_000)}}],
             "unique_count":1,"completeness":"complete",
             "sections":[
-                {"section_id":"alpha","completeness":"complete","truncated":false,"missing":[]},
-                {"section_id":"beta","completeness":"complete","truncated":false,"missing":[]}
+                {"section_id":"alpha","unique_count":1,"completeness":"complete","truncated":false,"missing":[]},
+                {"section_id":"beta","unique_count":0,"completeness":"complete","truncated":false,"missing":[]}
             ]
         });
         let fitted = super::fit_aggregate(output, 4096).unwrap();
         assert_eq!(fitted["completeness"], "partial");
+        assert_eq!(
+            fitted["unique_count"], 0,
+            "count is returned aggregate records"
+        );
         assert_eq!(fitted["sections"][0]["completeness"], "partial");
+        assert_eq!(
+            fitted["sections"][0]["unique_count"], 1,
+            "count is source rows observed before aggregate truncation"
+        );
         assert_eq!(fitted["sections"][0]["truncated"], true);
         assert_eq!(fitted["sections"][1]["completeness"], "complete");
         assert!(

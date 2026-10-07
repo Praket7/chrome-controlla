@@ -173,7 +173,7 @@ These actions do not establish app save/persistence, and a page can still change
 
 ## 8. Extract data completely
 
-Ask for named fields and a schema. Keep intermediate parsing/deduplication inside the runtime and use artifact output for large results. Every collection reports source, filters, unique records, expected count if meaningful, terminal cursor/end condition, missing sections and completeness.
+Ask for named fields and a schema. Keep intermediate parsing/deduplication inside the runtime and use artifact output for large results. The aggregate `unique_count` is the number of records returned; each section's `unique_count` is the number of distinct records observed in that section before global output-budget trimming. If output trimming removes rows, the affected section is marked partial with explicit missing coverage. Every collection reports source, filters, expected count if meaningful, terminal cursor/end condition, missing sections and completeness.
 
 For a virtualized page, collect stable IDs while expanding and scrolling the correct container. Recycled DOM rows are not new item identities. A bucket count of 42 and eight rendered rows means only eight rows have been observed. Do not claim all 42 until traversal and coverage evidence support that claim.
 

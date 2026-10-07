@@ -1852,34 +1852,68 @@ mod tests {
         // initial probe, so the final guarded fill must yield without overwrite.
         let interference_locator = crate::input::SemanticLocator::Css("#interference".into());
         let interference_fill = crate::input::InputAction::Fill("requested".into());
-        let interference = session
-            .connection()
-            .perform_guarded_input(
-                &registry,
-                &reference,
-                "real-chrome-fixture",
-                crate::sessions::IdentityRevisions {
-                    account: 1,
-                    document: 1,
-                },
-                crate::input::GuardedInput {
-                    expected: &snapshot,
-                    current: &snapshot,
-                    locator: &interference_locator,
-                    action: &interference_fill,
-                    expected_value: "before",
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(interference, crate::input::InputOutcome::Stale(_)));
-        let interference_value = session.connection().target_ref_command(
-            &registry, &reference, "real-chrome-fixture",
-            crate::sessions::IdentityRevisions { account: 1, document: 1 },
-            "Runtime.evaluate",
-            json!({"expression":"document.querySelector('#interference').value","returnByValue":true}),
-        ).await.unwrap();
-        assert_eq!(interference_value["result"]["value"], "external");
+        for attempt in 1..=3 {
+            // Reset and blur so each attempt traverses the same real Chrome
+            // focus-handler race, rather than merely observing a prior change.
+            session
+                .connection()
+                .target_ref_command(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    "Runtime.evaluate",
+                    json!({"expression":"(()=>{const e=document.querySelector('#interference');e.value='before';e.blur();return e.value})()","returnByValue":true}),
+                )
+                .await
+                .unwrap();
+            let interference = session
+                .connection()
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snapshot,
+                        current: &snapshot,
+                        locator: &interference_locator,
+                        action: &interference_fill,
+                        expected_value: "before",
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(interference, crate::input::InputOutcome::Stale(_)),
+                "interference attempt {attempt} unexpectedly wrote: {interference:?}"
+            );
+            let interference_value = session
+                .connection()
+                .target_ref_command(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    "Runtime.evaluate",
+                    json!({"expression":"document.querySelector('#interference').value","returnByValue":true}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                interference_value["result"]["value"], "external",
+                "interference attempt {attempt} did not preserve the external value"
+            );
+        }
 
         // The browser's IME protocol emits a real composition event sequence;
         // this probes Chrome protocol support, not a product-level input action.

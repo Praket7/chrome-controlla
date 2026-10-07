@@ -447,156 +447,174 @@ fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
 }
 
 #[test]
-fn subprocess_kill_recovers_running_job_without_replaying_effects() {
+fn subprocess_kill_recovers_each_supported_journal_boundary_without_replay() {
     use std::{
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
 
-    let root = std::env::temp_dir().join(format!(
-        "controlla-crash-recovery-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let ready = root.join("ready");
-    let effects = root.join("effects");
-    let state = root.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_worker", "--nocapture"])
-        .env("CONTROLLA_CRASH_STATE", &state)
-        .env("CONTROLLA_CRASH_READY", &ready)
-        .env("CONTROLLA_CRASH_EFFECTS", &effects)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < deadline {
-        if let Some(status) = child.try_wait().unwrap() {
-            std::fs::remove_dir_all(&root).unwrap();
-            panic!("crash worker exited before dispatch checkpoint: {status}");
+    fn stop_at_durable_boundary(
+        child: &mut Child,
+        ready: &std::path::Path,
+        root: &std::path::Path,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                let _ = std::fs::remove_dir_all(root);
+                panic!("crash worker exited before its durable boundary: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if !ready.exists() {
-        let _ = child.kill();
-        let _ = child.wait();
-        std::fs::remove_dir_all(&root).unwrap();
-        panic!("crash worker did not reach its in-flight dispatch before timeout");
-    }
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    let effect_count = std::fs::read_to_string(&effects).unwrap().lines().count();
-    assert_eq!(
-        effect_count, 2,
-        "both claimed fixture effects were sent once"
-    );
-
-    let journal = Journal::open(state.join("operations.sqlite")).unwrap();
-    assert_eq!(journal.recover_after_restart().unwrap(), 1);
-    let operation_id = std::fs::read_to_string(&ready).unwrap();
-    let operation = journal
-        .get("p", "s", &operation_id)
-        .unwrap()
-        .expect("operation survives process termination");
-    assert_eq!(operation.status, JobStatus::Unknown);
-    assert_eq!(operation.delivery, Delivery::Unknown);
-    assert_eq!(operation.dispatch_count, 2);
-    assert_eq!(operation.result.unwrap()["completed_steps"], 1);
-    assert!(
-        journal
-            .record_dispatch("p", "s", &operation.id, "retry-after-restart")
-            .is_err()
-    );
-    assert_eq!(
-        std::fs::read_to_string(&effects).unwrap().lines().count(),
-        effect_count,
-        "journal recovery and rejected replay do not repeat fixture effects"
-    );
-
-    drop(journal);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn subprocess_kill_before_dispatch_recovers_failed_not_sent() {
-    use std::{
-        process::{Command, Stdio},
-        thread,
-        time::{Duration, Instant},
-    };
-
-    let root = std::env::temp_dir().join(format!(
-        "controlla-pre-dispatch-crash-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let state = root.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let ready = root.join("ready");
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_worker", "--nocapture"])
-        .env("CONTROLLA_CRASH_STATE", &state)
-        .env("CONTROLLA_CRASH_READY", &ready)
-        .env("CONTROLLA_CRASH_EFFECTS", root.join("effects"))
-        .env("CONTROLLA_CRASH_BEFORE_DISPATCH", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < deadline {
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("worker exited before start checkpoint: {status}");
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(root);
+            panic!("crash worker did not reach its durable boundary before timeout");
         }
-        thread::sleep(Duration::from_millis(10));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
-    if !ready.exists() {
-        let _ = child.kill();
-        let _ = child.wait();
-        std::fs::remove_dir_all(&root).unwrap();
-        panic!("worker did not reach running/not-sent boundary before timeout");
-    }
-    child.kill().unwrap();
-    child.wait().unwrap();
 
-    let operation_id = std::fs::read_to_string(&ready).unwrap();
-    let journal = Journal::open(state.join("operations.sqlite")).unwrap();
-    assert_eq!(journal.recover_after_restart().unwrap(), 1);
-    let recovered = journal.get("p", "s", &operation_id).unwrap().unwrap();
-    assert_eq!(recovered.status, JobStatus::Failed);
-    assert_eq!(recovered.delivery, Delivery::NotSent);
-    assert_eq!(recovered.dispatch_count, 0);
-    assert!(
-        journal
-            .record_dispatch("p", "s", &operation_id, "retry")
-            .is_err()
-    );
-    assert!(!root.join("effects").exists());
-    drop(journal);
-    std::fs::remove_dir_all(root).unwrap();
+    let checkpoint = json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]});
+    for (
+        boundary,
+        expected_status,
+        expected_delivery,
+        expected_dispatches,
+        expected_result,
+        effects,
+    ) in [
+        ("admitted", JobStatus::Failed, Delivery::NotSent, 0, None, 0),
+        (
+            "running_not_sent",
+            JobStatus::Failed,
+            Delivery::NotSent,
+            0,
+            None,
+            0,
+        ),
+        (
+            "dispatch_claimed",
+            JobStatus::Unknown,
+            Delivery::Unknown,
+            1,
+            None,
+            0,
+        ),
+        (
+            "effect_before_ack",
+            JobStatus::Unknown,
+            Delivery::Unknown,
+            1,
+            None,
+            1,
+        ),
+        (
+            "acknowledged",
+            JobStatus::Unknown,
+            Delivery::Sent,
+            1,
+            None,
+            1,
+        ),
+        (
+            "checkpointed",
+            JobStatus::Unknown,
+            Delivery::Sent,
+            1,
+            Some(checkpoint.clone()),
+            1,
+        ),
+        (
+            "completed",
+            JobStatus::Completed,
+            Delivery::Sent,
+            1,
+            Some(checkpoint.clone()),
+            1,
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "controlla-crash-{boundary}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let ready = root.join("ready");
+        let effects_path = root.join("effects");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_worker", "--nocapture"])
+            .env("CONTROLLA_CRASH_STATE", &state)
+            .env("CONTROLLA_CRASH_READY", &ready)
+            .env("CONTROLLA_CRASH_EFFECTS", &effects_path)
+            .env("CONTROLLA_CRASH_BOUNDARY", boundary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        stop_at_durable_boundary(&mut child, &ready, &root);
+
+        let journal = Journal::open(state.join("operations.sqlite")).unwrap();
+        assert_eq!(
+            journal.recover_after_restart().unwrap(),
+            usize::from(boundary != "completed"),
+            "{boundary}"
+        );
+        let operation_id = std::fs::read_to_string(&ready).unwrap();
+        let operation = journal
+            .get("p", "s", &operation_id)
+            .unwrap()
+            .expect("operation survives forced process termination");
+        assert_eq!(operation.status, expected_status, "{boundary}");
+        assert_eq!(operation.delivery, expected_delivery, "{boundary}");
+        assert_eq!(operation.dispatch_count, expected_dispatches, "{boundary}");
+        assert_eq!(operation.result, expected_result, "{boundary}");
+        assert!(
+            journal
+                .record_dispatch("p", "s", &operation.id, "retry-after-restart")
+                .is_err(),
+            "replay must stay blocked after {boundary}"
+        );
+        let effect_count =
+            std::fs::read_to_string(&effects_path).map_or(0, |contents| contents.lines().count());
+        assert_eq!(
+            effect_count, effects,
+            "{boundary}: recovery cannot replay effects"
+        );
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
 fn crash_worker() {
     use std::io::Write;
 
-    let (Ok(state), Ok(ready), Ok(effects)) = (
+    fn publish_ready(path: &std::path::Path, operation_id: &str) {
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary).unwrap();
+        file.write_all(operation_id.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(temporary, path).unwrap();
+    }
+
+    fn pause_for_parent() -> ! {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    let (Ok(state), Ok(ready), Ok(effects), Ok(boundary)) = (
         std::env::var("CONTROLLA_CRASH_STATE"),
         std::env::var("CONTROLLA_CRASH_READY"),
         std::env::var("CONTROLLA_CRASH_EFFECTS"),
+        std::env::var("CONTROLLA_CRASH_BOUNDARY"),
     ) else {
         return;
     };
@@ -609,58 +627,60 @@ fn crash_worker() {
             &json!({"steps":["observe","observe"]}),
         )
         .unwrap();
-    assert!(journal.start("p", "s", &admission.operation.id).unwrap());
-
-    if std::env::var_os("CONTROLLA_CRASH_BEFORE_DISPATCH").is_some() {
-        std::fs::write(&ready, &admission.operation.id).unwrap();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+    if boundary != "admitted" {
+        assert!(journal.start("p", "s", &admission.operation.id).unwrap());
+    }
+    if matches!(
+        boundary.as_str(),
+        "dispatch_claimed" | "effect_before_ack" | "acknowledged" | "checkpointed" | "completed"
+    ) {
+        let claim = journal
+            .record_dispatch("p", "s", &admission.operation.id, "step-0")
+            .unwrap();
+        assert!(claim.acquired);
+        if boundary == "dispatch_claimed" {
+            publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+            pause_for_parent();
+        }
+        let mut effect = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&effects)
+            .unwrap();
+        effect.write_all(b"effect\n").unwrap();
+        effect.sync_all().unwrap();
+        if boundary == "effect_before_ack" {
+            publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+            pause_for_parent();
+        }
+        assert!(
+            journal
+                .acknowledge_dispatch("p", "s", &admission.operation.id, "step-0")
+                .unwrap()
+        );
+        if matches!(boundary.as_str(), "checkpointed" | "completed") {
+            journal
+                .checkpoint(
+                    "p",
+                    "s",
+                    &admission.operation.id,
+                    json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
+                )
+                .unwrap();
+        }
+        if boundary == "completed" {
+            journal
+                .complete(
+                    "p",
+                    "s",
+                    &admission.operation.id,
+                    json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
+                )
+                .unwrap();
         }
     }
-
-    let first = journal
-        .record_dispatch("p", "s", &admission.operation.id, "step-0")
-        .unwrap();
-    assert!(first.acquired);
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&effects)
-        .unwrap()
-        .write_all(b"effect\n")
-        .unwrap();
-    journal
-        .acknowledge_dispatch("p", "s", &admission.operation.id, "step-0")
-        .unwrap();
-    journal
-        .checkpoint(
-            "p",
-            "s",
-            &admission.operation.id,
-            json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
-        )
-        .unwrap();
-
-    let second = journal
-        .record_dispatch("p", "s", &admission.operation.id, "step-1")
-        .unwrap();
-    assert!(second.acquired);
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&effects)
-        .unwrap()
-        .write_all(b"effect\n")
-        .unwrap();
-    let mut ready_file = std::fs::File::create(format!("{ready}.tmp")).unwrap();
-    ready_file
-        .write_all(admission.operation.id.as_bytes())
-        .unwrap();
-    ready_file.sync_all().unwrap();
-    std::fs::rename(format!("{ready}.tmp"), ready).unwrap();
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
-    }
+    publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+    pause_for_parent();
 }
 
 #[test]

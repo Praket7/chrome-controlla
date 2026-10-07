@@ -239,6 +239,13 @@ Sol approved the local journal gate after reviewing two correction rounds. Tests
 
 The new red-first `startup_recovery_keeps_running_job_not_sent_when_dispatch_was_never_claimed` regression failed against the prior behavior (`running/unknown`), then passed after recovery was keyed to persisted delivery state. The focused `jobs` integration suite passes 18/18: real subprocess kills before dispatch recover as `failed/not_sent`, and after a dispatch claim recover as `unknown` and reject replay. Additional coverage preserves acknowledged `sent` delivery, leaves completed operations untouched, and expires running/not-sent work as failed. This verifies journal boundaries only; no live Chrome dispatch process was stopped.
 
+## Phase 3 expanded subprocess crash matrix — 2026-10-07
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-runtime --test jobs --locked --offline` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 17 passed, 0 failed. Child processes are killed and the journal reopened at seven durable fixture cut points: admitted, running/not-sent, claim-before-effect, effect-before-ack, acknowledged, checkpointed, and completed. Each recovery state is asserted and replay remains refused. |
+| Sol focused review of `jobs.rs` | pass | 2026-10-07 | Ready marker uses sync plus same-directory atomic rename; claim-before-effect pauses before writing the fixture effect. Review confirms fixture journal coverage only, not live browser dispatch or every runtime boundary. |
+
 ## Phase 4 local guard primitives — 2026-10-06
 
 | Check | Result | Environment | Evidence |
@@ -270,6 +277,12 @@ Text dispatch supports ordinary input and textarea controls only; sequential typ
 | `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome 154.0.8037.98 | Same test-owned isolated profile verifies ordinary Unicode fill/insert/sequential keys; stale expected value returns before mutation; explicitly marked masked tel and trusted-event-dependent inputs return unsupported without mutation; contenteditable returns unsupported; password returns unsupported without exposing its value; actual overlay at the click point causes stale refusal with no click-handler effect; a DOM drag moves from (20,100) to (140,160) and passes its bounds predicate. Strict-background text uses the page/CDP route with no native requirement. Profile/process are removed by explicit shutdown on success and `Drop` cleanup on assertion failure. |
 
 The masked/event-dependent check uses app-provided `data-masked` and `data-requires-trusted` markers. Undeclared app semantics are not inferred from DOM shape. IME, canvas drag, app-specific identity/document semantics, and independent OS focus/cursor/clipboard observation remain unqualified.
+
+## Phase 4 repeated Chrome interference fixture — 2026-10-07
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| `cargo test -p controlla-browser --locked --offline real_chrome_headless_provider_launch_and_runtime_smoke -- --ignored --nocapture` | pass | macOS 26 / Darwin 25.6 arm64, installed Google Chrome | 1 passed. Three deterministic cycles reset and blur the input, trigger its real Chrome focus handler to write an external value, then assert guarded fill yields and the external value remains. This is an isolated fixture, not a live-user race or check-to-dispatch timing bound. |
 
 ## Phase 5 local library gate — 2026-10-06
 

@@ -60,7 +60,8 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [x] Sol approved the local Phase 3 journal gate after corrective reviews; full local workspace tests pass (95 passed, 1 ignored) with format, Clippy, provenance and doc-link checks. Phase 6 later added the MCP workflow/job route and async QuickJS observation broker; these do not establish live browser mutation or exactly-once effects.
 - [x] Add the durable workflow/job MCP tools and local broker route through the current session adapter. No live browser mutation or arbitrary Promise completion is claimed.
 - [x] Verify the broker-backed QuickJS worker resolves a Promise after exactly 12 seconds; this is local worker evidence only.
-- [ ] Inject process crashes at every journal boundary and verify exact 12-second resolve/reject cases through both browser routes.
+- [x] Kill/reopen a child process at seven durable journal fixture cut points and verify recovered state plus replay refusal; see `verification-matrix.md`. This does not cover every runtime/browser boundary.
+- [ ] Verify exact 12-second resolve/reject and navigation during evaluation through live CDP and extension-bridge routes; inject kills at remaining runtime/browser dispatch boundaries.
 
 
 ### Phase 4 — reliable input, guards and interference
@@ -70,6 +71,7 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [x] Inject target navigation after final pre-dispatch check; confirm write is withheld and record fixture probe-to-mutation timing (2773 us in the recorded run).
 - [x] Add local fixtures for revision/dependency mismatch, Unicode input/readback, strict-background non-dispatch, locator ambiguity, mouse predicates, and race-window invalidation.
 - [x] Run an ignored installed-Chrome headless DOM fixture: revision-bound fill, insert, and ASCII sequential keys produced the expected Unicode value and UTF-16 caret position. Dedicated launch now bootstraps Page/Runtime for newly created targets.
+- [x] Repeat the installed-Chrome focus-handler interference fixture three times; every guarded fill yields and preserves the external value. Controlled fixture evidence only, not live-user interference or a timing bound.
 - [x] Extend the isolated Chrome fixture: stale values withhold writes; marked masked/event-dependent controls and plain contenteditable fail closed; password controls return unsupported without observed values; an overlay blocks click dispatch; DOM drag verifies the moved element bounds; strict-background text works with no native requirement.
 - [x] Exercise supported installed-Chrome DOM cases: declared masked/event-dependent controls and contenteditable fail closed, password values are not exposed, an overlay blocks click, and DOM drag verifies final bounds.
 - [x] Add guarded CDP text composition for ordinary input/textarea and verify composition events and committed Japanese text in isolated Chrome. Native OS IME candidate UI/conversion and masked/app-specific controls remain unqualified.

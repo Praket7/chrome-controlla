@@ -123,7 +123,7 @@ pub struct ExtractionResult {
     pub expected_count: Option<usize>,
     pub completeness: Completeness,
     pub cursor: Option<String>,
-    /// Extraction currently reports progress but does not implement resume.
+    /// Whether `cursor` identifies retained server-side state that can resume this extraction.
     pub cursor_is_resumable: bool,
     pub terminal_evidence: Vec<String>,
     pub missing: Vec<String>,
