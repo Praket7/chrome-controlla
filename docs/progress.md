@@ -137,11 +137,12 @@ This Phase 8 slice adds only generic browser fill/click. It does not implement p
 - [x] Add a checked versioned client-config generator with unique state directories; generated configs are still examples, not client acceptance.
 - [x] Add `controlla://guide/{topic}/{server_version}` resources and a child-process RMCP test for initialize negotiation, resource list/read, all tool schemas, and stale/invalid request errors.
 - [x] Add a child-process RMCP stdio check for the current no-initialize discovery lifecycle; it discovers the latest advertised protocol and exercises tool/resource listing over per-request metadata.
-- [x] Add a safe JSON config installer for Freebuff and OpenCode that preserves unrelated entries and refuses links, invalid JSON, conflicting entries, and detected concurrent edits. Claude Code prints a command for explicit human review; no client config outside temp fixtures was changed.
+- [x] Add a JSON config installer for Freebuff and OpenCode that preserves unrelated entries and refuses links, invalid JSON, and conflicting entries. Replacement is atomic and it best-effort detects edits before replacement; it does not serialize with arbitrary external writers. Claude Code prints a command for explicit human review; no client config outside temp fixtures was changed.
+- [x] Generate the initialize-time bootstrap tool names from the MCP router and direct clients to `tools/list` for current argument schemas; a focused test checks every registered tool name appears and that the bootstrap remains short.
 - [x] Run release-prep app, client, benchmark, docs, provenance, extension-command, package, and full Rust checks; 91 tests passed and 2 Chrome-required tests remained ignored in this environment.
 - [ ] Add and qualify authenticated remote transport; do not expose unauthenticated HTTP or raw CDP.
 - [ ] Run real-client setup/workflow/cleanup acceptance for each available client and record installed version and server SHA.
-- [ ] Cover every advertised protocol revision/transport, derive guide facts/bootstrap instructions from runtime schemas, and run B35 plus the 20-task fresh-agent usability suite.
+- [ ] Cover every advertised protocol revision/transport, generate full guide operation facts from runtime schemas (the descriptive guide table remains human-maintained), and run B35 plus the 20-task fresh-agent usability suite.
 
 ### Phase 10 — controlled comparison and optimization
 

@@ -2147,9 +2147,7 @@ impl ServerHandler for App {
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(
-            "Use session discovery and explicit target selection. Read the versioned guide resource for client setup and operating details.",
-        )
+        .with_instructions(bootstrap_instructions())
     }
 
     async fn list_resources(
@@ -2204,6 +2202,18 @@ impl ServerHandler for App {
             rmcp::model::ReadResourceResult::new(vec![contents]),
         ))
     }
+}
+
+fn bootstrap_instructions() -> String {
+    let registered = App::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Use tools/list for current argument schemas. Start with session discovery; connect only to explicitly selected target IDs, then use returned target references. Read the versioned guide resource for full instructions. Registered tools: {registered}."
+    )
 }
 
 fn guide_resource_uri(topic: &str, server_version: &str) -> String {
@@ -2386,8 +2396,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{App, validate_loopback_ws};
-    use rmcp::{RoleServer, ServiceExt, model::CallToolRequestParams, service::serve_directly};
+    use rmcp::{
+        RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
+        service::serve_directly,
+    };
     use serde_json::{Value, json};
+
+    #[test]
+    fn bootstrap_instructions_include_the_runtime_tool_registry() {
+        let instructions = App::default().get_info().instructions.unwrap();
+        let tools = App::tool_router().list_all();
+        for tool in &tools {
+            assert!(
+                instructions.contains(tool.name.as_ref()),
+                "bootstrap instructions omit registered tool {}",
+                tool.name
+            );
+        }
+        assert!(
+            instructions.len() <= 600,
+            "bootstrap instructions grew too long"
+        );
+    }
 
     #[test]
     fn state_directory_lock_has_one_owner_for_its_lifetime() {
@@ -2792,11 +2822,13 @@ mod tests {
                         json!({"session_id":session_id,"filename":"fixture.txt","bytes":[104,105]}),
                     )),
                 )
-                .await
-                .unwrap();
+                .await;
             assert!(
-                artifact.is_error.unwrap_or(false),
-                "Windows must fail closed for artifacts: {artifact:?}"
+                match artifact {
+                    Err(_) => true,
+                    Ok(result) => result.is_error.unwrap_or(false),
+                },
+                "Windows must fail closed for artifacts"
             );
         }
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();

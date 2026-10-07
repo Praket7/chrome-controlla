@@ -54,7 +54,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
 | CC-16 | partial | 7 | Evidence is bound to operation/target/account/revision/time/predicate; caller-controlled evidence always returns inconclusive because no runtime-controlled independent observer exists |
 | CC-17 | partial | 9 | `docs/clients.md` records dated local config shapes; no external client or live workflow acceptance |
-| CC-18 | partial | 9 | Versioned guide resources and child-process stdio tests cover legacy initialize and current discovery lifecycle; generated installer, full revision/transport matrix, real clients, and B35 remain open |
+| CC-18 | partial | 9 | Versioned guide resources and child-process stdio tests cover legacy initialize and current discovery lifecycle; initialize tool names are derived from the runtime router and `tools/list` provides live schemas. Human-authored guide facts, full revision/transport matrix, real clients, and B35 remain open |
 | CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
 | CC-20 | partial | 10 | Validated 30-task pilot and disjoint 100-task held-out manifests, baseline lock, and analysis fixtures exist; no pilot task or held-out comparison run has executed |
 | CC-21 | partial | 7 | Local fail-closed verifier/cache mechanics and cache-signature/quarantine tests exist; no production observer, qualification suite or execution integration |
@@ -341,6 +341,16 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | Current discovery lifecycle over packaged stdio | pass | macOS / Rust / rmcp 3.5.1 | A child process negotiated the SDK's latest protocol without `initialize`, then listed tools and versioned guide resources. This covers only the current lifecycle over local stdio, not other revisions/transports or real clients. |
 
 The client guide schema references were checked on 2026-10-06. Client binary versions were not recorded; examples are version/schema-labeled where formats differ and are not an advertised live support matrix.
+
+## Phase 9 registry-derived bootstrap — 2026-10-06
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| `cargo test -p controlla-runtime --lib bootstrap_instructions_include_the_runtime_tool_registry --locked --offline --quiet` | pass | macOS / Rust 1.99.0 | Initialization instructions enumerate names from `App::tool_router().list_all()` and remain at most 600 characters. The bootstrap directs clients to `tools/list` for schemas; guide operation descriptions remain human-authored. |
+| `cargo test -p controlla-runtime --locked --offline --quiet` | pass | macOS / Rust 1.99.0 | 31 runtime unit tests and all runtime integration groups passed, including the shared input and Windows artifact refusal regression. |
+| `cargo clippy -p controlla-runtime --all-targets --locked --offline -- -D warnings`; `cargo fmt --all -- --check`; `node tests/guide/check-master-example.mjs`; `npm run check:docs`; `git diff --check` | pass | macOS / Rust 1.99.0 / Node.js local | Runtime Clippy, workspace format/whitespace, guide sample shape, and all 23 Markdown files passed. |
+
+This is a short registry-derived bootstrap, not generated documentation or B35 usability evidence.
 
 ## Pre-live integration checks — 2026-10-06
 
