@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "e9ca1dd2734c24144249364c210c082e42d7d183e3222e55c5b4fa3bb9fb33d2",
-      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, and authenticated loopback HTTP implementation/tests, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 final 48994fc candidate and Windows/macOS/Ubuntu CI boundaries",
+      "destination_sha256": "2c1831b082da9f89777c7abe50d2c46eb07768b8454700982372bc11277c51cd",
+      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, and authenticated loopback HTTP implementation/tests, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 final e11732c candidate and Windows/macOS/Ubuntu CI boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
