@@ -182,8 +182,9 @@ The Phase 8 slice includes generic browser fill/click plus the three offline app
 - [x] Add and fixture-test strict shared-extension/server version matching; pairing rejects missing/stale extension versions and the extension releases selected-tab debugger attachments on server mismatch.
 - [x] Generate a local macOS arm64 release-candidate bundle from clean source commit `13c64e3`; verify its SBOM and all artifact checksums. The candidate is unpublished and not live-qualified.
 - [x] Pass hosted Windows, macOS, and Linux build/package CI on candidate source commit `13c64e3`; run `37618717861` passed all three OS jobs. Published consumer install remains open.
+- [x] Verify the host-matched npm package clean-prefix consumer install and command shim on Windows and Linux in hosted run [37628108314](https://github.com/Praket7/chrome-controlla/actions/runs/37628108314), alongside the macOS job. This installs the CI-built archive, not a published GitHub package.
 - [x] Verify a local distinct-binary package upgrade/rollback with installed executable digests; this is not live MCP server/client compatibility. Evidence: [distinct-binary lifecycle](review/phase12-binary-lifecycle.md).
-- [ ] Verify stale server/client compatibility beyond the extension handshake, Windows/Linux fresh installs, signed artifacts/SBOM, and consumer install from GitHub.
+- [ ] Verify stale/current server-client compatibility beyond the extension handshake, signed release artifacts, and consumer installation from GitHub.
 - [x] Run final review, commit all integrated changes, and push the authorized feature branch (`13c64e3` on `codex/phase4-5`).
 
 The dated Phase 12 review record will bind any distinct binaries, full digests, source commits, and local lifecycle output. No registry publication was performed.
