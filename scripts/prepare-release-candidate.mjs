@@ -36,12 +36,18 @@ if (extensionManifest.version !== packageJson.version) throw new Error('MCP pack
 const target = `${process.platform}-${process.arch}`;
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
-run('npm', ['pack', packageDir, '--pack-destination', out, '--json'], { stdio: 'pipe' });
+const isolatedNpmConfig = path.join(out, '.empty.npmrc');
+await writeFile(isolatedNpmConfig, '');
+run('npm', ['pack', packageDir, '--pack-destination', out, '--json'], {
+  stdio: 'pipe',
+  env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig },
+});
+await rm(isolatedNpmConfig, { force: true });
 const packageArchive = (await readdir(out)).find((name) => name.endsWith('.tgz'));
 if (!packageArchive) throw new Error('npm pack did not produce an archive');
 
 const extensionArchive = `chrome-controlla-extension-${packageJson.version}.tar.gz`;
-run('tar', ['-czf', path.join(out, extensionArchive), '-C', path.join(root, 'extensions/chrome-controlla'), '.']);
+run('tar', ['-czf', path.join(out, extensionArchive), '-C', path.join(root, 'extensions/chrome-controlla'), 'manifest.json', 'background.js', 'popup.html', 'popup.js', 'README.md']);
 
 const metadata = JSON.parse(run('cargo', ['metadata', '--locked', '--format-version', '1'], { stdio: 'pipe' }));
 if (!metadata.resolve) throw new Error('cargo metadata did not resolve the Controlla CLI dependency graph');

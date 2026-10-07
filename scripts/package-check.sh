@@ -31,11 +31,14 @@ if printf '%s\n' "$files" | grep -E '(^|/)(adapters|comptrol-core|comptrol-platf
     exit 1
 fi
 node_bin=$(command -v node)
-printf '%s\n' 'package-check: creating npm archive'
+# Isolate consumer installs from the invoking user's global npm allow-scripts policy.
 temp=$(mktemp -d "${TMPDIR:-/tmp}/controlla package.XXXXXX")
+: > "$temp/empty.npmrc"
+npm_cmd() { NPM_CONFIG_USERCONFIG="$temp/empty.npmrc" npm "$@"; }
+printf '%s\n' 'package-check: creating npm archive'
 trap '"$node_bin" -e '\''require("node:fs").rmSync(process.argv[1],{recursive:true,force:true})'\'' "$temp"' EXIT
 package="$PWD/packages/chrome-controlla/dist"
-archive_name=$(npm pack --silent --pack-destination "$temp" "$package")
+archive_name=$(npm_cmd pack --silent --pack-destination "$temp" "$package")
 archive="$temp/$archive_name"
 printf 'package-check: inspecting npm archive %s\n' "$archive_name"
 archive_files=$(tar -tzf "$archive" | tr -d '\r')
@@ -58,13 +61,13 @@ printf '%s\n' 'package-check: validating packed target metadata and license'
 tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);if(p.os?.length!==1||p.os[0]!==process.platform||p.cpu?.length!==1||p.cpu[0]!==process.arch){console.error(`package target mismatch: ${p.os}/${p.cpu} != ${process.platform}/${process.arch}`);process.exit(1)}if(p.license!=="Apache-2.0"){console.error(`unexpected license: ${p.license}`);process.exit(1)}})'
 prefix="$temp/clean prefix"
 printf '%s\n' 'package-check: installing packed archive into clean prefix'
-npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$archive"
+npm_cmd install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$archive"
 installed="$prefix/node_modules/chrome-controlla/bin/controlla.cjs"
 "$node_bin" "$installed" --help | grep -F 'Usage: controlla' >/dev/null
 PATH='' "$node_bin" "$installed" --version | grep -F 'controlla 0.1.0' >/dev/null
 printf '%s\n' 'package-check: checking npm command shim'
 # npm exec selects and launches the platform-appropriate command shim (including
 # Windows .cmd under Git Bash) as an installed consumer would.
-npm exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.0' >/dev/null
+npm_cmd exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.0' >/dev/null
 printf 'Verified host-bound npm archive (%s/%s), attribution, and clean-prefix package-local install.\n' "$(node -p 'process.platform')" "$(node -p 'process.arch')"
 node scripts/check-package-lifecycle.mjs
