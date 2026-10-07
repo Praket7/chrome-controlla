@@ -54,7 +54,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-16 | unimplemented | 7 | none |
 | CC-17 | unimplemented | 9 | none |
 | CC-18 | unimplemented | 9 | none |
-| CC-19 | unimplemented | 8 | none |
+| CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
 | CC-20 | unimplemented | 10 | none |
 | CC-21 | unimplemented | 7 | none |
 | CC-22 | unimplemented | 11 | none |
@@ -96,6 +96,16 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
 | B36 | partial | 4 | real Chrome strict-background text succeeds with no native requirement; strict-background mouse/native routes return `NeedsForeground` in fixtures; no native-dialog fixture or platform observer |
+
+### Phase 8 app qualification matrix — 2026-10-06
+
+| Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
+|---|---|---|---|---|
+| Google Slides | No edit route; generic observation only | No OAuth or Slides API adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
+| Canva | No app edit route | No Connect or Apps SDK adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
+| CapCut Web | No app UI adapter | No official timeline API route established | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
+
+These rows describe available code paths, not app validation. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 

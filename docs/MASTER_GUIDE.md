@@ -158,6 +158,8 @@ Download/export requires a completion event plus file checks: expected type, non
 
 ## 13. Design-app recipes
 
+**Current availability:** this preview has no Slides, Canva, or CapCut edit/execute/verify route. The recipes below describe qualification requirements only; they are not runnable integrations. Generic observation or file selection does not establish an app edit, save, or export. Check the per-app rows in `docs/verification-matrix.md`; if a requested change needs an app mutation, report it unsupported until a route and its evidence gates are qualified.
+
 ### Google Slides
 
 Identify presentation/account; obtain current object/revision data; choose qualified API or browser-only route; apply scoped changes; read back; render and inspect all affected slides; check overflow and intended layout; verify save and requested export. Use revision checks for API writes. Do not claim browser-only performance for API-assisted edits.

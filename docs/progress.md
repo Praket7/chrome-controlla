@@ -89,6 +89,17 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 This is a local contract and fail-closed cache-mechanics slice. Phase 6's workflow compiler is not present; cache is not wired to execution; and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
 
+## Phase 8 app capability gate — 2026-10-06
+
+- [x] Audited the current MCP tool surface and app-related code before adding app-specific routes. MCP exposes session, observe/extract, accessibility/crop, shared observe, artifact registration, and generic file selection; it exposes no app edit/execute/verify route or Slides/Canva/CapCut module.
+- [x] Recorded per-app readiness and evidence requirements in `verification-matrix.md` and the master guide. All professional-app workflow cells remain `unqualified`; the generic browser tools do not establish app support.
+- [ ] Slides editing/API route, OAuth, object/revision readback, reload/export and visual review are absent. No app-specific writes were attempted.
+- [ ] Canva Connect or Apps SDK route, account/entitlement qualification, page-lock/conflict handling and save/export verification are absent. No sync was used as a read probe.
+- [ ] CapCut Web has no implemented UI adapter or verified official timeline API route; no third-party API is substituted. Import/edit/export/playback remain unqualified.
+- [ ] Representative owned app documents/media, authenticated test accounts, and live reload/export evidence are still needed after supported routes exist. The user Chrome profile and external apps were not touched.
+
+This Phase 8 slice records honest gates only. It does not implement professional-app editing, app capability discovery, or live qualification; the remaining Phase 8 checklist items stay open.
+
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 
 | Check | Result | Environment | Evidence |
