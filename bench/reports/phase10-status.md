@@ -1,6 +1,6 @@
 # Phase 10 — controlled comparison status
 
-Captured 2026-10-06. Candidate package versions and artifact integrity values are in [`../baselines/versions.lock.json`](../baselines/versions.lock.json). These are reproducibility inputs only; no baseline package was installed or executed.
+Captured 2026-10-07. Candidate package versions and artifact integrity values are in [`../baselines/versions.lock.json`](../baselines/versions.lock.json). These are reproducibility inputs only; no baseline package was installed or executed.
 
 ## Preregistered primary outcomes
 
@@ -30,5 +30,7 @@ Captured 2026-10-06. Candidate package versions and artifact integrity values ar
 | 200 critical-workflow runs | Not run | No run data |
 | AGWC ablations / statistical report | Not run | Depends on valid runs |
 | Comparison claim | Prohibited | No results support one |
+
+Local revalidation on 2026-10-07 passed `npm run check:bench` (12 tests, frozen 100-template/20-critical split, deterministic Phase 6 fixture), `node scripts/check-phase10-pilot.mjs` (30 templates, five categories), and the full app/client/docs/provenance/package checks. These results validate manifests and harnesses only; no browser/model task or comparison was run.
 
 Phase 10 is **not complete**. Each pilot template now has a runnable *offline state fixture*, but these do not execute candidate tools, Chrome, or model tasks and are not pilot evidence. The held-out IDs and split digest are frozen before any pilot outcome. The 30-template pilot, 100-template × 5-reset comparison, 20 critical workflows × 10-reset runs, and AGWC ablations remain unrun. A preregistration addendum must freeze the exact model ID/version and any changed baseline pins before execution.

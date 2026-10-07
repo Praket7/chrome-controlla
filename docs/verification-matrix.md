@@ -397,12 +397,17 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Rust/package CI | pass | Windows, macOS, Ubuntu; source `e11732c` | [GitHub Actions run 37608861235](https://github.com/Praket7/chrome-controlla/actions/runs/37608861235) passed all build, test, dependency, docs, provenance, and package jobs. |
 | Local unpublished candidate | pass | macOS arm64; source `e11732c` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
 
-## Live shared-extension connection attempt — 2026-10-07
+## Live shared-extension pairing and read-only observation — 2026-10-07
 
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
 | Updated stdio MCP process | pass | Codex desktop, local macOS process | The configured `target/release/controlla mcp` process is running from the Phase 4/5 worktree. Session discovery works. |
 | Test Classroom selection | pass | Existing Chrome extension browser; user-authorized test account | Opened the supplied test Classroom and selected only that tab in the extension popup. No class content was modified. |
-| Shared-extension handshake | blocked | Chrome extension popup + local Controlla 0.1.0 | `pair_shared` created a one-tab session. `accept_shared` rejected the loaded extension with `extension version unknown does not match server version 0.1.0`; no `shared_observe` or input command ran. The popup identifies the required matching-extension reload. |
-| Extension source contract | pass | Local `extensions/chrome-controlla/` | Manifest version is `0.1.0`, permissions are `tabs` and `debugger`, and `node extensions/chrome-controlla/test-background.cjs` passes its version-handshake, cleanup, and command-allowlist checks. This does not prove the browser has this source loaded. |
-| Extension manager access | blocked | CUA browser policy | Navigation to `chrome://extensions/` was explicitly blocked by the browser-use URL policy, which forbids alternate-surface workarounds. The user must reload/load the matching unpacked extension from the project path before the live test can continue. |
+| Earlier shared-extension handshake | failed, superseded | Chrome extension popup + local Controlla 0.1.0 | An earlier attempt returned `extension version unknown does not match server version 0.1.0`. A later fresh session below accepted the loaded 0.1.0 extension. |
+| Shared-extension handshake | pass | Chrome Controlla Shared Tab Bridge 0.1.0 + local Controlla 0.1.0 | Popup paired only Chrome tab `1649771390` (`testing - Classroom`); server accepted session `session-3-1`. The endpoint/token are intentionally omitted. |
+| Shared target enumeration | pass | Same live session | `list_shared_targets` returned exact URL `https://classroom.google.com/c/ODI2NTQ5Mjc1ODU3` with root frame. |
+| Shared read-only observation | pass, bounded | Same live session | `shared_observe` on `body` returned a focused `h1` title (`Classroom`, `testing`) with no truncation; root frame, loader, and URL matched before and after. A broader body-text read was truncated, and the first `main` query returned empty/truncated; this verifies one bounded target-bound observation, not full-page extraction. No writes were sent. |
+| Shared-session cleanup | pass | Same live session | `release_shared` confirmed the provider debugger attachment was released after observation; the Chrome tab was left open. |
+| Extension source contract | pass | Local `extensions/chrome-controlla/` | Manifest version is `0.1.0`, permissions are `tabs` and `debugger`, and `node extensions/chrome-controlla/test-background.cjs` passes its version-handshake, cleanup, and command-allowlist checks. The live accepted handshake independently confirms a matching 0.1.0 extension was loaded. |
+| Live input, save, or app persistence | not run | Same live session | No mutating command was sent. This evidence does not establish input dispatch, Classroom save behavior, or application persistence. |
+| External MCP client acceptance | open | Not run | The session used the local Codex MCP process and extension popup; no separate MCP client was launched. |
