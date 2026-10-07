@@ -112,8 +112,15 @@ struct ScreenshotArgs {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct WorkflowArgs {
     session_id: String,
+    idempotency_key: String,
     target_ref: TargetRefInput,
-    steps: Vec<Value>,
+    steps: Vec<crate::workflow::WorkflowStep>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct WorkflowStatusArgs {
+    session_id: String,
+    operation_id: String,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -145,11 +152,494 @@ struct SharedLiveSession {
     handle: controlla_browser::sessions::SessionHandle,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct App {
     manager: BrowserManager,
     sessions: Arc<Mutex<BTreeMap<String, Arc<LiveSession>>>>,
     shared_sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<SharedLiveSession>>>>>,
+    jobs: crate::jobs::Journal,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::with_journal(crate::jobs::Journal::open(":memory:").expect("in-memory journal"))
+    }
+}
+
+impl App {
+    fn with_journal(jobs: crate::jobs::Journal) -> Self {
+        Self {
+            manager: BrowserManager::default(),
+            sessions: Arc::default(),
+            shared_sessions: Arc::default(),
+            jobs,
+        }
+    }
+}
+
+fn workflow_receipt(
+    operation_id: &str,
+    status: &str,
+    session_id: &str,
+    reference: &TargetRef,
+    browser_operations: u64,
+    steps: &[Value],
+    error: Option<&str>,
+) -> Value {
+    json!({
+        "schema_version":"1", "operation_id":operation_id, "status":status,
+        "replayed":false,
+        "target":{"session_id":session_id,"target_id":reference.target_id,
+            "navigation_epoch":reference.frame_revision,"target_revision":reference.target_revision,
+            "account_revision":reference.account_revision,"document_revision":reference.document_revision},
+        "result":{"completed_steps":steps.len(),"browser_operations":browser_operations,"steps":steps},
+        "metrics":{"browser_operations":browser_operations,"internal_model_calls":0},
+        "evidence":[], "artifacts":[], "error":error
+    })
+}
+
+async fn run_workflow_job(
+    jobs: crate::jobs::Journal,
+    session: Arc<LiveSession>,
+    session_id: String,
+    operation_id: String,
+    reference: TargetRef,
+    graph: crate::workflow::WorkflowGraph,
+) {
+    const PRINCIPAL: &str = "local-stdio";
+    if !jobs
+        .start(PRINCIPAL, &session_id, &operation_id)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(admitted) = jobs
+        .get(PRINCIPAL, &session_id, &operation_id)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let remaining = admitted.deadline_at_ms.saturating_sub(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining);
+    let mut completed = Vec::new();
+    if let Some(source) = graph.steps.first().and_then(|step| match step {
+        crate::workflow::WorkflowStep::Script { source } => Some(source.clone()),
+        _ => None,
+    }) {
+        let script_jobs = jobs.clone();
+        let script_session = session.clone();
+        let script_session_id = session_id.clone();
+        let script_operation_id = operation_id.clone();
+        let script_reference = reference.clone();
+        let script_completed = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let callback_jobs = script_jobs.clone();
+        let callback_session = script_session.clone();
+        let callback_sid = script_session_id.clone();
+        let callback_opid = script_operation_id.clone();
+        let callback_ref = script_reference.clone();
+        let callback_completed = script_completed.clone();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = call_count.clone();
+        let callback_deadline = deadline;
+        let broker: crate::workflow::ScriptBroker = Arc::new(move |raw| {
+            let jobs = callback_jobs.clone();
+            let session = callback_session.clone();
+            let session_id = callback_sid.clone();
+            let operation_id = callback_opid.clone();
+            let reference = callback_ref.clone();
+            let completed = callback_completed.clone();
+            let call_count = callback_count.clone();
+            let deadline = callback_deadline;
+            Box::pin(async move {
+                if call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= crate::workflow::MAX_OBSERVE_CALLS
+                {
+                    return Err("script browser operation limit exceeded".into());
+                }
+                let spec: crate::workflow::WorkflowObserveSpec = serde_json::from_str(&raw)
+                    .map_err(|_| "invalid brokered observe spec".to_owned())?;
+                crate::workflow::compile_steps(vec![crate::workflow::WorkflowStep::Observe {
+                    spec: spec.clone(),
+                }])
+                .map_err(|e| e.to_owned())?;
+                let registry = session.registry.lock().await;
+                if reference.session_id != session_id
+                    || reference.principal != session.handle.principal
+                    || !registry.contains_target(&session.handle, &reference.target_id)
+                {
+                    return Err("target_ref is not bound to this session".into());
+                }
+                let index = completed.lock().await.len();
+                let correlation = format!("{operation_id}:script:{index}");
+                let claim = jobs
+                    .record_dispatch("local-stdio", &session_id, &operation_id, &correlation)
+                    .map_err(|e| e.to_string())?;
+                if !claim.acquired {
+                    return Err("operation dispatch could not be claimed".into());
+                }
+                let pending = workflow_receipt(
+                    &operation_id,
+                    "running",
+                    &session_id,
+                    &reference,
+                    claim.operation.dispatch_count,
+                    &completed.lock().await,
+                    None,
+                );
+                jobs.checkpoint("local-stdio", &session_id, &operation_id, pending)
+                    .map_err(|e| e.to_string())?;
+                let step_deadline = deadline
+                    .min(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
+                match tokio::time::timeout_at(
+                    step_deadline,
+                    session.connection.observe(
+                        &registry,
+                        &reference,
+                        &session.handle.principal,
+                        IdentityRevisions {
+                            account: reference.account_revision,
+                            document: reference.document_revision,
+                        },
+                        &spec.clone().into_observe_spec(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(observation)) => {
+                        jobs.acknowledge_dispatch(
+                            "local-stdio",
+                            &session_id,
+                            &operation_id,
+                            &correlation,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let value = json!({"kind":"observe","observation":observation});
+                        let mut done = completed.lock().await;
+                        done.push(value);
+                        let receipt = workflow_receipt(
+                            &operation_id,
+                            "running",
+                            &session_id,
+                            &reference,
+                            claim.operation.dispatch_count,
+                            &done,
+                            None,
+                        );
+                        jobs.checkpoint("local-stdio", &session_id, &operation_id, receipt)
+                            .map_err(|e| e.to_string())?;
+                        serde_json::to_string(&observation).map_err(|e| e.to_string())
+                    }
+                    Ok(Err(error)) => {
+                        let receipt = workflow_receipt(
+                            &operation_id,
+                            "unknown",
+                            &session_id,
+                            &reference,
+                            claim.operation.dispatch_count,
+                            &completed.lock().await,
+                            Some(&error.to_string()),
+                        );
+                        let _ =
+                            jobs.mark_unknown("local-stdio", &session_id, &operation_id, receipt);
+                        Err("browser operation delivery is unknown".into())
+                    }
+                    Err(_) => {
+                        let receipt = workflow_receipt(
+                            &operation_id,
+                            "unknown",
+                            &session_id,
+                            &reference,
+                            claim.operation.dispatch_count,
+                            &completed.lock().await,
+                            Some("step outcome unknown after timeout"),
+                        );
+                        let _ =
+                            jobs.mark_unknown("local-stdio", &session_id, &operation_id, receipt);
+                        Err("browser operation delivery is unknown after timeout".into())
+                    }
+                }
+            })
+        });
+        let timeout_ms = remaining.min(crate::workflow::MAX_JOB_DEADLINE_MS);
+        let heap_limit = 8 * 1024 * 1024;
+        let worker = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(crate::workflow::run_script(
+                    &source, timeout_ms, heap_limit, broker,
+                ))
+        })
+        .await;
+        match worker {
+            Ok(Ok(output)) => {
+                let mut steps = script_completed.lock().await;
+                steps.push(json!({"kind":"script","output":output}));
+                let count = script_jobs
+                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |op| op.dispatch_count);
+                let receipt = workflow_receipt(
+                    &script_operation_id,
+                    "completed",
+                    &script_session_id,
+                    &script_reference,
+                    count,
+                    &steps,
+                    None,
+                );
+                let _ = script_jobs.complete(
+                    PRINCIPAL,
+                    &script_session_id,
+                    &script_operation_id,
+                    receipt,
+                );
+            }
+            Ok(Err(error)) => {
+                if script_jobs
+                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|op| op.delivery == crate::jobs::Delivery::Unknown)
+                {
+                    let steps = script_completed.lock().await;
+                    let count = script_jobs
+                        .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                        .ok()
+                        .flatten()
+                        .map_or(0, |op| op.dispatch_count);
+                    let receipt = workflow_receipt(
+                        &script_operation_id,
+                        "unknown",
+                        &script_session_id,
+                        &script_reference,
+                        count,
+                        &steps,
+                        Some("script stopped while browser delivery remained unknown"),
+                    );
+                    let _ = script_jobs.mark_unknown(
+                        PRINCIPAL,
+                        &script_session_id,
+                        &script_operation_id,
+                        receipt,
+                    );
+                    return;
+                }
+                let steps = script_completed.lock().await;
+                let count = script_jobs
+                    .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |op| op.dispatch_count);
+                let receipt = workflow_receipt(
+                    &script_operation_id,
+                    "failed",
+                    &script_session_id,
+                    &script_reference,
+                    count,
+                    &steps,
+                    Some(&error),
+                );
+                let _ =
+                    script_jobs.fail(PRINCIPAL, &script_session_id, &script_operation_id, receipt);
+            }
+            Err(error) => {
+                let _ = script_jobs.fail(
+                    PRINCIPAL,
+                    &script_session_id,
+                    &script_operation_id,
+                    json!({"status":"failed","error":error.to_string()}),
+                );
+            }
+        }
+        return;
+    }
+    for (index, step) in graph.steps.iter().enumerate() {
+        let outcome = match step {
+            crate::workflow::WorkflowStep::Wait { ms } => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::sleep(std::time::Duration::from_millis(*ms)),
+                )
+                .await
+                {
+                    Ok(()) => Ok(json!({"kind":"wait","ms":ms})),
+                    Err(_) => Err("job deadline exceeded".to_owned()),
+                }
+            }
+            crate::workflow::WorkflowStep::Checkpoint => {
+                Ok(json!({"kind":"checkpoint","after_step":index}))
+            }
+            crate::workflow::WorkflowStep::Script { .. } => {
+                Err("script step must run as an isolated worker".into())
+            }
+            crate::workflow::WorkflowStep::Observe { spec } => {
+                let registry = session.registry.lock().await;
+                if reference.session_id != session_id
+                    || reference.principal != session.handle.principal
+                    || !registry.contains_target(&session.handle, &reference.target_id)
+                {
+                    Err("target_ref is not bound to this session".into())
+                } else {
+                    let correlation = format!("{operation_id}:step:{index}");
+                    let claim = match jobs.record_dispatch(
+                        PRINCIPAL,
+                        &session_id,
+                        &operation_id,
+                        &correlation,
+                    ) {
+                        Ok(claim) if claim.acquired => claim,
+                        _ => return,
+                    };
+                    let pending = workflow_receipt(
+                        &operation_id,
+                        "running",
+                        &session_id,
+                        &reference,
+                        claim.operation.dispatch_count,
+                        &completed,
+                        None,
+                    );
+                    if jobs
+                        .checkpoint(PRINCIPAL, &session_id, &operation_id, pending)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let spec = spec.clone().into_observe_spec();
+                    let step_deadline = deadline
+                        .min(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
+                    match tokio::time::timeout_at(
+                        step_deadline,
+                        session.connection.observe(
+                            &registry,
+                            &reference,
+                            &session.handle.principal,
+                            IdentityRevisions {
+                                account: reference.account_revision,
+                                document: reference.document_revision,
+                            },
+                            &spec,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(observation)) => {
+                            if !jobs
+                                .acknowledge_dispatch(
+                                    PRINCIPAL,
+                                    &session_id,
+                                    &operation_id,
+                                    &correlation,
+                                )
+                                .unwrap_or(false)
+                            {
+                                return;
+                            }
+                            Ok(json!({"kind":"observe","observation":observation}))
+                        }
+                        Ok(Err(error)) => {
+                            let receipt = workflow_receipt(
+                                &operation_id,
+                                "unknown",
+                                &session_id,
+                                &reference,
+                                claim.operation.dispatch_count,
+                                &completed,
+                                Some(&error.to_string()),
+                            );
+                            let _ =
+                                jobs.mark_unknown(PRINCIPAL, &session_id, &operation_id, receipt);
+                            return;
+                        }
+                        Err(_) => {
+                            let receipt = workflow_receipt(
+                                &operation_id,
+                                "unknown",
+                                &session_id,
+                                &reference,
+                                claim.operation.dispatch_count,
+                                &completed,
+                                Some("step outcome unknown after timeout"),
+                            );
+                            let _ =
+                                jobs.mark_unknown(PRINCIPAL, &session_id, &operation_id, receipt);
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(value) => completed.push(value),
+            Err(error) => {
+                let receipt = workflow_receipt(
+                    &operation_id,
+                    "failed",
+                    &session_id,
+                    &reference,
+                    jobs.get(PRINCIPAL, &session_id, &operation_id)
+                        .ok()
+                        .flatten()
+                        .map_or(0, |op| op.dispatch_count),
+                    &completed,
+                    Some(&error),
+                );
+                let _ = jobs.fail(PRINCIPAL, &session_id, &operation_id, receipt);
+                return;
+            }
+        }
+        let receipt = workflow_receipt(
+            &operation_id,
+            "running",
+            &session_id,
+            &reference,
+            jobs.get(PRINCIPAL, &session_id, &operation_id)
+                .ok()
+                .flatten()
+                .map_or(0, |op| op.dispatch_count),
+            &completed,
+            None,
+        );
+        if jobs
+            .checkpoint(PRINCIPAL, &session_id, &operation_id, receipt)
+            .is_err()
+        {
+            return;
+        }
+    }
+    let receipt = workflow_receipt(
+        &operation_id,
+        "completed",
+        &session_id,
+        &reference,
+        jobs.get(PRINCIPAL, &session_id, &operation_id)
+            .ok()
+            .flatten()
+            .map_or(0, |op| op.dispatch_count),
+        &completed,
+        None,
+    );
+    let _ = jobs.complete(PRINCIPAL, &session_id, &operation_id, receipt);
+}
+
+fn operation_response(operation: crate::jobs::Operation, replayed: bool) -> Result<Value, String> {
+    Ok(json!({
+        "schema_version":"1", "operation_id":operation.id,
+        "status":operation.status, "delivery":operation.delivery,
+        "revision":operation.revision, "deadline_at_ms":operation.deadline_at_ms,
+        "deadline_error":operation.deadline_error, "replayed":replayed,
+        "metrics":{"browser_operations":operation.dispatch_count,"internal_model_calls":0},
+        "result":operation.result
+    }))
 }
 
 async fn run_file_select(s: Arc<LiveSession>, args: FileSelectArgs) -> Result<Value, String> {
@@ -305,7 +795,17 @@ impl App {
         &self,
         Parameters(args): Parameters<WorkflowArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        let graph = crate::workflow::compile(json!({"steps":args.steps})).map_err(invalid)?;
+        let graph = crate::workflow::compile_steps(args.steps).map_err(invalid)?;
+        if graph
+            .steps
+            .iter()
+            .any(|step| matches!(step, crate::workflow::WorkflowStep::Script { .. }))
+            && std::env::var("CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS").as_deref() != Ok("1")
+        {
+            return Err(invalid(
+                "trusted local scripts are disabled; set CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1 only for scripts from a trusted operator",
+            ));
+        }
         let reference: TargetRef = serde_json::from_value(
             serde_json::to_value(args.target_ref).map_err(|e| invalid(e.to_string()))?,
         )
@@ -324,65 +824,48 @@ impl App {
             &s.handle.principal,
         )
         .map_err(invalid)?;
-        let mut results = Vec::new();
-        for (index, step) in graph.steps.iter().enumerate() {
-            let result: Result<Value, String> = match step {
-                crate::workflow::WorkflowStep::Wait { ms } => {
-                    tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
-                    Ok(json!({"kind":"wait","ms":ms}))
-                }
-                crate::workflow::WorkflowStep::Checkpoint => {
-                    Ok(json!({"kind":"checkpoint","after_step":index}))
-                }
-                crate::workflow::WorkflowStep::Observe { spec } => {
-                    let registry = s.registry.lock().await;
-                    if !registry.contains_target(&s.handle, &reference.target_id) {
-                        Err("target_ref is not bound to this session".into())
-                    } else {
-                        match tokio::time::timeout(std::time::Duration::from_secs(10), s.connection.observe(
-                            &registry, &reference, &s.handle.principal,
-                            IdentityRevisions { account: reference.account_revision, document: reference.document_revision },
-                            spec,
-                        )).await {
-                            Ok(result) => result.map(|observation| json!({"kind":"observe","observation":observation})).map_err(|e| e.to_string()),
-                            Err(_) => Err("workflow step deadline exceeded".into()),
-                        }
-                    }
-                }
-            };
-            match result {
-                Ok(value) => {
-                    results.push(value);
-                    if serde_json::to_vec(&results)
-                        .map_err(|e| invalid(e.to_string()))?
-                        .len()
-                        > crate::workflow::MAX_OUTPUT_BYTES
-                    {
-                        results.pop();
-                        return Ok(rmcp::handler::server::wrapper::Json(
-                            serde_json::to_value(crate::workflow::WorkflowReceipt::partial(
-                                "workflow output byte limit exceeded",
-                                results,
-                            ))
-                            .map_err(|e| invalid(e.to_string()))?,
-                        ));
-                    }
-                }
-                Err(error) => {
-                    return Ok(rmcp::handler::server::wrapper::Json(
-                        serde_json::to_value(crate::workflow::WorkflowReceipt::partial(
-                            error, results,
-                        ))
-                        .map_err(|e| invalid(e.to_string()))?,
-                    ));
-                }
-            }
+        let request = json!({"target_ref":reference,"steps":graph.steps});
+        let admission = self
+            .jobs
+            .admit_with_deadline(
+                &s.handle.principal,
+                &args.session_id,
+                &args.idempotency_key,
+                &request,
+                crate::workflow::MAX_JOB_DEADLINE_MS,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        if !admission.replayed || admission.operation.status == crate::jobs::JobStatus::Accepted {
+            tokio::spawn(run_workflow_job(
+                self.jobs.clone(),
+                s,
+                args.session_id,
+                admission.operation.id.clone(),
+                reference,
+                graph,
+            ));
         }
-        Ok(rmcp::handler::server::wrapper::Json(json!({
-            "status":"completed","completed_steps":results.len(),
-            "browser_operations":results.iter().filter(|s|s["kind"]=="observe").count(),
-            "steps":results,"artifacts":[],"error":null
-        })))
+        Ok(rmcp::handler::server::wrapper::Json(
+            operation_response(admission.operation, admission.replayed).map_err(invalid)?,
+        ))
+    }
+
+    #[tool(
+        name = "workflow_status",
+        description = "Read the durable status and latest persisted checkpoint for a workflow operation."
+    )]
+    async fn workflow_status(
+        &self,
+        Parameters(args): Parameters<WorkflowStatusArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let operation = self
+            .jobs
+            .get("local-stdio", &args.session_id, &args.operation_id)
+            .map_err(|error| invalid(error.to_string()))?
+            .ok_or_else(|| invalid("unknown operation_id for this session"))?;
+        Ok(rmcp::handler::server::wrapper::Json(
+            operation_response(operation, true).map_err(invalid)?,
+        ))
     }
 
     #[tool(
@@ -1237,11 +1720,20 @@ fn validate_loopback_ws(endpoint: &str) -> Result<(), String> {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = std::env::var_os("CONTROLLA_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".chrome-controlla"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".chrome-controlla"));
+    std::fs::create_dir_all(&state_dir)?;
+    let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
-        App::default()
+        App::with_journal(journal)
             .serve(rmcp::transport::io::stdio())
             .await?
             .waiting()
@@ -1312,6 +1804,7 @@ mod tests {
         assert!(names.contains(&"session"));
         assert!(names.contains(&"observe"));
         assert!(names.contains(&"workflow"));
+        assert!(names.contains(&"workflow_status"));
         assert!(names.contains(&"extract"));
         assert!(names.contains(&"accessibility"));
         assert!(names.contains(&"screenshot_crop"));
@@ -1559,15 +2052,46 @@ mod tests {
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
         assert!(!observed.is_error.unwrap_or(false), "{observed:?}");
         let workflow = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
-            "session_id":session_id,"target_ref":target_ref,
+            "session_id":session_id,"idempotency_key":"phase6-integration","target_ref":target_ref,
             "steps":[{"kind":"observe","spec":{"selector":"p","fields":{"text":"p"},"max_items":2,"max_text_chars":100,"max_bytes":4096,"cursor":null}},{"kind":"checkpoint"}]
         })))).await.unwrap();
         let workflow = workflow.structured_content.unwrap();
-        assert_eq!(workflow["status"], "completed");
-        assert_eq!(workflow["completed_steps"], 2);
-        assert_eq!(workflow["browser_operations"], 1);
+        assert!(
+            workflow["operation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(workflow["status"], "accepted");
+        let operation_id = workflow["operation_id"].as_str().unwrap().to_owned();
+        let mut status = Value::Null;
+        for _ in 0..50 {
+            status = client
+                .call_tool(
+                    CallToolRequestParams::new("workflow_status").with_arguments(args(json!({
+                        "session_id":session_id,"operation_id":operation_id
+                    }))),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            if status["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(status["status"], "completed", "{status}");
+        assert_eq!(status["metrics"]["browser_operations"], 1);
+        assert_eq!(status["result"]["target"]["target_id"], "tab-1");
+        assert_eq!(status["result"]["result"]["browser_operations"], 1);
+        let replay = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
+            "session_id":session_id,"idempotency_key":"phase6-integration","target_ref":target_ref,
+            "steps":[{"kind":"observe","spec":{"selector":"p","fields":{"text":"p"},"max_items":2,"max_text_chars":100,"max_bytes":4096,"cursor":null}},{"kind":"checkpoint"}]
+        })))).await.unwrap().structured_content.unwrap();
+        assert_eq!(replay["operation_id"], operation_id);
+        assert_eq!(replay["replayed"], true);
         let crossed_session = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
-            "session_id":session_id,"target_ref":{ "session_id":"other-session", "principal":"local-stdio", "capability_revision":1, "browser_instance_id":"x", "browser_generation":1, "target_id":"tab-1", "target_revision":"x", "frame_id":"x", "frame_revision":1, "account_revision":0, "document_revision":0 },
+            "session_id":session_id,"idempotency_key":"crossed-session","target_ref":{ "session_id":"other-session", "principal":"local-stdio", "capability_revision":1, "browser_instance_id":"x", "browser_generation":1, "target_id":"tab-1", "target_revision":"x", "frame_id":"x", "frame_revision":1, "account_revision":0, "document_revision":0 },
             "steps":[{"kind":"checkpoint"}]
         })))).await;
         assert!(crossed_session.is_err() || crossed_session.unwrap().is_error.unwrap_or(false));

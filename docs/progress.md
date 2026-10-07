@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence; Phase 6 adds a bounded deterministic workflow graph via MCP stdio. JavaScript scripting, arbitrary mutation programs, workflow-generated artifacts and durable receipts remain blocked. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -97,7 +97,9 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 ## Phase 6 deterministic workflow slice — 2026-10-06
 
-- [x] Runtime spike selected Wasmtime as a future worker candidate based on its documented fuel/epoch interruption, async host functions, and memory-growth limiter; QuickJS remains an alternative. No runtime dependency was added, and `node:vm` is not treated as isolation.
-- [x] Add typed observation/wait/checkpoint graph compilation and a local MCP `workflow` tool. Each observation revalidates the current session-bound target, has a 10-second deadline, and contributes to a 1 MiB aggregate declared output bound.
-- [x] Add fail-closed compiler tests for cross-session/principal references, import/network/file/process fields, unknown node fields, step count, wait ceilings, observation bounds, and aggregate output ceilings.
-- [ ] Arbitrary JavaScript, mutation scripts, effect-aware splitting, generated artifacts, persistent operation receipts, and receipt recovery after caller cancellation remain blocked pending isolated worker and durable broker integration.
+- [x] Spike pinned `rquickjs 0.14.0`: verified async broker functions, interrupt, heap and stack caps; Wasmtime was confirmed to be Wasm, not JavaScript. `node:vm` is not treated as isolation.
+- [x] Add typed observation/wait/checkpoint/script IR; deterministic observations revalidate current session-bound target and bound each call to 10 seconds.
+- [x] Add red-first compiler and JavaScript security tests for cross-session handle rejection, no loader/ambient network/file/process globals, loop interruption, memory/output caps, and workflow limits.
+- [x] Add asynchronous MCP job admission, persisted 60-second deadline/status/checkpoints, resumable partial receipts, per-dispatch claims/counts, and unknown delivery after timeout. A mocked-CDP integration test covers workflow submission and recovery through `workflow_status`.
+- [x] Add an opt-in local-trust JavaScript worker with only an async read broker. Each call rechecks principal/session/target and claims browser dispatch before execution.
+- [ ] OS process isolation, untrusted/production script qualification, mutation programs, effect-aware splitting, generated artifacts, and representative app/platform qualification remain blocked.

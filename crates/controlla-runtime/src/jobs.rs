@@ -74,6 +74,7 @@ pub struct Operation {
     pub dispatch_correlation: Option<String>,
     pub deadline_at_ms: u64,
     pub delivery: Delivery,
+    pub dispatch_count: u64,
     pub deadline_error: Option<String>,
 }
 
@@ -125,6 +126,18 @@ impl Journal {
                 UNIQUE(principal, session, idem_key)
             );",
         )?;
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(operations)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !columns.iter().any(|column| column == "dispatch_count") {
+            connection.execute(
+                "ALTER TABLE operations ADD COLUMN dispatch_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -194,7 +207,7 @@ impl Journal {
     ) -> Result<DispatchClaim, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='accepted' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let changed = connection.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', dispatch_count=dispatch_count+1, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND (status='accepted' OR (status='running' AND delivery IN ('not_sent','sent'))) AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
         if changed == 0 {
             expire_one(&connection, principal, session, id)?;
             let current = get_conn(&connection, principal, session, id)?;
@@ -216,6 +229,17 @@ impl Journal {
         })
     }
 
+    /// Atomically appoint one runner for an admitted job without claiming external delivery.
+    pub fn start(&self, principal: &str, session: &str, id: &str) -> Result<bool, JournalError> {
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        expire_one(&connection, principal, session, id)?;
+        let changed = connection.execute(
+            "UPDATE operations SET status='running', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='accepted' AND deadline_at_ms>?4",
+            params![id, principal, session, now_ms() as i64],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn complete(
         &self,
         principal: &str,
@@ -224,6 +248,50 @@ impl Journal {
         result: Value,
     ) -> Result<Operation, JournalError> {
         self.finish(principal, session, id, JobStatus::Completed, Some(result))
+    }
+
+    /// Persist a resumable receipt after a completed step while leaving the operation running.
+    pub fn checkpoint(
+        &self,
+        principal: &str,
+        session: &str,
+        id: &str,
+        result: Value,
+    ) -> Result<Operation, JournalError> {
+        let encoded = serde_json::to_string(&result)?;
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        expire_one(&connection, principal, session, id)?;
+        let changed = connection.execute(
+            "UPDATE operations SET result=?4, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?5",
+            params![id, principal, session, encoded, now_ms() as i64],
+        )?;
+        if changed == 0 {
+            expire_one(&connection, principal, session, id)?;
+            return Err(JournalError::InvalidTransition("checkpoint"));
+        }
+        get_conn(&connection, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("checkpoint"))
+    }
+
+    /// Preserve an operation receipt when dispatch outcome cannot be established.
+    pub fn mark_unknown(
+        &self,
+        principal: &str,
+        session: &str,
+        id: &str,
+        result: Value,
+    ) -> Result<Operation, JournalError> {
+        let encoded = serde_json::to_string(&result)?;
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE operations SET status='unknown', result=?4, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running'",
+            params![id, principal, session, encoded],
+        )?;
+        if changed == 0 {
+            return Err(JournalError::InvalidTransition("unknown outcome"));
+        }
+        get_conn(&connection, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("unknown outcome"))
     }
 
     pub fn fail(
@@ -377,7 +445,7 @@ fn get_conn(
 ) -> Result<Option<Operation>, JournalError> {
     Ok(connection
         .query_row(
-            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
+            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery,dispatch_count FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
             params![id, principal, session],
             row_operation,
         )
@@ -391,7 +459,7 @@ fn get_tx(
 ) -> Result<Option<Operation>, JournalError> {
     Ok(tx
         .query_row(
-            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
+            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery,dispatch_count FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
             params![id, principal, session],
             row_operation,
         )
@@ -412,6 +480,7 @@ fn row_operation(row: &rusqlite::Row<'_>) -> Result<Operation, rusqlite::Error> 
         dispatch_correlation: row.get(4)?,
         deadline_at_ms: row.get::<_, i64>(5)? as u64,
         delivery: Delivery::parse(&row.get::<_, String>(7)?)?,
+        dispatch_count: row.get::<_, i64>(8)? as u64,
         deadline_error: row.get(6)?,
     })
 }

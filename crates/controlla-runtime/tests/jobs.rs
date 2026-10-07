@@ -113,6 +113,65 @@ fn admission_is_scoped_durable_and_conflicts_on_changed_request() {
 }
 
 #[test]
+fn workflow_checkpoint_survives_reopen_and_each_browser_dispatch_is_claimed() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("local-stdio", "s", "workflow-1", &json!({"steps":[]}))
+        .unwrap();
+    assert!(
+        journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    assert!(
+        !journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    let first = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    assert_eq!(first.operation.dispatch_count, 1);
+    journal
+        .acknowledge_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    journal.checkpoint("local-stdio", "s", &admitted.operation.id, json!({"completed_steps":1,"browser_operations":1,"steps":[{"kind":"observe","value":"saved"}]})).unwrap();
+    let second = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-2")
+        .unwrap();
+    assert!(second.acquired);
+    assert_eq!(second.operation.dispatch_count, 2);
+    let pending = journal
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery, Delivery::Unknown);
+    drop(journal);
+    let reopened = Journal::open(&path).unwrap();
+    let restored = reopened
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.result.as_ref().unwrap()["browser_operations"], 1);
+    assert_eq!(restored.delivery, Delivery::Unknown);
+    assert_eq!(restored.dispatch_count, 2);
+    let unknown = reopened
+        .mark_unknown(
+            "local-stdio",
+            "s",
+            &admitted.operation.id,
+            restored.result.clone().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(unknown.status, JobStatus::Unknown);
+    assert_eq!(unknown.delivery, Delivery::Unknown);
+    cleanup(&path);
+}
+
+#[test]
 fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
     let path = temp_db();
     let _ = std::fs::remove_file(&path);

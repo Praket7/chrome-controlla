@@ -18,6 +18,7 @@ thiserror = "=2.0.20"
 
 rmcp = { version = "=3.5.1", features = ["transport-io", "macros"] }
 schemars = "=1.2.2"
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "futures"] }
 
 [dev-dependencies]
 rmcp = { version = "=3.5.1", features = ["client"] }
