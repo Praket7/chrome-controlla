@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "fd0c089ac7dd0a77ee50967034fe442a380a6aece9cfc2facc90be7e2aff41e7",
-      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries; Phase 7 adds local deterministic verifier and in-memory cache scope, provenance, and qualification-expiry checklist evidence; Phase 7 review records fail-closed untrusted evidence, opaque qualification tokens and unqualified CC-16",
+      "destination_sha256": "99eefa0fb0657df3904a75d8f8f5699356e6509977718b89dfe8605283c64f43",
+      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification; Phase 6 records bounded QuickJS workflows, durable journal recovery, and exclusive state-directory ownership; Phase 7 records fail-closed verifier/cache mechanics without production observer integration; Phase 8 records app qualification gates; Phase 9 records local stdio guide and setup scope; Phase 10 records pinned candidate artifacts and explicitly unrun benchmark gates",
       "license": "user-provided design document; no third-party license asserted"
     },
     {

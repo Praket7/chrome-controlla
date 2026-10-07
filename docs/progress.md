@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phase 4 guarded input, Phase 5 bounded extraction, and the Phase 7 local verifier/cache slice have fixture evidence recorded in `verification-matrix.md`. Phase 6 remains unimplemented. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. Phase 7 provides fail-closed verifier/cache mechanics without a production observer or workflow integration. Phase 8 app routes remain unimplemented; Phase 9 has local stdio setup and a version-matched guide tool only. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -114,3 +114,12 @@ This Phase 8 slice records honest gates only. It does not implement professional
 - The stdio adapter is local-only. Explicit CDP requires `COMPTROL_ALLOW_DIRECT_CDP=1` plus `COMPTROL_CDP_ENDPOINT`; only loopback IP literals are accepted. Permissioned auto-connect requires `COMPTROL_CHROME_AUTO_CONNECT=1` and preserves Chrome's native consent prompt.
 - Synthetic list and hidden-section fixtures do not qualify representative app account markers, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
 - `execute`, `jobs`, guide resource, durable MCP identity, artifact output/download, and shared-extension input/extraction are outside this slice.
+
+## Phase 6 deterministic workflow slice — 2026-10-06
+
+- [x] Spike pinned `rquickjs 0.14.0`: verified async broker functions, interrupt, heap and stack caps; Wasmtime was confirmed to be Wasm, not JavaScript. `node:vm` is not treated as isolation.
+- [x] Add typed observation/wait/checkpoint/script IR; deterministic observations revalidate current session-bound target and bound each call to 10 seconds.
+- [x] Add red-first compiler and JavaScript security tests for cross-session handle rejection, no loader/ambient network/file/process globals, loop interruption, memory/output caps, and workflow limits.
+- [x] Add asynchronous MCP job admission, persisted 60-second deadline/status/checkpoints, resumable partial receipts, per-dispatch claims/counts, unknown delivery after timeout, exclusive state-directory lifetime lock, and startup recovery that preserves running checkpoints as unknown without replay. Concurrent clients need separate `CONTROLLA_STATE_DIR` values. Client disconnect does not cancel an accepted job; no workflow-cancel tool is exposed.
+- [x] Add an opt-in local-trust JavaScript worker with only an async read broker. Each call rechecks principal/session/target and claims browser dispatch before execution.
+- [ ] OS process isolation, untrusted/production script qualification, mutation programs, effect-aware splitting, generated artifacts, and representative app/platform qualification remain blocked.

@@ -113,6 +113,112 @@ fn admission_is_scoped_durable_and_conflicts_on_changed_request() {
 }
 
 #[test]
+fn workflow_checkpoint_survives_reopen_and_each_browser_dispatch_is_claimed() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("local-stdio", "s", "workflow-1", &json!({"steps":[]}))
+        .unwrap();
+    assert!(
+        journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    assert!(
+        !journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    let first = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    assert_eq!(first.operation.dispatch_count, 1);
+    journal
+        .acknowledge_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    journal.checkpoint("local-stdio", "s", &admitted.operation.id, json!({"completed_steps":1,"browser_operations":1,"steps":[{"kind":"observe","value":"saved"}]})).unwrap();
+    let second = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-2")
+        .unwrap();
+    assert!(second.acquired);
+    assert_eq!(second.operation.dispatch_count, 2);
+    let pending = journal
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery, Delivery::Unknown);
+    drop(journal);
+    let reopened = Journal::open(&path).unwrap();
+    let restored = reopened
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.result.as_ref().unwrap()["browser_operations"], 1);
+    assert_eq!(restored.delivery, Delivery::Unknown);
+    assert_eq!(restored.dispatch_count, 2);
+    let unknown = reopened
+        .mark_unknown(
+            "local-stdio",
+            "s",
+            &admitted.operation.id,
+            restored.result.clone().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(unknown.status, JobStatus::Unknown);
+    assert_eq!(unknown.delivery, Delivery::Unknown);
+    cleanup(&path);
+}
+
+#[test]
+fn startup_recovery_marks_running_unknown_and_preserves_checkpoint_without_replay() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("p", "s", "running-key", &json!({"step":1}))
+        .unwrap();
+    assert!(journal.start("p", "s", &admitted.operation.id).unwrap());
+    let claim = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "sent-1")
+        .unwrap();
+    assert!(claim.acquired);
+    let checkpoint = json!({"operation_id":admitted.operation.id,"status":"running","completed_steps":1,"target_revision":12});
+    journal
+        .checkpoint("p", "s", &admitted.operation.id, checkpoint.clone())
+        .unwrap();
+    let queued = journal
+        .admit("p", "s", "queued-key", &json!({"step":2}))
+        .unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.recover_after_restart().unwrap(), 2);
+    let recovered = journal
+        .get("p", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, JobStatus::Unknown);
+    assert_eq!(recovered.delivery, Delivery::Unknown);
+    assert_eq!(recovered.dispatch_count, 1);
+    assert_eq!(recovered.result, Some(checkpoint));
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "retry")
+            .is_err()
+    );
+    let recovered_queued = journal
+        .get("p", "s", &queued.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_queued.status, JobStatus::Failed);
+    assert_eq!(recovered_queued.delivery, Delivery::NotSent);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
 fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
     let path = temp_db();
     let _ = std::fs::remove_file(&path);

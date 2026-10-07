@@ -208,15 +208,15 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `compile(request, capabilities) -> WorkflowGraph`; `run(graph, budget) -> OperationReceipt`; broker API `call(session_handle, operation, args) -> TypedResult`.
 
-- [ ] Spike candidate script runtimes for wall/CPU/memory interruption, async host calls and isolation. Record the result and select one; do not stall the deterministic graph path on scripting research.
-- [ ] Create failing tests for B27/B31/B32, cross-session handles, module import, network/file/process escape and output limits. Protect broker authority independently from JS parsing.
-- [ ] Implement typed IR nodes and conservative effect/read/write metadata. SDK scripts may use bounded dynamic control flow; unsupported static analysis gets conservative scheduling rather than a fake proof.
-- [ ] Implement batching boundaries, local condition waits, checkpointing, compact return values and script-generated artifact output. Count all underlying calls.
+- [x] Spike candidate runtimes for interruption, memory bounds and asynchronous host calls. Wasmtime remains a WebAssembly engine, not a JavaScript runtime. A runnable pinned `rquickjs 0.14.0` probe and official crate API confirm interrupt handlers, memory/stack limits and futures-based async host calls. See [rquickjs 0.14.0 API](https://docs.rs/rquickjs/0.14.0/rquickjs/), [Wasmtime interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html), and [Wasmtime ResourceLimiter](https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html). `node:vm` is not treated as a security boundary.
+- [x] Add red-first compiler and worker tests for cross-session handles, unavailable imports and ambient file/network/process access, loop interruption, heap/output limits, and workflow step/wait/output bounds.
+- [x] Implement typed bounded graph/script IR and a fresh-context QuickJS worker. Its only host function is an asynchronous, per-call reauthorized read broker; scripts are local-trust-only and disabled unless `CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1`. QuickJS is in-process and its API limits are not an OS/process security boundary; untrusted and production scripts remain gated pending process isolation and platform qualification.
+- [x] Add bounded asynchronous MCP admission, a 60-second durable job deadline, resumable `workflow_status`, persistent checkpoints/partial receipts, pre-dispatch operation claims/counting, unknown delivery after timeout, and receipts bound to operation, target, and revisions. Startup takes an exclusive state-directory lifetime lock before recovery: accepted/not-sent work fails and running work becomes unknown while preserving checkpoints; browser effects are never retried. Script broker calls reserve their declared output budget against the workflow-wide cap before dispatch. Client disconnect does not cancel an accepted job; there is no workflow-cancel tool. Receipts currently contain an empty workflow-artifact list.
 - [ ] Add dependency-scoped invalidation and effect-aware splitting. Start with rules, not RL.
 - [ ] Compare fixed batch, code mode, and guarded compiler on fixtures; profile local overhead before optimizing Rust internals.
-- [ ] Commit `feat: execute bounded browser programs with guarded checkpoints`.
+- [x] Commit the Phase 6 implementation and review fixes (`3271bb6`, bounded deterministic workflows; `5ce2100`, async receipts; `dc16a0d`, aggregate output and restart recovery; `1831f9a`, journal ownership lock).
 
-**Gate:** useful multi-action scripts without ambient host authority; cancellation and partial receipts survive script failure.
+**Gate:** a useful deterministic read graph and gated trusted-local JavaScript path are implemented through the stdio MCP server. The in-process QuickJS worker is not qualified as an OS security boundary, so untrusted/production script execution remains blocked. Arbitrary writes, mutation batching, workflow-generated artifacts, dependency-scoped invalidation, effect-aware splitting, and cross-platform process isolation are not claimed.
 
 ## Phase 7 — outcome verification and workflow cache
 
