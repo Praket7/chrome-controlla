@@ -2,6 +2,7 @@ pub mod capability;
 pub mod doctor;
 pub mod jobs;
 pub mod mcp;
+pub mod workflow;
 
 #[cfg(test)]
 mod tests {

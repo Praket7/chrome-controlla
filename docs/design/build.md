@@ -208,15 +208,15 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `compile(request, capabilities) -> WorkflowGraph`; `run(graph, budget) -> OperationReceipt`; broker API `call(session_handle, operation, args) -> TypedResult`.
 
-- [ ] Spike candidate script runtimes for wall/CPU/memory interruption, async host calls and isolation. Record the result and select one; do not stall the deterministic graph path on scripting research.
-- [ ] Create failing tests for B27/B31/B32, cross-session handles, module import, network/file/process escape and output limits. Protect broker authority independently from JS parsing.
-- [ ] Implement typed IR nodes and conservative effect/read/write metadata. SDK scripts may use bounded dynamic control flow; unsupported static analysis gets conservative scheduling rather than a fake proof.
-- [ ] Implement batching boundaries, local condition waits, checkpointing, compact return values and script-generated artifact output. Count all underlying calls.
+- [x] Spike candidate runtimes for wall/CPU/memory interruption, async host calls and isolation. Wasmtime is selected as the future worker candidate: its official Rust API documents fuel/epoch interruption, async host calls, and memory/table growth limits; its resource limiter explicitly does not account for all host/engine memory. QuickJS documents interrupt and memory-allocation limits, but its C module and async-call bridge need a native boundary. Neither engine is enabled here: process isolation, cancellation, broker ABI, and cross-platform packaging require qualification. See [Wasmtime interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html), [Wasmtime configuration](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html), [Wasmtime ResourceLimiter](https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html), and [QuickJS API](https://bellard.org/quickjs/quickjs.html). `node:vm` is not treated as a security boundary.
+- [x] Add red-first compiler tests for cross-session handles, disallowed module/network/file/process fields and step/wait/output limits. The deterministic path has no script parser to trust; broker checks stay in the session-bound MCP execution path.
+- [x] Implement typed bounded IR nodes for observation, wait and checkpoint, with per-step broker authority revalidation. Arbitrary script control flow, effect analysis, mutation batching and inferred purity are explicitly blocked.
+- [x] Add bounded sequential execution, per-observation deadline, checkpoint receipts, partial results and underlying browser-operation counts. Workflow-created artifacts are not implemented; receipts return an empty artifact list.
 - [ ] Add dependency-scoped invalidation and effect-aware splitting. Start with rules, not RL.
 - [ ] Compare fixed batch, code mode, and guarded compiler on fixtures; profile local overhead before optimizing Rust internals.
 - [ ] Commit `feat: execute bounded browser programs with guarded checkpoints`.
 
-**Gate:** useful multi-action scripts without ambient host authority; cancellation and partial receipts survive script failure.
+**Gate:** a useful multi-action deterministic read workflow is available without ambient host authority. JS scripting remains blocked: MCP request cancellation drops the in-flight handler and cannot persist/return a receipt; completed step errors and deadlines do return partial receipts. No arbitrary writes or script-generated artifacts are claimed.
 
 ## Phase 7 — outcome verification and workflow cache
 

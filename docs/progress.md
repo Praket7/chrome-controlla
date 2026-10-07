@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence; Phase 6 adds a bounded deterministic workflow graph via MCP stdio. JavaScript scripting, arbitrary mutation programs, workflow-generated artifacts and durable receipts remain blocked. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -94,3 +94,10 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 - The stdio adapter is local-only. Explicit CDP requires `COMPTROL_ALLOW_DIRECT_CDP=1` plus `COMPTROL_CDP_ENDPOINT`; only loopback IP literals are accepted. Permissioned auto-connect requires `COMPTROL_CHROME_AUTO_CONNECT=1` and preserves Chrome's native consent prompt.
 - Synthetic list and hidden-section fixtures do not qualify representative app account markers, browser/client performance, or general virtualized-list behavior. MCP transport tests use mocked CDP; no external MCP client acceptance is claimed.
 - `execute`, `jobs`, guide resource, durable MCP identity, artifact output/download, and shared-extension input/extraction are outside this slice.
+
+## Phase 6 deterministic workflow slice — 2026-10-06
+
+- [x] Runtime spike selected Wasmtime as a future worker candidate based on its documented fuel/epoch interruption, async host functions, and memory-growth limiter; QuickJS remains an alternative. No runtime dependency was added, and `node:vm` is not treated as isolation.
+- [x] Add typed observation/wait/checkpoint graph compilation and a local MCP `workflow` tool. Each observation revalidates the current session-bound target, has a 10-second deadline, and contributes to a 1 MiB aggregate declared output bound.
+- [x] Add fail-closed compiler tests for cross-session/principal references, import/network/file/process fields, unknown node fields, step count, wait ceilings, observation bounds, and aggregate output ceilings.
+- [ ] Arbitrary JavaScript, mutation scripts, effect-aware splitting, generated artifacts, persistent operation receipts, and receipt recovery after caller cancellation remain blocked pending isolated worker and durable broker integration.

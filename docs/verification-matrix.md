@@ -37,7 +37,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-11 | partial | 4 | strict-background mouse input returns `NeedsForeground`; read-only macOS observer confirms unchanged frontmost app, cursor, and pasteboard change count for one isolated Chrome text fixture; other OSes/modes and repeated interference remain unqualified |
 | CC-12 | partial | 4 | installed Chrome verifies Unicode text/caret, guarded IME composition, fail-closed marked controls, overlay refusal, and DOM drag result; OS IME UI, app-specific semantics, and canvas movement remain unqualified |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
-| CC-14 | unimplemented | 6 | none |
+| CC-14 | partial | 6 | Deterministic bounded graph and fail-closed limits are fixture-verified through MCP; arbitrary JS, CPU/memory worker bounds and durable cancellation are blocked |
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
 | CC-16 | unimplemented | 7 | none |
 | CC-17 | unimplemented | 9 | none |
@@ -46,7 +46,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-20 | unimplemented | 10 | none |
 | CC-21 | unimplemented | 7 | none |
 | CC-22 | unimplemented | 11 | none |
-| CC-23 | unimplemented | 6 | none |
+| CC-23 | partial | 6 | `workflow` MCP graph compiles observe/wait/checkpoint nodes and reports browser-operation counts; mutations, generated artifacts and durable receipts are not implemented |
 | CC-24 | unimplemented | 12 | none |
 | B01 | fixture_verified | 1 | direct-only/bridge-only evaluator fixture, catalog and dispatch decisions match |
 | B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
@@ -74,12 +74,12 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B24 | partial | 4 | read-only macOS observer confirms unchanged pasteboard change count in one isolated strict-background text fixture; MCP artifact registration/file selection has fixture coverage, while other platforms, repeated races, and app acceptance remain open |
 | B25 | partial | 4 | strict-background text uses CDP and one macOS snapshot confirms unchanged frontmost app/cursor; mouse returns `NeedsForeground`; other OSes/modes and repeated disruption remain open |
 | B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
-| B27 | unimplemented | 6 | none |
+| B27 | partial | 6 | Workflow schema rejects unknown script/module/network/file/process fields; no executable scripting surface exists, so page-prompt injection behavior in a worker is unqualified |
 | B28 | unimplemented | 7 | none |
 | B29 | unimplemented | 7 | none |
 | B30 | unimplemented | 7 | none |
-| B31 | unimplemented | 6 | none |
-| B32 | unimplemented | 6 | none |
+| B31 | fixture_verified | 6 | MCP workflow rejects target references whose session differs, and compiler unit checks reject cross-principal/session bindings before execution |
+| B32 | partial | 6 | Workflow step count, per-step/aggregate waits, observe limits and aggregate declared bytes are rejected above bounds; infinite-loop and memory-flood worker termination remain blocked with scripting |
 | B33 | partial | 5 | fixture policy classifies wrong-account 404 unknown; mocked CDP preflight returns unknown and sends no scroll command; real 404/account UI remains unqualified |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none |
@@ -286,3 +286,14 @@ MCP transport and extraction assertions use mocked CDP, not an external MCP clie
 | Sol low independent review | approved | commits `197b8a6`, `8784f1b`, `1fd49f9`, `d211c50`, `e69674b`, `a50d088` | Final review approved scoped local Phase 4/5 gates; earlier artifact selection and cleanup findings were fixed and re-reviewed. |
 
 The local Phase 4/5 gates are complete. File insertion proves Chrome selected the requested file, not app acceptance or persistence. The MCP shared route is fixture-verified, not qualified against the installed extension or external client. Remaining boundaries are listed in `blockers.md`: OS-level IME, canvas app-specific verification, repeated/native interference outside the single macOS fixture, representative app behavior, other OS/mode cells, and external MCP client acceptance.
+
+## Phase 6 deterministic workflow gate — 2026-10-06
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| Red-first compiler limit/security test | fail before implementation, then pass | macOS 26 / Rust 1.99.0 | Initial compile lacked `compile`; after implementation, verifies rejected unsupported script/module/network/file/process fields, cross-session/principal handles, >20 nodes, >10s wait, >30s cumulative wait, over-budget observations, invalid item/output limits. |
+| MCP workflow call against mocked CDP | pass | macOS 26 / Rust 1.99.0 | rmcp stdio-style duplex call runs observe + checkpoint, returns completed receipt, count 2 steps and 1 underlying browser operation; mismatched session TargetRef is rejected. |
+| `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked --offline -- -D warnings && cargo test --workspace --locked --offline --quiet` | pass | macOS 26 / Darwin 25.6 arm64, Rust 1.99.0 | 130 passed, 3 ignored across workspace unit/integration groups; formatting and warning-free Clippy pass. |
+| `npm run check:provenance && npm run check:docs && ./scripts/check-dependencies.sh && git diff --check` | pass | macOS 26 / Node 24.19.0 / npm 11.17.0 | 13 provenance digests/22 retained tests; 13 Markdown files; dependency and whitespace checks clean. |
+
+The runtime spike selects Wasmtime as a future worker candidate, not an enabled sandbox. Official Wasmtime docs show fuel/epoch interruption, async host calls, and memory growth limits; they also state the ResourceLimiter does not account for all engine/embedder memory. QuickJS docs show memory and interrupt hooks but no async broker prototype was built. No JS engine dependency was added. `node:vm` is not a security boundary. Arbitrary scripts, worker process isolation, hard CPU/RSS limits, cancellation receipts, generated artifacts, effect-aware scheduling and mutation programs remain blocked; the implemented path is a bounded deterministic read graph only.

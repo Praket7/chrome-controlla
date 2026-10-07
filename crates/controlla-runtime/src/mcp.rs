@@ -110,6 +110,13 @@ struct ScreenshotArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct WorkflowArgs {
+    session_id: String,
+    target_ref: TargetRefInput,
+    steps: Vec<Value>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ArtifactRegisterArgs {
     session_id: String,
     filename: String,
@@ -290,6 +297,94 @@ async fn shared_frame_identity(
 
 #[tool_router(server_handler)]
 impl App {
+    #[tool(
+        name = "workflow",
+        description = "Compile and run a bounded deterministic workflow graph. JavaScript scripts are not enabled."
+    )]
+    async fn workflow(
+        &self,
+        Parameters(args): Parameters<WorkflowArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let graph = crate::workflow::compile(json!({"steps":args.steps})).map_err(invalid)?;
+        let reference: TargetRef = serde_json::from_value(
+            serde_json::to_value(args.target_ref).map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|_| invalid("target_ref must be a complete current TargetRef"))?;
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        crate::workflow::validate_binding(
+            &args.session_id,
+            &reference.session_id,
+            &reference.principal,
+            &s.handle.principal,
+        )
+        .map_err(invalid)?;
+        let mut results = Vec::new();
+        for (index, step) in graph.steps.iter().enumerate() {
+            let result: Result<Value, String> = match step {
+                crate::workflow::WorkflowStep::Wait { ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                    Ok(json!({"kind":"wait","ms":ms}))
+                }
+                crate::workflow::WorkflowStep::Checkpoint => {
+                    Ok(json!({"kind":"checkpoint","after_step":index}))
+                }
+                crate::workflow::WorkflowStep::Observe { spec } => {
+                    let registry = s.registry.lock().await;
+                    if !registry.contains_target(&s.handle, &reference.target_id) {
+                        Err("target_ref is not bound to this session".into())
+                    } else {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), s.connection.observe(
+                            &registry, &reference, &s.handle.principal,
+                            IdentityRevisions { account: reference.account_revision, document: reference.document_revision },
+                            spec,
+                        )).await {
+                            Ok(result) => result.map(|observation| json!({"kind":"observe","observation":observation})).map_err(|e| e.to_string()),
+                            Err(_) => Err("workflow step deadline exceeded".into()),
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(value) => {
+                    results.push(value);
+                    if serde_json::to_vec(&results)
+                        .map_err(|e| invalid(e.to_string()))?
+                        .len()
+                        > crate::workflow::MAX_OUTPUT_BYTES
+                    {
+                        results.pop();
+                        return Ok(rmcp::handler::server::wrapper::Json(
+                            serde_json::to_value(crate::workflow::WorkflowReceipt::partial(
+                                "workflow output byte limit exceeded",
+                                results,
+                            ))
+                            .map_err(|e| invalid(e.to_string()))?,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Ok(rmcp::handler::server::wrapper::Json(
+                        serde_json::to_value(crate::workflow::WorkflowReceipt::partial(
+                            error, results,
+                        ))
+                        .map_err(|e| invalid(e.to_string()))?,
+                    ));
+                }
+            }
+        }
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"completed","completed_steps":results.len(),
+            "browser_operations":results.iter().filter(|s|s["kind"]=="observe").count(),
+            "steps":results,"artifacts":[],"error":null
+        })))
+    }
+
     #[tool(
         name = "artifact_register",
         description = "Register bounded bytes under an opaque artifact handle scoped to this direct CDP session."
@@ -1216,6 +1311,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"session"));
         assert!(names.contains(&"observe"));
+        assert!(names.contains(&"workflow"));
         assert!(names.contains(&"extract"));
         assert!(names.contains(&"accessibility"));
         assert!(names.contains(&"screenshot_crop"));
@@ -1231,6 +1327,7 @@ mod tests {
             "artifact_register",
             "file_select",
             "shared_observe",
+            "workflow",
         ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -1461,6 +1558,19 @@ mod tests {
         );
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
         assert!(!observed.is_error.unwrap_or(false), "{observed:?}");
+        let workflow = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
+            "session_id":session_id,"target_ref":target_ref,
+            "steps":[{"kind":"observe","spec":{"selector":"p","fields":{"text":"p"},"max_items":2,"max_text_chars":100,"max_bytes":4096,"cursor":null}},{"kind":"checkpoint"}]
+        })))).await.unwrap();
+        let workflow = workflow.structured_content.unwrap();
+        assert_eq!(workflow["status"], "completed");
+        assert_eq!(workflow["completed_steps"], 2);
+        assert_eq!(workflow["browser_operations"], 1);
+        let crossed_session = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
+            "session_id":session_id,"target_ref":{ "session_id":"other-session", "principal":"local-stdio", "capability_revision":1, "browser_instance_id":"x", "browser_generation":1, "target_id":"tab-1", "target_revision":"x", "frame_id":"x", "frame_revision":1, "account_revision":0, "document_revision":0 },
+            "steps":[{"kind":"checkpoint"}]
+        })))).await;
+        assert!(crossed_session.is_err() || crossed_session.unwrap().is_error.unwrap_or(false));
         let ax = client.call_tool(CallToolRequestParams::new("accessibility").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"selector":"#fixture","max_bytes":8192})))).await.unwrap();
         assert!(!ax.is_error.unwrap_or(false), "{ax:?}");
         assert_eq!(
