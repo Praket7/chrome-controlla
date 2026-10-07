@@ -396,3 +396,13 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 |---|---|---|---|
 | Rust/package CI | pass | Windows, macOS, Ubuntu; source `e11732c` | [GitHub Actions run 37608861235](https://github.com/Praket7/chrome-controlla/actions/runs/37608861235) passed all build, test, dependency, docs, provenance, and package jobs. |
 | Local unpublished candidate | pass | macOS arm64; source `e11732c` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
+
+## Live shared-extension connection attempt — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Updated stdio MCP process | pass | Codex desktop, local macOS process | The configured `target/release/controlla mcp` process is running from the Phase 4/5 worktree. Session discovery works. |
+| Test Classroom selection | pass | Existing Chrome extension browser; user-authorized test account | Opened the supplied test Classroom and selected only that tab in the extension popup. No class content was modified. |
+| Shared-extension handshake | blocked | Chrome extension popup + local Controlla 0.1.0 | `pair_shared` created a one-tab session. `accept_shared` rejected the loaded extension with `extension version unknown does not match server version 0.1.0`; no `shared_observe` or input command ran. The popup identifies the required matching-extension reload. |
+| Extension source contract | pass | Local `extensions/chrome-controlla/` | Manifest version is `0.1.0`, permissions are `tabs` and `debugger`, and `node extensions/chrome-controlla/test-background.cjs` passes its version-handshake, cleanup, and command-allowlist checks. This does not prove the browser has this source loaded. |
+| Extension manager access | blocked | CUA browser policy | Navigation to `chrome://extensions/` was explicitly blocked by the browser-use URL policy, which forbids alternate-surface workarounds. The user must reload/load the matching unpacked extension from the project path before the live test can continue. |
