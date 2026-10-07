@@ -166,6 +166,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations. Process-kill injection at every journal boundary remains open.
 - [x] Separate bounded caller wait from durable operation state, persist a bounded 60-second default job deadline, and expose monotonic revisions. The workflow worker consumes declared step, time, observation, and output bounds.
 - [x] Exercise fulfilled, rejected, delayed, and never-settling JavaScript promises through the pinned QuickJS async broker, including rejection propagation to scripts. This is local worker evidence only.
+- [x] Verify a broker-backed QuickJS Promise resolving after exactly 12 seconds through the local worker wrapper. This does not qualify browser routes.
 - [ ] Qualify the exact 12-second Promise case and navigation during evaluation through live CDP and extension-bridge browser routes; inject process kills at every journal/dispatch boundary.
 - [x] Cancellation blocks queued dispatch; expiry before dispatch becomes `failed` with `deadline_error=deadline_exceeded` and `delivery=not_sent`. Expiry/recovery after dispatch becomes `unknown` while preserving delivery as `sent` only when transport acknowledgement was recorded, otherwise `unknown`.
 - [x] Commit reviewed local journal gate as `feat: persist browser jobs and reconcile uncertain effects`.

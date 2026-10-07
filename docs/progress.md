@@ -57,6 +57,7 @@ Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` ma
 - [x] Red-first focused tests observed the missing jobs module/Tokio compile failure; ten focused journal/lifecycle tests cover competing admissions/claims, crash windows, fixture endpoint send counting across replay, deadline recovery, and pre-send failure delivery status.
 - [x] Sol approved the local Phase 3 journal gate after corrective reviews; full local workspace tests pass (95 passed, 1 ignored) with format, Clippy, provenance and doc-link checks. Phase 6 later added the MCP workflow/job route and async QuickJS observation broker; these do not establish live browser mutation or exactly-once effects.
 - [x] Add the durable workflow/job MCP tools and local broker route through the current session adapter. No live browser mutation or arbitrary Promise completion is claimed.
+- [x] Verify the broker-backed QuickJS worker resolves a Promise after exactly 12 seconds; this is local worker evidence only.
 - [ ] Inject process crashes at every journal boundary and verify exact 12-second resolve/reject cases through both browser routes.
 
 

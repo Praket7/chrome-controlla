@@ -476,6 +476,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn js_worker_resolves_broker_promise_after_exactly_12_seconds() {
+        let broker: MockBroker = Arc::new(|input| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                Ok(format!("{{\"received\":{input}}}"))
+            })
+        });
+        let output = run_script(
+            "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).then(value=>value.received.selector);",
+            15_000,
+            8 * 1024 * 1024,
+            broker,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "\"p\"");
+    }
+
+    #[tokio::test]
     async fn js_worker_propagates_rejected_async_promise_from_broker() {
         let caught = run_script(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).catch(error=>error.message);",
