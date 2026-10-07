@@ -308,15 +308,16 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Files:** release workflow, package manifests, checksums/SBOM, support matrix, release notes, benchmark report, guide, rollback instructions.
 
-- [ ] Run necessary full integration/security/package/docs checks on the release commit. Use actual platform runners for cross-platform claims.
+- [x] Run the configured Rust, dependency, client, app-brief, benchmark, docs, provenance, extension, and package checks on the candidate source commit. Hosted run `37564319202` passed Windows, macOS, and Linux build/package jobs.
 - [x] Test clean-prefix installation, package-version upgrade/rollback, uninstall, and unrelated user-data preservation on the current host. This is npm lifecycle mechanics only, using one binary copied under two package version labels.
 - [x] Prepare the local release-candidate bundle path: host package and extension archives, runtime dependency SBOM, artifact checksums, support matrix, release notes, and rollback instructions. The bundle remains unpublished and must be generated from a clean release commit.
-- [x] Generate the unpublished macOS arm64 release-candidate bundle from clean source commit `5ac2cb4`; verify the recorded SBOM and archive checksums. This does not qualify other hosts or consumer installation.
+- [x] Generate the unpublished macOS arm64 release-candidate bundle from clean source commit `2f4fb06`; verify the recorded SBOM and archive checksums. This does not qualify other hosts or consumer installation.
 - [x] Reject stale or missing shared-extension versions during pairing and verify the extension releases its debugger attachment on mismatch. This local fixture does not qualify release-binary upgrade compatibility.
 - [ ] Test distinct release-binary upgrade/rollback, Windows/Linux installation, and compatibility. No credential/browser-profile deletion on uninstall without explicit request.
-- [ ] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims.
-- [x] Prepare and checksum a local macOS arm64 release candidate from clean commit `5ac2cb4`; push the feature branch to the authorized Chrome Controlla repository. The candidate is unpublished; no GitHub release was created.
-- [ ] Pass hosted CI on the final candidate commit and verify Windows/Linux consumer installs; these remain separate from local macOS package checks.
+- [x] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims; archive listings contain only expected CLI, license/notice, core binary, and Chrome extension files.
+- [x] Prepare and checksum a local macOS arm64 release candidate from clean commit `2f4fb06`; push the feature branch to the authorized Chrome Controlla repository. The candidate is unpublished; no GitHub release was created.
+- [x] Pass hosted build/package CI on the candidate source commit; run `37564319202` passed Windows, macOS, and Linux.
+- [ ] Verify published Windows/Linux consumer installs; CI-built artifacts are not a public consumer installation.
 - [ ] Publish/deploy only within actual authorization. If final approval is required, present exact version, diff, test report, visibility, costs and artifact destinations so approval is the last step.
 - [ ] After any authorized publication, verify registry/release availability and a clean consumer installation. A successful upload command is not release verification.
 - [ ] Deliver repo URL/commit, install instructions, master guide, capability matrix, benchmark results, known blockers, and exact verification boundaries. Record all 24 CC requirements and 36 B cases as passed/failed/blocked/unimplemented with evidence.

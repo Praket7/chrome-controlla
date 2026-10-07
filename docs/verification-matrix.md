@@ -366,6 +366,6 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
-| Clean-tree release-candidate assembly | pass | macOS arm64 / source commit `5ac2cb4` | `npm run prepare:release-candidate`; generated npm archive, extension archive, host-filtered Cargo SBOM, release manifest, and SHA256SUMS under `dist/release-candidate/`. Candidate is unpublished. |
+| Clean-tree release-candidate assembly | pass | macOS arm64 / source commit `2f4fb06` | `npm run prepare:release-candidate`; generated npm archive, extension archive, host-filtered Cargo SBOM, release manifest, and SHA256SUMS under `dist/release-candidate/`. Candidate is unpublished. |
 | Candidate file digests | pass | macOS arm64 | All entries in `SHA256SUMS` verified. This checks local artifact integrity, not consumer download or signature verification. |
-| Cross-platform CI | pending | GitHub Actions / source commit `5ac2cb4` | Run `37563019490`; do not claim cross-platform pass until all OS jobs complete. |
+| Cross-platform build/package CI | pass | GitHub Actions / source commit `2f4fb06` | Run `37564319202` passed Rust format, Clippy, workspace tests, host package build, and package checks on Windows, macOS, and Linux. No published consumer install was performed. |
