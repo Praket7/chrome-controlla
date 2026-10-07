@@ -13,7 +13,7 @@ await writeFile(isolatedNpmConfig, '');
 const run = (command, args, options = {}) => {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
-    env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig },
+    env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig, npm_config_userconfig: isolatedNpmConfig },
     ...options,
   });
   assert.equal(result.status, 0, `${command} ${args.join(' ')} failed:\n${result.stderr}`);
