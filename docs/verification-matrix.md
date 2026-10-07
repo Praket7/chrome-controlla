@@ -396,8 +396,8 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
-| Rust/package CI | pass | Windows, macOS, Ubuntu; source `e11732c` | [GitHub Actions run 37608861235](https://github.com/Praket7/chrome-controlla/actions/runs/37608861235) passed all build, test, dependency, docs, provenance, and package jobs. |
-| Local unpublished candidate | pass | macOS arm64; source `e11732c` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
+| Rust/package CI | pass | Windows, macOS, Ubuntu; source `13c64e3` | [GitHub Actions run 37618717861](https://github.com/Praket7/chrome-controlla/actions/runs/37618717861) passed all build, test, dependency, docs, provenance, and package jobs. |
+| Local unpublished candidate | pass | macOS arm64; source `13c64e3` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
 
 ## Live shared-extension pairing and read-only observation — 2026-10-07
 
