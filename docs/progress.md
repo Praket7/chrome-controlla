@@ -34,19 +34,21 @@ Status: Phases 0–5 implementation and local/CI gates are committed and pushed 
 - [x] Add side-effect-free Rust CLI parsing/help/schema, invalid-flag exit code 2, and conservative JSON doctor report.
 - [x] Add a package-relative launcher and host/architecture-bound npm archive with Apache license and NOTICE; clean-prefix install with spaces and restricted PATH verified on macOS arm64.
 - [x] Add direct-only, bridge-only, unconfigured, denied, revoked, bounded dispatch/revocation, global/subcommand open-stdin help, doctor health-separation and launcher tests.
-- [ ] Live transport/process/authentication round trip and client/browser dispatch remain unavailable: no service or browser runtime exists yet.
+- [x] Start a bounded authenticated loopback HTTP service and verify initialize, tool discovery, guide call, and missing-bearer rejection; see the Phase 9 process-smoke evidence.
+- [ ] External MCP-client tool acceptance and fresh selected-tab browser dispatch remain open. The extension is installed and a Classroom tab is reachable, but the current screenshot has no selected tab/credentials; the MCP pairing attempt timed out and was released.
 
-The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Hosted CI run `37465119376` passed the full configured matrix for commit `8dbf51d`; local checks pass with 36 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. Phase 1 evidence and remaining platform/live boundaries are in `verification-matrix.md` and `blockers.md`. Phase 2 code now has independent approval and local evidence; the live extension, headed Chrome and native input observation qualifications remain open.
+The first Phase 1 Sol review was not approved; all reported findings were fixed and Sol approved the local/fixture gate on 2026-10-06. Hosted CI run `37465119376` passed the configured matrix for commit `8dbf51d`; local checks pass with 36 workspace tests. Red-first execution evidence was not recorded, so it is not claimed. The bounded loopback HTTP process smoke is now verified; external-client tool actions and live browser dispatch remain open. Phase 2 has independent approval and local evidence plus an earlier selected-tab attachment/read-only Classroom observation/release. Native input observation and fresh post-fix browser actions remain open.
 
 ### Phase 2 — persistent sessions, modes, identities and tabs
 
 - [x] Implement persistent target/frame tracking, revision-bound references, per-target scheduling, shared-document locks, and dedicated/shared provider fixtures.
 - [x] Implement owned/adopted/borrowed tab records, cleanup receipts, crash reconciliation, safe recovery handles, retryable pairing/cleanup, and focused cancellation/lifecycle tests.
 - [x] Pass Sol's independent code review on 2026-10-06. Review findings and fixes are summarized in the Phase 2 local acceptance entry in `verification-matrix.md`.
-- [ ] Qualify live MV3 extension attachment, headed Chrome, independent in-tab cleanup observation, and native focus/cursor/clipboard behavior. These are not claimed from fixtures or the headless provider smoke.
+- [x] Qualify one live MV3 attachment to the explicitly selected test Classroom tab in headed Chrome; observe the intended page and release debugger attachment while leaving the tab open (recorded under Phase 5).
+- [ ] Repeat attachment/cleanup independently and qualify native focus/cursor/clipboard behavior across supported OSes/modes.
 - [x] Commit and push the reviewed Phase 2 implementation; hosted CI run `37511048769` passed on Ubuntu, macOS, and Windows for final commit `928c3a8`.
 
-Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` made the 1/4/8 scheduler fixture deterministic and fixed a Windows-only Clippy warning. Hosted CI run `37511048769` passed on all three configured operating systems. The failed intermediate runs and their causes are recorded in `verification-matrix.md`. The local code gate is complete; live browser, app-identity, and native input qualification remain open.
+Phase 2 source landed in `f0fd586`; follow-up commits `cfcf877` and `928c3a8` made the 1/4/8 scheduler fixture deterministic and fixed a Windows-only Clippy warning. Hosted CI run `37511048769` passed on all three configured operating systems. The failed intermediate runs and their causes are recorded in `verification-matrix.md`. The local code gate is complete. One live selected-tab Chrome attachment/read-only observation/release is recorded, while repeated cleanup, independent app identity, and native input qualification remain open.
 
 ### Phase 3 — durable jobs and idempotency
 
