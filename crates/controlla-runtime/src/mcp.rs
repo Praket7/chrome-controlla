@@ -1719,6 +1719,35 @@ fn validate_loopback_ws(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn acquire_state_directory_lock(
+    state_dir: &std::path::Path,
+) -> Result<std::fs::File, std::io::Error> {
+    let lock_path = state_dir.join("server.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "state directory is already owned by another Chrome Controlla process; set CONTROLLA_STATE_DIR to a separate directory for concurrent clients ({})",
+                state_dir.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "unable to lock state directory {}: {error}",
+                state_dir.display()
+            ),
+        )),
+    }
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = std::env::var_os("CONTROLLA_STATE_DIR")
         .map(std::path::PathBuf::from)
@@ -1728,6 +1757,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".chrome-controlla"));
     std::fs::create_dir_all(&state_dir)?;
+    let _state_lock = acquire_state_directory_lock(&state_dir)?;
     let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))?;
     journal.recover_after_restart()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1748,6 +1778,27 @@ mod tests {
     use super::{App, validate_loopback_ws};
     use rmcp::{RoleServer, ServiceExt, model::CallToolRequestParams, service::serve_directly};
     use serde_json::{Value, json};
+
+    #[test]
+    fn state_directory_lock_has_one_owner_for_its_lifetime() {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "chrome-controlla-state-lock-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = super::acquire_state_directory_lock(&dir).unwrap();
+        let second = super::acquire_state_directory_lock(&dir);
+        let error = second.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("CONTROLLA_STATE_DIR"));
+        drop(first);
+        let third = super::acquire_state_directory_lock(&dir).unwrap();
+        drop(third);
+        std::fs::remove_file(dir.join("server.lock")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn only_loopback_devtools_websockets_are_accepted() {

@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "419c552ead187a2b5e47d954675527ba95c6b127f942a007d8e42f27b2e43ae5",
-      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and Phase 6 bounded workflow implementation, runtime spike and scripting boundary; Phase 6 fix pass records pinned rquickjs worker, durable async workflow jobs, status/checkpoint receipts, test results, and remaining isolation/qualification boundaries",
+      "destination_sha256": "09b90dd36bda15c704b1528d81a2c71a210a92d09b91581bc29402825536ef75",
+      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and Phase 6 bounded workflow implementation, runtime spike and scripting boundary; Phase 6 fix pass records pinned rquickjs worker, durable async workflow jobs, status/checkpoint receipts, test results, and remaining isolation/qualification boundaries; Phase 6 adds a standard-library exclusive state-directory lifetime lock before journal startup recovery and documents separate state directories for concurrent clients",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
