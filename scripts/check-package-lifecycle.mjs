@@ -11,12 +11,14 @@ const temp = await mkdtemp(path.join(os.tmpdir(), 'controlla-lifecycle-'));
 const isolatedNpmConfig = path.join(temp, 'empty.npmrc');
 await writeFile(isolatedNpmConfig, '');
 const run = (command, args, options = {}) => {
-  const result = spawnSync(command, args, {
+  const executable = process.platform === 'win32' && command === 'npm' ? 'npm.cmd' : command;
+  const result = spawnSync(executable, args, {
     encoding: 'utf8',
     env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig, npm_config_userconfig: isolatedNpmConfig, NPM_CONFIG_ALLOW_SCRIPTS: '', npm_config_allow_scripts: '' },
+    shell: process.platform === 'win32' && command === 'npm',
     ...options,
   });
-  assert.equal(result.status, 0, `${command} ${args.join(' ')} failed:\n${result.stderr}`);
+  assert.equal(result.status, 0, `${command} ${args.join(' ')} failed:\n${result.stderr ?? result.error?.message ?? ''}`);
   return result.stdout.trim();
 };
 
