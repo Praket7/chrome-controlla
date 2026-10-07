@@ -1,5 +1,6 @@
 //! Offline, identity-bound Canva design planning. Plans are not dispatched.
 
+use crate::apps::CanvaPageType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
@@ -15,13 +16,6 @@ pub struct CanvaPlanBinding {
     pub identity: CanvaIdentity,
     pub session_id: String,
     pub expected_version: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CanvaPageType {
-    Absolute,
-    Unsupported,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
@@ -73,11 +67,11 @@ pub struct CanvaPage {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvaEffect {
-    Mutation,
+    AdvisoryOnly,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
-pub struct CanvaSyncMutation {
+pub struct CanvaSyncCandidate {
     pub operation: String,
     pub effect: CanvaEffect,
     pub identity: CanvaIdentity,
@@ -93,11 +87,12 @@ pub struct CanvaDesignPlan {
     pub height: u16,
     pub tokens: CanvaVisualTokens,
     pub pages: Vec<CanvaPage>,
-    pub sync: CanvaSyncMutation,
+    pub preconditions_authoritative: bool,
+    pub sync_candidate: CanvaSyncCandidate,
 }
 
-/// Builds a fixed five-page editable design plan after checking exact target and session state.
-/// This is local planning only; the mutation record is not a Canva API request.
+/// Builds a fixed five-page design plan after checking caller assertions.
+/// This is local planning only; assertions are unverified and the sync candidate is advisory.
 pub fn plan_heat_ready_design(
     binding: &CanvaPlanBinding,
     session: &CanvaSession,
@@ -203,9 +198,10 @@ pub fn plan_heat_ready_design(
         height: 720,
         tokens,
         pages,
-        sync: CanvaSyncMutation {
+        preconditions_authoritative: false,
+        sync_candidate: CanvaSyncCandidate {
             operation: "sync".into(),
-            effect: CanvaEffect::Mutation,
+            effect: CanvaEffect::AdvisoryOnly,
             identity: identity.clone(),
             session_id: binding.session_id.clone(),
             expected_version: binding.expected_version.clone(),
@@ -244,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_five_ordered_editable_pages_and_marks_sync_as_mutation() {
+    fn plan_is_five_ordered_editable_pages_and_marks_sync_as_advisory() {
         let (binding, session) = fixture();
         let plan = plan_heat_ready_design(&binding, &session, 2_000).unwrap();
         assert_eq!(
@@ -271,11 +267,15 @@ mod tests {
                 .contains("[Add date]"))
         );
         assert_eq!(plan.tokens.footer, "NEIGHBORHOOD HEAT-READY KIT");
-        assert_eq!(plan.sync.operation, "sync");
-        assert_eq!(plan.sync.effect, CanvaEffect::Mutation);
-        assert_eq!(plan.sync.session_id, binding.session_id);
-        assert_eq!(plan.sync.expected_version, binding.expected_version);
-        assert_eq!(plan.sync.identity, binding.identity);
+        assert!(!plan.preconditions_authoritative);
+        assert_eq!(plan.sync_candidate.operation, "sync");
+        assert_eq!(plan.sync_candidate.effect, CanvaEffect::AdvisoryOnly);
+        assert_eq!(plan.sync_candidate.session_id, binding.session_id);
+        assert_eq!(
+            plan.sync_candidate.expected_version,
+            binding.expected_version
+        );
+        assert_eq!(plan.sync_candidate.identity, binding.identity);
     }
 
     #[test]

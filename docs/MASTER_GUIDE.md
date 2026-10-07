@@ -217,11 +217,11 @@ This preview has no download or export tool. `artifact_register` plus `file_sele
 
 ### Google Slides
 
-Identify presentation/account; obtain current object/revision data; choose qualified API or browser-only route; apply scoped changes; read back; render and inspect all affected slides; check overflow and intended layout; verify save and requested export. Use revision checks for API writes. Do not claim browser-only performance for API-assisted edits.
+Identify presentation/account; obtain current object/revision data; choose qualified API or browser-only route; apply scoped changes; read back; render and inspect all affected slides; check overflow and intended layout; verify save and requested export. Use revision checks for API writes. The offline `slides_deck_plan` accepts caller assertions only and marks them non-authoritative; it emits no deletion requests and cannot be dispatched until an authenticated route independently reads the full inventory and revision. Do not claim browser-only performance for API-assisted edits.
 
 ### Canva
 
-Identify design/page and supported operation. `canva_sync_preflight` and `canva_design_plan` validate caller-supplied snapshots; they do not connect to Canva or independently verify session age/page lock. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. `sync` can write as well as refresh. In this preview, do not call `sync`; no edit/persist/export route exists.
+Identify design/page and supported operation. `canva_sync_preflight` and `canva_design_plan` use unverified caller assertions; they do not connect to Canva or independently verify identity, session age, or page lock. `sync_candidate` is advisory and cannot authorize a write. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. `sync` can write as well as refresh. In this preview, do not call `sync`; no edit/persist/export route exists.
 
 ### CapCut Web
 

@@ -216,6 +216,8 @@ struct SlidesDeckPlanArgs {
     account_id: String,
     presentation_id: String,
     required_revision_id: String,
+    asserted_existing_slide_ids: Vec<String>,
+    asserted_existing_object_ids: Vec<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -2237,7 +2239,7 @@ impl App {
 
     #[tool(
         name = "slides_deck_plan",
-        description = "Compile the checked-in 10-slide acceptance brief into a revision-bound editable Google Slides API request. Planning only: it performs no OAuth, network request, write, readback, or export."
+        description = "Compile a candidate 10-slide Google Slides API request from caller assertions. These assertions are not authoritative or authenticated; the candidate is not executable until a live route verifies the entire deck inventory and revision. No OAuth, network request, write, readback, or export occurs."
     )]
     async fn slides_deck_plan(
         &self,
@@ -2249,10 +2251,16 @@ impl App {
             presentation_id: args.presentation_id,
             required_revision_id: args.required_revision_id,
         };
-        let plan = crate::slides_deck::compile_urban_heat_deck(&binding).map_err(invalid)?;
+        let start = crate::slides_deck::SlidesDeckStart {
+            asserted_existing_slide_ids: args.asserted_existing_slide_ids,
+            asserted_existing_object_ids: args.asserted_existing_object_ids,
+        };
+        let plan =
+            crate::slides_deck::compile_urban_heat_deck(&binding, &start).map_err(invalid)?;
         Ok(rmcp::handler::server::wrapper::Json(json!({
             "status":"planned_not_dispatched",
             "plan":plan,
+            "preconditions_authoritative":false,
             "side_effects":false,
             "app_acceptance":"not_established"
         })))
@@ -2260,7 +2268,7 @@ impl App {
 
     #[tool(
         name = "canva_design_plan",
-        description = "Compile the five-page Heat-Ready Canva brief after checking caller-provided exact identity, session, version, expiry, and page state. Planning only; no Canva SDK/OAuth call or sync."
+        description = "Compile the five-page Heat-Ready Canva brief using unverified caller assertions for identity, session, version, expiry, and page state. These checks are advisory only and cannot authorize a sync. No Canva SDK/OAuth call or app mutation occurs."
     )]
     async fn canva_design_plan(
         &self,
@@ -2275,6 +2283,7 @@ impl App {
         Ok(rmcp::handler::server::wrapper::Json(json!({
             "status":"planned_not_dispatched",
             "plan":plan,
+            "preconditions_authoritative":false,
             "side_effects":false,
             "app_acceptance":"not_established"
         })))
@@ -2743,10 +2752,36 @@ mod tests {
         let app_caps = app_caps.structured_content.unwrap();
         assert_eq!(app_caps["live_qualified"], false);
         assert_eq!(app_caps["side_effects"], false);
+        let slides_tool = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "slides_deck_plan")
+            .unwrap();
+        let slides_schema = serde_json::to_value(&slides_tool.input_schema).unwrap();
+        let slides_required = slides_schema["required"].as_array().unwrap();
+        assert!(
+            slides_required
+                .iter()
+                .any(|field| field == "asserted_existing_slide_ids")
+        );
+        assert!(
+            slides_required
+                .iter()
+                .any(|field| field == "asserted_existing_object_ids")
+        );
+        let canva_tool = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "canva_design_plan")
+            .unwrap();
+        let canva_schema = serde_json::to_value(&canva_tool.input_schema).unwrap();
+        let schema_text = serde_json::to_string(&canva_schema).unwrap();
+        assert!(schema_text.contains("absolute"));
+        assert!(schema_text.contains("unsupported"));
         let deck = client
             .call_tool(
                 CallToolRequestParams::new("slides_deck_plan").with_arguments(
-                    json!({"principal":"p","account_id":"a","presentation_id":"deck-1","required_revision_id":"rev-1"})
+                    json!({"principal":"p","account_id":"a","presentation_id":"deck-1","required_revision_id":"rev-1","asserted_existing_slide_ids":["existing-slide"],"asserted_existing_object_ids":["existing-slide","placeholder-title","placeholder-body"]})
                         .as_object().unwrap().clone(),
                 ),
             )
@@ -2754,6 +2789,7 @@ mod tests {
         assert_eq!(deck["status"], "planned_not_dispatched");
         assert_eq!(deck["plan"]["slide_titles"].as_array().unwrap().len(), 10);
         assert_eq!(deck["side_effects"], false);
+        assert_eq!(deck["preconditions_authoritative"], false);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2768,6 +2804,8 @@ mod tests {
         )).await.unwrap().structured_content.unwrap();
         assert_eq!(canva["status"], "planned_not_dispatched");
         assert_eq!(canva["plan"]["pages"].as_array().unwrap().len(), 5);
+        assert_eq!(canva["preconditions_authoritative"], false);
+        assert_eq!(canva["plan"]["sync_candidate"]["effect"], "advisory_only");
         let roles = [
             "shade_shot",
             "water_rest_shot",

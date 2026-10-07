@@ -13,14 +13,28 @@ pub struct SlidesDeckPlan {
     pub presentation_id: String,
     pub required_revision_id: String,
     pub slide_titles: Vec<String>,
+    pub slide_ids: Vec<String>,
     pub object_ids: Vec<String>,
     pub request_body: Value,
+    /// Caller-supplied start assertions are never treated as live observation.
+    pub preconditions_authoritative: bool,
     pub qualification: Qualification,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
+pub struct SlidesDeckStart {
+    /// Assertions only. A future executor must independently read the full deck.
+    pub asserted_existing_slide_ids: Vec<String>,
+    /// Full-deck object inventory asserted by the caller, not independently verified.
+    pub asserted_existing_object_ids: Vec<String>,
 }
 
 /// Compile the checked-in 10-slide Urban Heat brief into editable native shapes and text.
 /// Chart figures are intentionally illustrative and are not presented as local measurements.
-pub fn compile_urban_heat_deck(binding: &SlidesBinding) -> Result<SlidesDeckPlan, &'static str> {
+pub fn compile_urban_heat_deck(
+    binding: &SlidesBinding,
+    start: &SlidesDeckStart,
+) -> Result<SlidesDeckPlan, &'static str> {
     if binding.principal.is_empty()
         || binding.account_id.is_empty()
         || binding.presentation_id.is_empty()
@@ -30,6 +44,27 @@ pub fn compile_urban_heat_deck(binding: &SlidesBinding) -> Result<SlidesDeckPlan
     }
     if !safe_segment(&binding.presentation_id) || binding.required_revision_id.len() > 256 {
         return Err("Slides presentation identifier is unsafe or revision identifier is too long");
+    }
+    if start.asserted_existing_slide_ids.len() != 1
+        || !valid_object_id(&start.asserted_existing_slide_ids[0])
+        || start.asserted_existing_slide_ids[0].starts_with("cc_heat_")
+        || start
+            .asserted_existing_object_ids
+            .iter()
+            .any(|id| !valid_object_id(id))
+        || start
+            .asserted_existing_object_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != start.asserted_existing_object_ids.len()
+        || !start
+            .asserted_existing_object_ids
+            .contains(&start.asserted_existing_slide_ids[0])
+    {
+        return Err(
+            "Slides plan requires assertions for exactly one valid starting slide and a unique full-deck object inventory containing it",
+        );
     }
 
     let slides = [
@@ -75,17 +110,28 @@ pub fn compile_urban_heat_deck(binding: &SlidesBinding) -> Result<SlidesDeckPlan
         ),
     ];
 
+    let existing_slide_id = &start.asserted_existing_slide_ids[0];
     let mut requests = Vec::new();
     let mut object_ids = Vec::new();
     let mut slide_titles = Vec::new();
+    let mut slide_ids = Vec::new();
     for (index, (title, body)) in slides.iter().enumerate() {
         let n = index + 1;
-        let slide_id = format!("cc_heat_s{n:02}");
+        let slide_id = if n == 1 {
+            existing_slide_id.clone()
+        } else {
+            format!("cc_heat_s{n:02}")
+        };
+        slide_ids.push(slide_id.clone());
         slide_titles.push((*title).to_string());
-        requests.push(json!({"createSlide": {
-            "objectId": slide_id,
-            "slideLayoutReference": {"predefinedLayout": "BLANK"}
-        }}));
+        if n == 1 {
+            // Never turn caller-supplied object IDs into destructive requests.
+        } else {
+            requests.push(json!({"createSlide": {
+                "objectId": slide_id,
+                "slideLayoutReference": {"predefinedLayout": "BLANK"}
+            }}));
+        }
         add_text_box(
             &mut requests,
             &mut object_ids,
@@ -128,17 +174,31 @@ pub fn compile_urban_heat_deck(binding: &SlidesBinding) -> Result<SlidesDeckPlan
         }
     }
 
+    let inventory = start
+        .asserted_existing_object_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if object_ids.iter().any(|id| inventory.contains(id))
+        || slide_ids.iter().skip(1).any(|id| inventory.contains(id))
+    {
+        return Err(
+            "Slides plan contains generated object IDs that collide with the asserted full-deck inventory",
+        );
+    }
+
     Ok(SlidesDeckPlan {
         principal: binding.principal.clone(),
         account_id: binding.account_id.clone(),
         presentation_id: binding.presentation_id.clone(),
         required_revision_id: binding.required_revision_id.clone(),
         slide_titles,
+        slide_ids,
         object_ids,
         request_body: json!({
             "requests": requests,
             "writeControl": {"requiredRevisionId": binding.required_revision_id}
         }),
+        preconditions_authoritative: false,
         qualification: Qualification::RequiresConnection,
     })
 }
@@ -276,9 +336,18 @@ fn rgb(red: f64, green: f64, blue: f64) -> Value {
 fn safe_segment(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
+        && !value.bytes().any(|b| b.is_ascii_control() || b == b'/')
+}
+
+fn valid_object_id(value: &str) -> bool {
+    (5..=50).contains(&value.len())
         && value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_:-".contains(&b))
 }
 
 #[cfg(test)]
@@ -294,9 +363,20 @@ mod tests {
         }
     }
 
+    fn start() -> SlidesDeckStart {
+        SlidesDeckStart {
+            asserted_existing_slide_ids: vec!["existing-slide".into()],
+            asserted_existing_object_ids: vec![
+                "existing-slide".into(),
+                "placeholder-title".into(),
+                "placeholder-body".into(),
+            ],
+        }
+    }
+
     #[test]
     fn compiles_ten_editable_slides_with_revision_bound_illustrative_chart_and_sources() {
-        let plan = compile_urban_heat_deck(&binding()).unwrap();
+        let plan = compile_urban_heat_deck(&binding(), &start()).unwrap();
         assert_eq!(plan.slide_titles.len(), 10);
         assert_eq!(
             plan.object_ids
@@ -315,7 +395,13 @@ mod tests {
                 .iter()
                 .filter(|r| r.get("createSlide").is_some())
                 .count(),
-            10
+            9
+        );
+        assert_eq!(plan.slide_ids[0], "existing-slide");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.get("deleteObject").is_some())
         );
         assert!(requests.iter().any(|r| {
             r.get("insertText")
@@ -334,12 +420,13 @@ mod tests {
                 .is_some_and(|v| v.get("shapeType").and_then(Value::as_str) == Some("IMAGE"))
         }));
         assert_eq!(plan.qualification, Qualification::RequiresConnection);
+        assert!(!plan.preconditions_authoritative);
     }
 
     #[test]
     fn stable_safe_object_ids_and_request_order_are_deterministic() {
-        let first = compile_urban_heat_deck(&binding()).unwrap();
-        let second = compile_urban_heat_deck(&binding()).unwrap();
+        let first = compile_urban_heat_deck(&binding(), &start()).unwrap();
+        let second = compile_urban_heat_deck(&binding(), &start()).unwrap();
         assert_eq!(first.object_ids, second.object_ids);
         assert_eq!(first.request_body, second.request_body);
         assert!(first.object_ids.iter().all(|id| safe_segment(id)));
@@ -349,9 +436,30 @@ mod tests {
     fn rejects_missing_or_unsafe_binding_before_plan_construction() {
         let mut bad = binding();
         bad.required_revision_id.clear();
-        assert!(compile_urban_heat_deck(&bad).is_err());
+        assert!(compile_urban_heat_deck(&bad, &start()).is_err());
         let mut bad = binding();
         bad.presentation_id = "id/path".into();
-        assert!(compile_urban_heat_deck(&bad).is_err());
+        assert!(compile_urban_heat_deck(&bad, &start()).is_err());
+        let mut bad_start = start();
+        bad_start.asserted_existing_slide_ids = vec!["cc_heat_s02".into()];
+        assert!(compile_urban_heat_deck(&binding(), &bad_start).is_err());
+    }
+
+    #[test]
+    fn rejects_multiple_slides_and_generated_ids_colliding_with_asserted_inventory() {
+        let mut multiple = start();
+        multiple
+            .asserted_existing_slide_ids
+            .push("second-slide".into());
+        multiple
+            .asserted_existing_object_ids
+            .push("second-slide".into());
+        assert!(compile_urban_heat_deck(&binding(), &multiple).is_err());
+
+        let mut collision = start();
+        collision
+            .asserted_existing_object_ids
+            .push("cc_heat_s02_title".into());
+        assert!(compile_urban_heat_deck(&binding(), &collision).is_err());
     }
 }

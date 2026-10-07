@@ -103,8 +103,8 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 | Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
 |---|---|---|---|---|
-| Google Slides | Generic guarded shared fill/click only; no live app route | Offline 10-slide request compiler; fixture-tested per-edit revision-bound request; no token injection/API dispatch | Generic browser tools plus `app_capabilities`, `slides_plan_text_edit`, and `slides_deck_plan` | `unqualified` |
-| Canva | Generic guarded shared fill/click only; no live app route | Offline five-page design plan and caller-snapshot expiry/lock preflight; Apps SDK connection absent | Generic browser tools plus `app_capabilities`, `canva_sync_preflight`, and `canva_design_plan` | `unqualified` |
+| Google Slides | Generic guarded shared fill/click only; no live app route | Offline 10-slide candidate uses caller-asserted inventory, explicitly non-authoritative, and emits no deletes; no token injection/API dispatch | Generic browser tools plus `app_capabilities`, `slides_plan_text_edit`, and `slides_deck_plan` | `unqualified` |
+| Canva | Generic guarded shared fill/click only; no live app route | Offline five-page plan uses unverified caller assertions; sync candidate is advisory; Apps SDK connection absent | Generic browser tools plus `app_capabilities`, `canva_sync_preflight`, and `canva_design_plan` | `unqualified` |
 | CapCut Web | No qualified controls or verifier | Offline asset/timing recipe validation only; no official general timeline API route established | Generic browser tools plus `app_capabilities`, unsupported `capcut_web_plan`, and `capcut_recipe_plan` | `unqualified` |
 
 These rows describe available code paths, not app validation. Planning/preflight tools do not dispatch. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.

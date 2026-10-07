@@ -201,7 +201,7 @@ fn valid_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-:".contains(&byte))
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvaPageType {
     Absolute,
