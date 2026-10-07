@@ -439,14 +439,50 @@ async fn run_workflow_job(
         .await;
         match worker {
             Ok(Ok(output)) => {
+                let artifact = match crate::workflow::validate_script_artifact(
+                    &output,
+                    &script_operation_id,
+                    PRINCIPAL,
+                    &script_session_id,
+                ) {
+                    Ok(artifact) => artifact,
+                    Err(error) => {
+                        let steps = script_completed.lock().await;
+                        let count = script_jobs
+                            .get(PRINCIPAL, &script_session_id, &script_operation_id)
+                            .ok()
+                            .flatten()
+                            .map_or(0, |op| op.dispatch_count);
+                        let receipt = workflow_receipt(
+                            &script_operation_id,
+                            "failed",
+                            &script_session_id,
+                            &script_reference,
+                            count,
+                            &steps,
+                            Some(&error),
+                        );
+                        let _ = script_jobs.fail(
+                            PRINCIPAL,
+                            &script_session_id,
+                            &script_operation_id,
+                            receipt,
+                        );
+                        return;
+                    }
+                };
                 let mut steps = script_completed.lock().await;
-                steps.push(json!({"kind":"script","output":output}));
+                let script_output = artifact.as_ref().map_or_else(
+                    || json!(output),
+                    |artifact| json!({"artifact_id":artifact["artifact_id"]}),
+                );
+                steps.push(json!({"kind":"script","output":script_output}));
                 let count = script_jobs
                     .get(PRINCIPAL, &script_session_id, &script_operation_id)
                     .ok()
                     .flatten()
                     .map_or(0, |op| op.dispatch_count);
-                let receipt = workflow_receipt(
+                let mut receipt = workflow_receipt(
                     &script_operation_id,
                     "completed",
                     &script_session_id,
@@ -455,6 +491,7 @@ async fn run_workflow_job(
                     &steps,
                     None,
                 );
+                receipt["artifacts"] = json!(artifact.into_iter().collect::<Vec<_>>());
                 let _ = script_jobs.complete(
                     PRINCIPAL,
                     &script_session_id,
@@ -1987,7 +2024,7 @@ impl App {
                 include_str!("../../../docs/clients.md"),
             ),
             "master" => (
-                "master-2026-10-06-v1",
+                "master-2026-10-06-v2",
                 include_str!("../../../docs/MASTER_GUIDE.md"),
             ),
             _ => return Err(invalid("topic must be clients or master")),
@@ -2236,7 +2273,7 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
             include_str!("../../../docs/clients.md"),
         )),
         "master" => Some((
-            "master-2026-10-06-v1",
+            "master-2026-10-06-v2",
             include_str!("../../../docs/MASTER_GUIDE.md"),
         )),
         _ => None,
@@ -2639,6 +2676,7 @@ mod tests {
         use tokio_tungstenite::{accept_async, tungstenite::Message};
         static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _env_guard = ENV_LOCK.lock().await;
+        let previous_trusted_scripts = std::env::var_os("CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS");
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let endpoint = format!("ws://{address}/devtools/browser/mock");
@@ -2872,6 +2910,65 @@ mod tests {
         })))).await.unwrap().structured_content.unwrap();
         assert_eq!(replay["operation_id"], operation_id);
         assert_eq!(replay["replayed"], true);
+        unsafe { std::env::set_var("CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS", "1") };
+        let artifact_start = client
+            .call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
+                "session_id":session_id,"idempotency_key":"phase6-artifact","target_ref":target_ref,
+                "steps":[{"kind":"script","source":"await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}); return {kind:'artifact',filename:'summary.json',media_type:'application/json',bytes:[123,125]};"}]
+            }))))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let artifact_operation = artifact_start["operation_id"].as_str().unwrap().to_owned();
+        let mut artifact_status = Value::Null;
+        for _ in 0..50 {
+            artifact_status = client
+                .call_tool(
+                    CallToolRequestParams::new("workflow_status").with_arguments(args(json!({
+                        "session_id":session_id,"operation_id":artifact_operation
+                    }))),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            if artifact_status["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(artifact_status["status"], "completed", "{artifact_status}");
+        let artifact = &artifact_status["result"]["artifacts"][0];
+        assert_eq!(artifact["operation_id"], artifact_operation);
+        assert_eq!(artifact["principal"], "local-stdio");
+        assert_eq!(artifact["session_id"], session_id);
+        assert_eq!(artifact["bytes"], json!([123, 125]));
+        assert_eq!(
+            artifact["sha256"],
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+        let artifact_replay = client
+            .call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
+                "session_id":session_id,"idempotency_key":"phase6-artifact","target_ref":target_ref,
+                "steps":[{"kind":"script","source":"await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}); return {kind:'artifact',filename:'summary.json',media_type:'application/json',bytes:[123,125]};"}]
+            }))))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(artifact_replay["replayed"], true);
+        assert_eq!(
+            artifact_replay["result"]["artifacts"][0]["bytes"],
+            json!([123, 125])
+        );
+        unsafe {
+            if let Some(value) = previous_trusted_scripts {
+                std::env::set_var("CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS", value);
+            } else {
+                std::env::remove_var("CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS");
+            }
+        }
         let crossed_session = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(args(json!({
             "session_id":session_id,"idempotency_key":"crossed-session","target_ref":{ "session_id":"other-session", "principal":"local-stdio", "capability_revision":1, "browser_instance_id":"x", "browser_generation":1, "target_id":"tab-1", "target_revision":"x", "frame_id":"x", "frame_revision":1, "account_revision":0, "document_revision":0 },
             "steps":[{"kind":"checkpoint"}]

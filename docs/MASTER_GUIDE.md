@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: local Phase 9 setup preview `master-2026-10-06-v1`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
+Version: local Phase 9 setup preview `master-2026-10-06-v2`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -19,7 +19,7 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | `session` | Discover providers, inspect configured targets, connect with selected IDs, list references | Guessing the active tab, connecting without explicit target IDs |
 | `observe` | Bounded CSS/DOM fields, selected-node AX, or a pixel-budgeted PNG crop from one explicit target | Full raw DOM/tree/image; inferring off-screen completeness |
 | `extract` | Bounded extraction across caller-declared sections with stable IDs, verified expansion controls, completeness evidence, and resumable cursors | Treating absent account/count/terminal evidence as complete |
-| `workflow` | Submit bounded observe/wait/checkpoint nodes or an opt-in trusted-local read-only script | Assuming it can mutate pages or access files/network/processes |
+| `workflow` | Submit bounded observe/wait/checkpoint nodes or an opt-in trusted-local read-only script with one bounded inline artifact return | Assuming it can mutate pages or access files/network/processes |
 | `workflow_status` | Poll the operation ID for durable status, revision, and checkpoint receipts | Retrying a browser effect after an unknown outcome |
 | `guide` | Read the version-matched `clients` or `master` documentation | Assuming examples prove a client is qualified |
 | `shared_input` | Guarded fill/click on one explicitly paired Chrome tab with exact current value and post-action DOM readback | Rich editors, masked/trusted controls, app save/persistence, or app-specific qualification |
@@ -40,6 +40,8 @@ The `session` tool uses `action="discover"` for provider status, `action="target
 `extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
 
 This preview does not implement generic `execute` or `jobs`. `workflow` and `workflow_status` provide only the bounded workflow subset described above.
+
+Trusted-local scripts are default-off and run in-process; they are not an OS isolation boundary. A script may return one artifact as {kind:"artifact",filename:"summary.json",media_type:"application/json",bytes:[123,125]}. Only application/json, application/pdf, image/png, and text/plain are accepted; the basename must be safe and bytes must contain 1–12 KiB. `workflow_status` returns the bytes as a JSON uint8 array with SHA-256 and operation/principal/session binding. No file is written or download handle created.
 
 This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). A host-bound local npm package can be staged with `scripts/package-build.sh` and installed from `packages/chrome-controlla/dist`; the guide there shows the command and package-local executable path. Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
 

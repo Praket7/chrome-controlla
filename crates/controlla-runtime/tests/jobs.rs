@@ -172,6 +172,77 @@ fn workflow_checkpoint_survives_reopen_and_each_browser_dispatch_is_claimed() {
 }
 
 #[test]
+fn inline_artifact_receipt_survives_reopen_and_idempotent_replay() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let request = json!({"steps":[{"kind":"script","source":"artifact fixture"}]});
+    let admitted = journal
+        .admit("local-stdio", "session-a", "artifact-key", &request)
+        .unwrap();
+    journal
+        .start("local-stdio", "session-a", &admitted.operation.id)
+        .unwrap();
+    journal
+        .record_dispatch(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            "script-observe",
+        )
+        .unwrap();
+    journal
+        .acknowledge_dispatch(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            "script-observe",
+        )
+        .unwrap();
+    let receipt = json!({"artifacts":[{
+        "operation_id":admitted.operation.id,
+        "principal":"local-stdio",
+        "session_id":"session-a",
+        "filename":"summary.json",
+        "media_type":"application/json",
+        "bytes":[123,125]
+    }]});
+    journal
+        .complete(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            receipt.clone(),
+        )
+        .unwrap();
+    drop(journal);
+    let reopened = Journal::open(&path).unwrap();
+    let status = reopened
+        .get("local-stdio", "session-a", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.result.as_ref().unwrap(), &receipt);
+    let replay = reopened
+        .admit("local-stdio", "session-a", "artifact-key", &request)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.operation.result.unwrap(), receipt);
+    assert!(
+        reopened
+            .get("other-principal", "session-a", &admitted.operation.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .get("local-stdio", "other-session", &admitted.operation.id)
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&path);
+}
+
+#[test]
 fn startup_recovery_marks_running_unknown_and_preserves_checkpoint_without_replay() {
     let path = temp_db();
     cleanup(&path);

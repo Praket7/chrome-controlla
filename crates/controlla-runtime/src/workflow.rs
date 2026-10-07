@@ -1,6 +1,7 @@
 use rquickjs::{AsyncContext, AsyncRuntime, Function, Promise, function::Async};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     future::Future,
     pin::Pin,
@@ -16,6 +17,7 @@ pub const MAX_JOB_DEADLINE_MS: u64 = 60_000;
 pub const MAX_OUTPUT_BYTES: usize = 1_000_000;
 pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_GENERATED_ARTIFACT_BYTES: usize = 12 * 1024;
 pub const MIN_SCRIPT_HEAP_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SCRIPT_HEAP_BYTES: usize = 128 * 1024 * 1024;
 pub type ScriptBroker = Arc<
@@ -134,6 +136,69 @@ pub struct WorkflowRequest {
 #[derive(Clone, Debug)]
 pub struct WorkflowGraph {
     pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptArtifactRequest {
+    kind: String,
+    filename: String,
+    media_type: String,
+    bytes: Vec<u8>,
+}
+
+/// Parses the explicit script artifact return shape into an inline, receipt-bound value.
+pub fn validate_script_artifact(
+    output: &str,
+    operation_id: &str,
+    principal: &str,
+    session_id: &str,
+) -> Result<Option<Value>, String> {
+    let value: Value = serde_json::from_str(output).map_err(|_| "invalid script JSON output")?;
+    if value.get("kind").and_then(Value::as_str) != Some("artifact") {
+        return Ok(None);
+    }
+    let artifact: ScriptArtifactRequest =
+        serde_json::from_value(value).map_err(|_| "invalid artifact return fields")?;
+    if artifact.kind != "artifact"
+        || artifact.bytes.is_empty()
+        || artifact.bytes.len() > MAX_GENERATED_ARTIFACT_BYTES
+    {
+        return Err("artifact bytes must contain 1..=12288 bytes".into());
+    }
+    if artifact.filename.is_empty()
+        || artifact.filename.len() > 128
+        || artifact.filename.starts_with('.')
+        || artifact.filename == ".."
+        || !artifact
+            .filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("artifact filename must be 1..=128 safe ASCII characters".into());
+    }
+    if !matches!(
+        artifact.media_type.as_str(),
+        "application/json" | "application/pdf" | "image/png" | "text/plain"
+    ) {
+        return Err("artifact media_type is unsupported".into());
+    }
+    let sha256 = Sha256::digest(&artifact.bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(Some(serde_json::json!({
+        "artifact_id": format!("{operation_id}:artifact:0"),
+        "operation_id": operation_id,
+        "principal": principal,
+        "session_id": session_id,
+        "filename": artifact.filename,
+        "media_type": artifact.media_type,
+        "encoding": "uint8-array",
+        "size": artifact.bytes.len(),
+        "sha256": sha256,
+        "bytes": artifact.bytes
+    })))
 }
 
 /// Declared effects are scheduling hints, never proof that a page is side-effect free.
@@ -447,6 +512,43 @@ mod tests {
         .await
         .expect("run_script must enforce its own deadline");
         assert!(result.unwrap_err().contains("deadline"));
+    }
+
+    #[test]
+    fn generated_artifact_contract_is_bounded_strict_and_identity_bound() {
+        let result = validate_script_artifact(
+            r#"{"kind":"artifact","filename":"summary.json","media_type":"application/json","bytes":[123,125]}"#,
+            "operation-1",
+            "local-stdio",
+            "session-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["operation_id"], "operation-1");
+        assert_eq!(result["principal"], "local-stdio");
+        assert_eq!(result["session_id"], "session-1");
+        assert_eq!(result["filename"], "summary.json");
+        assert_eq!(result["bytes"], json!([123, 125]));
+        for invalid in [
+            r#"{"kind":"artifact","filename":"../x","media_type":"text/plain","bytes":[1]}"#,
+            r#"{"kind":"artifact","filename":"x","media_type":"application/x-executable","bytes":[1]}"#,
+            r#"{"kind":"artifact","filename":"x","media_type":"text/plain","bytes":[256]}"#,
+            r#"{"kind":"artifact","filename":"x","media_type":"text/plain","bytes":[1],"path":"/tmp/x"}"#,
+        ] {
+            assert!(validate_script_artifact(invalid, "op", "p", "s").is_err());
+        }
+        let oversized = format!(
+            r#"{{"kind":"artifact","filename":"x","media_type":"text/plain","bytes":[{}]}}"#,
+            std::iter::repeat_n("1", MAX_GENERATED_ARTIFACT_BYTES + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(validate_script_artifact(&oversized, "op", "p", "s").is_err());
+        assert!(
+            validate_script_artifact(r#"{"kind":"value","anything":true}"#, "op", "p", "s")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
