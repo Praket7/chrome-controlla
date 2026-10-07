@@ -25,6 +25,15 @@ test('offline fixture rejects unsafe paths and unsupported operations', () => {
   assert.throws(() => runOfflineFixture(invalid), /invalid offline fixture/);
 });
 
+test('malformed set-if conditions return validation errors instead of throwing', () => {
+  for (const when of [null, { path: '/records/0/status', equals: 'ready' }]) {
+    const invalid = structuredClone(fixture);
+    invalid.actions[0] = { op: 'set-if', path: '/records/0/status', value: 'done', when };
+    assert.ok(validateFixtureContract(invalid).some((error) => error.includes('set-if requires conditions')));
+    assert.throws(() => runOfflineFixture(invalid), /invalid offline fixture/);
+  }
+});
+
 test('predicate failure stays visible and never becomes a pass from the action description', () => {
   const invalid = structuredClone(fixture);
   invalid.predicates[0].expected = 'done';

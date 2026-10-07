@@ -46,7 +46,7 @@ export function validateFixtureContract(fixture) {
     if (['set', 'set-if'].includes(action?.op) && !Object.hasOwn(action, 'value')) errors.push(`action ${i + 1}: set requires value`);
     if (action?.op === 'append' && !Object.hasOwn(action, 'value')) errors.push(`action ${i + 1}: append requires value`);
     if (action?.op === 'set-if' && (!Array.isArray(action.when) || action.when.length === 0)) errors.push(`action ${i + 1}: set-if requires conditions`);
-    for (const condition of action?.when ?? []) {
+    for (const condition of (Array.isArray(action?.when) ? action.when : [])) {
       try { pointer(condition?.path); } catch (error) { errors.push(`action ${i + 1}: ${error.message}`); }
       if (!Object.hasOwn(condition ?? {}, 'equals')) errors.push(`action ${i + 1}: condition requires equals`);
     }
