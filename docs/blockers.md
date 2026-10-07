@@ -1,5 +1,11 @@
 # Blockers and external dependencies
 
+## Phase 7 boundary
+
+- The deterministic verifier and in-memory cache are not connected to MCP execution or Phase 6's unimplemented workflow compiler. Each mutation still requires fresh authorization in its execution path.
+- Independent evidence is an input contract only; no app-specific observer, persisted-state readback, visual reviewer, or browser download capture is implemented here. Visual predicates return inconclusive.
+- B28–B30 adversarial fixtures with ground truth outside the agent-visible page, cache cold/warm cost accounting, live app qualification, and the release-suite false-completion gate remain open. Do not infer Phase 7 release qualification from the focused unit tests.
+
 ## Phase 0
 
 No Phase 0 blocker. The local Rust installation was discovered at `~/.cargo/bin`; it was not initially on the login shell PATH. Build evidence below invokes Cargo by its absolute path.

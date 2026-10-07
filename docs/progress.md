@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phase 4 guarded input, Phase 5 bounded extraction, and the Phase 7 local verifier/cache slice have fixture evidence recorded in `verification-matrix.md`. Phase 6 remains unimplemented. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -79,6 +79,15 @@ The supported-control code path includes the final fill-side value comparison an
 - [x] Add selected-node accessibility, byte-preflighted screenshot crop, and bounded single-use resumable cursors bound to target/revision/spec.
 
 Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.99.0: focused observation tests cover mocked wrong-account/no-scroll, selector exceptions, malformed evaluation values, empty results, missing fields, expected counts, page-script limits and exact final-size enforcement. Phase 5 advanced tests additionally bound AX selection and crop pixels, scope IDs by section, preserve deterministic cursor bindings, and mark trimmed coverage partial. Native selector/text reads still have no wall-time bound.
+
+## Phase 7 local implementation record — 2026-10-06
+
+- [x] Added red-first tests for page-claim fake success, wrong target/revision, old evidence, predicate mismatch, field/object/state predicates, truncated artifact bytes, workflow scope/expiry/provenance and quarantine.
+- [x] Added deterministic JSON field equality, array-object existence and exact-state verifiers; evidence must be independent, fresh, and bound to principal/session/target/revision/predicate. Visual-only predicates return `inconclusive`.
+- [x] Added byte-length plus SHA-256 artifact validation and an in-memory cache schema v1 with training/validation provenance, environment/authority preconditions, expiry and quarantine.
+- [ ] B28–B30 independent-ground-truth fixtures, cold/warm cost study, live app persistence, artifact download capture and user-visible workflow/MCP integration remain open.
+
+This is a local deterministic library slice. Phase 6's workflow compiler is not present, and the cache is not wired to execution. Callers must reauthorize each mutation. Evidence structs do not create an independent observer: only actual independent readback supplied by a qualified observer can support a pass. No app persistence, visual quality or live cache qualification is claimed.
 
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 

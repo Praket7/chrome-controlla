@@ -1,7 +1,10 @@
+pub mod artifacts;
+pub mod cache;
 pub mod capability;
 pub mod doctor;
 pub mod jobs;
 pub mod mcp;
+pub mod verifier;
 
 #[cfg(test)]
 mod tests {

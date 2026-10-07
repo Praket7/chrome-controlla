@@ -225,10 +225,10 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 **Interfaces:** `verify(target, predicate, evidence_scope) -> VerificationResult`; `qualify(workflow, suite) -> Qualification`; `lookup(signature) -> QualifiedWorkflow | Miss`; `quarantine(id, reason)`.
 
 - [ ] Test persuasive fake success, old screenshot, wrong revision, stale save, truncated download and changed control semantics with independent ground truth.
-- [ ] Implement deterministic field/object/state verifiers and artifact validators. Use visual review for visual criteria; record inconclusive when necessary.
-- [ ] Bind receipts to target, app/account, revision, observer/time and predicate. Keep process correctness and outcome correctness separate.
-- [ ] Implement versioned workflow cache with training/validation provenance, environment and authority preconditions, expiration/requalification and quarantine.
-- [ ] Validate cold/warm behavior and include preparation/recovery costs. A historical success never authorizes a present mutation.
+- [x] Implement deterministic JSON field/object/state verifiers and byte-length/SHA-256 artifact checks. Visual criteria remain inconclusive without visual review.
+- [x] Bind evidence to principal/session/target/revision, independent observer, observation time and predicate hash. Keep process correctness and outcome correctness separate.
+- [x] Implement an in-memory versioned workflow cache with training/validation provenance, environment/authority preconditions, expiration and quarantine. Cache hits do not authorize mutations.
+- [ ] Validate cold/warm performance and include preparation/recovery costs. Current fixture tests establish lookup behavior only; a historical success never authorizes a present mutation.
 - [ ] Commit `feat: verify outcomes and retire stale workflows`.
 
 **Gate:** no release-suite false completion; visual/aesthetic uncertainty is preserved, not coerced into pass.

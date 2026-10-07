@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "d78fe1bb9bdaf03b21bb49928b19c9341c4202f4db7e182faefa9154db6ef03c",
-      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries",
+      "destination_sha256": "edcd600e5d2b3d16f71fd2667b6392e2713513a5828262b464c600c220054ae4",
+      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries; Phase 7 adds local deterministic verifier and in-memory cache scope, provenance, and qualification-expiry checklist evidence",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
