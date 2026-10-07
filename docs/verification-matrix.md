@@ -403,6 +403,14 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Rust/package CI | pass | Windows, macOS, Ubuntu; source `13c64e3` | [GitHub Actions run 37618717861](https://github.com/Praket7/chrome-controlla/actions/runs/37618717861) passed all build, test, dependency, docs, provenance, and package jobs. |
 | Local unpublished candidate | pass | macOS arm64; source `13c64e3` | `npm run prepare:release-candidate` completed; checksums for the npm package, extension archive, and SBOM verified. Candidate status is `local-candidate-not-published`; no live client/app/browser acceptance. |
 
+## Phase 12 current source candidate — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Release candidate build and package lifecycle | pass | macOS arm64 | `npm run prepare:release-candidate` completed for commit `7d5b95b63201350b806068686ef871d31bd92841`; clean-prefix install and upgrade/rollback/uninstall lifecycle passed; staged SBOM, npm archive, extension archive, and `SHA256SUMS` verified. |
+| Hosted CI | pass | GitHub Actions | Run [37624887673](https://github.com/Praket7/chrome-controlla/actions/runs/37624887673) passed Ubuntu, macOS, and Windows. |
+| Live use of this server binary | pending | Locked local Mac | Restart Codex MCP and repeat selected-tab live checks; no extension reload is needed because its source is unchanged. |
+
 ## Live shared-extension pairing and read-only observation — 2026-10-07
 
 | Check | Result | Environment | Evidence / boundary |

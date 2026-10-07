@@ -184,6 +184,10 @@ The Phase 8 slice includes generic browser fill/click plus the three offline app
 
 The dated Phase 12 review record will bind any distinct binaries, full digests, source commits, and local lifecycle output. No registry publication was performed.
 
+## Phase 12 current candidate follow-up — 2026-10-07
+
+Commit `7d5b95b63201350b806068686ef871d31bd92841` includes the Phase 3 recovery correction and Phase 9 guide-version fix. `npm run prepare:release-candidate` completed for macOS arm64 and every staged artifact checksum verified. The package install/lifecycle check passed; hosted CI run [37624887673](https://github.com/Praket7/chrome-controlla/actions/runs/37624887673) passed on Ubuntu, macOS, and Windows. The candidate remains local and unpublished. The staged extension source is unchanged; the active Codex MCP still needs a restart before live verification can use the rebuilt server binary.
+
 ### Phase 11 — optional learning decision
 
 No learning experiment was run. The build plan makes this stage optional and requires it to earn its runtime cost; no controlled comparison runs or consented test traces currently exist. Keep deterministic rules as the policy and revisit learning only after the Phase 10 pilot/held-out gates produce suitable evidence. This is a deferred experiment, not a completed learning feature.
