@@ -1,5 +1,21 @@
 # Blockers and external dependencies
 
+## Phase 8 app workflow gates
+
+| Application | Current state | Exact gate before claiming workflow support |
+|---|---|---|
+| Google Slides | `unqualified`; MCP has no edit/execute route and no Slides API adapter | Add an explicitly authorized OAuth route or browser-only adapter; bind presentation/object IDs and revisions; read back structure; reload/export and inspect affected slides. Keep API-assisted and browser-only evidence separate. |
+| Canva | `unqualified`; no Connect or Apps SDK route is present | Add an authorized scoped route; qualify entitlement and one-minute edit-session expiry, unsupported/locked pages, collaborator conflicts, and `sync` as a write; read back design state and inspect export. |
+| CapCut Web | `unqualified`; no editor route is present and no official general timeline API was established in research | Add a bounded, app-specific UI adapter only; verify imported media, timeline/captions, exported file and playback. Native draft editing and third-party APIs are outside this claim. |
+
+The current MCP server exposes generic session, observation/extraction, accessibility/crop, artifact registration, and file selection tools. It does not expose app mutations or runtime-controlled app verification. Generic file selection is not app acceptance or persistence evidence. No live app was opened and no user Chrome profile was used. Test documents/media, authenticated test accounts, and a supported route are prerequisites for live qualification; authentication alone would not supply the missing route.
+
+## Phase 7 boundary
+
+- CC-16 is not passed: no runtime-controlled observer exists. Caller-set scope/observer labels are untrusted, so public verification always returns `inconclusive`; evidence includes operation/provenance and app/account bindings but does not establish observed or persisted success.
+- The cache has canonical precondition signatures and fail-closed quarantine mechanics, but there is no production suite runner to mint its opaque qualification token. Its unit-only qualification receipts are not live qualification. Cache is in-memory and not connected to Phase 6/MCP execution.
+- B28–B30 independent-ground-truth fixtures, cache cold/warm cost accounting, live app persistence, artifact download capture, visual review, and the release-suite false-completion gate remain open.
+
 ## Phase 0
 
 No Phase 0 blocker. The local Rust installation was discovered at `~/.cargo/bin`; it was not initially on the login shell PATH. Build evidence below invokes Cargo by its absolute path.

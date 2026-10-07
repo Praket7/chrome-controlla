@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phase 4 guarded text/IME/file input and Phase 5 extraction local fixtures are implemented; final verification is recorded in `verification-matrix.md`. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phase 4 guarded input, Phase 5 bounded extraction, and the Phase 7 local verifier/cache slice have fixture evidence recorded in `verification-matrix.md`. Phase 6 remains unimplemented. The unpacked Chrome extension is loaded in the user's Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -79,6 +79,26 @@ The supported-control code path includes the final fill-side value comparison an
 - [x] Add selected-node accessibility, byte-preflighted screenshot crop, and bounded single-use resumable cursors bound to target/revision/spec.
 
 Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.99.0: focused observation tests cover mocked wrong-account/no-scroll, selector exceptions, malformed evaluation values, empty results, missing fields, expected counts, page-script limits and exact final-size enforcement. Phase 5 advanced tests additionally bound AX selection and crop pixels, scope IDs by section, preserve deterministic cursor bindings, and mark trimmed coverage partial. Native selector/text reads still have no wall-time bound.
+
+## Phase 7 local implementation record — 2026-10-06
+
+- [x] Red-first review-fix tests reproduced forged `IndependentState` claims passing and cache target drift failing to quarantine. Added checks for operation/provenance fields and positive, truncated, and same-length-corrupt artifacts.
+- [x] Evidence declarations bind operation/provenance ID, principal/session/target/app/account/revision, observer label, time and predicate hash. Because no runtime-controlled app observer exists, all caller-supplied evidence now returns `inconclusive`.
+- [x] Added canonical cache signatures over workflow/site/app/schema/content/permission/identity/footprint/verifier/version/authority/failure-policy fields; drift and non-pass verification quarantine. Admission and unquarantine require an opaque successful training/validation token.
+- [ ] No production suite runner can mint qualification tokens, so production cache admission is not available. B28–B30 independent-ground-truth fixtures, CC-16, cold/warm cost study, live app persistence, artifact download capture and workflow/MCP integration remain open.
+
+This is a local contract and fail-closed cache-mechanics slice. Phase 6's workflow compiler is not present; cache is not wired to execution; and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
+
+## Phase 8 app capability gate — 2026-10-06
+
+- [x] Audited the current MCP tool surface and app-related code before adding app-specific routes. MCP exposes session, observe/extract, accessibility/crop, shared observe, artifact registration, and generic file selection; it exposes no app edit/execute/verify route or Slides/Canva/CapCut module.
+- [x] Recorded per-app readiness and evidence requirements in `verification-matrix.md` and the master guide. All professional-app workflow cells remain `unqualified`; the generic browser tools do not establish app support.
+- [ ] Slides editing/API route, OAuth, object/revision readback, reload/export and visual review are absent. No app-specific writes were attempted.
+- [ ] Canva Connect or Apps SDK route, account/entitlement qualification, page-lock/conflict handling and save/export verification are absent. No sync was used as a read probe.
+- [ ] CapCut Web has no implemented UI adapter or verified official timeline API route; no third-party API is substituted. Import/edit/export/playback remain unqualified.
+- [ ] Representative owned app documents/media, authenticated test accounts, and live reload/export evidence are still needed after supported routes exist. The user Chrome profile and external apps were not touched.
+
+This Phase 8 slice records honest gates only. It does not implement professional-app editing, app capability discovery, or live qualification; the remaining Phase 8 checklist items stay open.
 
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 

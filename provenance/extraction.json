@@ -94,16 +94,16 @@
       "source_path": "../../outputs/improvements.md",
       "destination_path": "docs/design/improvements.md",
       "source_sha256": "f333236504419021b4c36810acc17a795d6dc7898a14e79ba490058e873b5592",
-      "destination_sha256": "1a8112e19fe7158312e81caca4d220b44627a264f1b6c671cd916ac0aa813e21",
-      "edits": "updated relative link to relocated master guide",
+      "destination_sha256": "8b0a13156b62ae5c580f56b8a21231e5d84236f81ca431f3f2a1d484b9978446",
+      "edits": "updated relative link to relocated master guide; Phase 7 review records canonical cache preconditions and unqualified observer/cache admission gates",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "d78fe1bb9bdaf03b21bb49928b19c9341c4202f4db7e182faefa9154db6ef03c",
-      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries",
+      "destination_sha256": "fd0c089ac7dd0a77ee50967034fe442a380a6aece9cfc2facc90be7e2aff41e7",
+      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification, and remaining platform qualification boundaries; Phase 7 adds local deterministic verifier and in-memory cache scope, provenance, and qualification-expiry checklist evidence; Phase 7 review records fail-closed untrusted evidence, opaque qualification tokens and unqualified CC-16",
       "license": "user-provided design document; no third-party license asserted"
     },
     {

@@ -222,14 +222,14 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Files:** `verifier.rs`, `cache.rs`, `artifacts.rs`, B28–30 tests, rubric schemas.
 
-**Interfaces:** `verify(target, predicate, evidence_scope) -> VerificationResult`; `qualify(workflow, suite) -> Qualification`; `lookup(signature) -> QualifiedWorkflow | Miss`; `quarantine(id, reason)`.
+**Interfaces:** `verify(operation_binding, predicate, evidence) -> VerificationResult`; `qualify(definition, observed_suite) -> opaque QualificationToken`; `insert(token)`; `lookup(workflow_id, current_definition, now) -> QualifiedWorkflow | Miss | Quarantined`; `quarantine(id, reason)`.
 
 - [ ] Test persuasive fake success, old screenshot, wrong revision, stale save, truncated download and changed control semantics with independent ground truth.
-- [ ] Implement deterministic field/object/state verifiers and artifact validators. Use visual review for visual criteria; record inconclusive when necessary.
-- [ ] Bind receipts to target, app/account, revision, observer/time and predicate. Keep process correctness and outcome correctness separate.
-- [ ] Implement versioned workflow cache with training/validation provenance, environment and authority preconditions, expiration/requalification and quarantine.
-- [ ] Validate cold/warm behavior and include preparation/recovery costs. A historical success never authorizes a present mutation.
-- [ ] Commit `feat: verify outcomes and retire stale workflows`.
+- [ ] Implement outcome field/object/state verification from runtime-controlled independent evidence. Caller-supplied evidence currently always returns `inconclusive`; visual predicates also remain inconclusive.
+- [x] Bind evidence claims to operation/provenance ID, principal/session/target/app/account/revision, observer label, time and predicate hash. These fields do not establish observer trust.
+- [x] Implement the canonical cache contract and in-memory quarantine/expiry mechanics. Insert/unquarantine requires an opaque successful training/validation token; no production observer or suite runner can mint one yet, so production cache admission is unavailable.
+- [ ] Validate cold/warm performance and include preparation/recovery costs. Current fixture tests establish lookup behavior only; a historical success never authorizes a present mutation.
+- [x] Commit `feat: verify outcomes and retire stale workflows` (local fixture implementation; release gate remains open).
 
 **Gate:** no release-suite false completion; visual/aesthetic uncertainty is preserved, not coerced into pass.
 
