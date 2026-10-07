@@ -158,6 +158,8 @@ The Phase 8 slice includes generic browser fill/click plus the three offline app
 - [x] Cover every rmcp-advertised initialize revision over packaged stdio; other transports remain unsupported. Run four five-task fresh-agent groups for B35/guide usability: 20/20 pass after guide corrections against current packaged schemas; no browser or app was connected.
 - [ ] Generate full descriptive guide facts from runtime schemas and test every supported external client in a live client session.
 
+**HTTP process smoke — 2026-10-07:** Started `serve-http` as a temporary local process on `127.0.0.1` with a random bearer, disposable state directory, and test principal. A separate HTTP harness completed MCP initialize, `tools/list`, and the master guide call (v3); a request without bearer returned 401. The process was stopped and its state removed. This verifies the live loopback listener and a bounded HTTP protocol exchange, not acceptance by OpenCode/Freebuff/Claude/ChatGPT or browser actions.
+
 ### Phase 10 — controlled comparison and optimization
 
 - [x] Preregister 30 pilot templates (six each for generic, extraction, interference, multi-tab, and design), three planned repetitions, reset/predicate rules, seeded order randomization, outcomes, analysis, and a strict no-results status; validate with the Node built-in test runner and manifest checker.
