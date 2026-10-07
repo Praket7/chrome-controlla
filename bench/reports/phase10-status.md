@@ -21,14 +21,14 @@ Captured 2026-10-06. Candidate package versions and artifact integrity values ar
 
 | Work | State | Evidence |
 |---|---|---|
-| Offline fixture contract | Verified locally | `node --test bench/analysis/offline-task-harness.test.mjs` passes clone-based reset, bounded state operations, and independent predicate-readback fixtures. This is contract validation only; it is not pilot execution or browser/model comparison evidence. |
-| Candidate package versions | Partial | Registry artifacts and most source commits/tags pinned; Stagehand source commit remains unavailable from package metadata |
+| Offline task fixtures | Verified locally | All 30 pilot templates bind task-specific initial-state resets, bounded setup/actions, and independent state predicate readback. Synthetic interference cases verify stale writes are withheld in the fixture harness. They do not verify candidate-reported outputs, app behavior, or visual quality. `npm run check:bench` validates these fixtures; no candidate, browser, or model ran. |
+| Candidate package versions | Partial | Exact package versions and registry integrity values are recorded in the baseline lock. Source revisions are recorded where locally available; Stagehand source commit is still unresolved. None of the baselines is installed or tested. |
 | Protocol/config parity | Not run | No baseline packages installed/configured |
 | 30-template pilot manifest | Preregistered and structurally validated | `../tasks/phase10-pilot.json` defines 30 templates (six per category), three planned repetitions, reset/predicate fields, seeded candidate-order randomization, outcomes, analysis rules, and the no-results boundary; `node --test bench/phase10-pilot.test.mjs` and `node scripts/check-phase10-pilot.mjs` pass. No task has been run. |
-| Pilot execution | Not run | The offline harness is not connected to pilot task-specific resets/predicates; candidate configuration parity is not frozen, and no baseline was installed |
+| Pilot execution | Not run | No candidate configuration was run. The exact model ID/version is intentionally unresolved in the frozen held-out config, and no baseline was installed. Add a dated preregistration addendum binding the same exact model/config and candidate versions before any pilot run; do not infer model identity from this fixture suite. |
 | 500 held-out runs | Not run | No run data |
 | 200 critical-workflow runs | Not run | No run data |
 | AGWC ablations / statistical report | Not run | Depends on valid runs |
 | Comparison claim | Prohibited | No results support one |
 
-Phase 10 is **not complete**. The pilot manifest is a reproducible preregistration artifact, not a runnable harness or evidence. Held-out IDs and split digest must be frozen before inspecting pilot outcomes; the 100-template × 5-reset comparison and 20 critical workflows × 10 resets remain unrun.
+Phase 10 is **not complete**. Each pilot template now has a runnable *offline state fixture*, but these do not execute candidate tools, Chrome, or model tasks and are not pilot evidence. The held-out IDs and split digest are frozen before any pilot outcome. The 30-template pilot, 100-template × 5-reset comparison, 20 critical workflows × 10-reset runs, and AGWC ablations remain unrun. A preregistration addendum must freeze the exact model ID/version and any changed baseline pins before execution.

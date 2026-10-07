@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateFixtureContract } from '../bench/analysis/offline-task-harness.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const manifestPath = path.join(root, 'bench/tasks/phase10-pilot.json');
@@ -27,6 +28,17 @@ export function validatePilot(pilot, baselines) {
     for (const field of ['prompt', 'initial_state', 'reset', 'success_predicate']) {
       if (!task[field] || (typeof task[field] === 'string' && !task[field].trim())) errors.push(`${task.id} requires ${field}`);
     }
+    const fixtureErrors = validateFixtureContract({
+      schema_version: 1,
+      kind: 'offline-fixture-only',
+      id: task.id,
+      initial_state: task.initial_state,
+      reset: { strategy: 'clone-initial-state' },
+      before_actions: task.offline_fixture?.before_actions,
+      actions: task.offline_fixture?.actions,
+      predicates: task.offline_fixture?.predicates,
+    });
+    if (fixtureErrors.length) errors.push(`${task.id} offline fixture: ${fixtureErrors.join('; ')}`);
     if (task.category === 'design' && task.review_sample_disclosure !== 'included in six design-review templates; report separately') {
       errors.push(`${task.id} must disclose design-review sampling`);
     }
