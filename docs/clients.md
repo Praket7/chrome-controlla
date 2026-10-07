@@ -2,7 +2,7 @@
 
 Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1.0`. Client setup formats checked against upstream documentation/source on 2026-10-06; client binary versions and live client acceptance are not recorded by this guide.
 
-This preview runs MCP over local stdio only. Build the executable, then replace `/ABS/PATH/TO/controlla` below with its absolute path (normally `target/release/controlla`); the MCP command is `controlla mcp`. Do not point a client at an HTTP endpoint: this branch has no remote listener or authentication. To enable permissioned Chrome auto-connect, set `COMPTROL_CHROME_AUTO_CONNECT=1` in the client configuration and enable Chrome Remote Debugging at `chrome://inspect/#remote-debugging`. Chrome may ask for consent. Alternatively, configure an explicitly approved loopback CDP WebSocket using `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT`; never expose that endpoint outside loopback.
+This preview runs MCP over local stdio only. Build the executable, then replace `/ABS/PATH/TO/controlla` below with its absolute path (normally `target/release/controlla`); the MCP command is `controlla mcp`. Do not point a client at an HTTP endpoint: this branch has no remote listener or authentication. Each concurrently running client process needs a unique absolute `CONTROLLA_STATE_DIR`; the server locks this directory before journal recovery. To enable permissioned Chrome auto-connect, set `COMPTROL_CHROME_AUTO_CONNECT=1` in the client configuration and enable Chrome Remote Debugging at `chrome://inspect/#remote-debugging`. Chrome may ask for consent. Alternatively, configure an explicitly approved loopback CDP WebSocket using `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT`; never expose that endpoint outside loopback.
 
 The `guide` MCP tool returns this document for `topic: "clients"` and `server_version: "0.1.0"`. It rejects other server versions so clients do not silently receive mismatched instructions.
 
@@ -16,7 +16,10 @@ The current Codebuff source reads `.agents/mcp.json` (project, parent, then home
     "chrome-controlla": {
       "command": "/ABS/PATH/TO/controlla",
       "args": ["mcp"],
-      "env": { "COMPTROL_CHROME_AUTO_CONNECT": "1" }
+      "env": {
+        "COMPTROL_CHROME_AUTO_CONNECT": "1",
+        "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/freebuff"
+      }
     }
   }
 }
@@ -36,7 +39,10 @@ The v1 config puts named servers directly under `mcp` and uses `enabled`:
       "type": "local",
       "command": ["/ABS/PATH/TO/controlla", "mcp"],
       "enabled": true,
-      "environment": { "COMPTROL_CHROME_AUTO_CONNECT": "1" }
+      "environment": {
+        "COMPTROL_CHROME_AUTO_CONNECT": "1",
+        "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/opencode-v1"
+      }
     }
   }
 }
@@ -54,7 +60,10 @@ The v2 config nests named servers under `mcp.servers`; servers connect unless `d
       "chrome-controlla": {
         "type": "local",
         "command": ["/ABS/PATH/TO/controlla", "mcp"],
-        "environment": { "COMPTROL_CHROME_AUTO_CONNECT": "1" }
+        "environment": {
+          "COMPTROL_CHROME_AUTO_CONNECT": "1",
+          "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/opencode-v2"
+        }
       }
     }
   }
@@ -68,7 +77,7 @@ Use the schema matching the installed OpenCode major version; v1 and v2 config n
 Register a user-scope local stdio process:
 
 ```sh
-claude mcp add --env COMPTROL_CHROME_AUTO_CONNECT=1 --transport stdio --scope user chrome-controlla -- /ABS/PATH/TO/controlla mcp
+claude mcp add --env COMPTROL_CHROME_AUTO_CONNECT=1 --env CONTROLLA_STATE_DIR=/ABS/PATH/TO/controlla-state/claude --transport stdio --scope user chrome-controlla -- /ABS/PATH/TO/controlla mcp
 claude mcp get chrome-controlla
 ```
 

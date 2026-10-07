@@ -210,6 +210,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 - [x] Spike candidate runtimes for interruption, memory bounds and asynchronous host calls. Wasmtime remains a WebAssembly engine, not a JavaScript runtime. A runnable pinned `rquickjs 0.14.0` probe and official crate API confirm interrupt handlers, memory/stack limits and futures-based async host calls. See [rquickjs 0.14.0 API](https://docs.rs/rquickjs/0.14.0/rquickjs/), [Wasmtime interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html), and [Wasmtime ResourceLimiter](https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html). `node:vm` is not treated as a security boundary.
 - [x] Add red-first compiler and worker tests for cross-session handles, unavailable imports and ambient file/network/process access, loop interruption, heap/output limits, and workflow step/wait/output bounds.
+- [x] Enforce the script deadline around pending async JavaScript as well as active bytecode; a never-settling Promise regression returns an error and releases the worker future.
 - [x] Implement typed bounded graph/script IR and a fresh-context QuickJS worker. Its only host function is an asynchronous, per-call reauthorized read broker; scripts are local-trust-only and disabled unless `CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1`. QuickJS is in-process and its API limits are not an OS/process security boundary; untrusted and production scripts remain gated pending process isolation and platform qualification.
 - [x] Add bounded asynchronous MCP admission, a 60-second durable job deadline, resumable `workflow_status`, persistent checkpoints/partial receipts, pre-dispatch operation claims/counting, unknown delivery after timeout, and receipts bound to operation, target, and revisions. Startup takes an exclusive state-directory lifetime lock before recovery: accepted/not-sent work fails and running work becomes unknown while preserving checkpoints; browser effects are never retried. Script broker calls reserve their declared output budget against the workflow-wide cap before dispatch. Client disconnect does not cancel an accepted job; there is no workflow-cancel tool. Receipts currently contain an empty workflow-artifact list.
 - [ ] Add dependency-scoped invalidation and effect-aware splitting. Start with rules, not RL.
@@ -260,9 +261,10 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 - [ ] Implement supported MCP protocol negotiation and transport behavior against pinned SDK conformance tests. Do not mix “latest” protocol semantics with legacy initialization assumptions.
 - [ ] Add authenticated remote endpoint, principal/audience-bound authorization and optional paired outbound local bridge. No public unauthenticated browser control; validate tenant and target binding.
-- [ ] Generate Freebuff, OpenCode v1/v2 as supported, Claude Code and ChatGPT setup instructions for actual versions. Do not assume every platform has the same config nesting or local process support.
+- [x] Record dated local stdio setup examples for Freebuff/Codebuff, OpenCode v1/v2, Claude Code, and ChatGPT's local-process limitation in `docs/clients.md`; examples are schema-checked but installed client versions and client acceptance remain open.
+- [ ] Generate release-specific client instructions and verify actual client versions. Do not assume every platform has the same config nesting or local process support.
 - [ ] In each available real client, run session setup, observation, guarded edit, long job, reconnect/reconcile, structured result/artifact and cleanup. Record client version and server SHA. A raw JSON-RPC smoke alone does not qualify a client.
-- [ ] Turn the companion master-guide draft into exact runnable documentation. Generate shared facts from registry/schema. Implement `guide` and the canonical resource; include short bootstrap instructions in session/tool responses.
+- [ ] Turn the companion master-guide draft into exact runnable documentation and generate shared facts from registry/schema. A version-bound read-only `guide` tool now serves `clients` and `master`; canonical resource, generated facts, and short bootstrap instructions in session/tool responses remain open.
 - [ ] Run B35 and the 20-task fresh-agent usability suite. Fix tool ambiguity, missing recovery instructions and invented flags rather than adding a larger wall of prose.
 - [ ] Commit `feat: qualify MCP clients and ship executable master guide`.
 
@@ -302,7 +304,8 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 **Files:** release workflow, package manifests, checksums/SBOM, support matrix, release notes, benchmark report, guide, rollback instructions.
 
 - [ ] Run necessary full integration/security/package/docs checks on the release commit. Use actual platform runners for cross-platform claims.
-- [ ] Test fresh installation, version upgrade, rollback, stale daemon/extension mismatch, uninstall, and user-data preservation. No credential/browser-profile deletion on uninstall without explicit request.
+- [x] Test clean-prefix installation, package-version upgrade/rollback, uninstall, and unrelated user-data preservation on the current host. This is npm lifecycle mechanics only, using one binary copied under two package version labels.
+- [ ] Test distinct release-binary upgrade/rollback, stale daemon/extension mismatch, Windows/Linux installation, and compatibility. No credential/browser-profile deletion on uninstall without explicit request.
 - [ ] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims.
 - [ ] Prepare a release candidate with reproducible artifacts. Create/push to the authorized new repository; never push Chrome Controlla changes into Comptrol by accident.
 - [ ] Publish/deploy only within actual authorization. If final approval is required, present exact version, diff, test report, visibility, costs and artifact destinations so approval is the last step.

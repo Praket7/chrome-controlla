@@ -8,6 +8,7 @@ use controlla_browser::{
 };
 use rmcp::{ServiceExt, handler::server::wrapper::Parameters, tool, tool_router};
 use serde_json::{Value, json};
+use std::time::Duration;
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -80,6 +81,17 @@ struct SharedObserveArgs {
     session_id: String,
     chrome_tab_id: String,
     spec: ObserveInput,
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SharedInputArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    selector: String,
+    action: String,
+    expected_value: String,
+    value: String,
+    postcondition: Option<String>,
+    timeout_ms: Option<u64>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -795,7 +807,7 @@ async fn shared_frame_identity(
 impl App {
     #[tool(
         name = "workflow",
-        description = "Compile and run a bounded deterministic workflow graph. JavaScript scripts are not enabled."
+        description = "Compile and run a bounded deterministic workflow graph. Trusted-local JavaScript is opt-in via CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1; scripts have no filesystem/network/process access and remain in-process."
     )]
     async fn workflow(
         &self,
@@ -1469,6 +1481,292 @@ impl App {
         Ok(rmcp::handler::server::wrapper::Json(result))
     }
 
+    #[tool(
+        name = "shared_input",
+        description = "Perform one guarded fill or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value/text; enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
+    )]
+    async fn shared_input(
+        &self,
+        Parameters(args): Parameters<SharedInputArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        if args.selector.trim().is_empty()
+            || args.selector.len() > 512
+            || args.selector.contains('\0')
+            || args.expected_value.len() > 16_384
+            || args.value.len() > 16_384
+        {
+            return Err(invalid("selector and values exceed shared input bounds"));
+        }
+        if args.action != "fill" && args.action != "click" {
+            return Err(invalid("shared input action must be fill or click"));
+        }
+        if args.action == "click"
+            && args
+                .postcondition
+                .as_ref()
+                .is_none_or(|value| value.len() > 16_384)
+        {
+            return Err(invalid("click requires a bounded exact postcondition"));
+        }
+        let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(60_000).clamp(6_000, 60_000));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let action_deadline = deadline - Duration::from_secs(5);
+        let recovery_deadline = deadline - Duration::from_secs(2);
+        let shared = tokio::time::timeout_at(deadline, self.shared_sessions.lock())
+            .await
+            .map_err(|_| invalid("shared input deadline exceeded waiting for session registry"))?
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let shared = tokio::time::timeout_at(deadline, shared.lock())
+            .await
+            .map_err(|_| invalid("shared input deadline exceeded waiting for session"))?;
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let before = tokio::time::timeout_at(
+            action_deadline,
+            shared_frame_identity(
+                connection,
+                &shared.registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+            ),
+        )
+        .await
+        .map_err(|_| invalid("shared input deadline exceeded before dispatch"))?
+        .map_err(invalid)?;
+        let selector = serde_json::to_string(&args.selector).map_err(|e| invalid(e.to_string()))?;
+        let expected =
+            serde_json::to_string(&args.expected_value).map_err(|e| invalid(e.to_string()))?;
+        let expression = if args.action == "fill" {
+            let value = serde_json::to_string(&args.value).map_err(|e| invalid(e.to_string()))?;
+            format!(
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
+            )
+        } else {
+            format!(
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe=['password','hidden','file','submit','reset','image'].includes(t)||(e instanceof HTMLButtonElement&&e.type==='submit'),disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');if(!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};return {{ok:true,x,y}};}})()"#
+            )
+        };
+        let (preflight, mut action_error) = match tokio::time::timeout_at(
+            action_deadline,
+            connection.command(
+                &shared.registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.evaluate",
+                json!({"expression":expression,"returnByValue":true,"awaitPromise":false}),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => (
+                response
+                    .pointer("/result/value")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                None,
+            ),
+            Ok(Err(error)) => (
+                Value::Null,
+                Some(format!("input dispatch outcome is uncertain: {error}")),
+            ),
+            Err(_) => (
+                Value::Null,
+                Some("shared input deadline exceeded; effect may have occurred".into()),
+            ),
+        };
+        if action_error.is_none() && preflight["ok"] != true {
+            action_error = Some(format!(
+                "shared input refused: {}",
+                preflight["reason"].as_str().unwrap_or("unverifiable")
+            ));
+        }
+        let observed_value;
+        if args.action == "fill" {
+            let observed = preflight["value"].as_str().unwrap_or_default().to_owned();
+            if action_error.is_none() {
+                let readback = format!(
+                    r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false}}}};if(es.length!==1)return {{ok:false}};const e=es[0],v=e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement?e.value:null;return {{ok:e.isConnected&&v==={expected_value},value:v}};}})()"#,
+                    expected_value =
+                        serde_json::to_string(&args.value).map_err(|e| invalid(e.to_string()))?
+                );
+                match tokio::time::timeout_at(
+                    action_deadline,
+                    connection.command(
+                        &shared.registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        "Runtime.evaluate",
+                        json!({"expression":readback,"returnByValue":true,"awaitPromise":false}),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => {
+                        let value = response
+                            .pointer("/result/value")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if value["ok"] == true && value["value"].as_str() == Some(&args.value) {
+                            observed_value = value["value"].as_str().unwrap_or_default().to_owned();
+                        } else {
+                            action_error = Some("shared fill post-event readback did not match; effect may have occurred".into());
+                            observed_value = observed;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        action_error = Some(format!(
+                            "shared fill post-event readback failed; effect may have occurred: {error}"
+                        ));
+                        observed_value = observed;
+                    }
+                    Err(_) => {
+                        action_error = Some("shared fill post-event readback deadline exceeded; effect may have occurred".into());
+                        observed_value = observed;
+                    }
+                }
+            } else {
+                observed_value = observed;
+            }
+        } else if action_error.is_none() {
+            if let Some((_x, _y)) = preflight["x"].as_f64().zip(preflight["y"].as_f64()) {
+                let refreshed = tokio::time::timeout_at(
+                    action_deadline,
+                    connection.command(
+                        &shared.registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        "Runtime.evaluate",
+                        json!({"expression":expression,"returnByValue":true,"awaitPromise":false}),
+                    ),
+                )
+                .await
+                .map_err(|_| "click revalidation deadline exceeded".to_owned())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                let refreshed = match refreshed {
+                    Ok(response) => response
+                        .pointer("/result/value")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    Err(error) => {
+                        action_error = Some(format!(
+                            "click target revalidation failed before dispatch: {error}"
+                        ));
+                        Value::Null
+                    }
+                };
+                if action_error.is_none() && refreshed["ok"] != true {
+                    action_error = Some(format!(
+                        "click target changed before dispatch: {}",
+                        refreshed["reason"].as_str().unwrap_or("unverifiable")
+                    ));
+                }
+                if action_error.is_none() {
+                    if let Some((x, y)) = refreshed["x"].as_f64().zip(refreshed["y"].as_f64()) {
+                        let press = tokio::time::timeout_at(
+                            action_deadline,
+                            connection.command(
+                                &shared.registry,
+                                &shared.handle,
+                                &args.chrome_tab_id,
+                                "Input.dispatchMouseEvent",
+                                json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| "mouse press deadline exceeded".to_owned())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                        let release = tokio::time::timeout_at(
+                            recovery_deadline,
+                            connection.command(
+                                &shared.registry,
+                                &shared.handle,
+                                &args.chrome_tab_id,
+                                "Input.dispatchMouseEvent",
+                                json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| "mouse release deadline exceeded".to_owned())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                        match (press, release) {
+                            (Ok(_), Ok(_)) => {}
+                            (Err(press_error), Ok(_)) => {
+                                action_error = Some(format!(
+                                    "mouse press outcome uncertain; release was attempted: {press_error}"
+                                ))
+                            }
+                            (Ok(_), Err(release_error)) => {
+                                action_error = Some(format!(
+                                    "mouse release outcome uncertain; pointer button may remain pressed: {release_error}"
+                                ))
+                            }
+                            (Err(press_error), Err(release_error)) => {
+                                action_error = Some(format!(
+                                    "mouse press outcome uncertain ({press_error}); release also uncertain and pointer button may remain pressed ({release_error})"
+                                ))
+                            }
+                        }
+                    } else {
+                        action_error =
+                            Some("click coordinates unavailable after revalidation".into());
+                    }
+                }
+            } else {
+                action_error = Some("click target coordinates unavailable".into());
+            }
+            let postcondition = args.postcondition.as_deref().unwrap_or_default();
+            if action_error.is_none() {
+                let postcondition_json =
+                    serde_json::to_string(postcondition).map_err(|e| invalid(e.to_string()))?;
+                match tokio::time::timeout_at(action_deadline, connection.command(
+                    &shared.registry, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
+                    json!({"expression":format!(r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return false}};if(es.length!==1)return false;const e=es[0],current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');return e.isConnected&&current==={postcondition_json};}})()"#),"returnByValue":true,"awaitPromise":false}),
+                )).await {
+                    Ok(Ok(readback)) if readback.pointer("/result/value") == Some(&Value::Bool(true)) => {}
+                    Ok(Ok(_)) => action_error = Some("click postcondition did not match; effect may have occurred".into()),
+                    Ok(Err(error)) => action_error = Some(format!("click postcondition readback failed; effect may have occurred: {error}")),
+                    Err(_) => action_error = Some("click postcondition deadline exceeded; effect may have occurred".into()),
+                }
+            }
+            observed_value = postcondition.to_owned();
+        } else {
+            observed_value = String::new();
+        }
+        let after = tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(
+                connection,
+                &shared.registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            invalid("post-action identity readback deadline exceeded; effect may have occurred")
+        })?
+        .map_err(|e| {
+            invalid(format!(
+                "post-action identity readback failed; effect may have occurred: {e}"
+            ))
+        })?;
+        if before != after {
+            return Err(invalid(
+                "shared target changed frame, loader, or URL during input; effect may have occurred",
+            ));
+        }
+        if let Some(error) = action_error {
+            return Err(invalid(error));
+        }
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "action":args.action,"observed_value":observed_value,"verified":true,
+            "identity":"same root frame, loader, and URL before and after"
+        })))
+    }
     #[tool(
         name = "extract",
         description = "Bounded extraction across caller-declared sections; every section reports completeness independently."
@@ -2481,6 +2779,255 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(released.structured_content.unwrap()["released"], true);
+        client.cancel().await.unwrap();
+        let _ = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_shared_input_fills_with_readback_and_refuses_stale_or_ambiguous_targets() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let server = serve_directly::<RoleServer, _, _, _, _>(App::default(), server_io, None);
+        let server_task = tokio::spawn(async move { server.waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let listed = client.list_tools(None).await.unwrap();
+        assert!(listed.tools.iter().any(|tool| tool.name == "shared_input"));
+        let args = |value: Value| value.as_object().unwrap().clone();
+        let paired = client
+            .call_tool(
+                CallToolRequestParams::new("session")
+                    .with_arguments(args(json!({"action":"pair_shared","target_ids":["123"]}))),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let endpoint = paired["endpoint"].as_str().unwrap().to_owned();
+        let token = paired["one_session_token"].as_str().unwrap().to_owned();
+        let session_id = paired["session_id"].as_str().unwrap().to_owned();
+        let accept = client.call_tool(CallToolRequestParams::new("session").with_arguments(args(
+            json!({"action":"accept_shared","session_id":session_id}),
+        )));
+        let extension = async move {
+            let (mut peer, _) = connect_async(endpoint).await.unwrap();
+            peer.send(Message::Text(
+                json!({"type":"hello","token":token,"targets":["123"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                peer.next().await.unwrap().unwrap().to_text().unwrap(),
+                "{\"type\":\"ready\"}"
+            );
+            peer
+        };
+        let (accepted, mut extension) = tokio::join!(accept, extension);
+        assert_eq!(
+            accepted.unwrap().structured_content.unwrap()["accepted"],
+            true
+        );
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let expressions = Arc::new(StdMutex::new(Vec::new()));
+        let mouse_events = Arc::new(StdMutex::new(Vec::new()));
+        let frame_reads = Arc::new(StdMutex::new(0usize));
+        let seen_server = seen.clone();
+        let expressions_server = expressions.clone();
+        let mouse_events_server = mouse_events.clone();
+        let frame_reads_server = frame_reads.clone();
+        let extension_task = tokio::spawn(async move {
+            let mut eval_index = 0;
+            let mut mouse_presses = 0;
+            while let Some(Ok(message)) = extension.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                seen_server.lock().unwrap().push(method.clone());
+                let result = match method.as_str() {
+                    "Page.getFrameTree" => {
+                        *frame_reads_server.lock().unwrap() += 1;
+                        json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}})
+                    }
+                    "Runtime.evaluate" => {
+                        expressions_server
+                            .lock()
+                            .unwrap()
+                            .push(request["params"]["expression"].as_str().unwrap().to_owned());
+                        let outcomes = [
+                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                            json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener"}}}),
+                            json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
+                            json!({"result":{"type":"object","value":{"ok":false,"reason":"ambiguous"}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
+                            json!({"result":{"type":"boolean","value":true}}),
+                            json!({"result":{"type":"object","value":{"ok":true}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
+                        ];
+                        let result = outcomes
+                            .get(eval_index)
+                            .cloned()
+                            .unwrap_or_else(|| json!({"result":{"type":"boolean","value":true}}));
+                        eval_index += 1;
+                        result
+                    }
+                    "Input.dispatchMouseEvent" => {
+                        mouse_events_server.lock().unwrap().push((
+                            request["params"]["type"].as_str().unwrap().to_owned(),
+                            request["params"]["x"].as_f64().unwrap(),
+                            request["params"]["y"].as_f64().unwrap(),
+                        ));
+                        if request["params"]["type"] == "mousePressed" {
+                            mouse_presses += 1;
+                            if mouse_presses == 2 {
+                                json!({"error":"fixture uncertain dispatch"})
+                            } else {
+                                json!({"result":{}})
+                            }
+                        } else if mouse_presses == 3 {
+                            json!({"error":"fixture uncertain release"})
+                        } else {
+                            json!({"result":{}})
+                        }
+                    }
+                    _ => panic!("unexpected shared command: {method}"),
+                };
+                let response = if result.get("error").is_some() {
+                    json!({"type":"result","id":request["id"],"error":result["error"]})
+                } else {
+                    json!({"type":"result","id":request["id"],"result":result})
+                };
+                extension
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let fill = |expected_value: &str| {
+            client.call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"fill","expected_value":expected_value,"value":"new"
+                }))),
+            )
+        };
+        let filled = fill("old").await.unwrap();
+        assert_eq!(filled.structured_content.unwrap()["observed_value"], "new");
+        let changed_after_event = fill("old").await;
+        assert!(
+            changed_after_event.is_err() || changed_after_event.unwrap().is_error.unwrap_or(false)
+        );
+        let stale = fill("old").await;
+        assert!(stale.is_err() || stale.unwrap().is_error.unwrap_or(false));
+        let ambiguous = fill("old").await;
+        assert!(ambiguous.is_err() || ambiguous.unwrap().is_error.unwrap_or(false));
+        let clicked = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await
+            .unwrap();
+        assert!(clicked.structured_content.unwrap()["verified"] == true);
+        let missing_coordinates = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await;
+        assert!(missing_coordinates.is_err());
+        let uncertain_dispatch = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await;
+        assert!(uncertain_dispatch.is_err());
+        let stale_click = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await;
+        assert!(stale_click.is_err());
+        let uncertain_release = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await;
+        assert!(
+            uncertain_release.is_err(),
+            "a lost release acknowledgement remains an error"
+        );
+        extension_task.abort();
+        {
+            let methods = seen.lock().unwrap();
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| method.as_str() == "Input.dispatchMouseEvent")
+                    .count(),
+                6,
+                "attempt a mouse release even when the press acknowledgement is uncertain"
+            );
+            assert_eq!(
+                &mouse_events.lock().unwrap()[..2],
+                &[
+                    ("mousePressed".to_owned(), 14.0, 15.0),
+                    ("mouseReleased".to_owned(), 14.0, 15.0)
+                ],
+                "dispatch must use the click geometry from the immediately refreshed hit test"
+            );
+            assert_eq!(
+                *frame_reads.lock().unwrap(),
+                18,
+                "every attempted action performs a post-action identity read"
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| method.as_str() == "Runtime.evaluate")
+                    .count(),
+                16
+            );
+            let expressions = expressions.lock().unwrap();
+            assert!(
+                expressions[0].contains("document.elementFromPoint"),
+                "fill must reject covered controls"
+            );
+            assert!(
+                expressions[0].contains("b.left<0")
+                    && expressions[0].contains("b.right>innerWidth"),
+                "fill must reject offscreen controls"
+            );
+            assert!(
+                expressions[0].contains("matches(':disabled')"),
+                "fill must reject inherited disabled state"
+            );
+            assert!(expressions[7].contains("HTMLButtonElement&&e.type==='submit'"));
+            assert!(expressions[7].contains("matches(':disabled')"));
+        }
         client.cancel().await.unwrap();
         let _ = server_task.await.unwrap();
     }

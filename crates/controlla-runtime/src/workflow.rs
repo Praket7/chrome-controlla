@@ -50,7 +50,7 @@ pub async fn run_script(
         .await
         .map_err(|e| format!("QuickJS context failed: {e}"))?;
     let observe_budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let result = context.async_with(async |ctx| {
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), context.async_with(async |ctx| {
         let host_broker = broker.clone();
         let host_budget = observe_budget.clone();
         let host = Function::new(ctx.clone(), Async(move |input: String| {
@@ -83,7 +83,9 @@ pub async fn run_script(
         let wrapped = format!("(async()=>{{const value=await (async()=>{{{source}\n}})();return JSON.stringify(value===undefined?null:value)}})()");
         let promise = ctx.eval::<Promise, _>(wrapped).map_err(|e| format!("script failed: {e}"))?;
         promise.into_future::<String>().await.map_err(|e| format!("script failed: {e}"))
-    }).await?;
+    }))
+    .await
+    .map_err(|_| "script deadline exceeded".to_string())??;
     if result.len() > MAX_SCRIPT_OUTPUT_BYTES {
         return Err("script output exceeds 65536 bytes".into());
     }
@@ -372,6 +374,22 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn js_worker_deadline_cancels_a_never_settling_promise() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            run_script(
+                "return await new Promise(()=>{});",
+                20,
+                8 * 1024 * 1024,
+                broker(),
+            ),
+        )
+        .await
+        .expect("run_script must enforce its own deadline");
+        assert!(result.unwrap_err().contains("deadline"));
     }
 
     #[tokio::test]

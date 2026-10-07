@@ -1,6 +1,6 @@
 # Build progress
 
-Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. Phase 7 provides fail-closed verifier/cache mechanics without a production observer or workflow integration. Phase 8 app routes remain unimplemented; Phase 9 has local stdio setup and a version-matched read-only guide tool only. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
+Status: Phases 0–3 are gated and pushed. Phases 4–5 have local fixture evidence. Phase 6 provides bounded deterministic workflows, durable resumable jobs, and a default-off trusted-local QuickJS script worker through MCP stdio. Phase 7 provides fail-closed verifier/cache mechanics without a production observer or workflow integration. Phase 8 now includes a generic shared-extension fill/click MCP route verified by fixtures; Slides/Canva/CapCut adapters and live app qualification remain open. Phase 9 has local stdio setup and a version-matched read-only guide tool only. The in-process JS runtime is not an OS security boundary; untrusted/production scripts, arbitrary mutation programs, and workflow-generated artifacts remain blocked. The unpacked Chrome extension is loaded in Chrome, but live pairing/dispatch has not been verified. Broad live-app/platform qualification remains open. File artifacts can be registered and selected through local MCP stdio on Unix; app acceptance/persistence is not claimed.
 
 ## Phase 0 — source extraction and baseline
 
@@ -87,18 +87,19 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 - [x] Added canonical cache signatures over workflow/site/app/schema/content/permission/identity/footprint/verifier/version/authority/failure-policy fields; drift and non-pass verification quarantine. Admission and unquarantine require an opaque successful training/validation token.
 - [ ] No production suite runner can mint qualification tokens, so production cache admission is not available. B28–B30 independent-ground-truth fixtures, CC-16, cold/warm cost study, live app persistence, artifact download capture and workflow/MCP integration remain open.
 
-This is a local contract and fail-closed cache-mechanics slice. Phase 6's workflow compiler is not present; cache is not wired to execution; and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
+This is a local contract and fail-closed cache-mechanics slice. The Phase 6 workflow compiler is present, but the cache is not wired to execution and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
 
 ## Phase 8 app capability gate — 2026-10-06
 
-- [x] Audited the current MCP tool surface and app-related code before adding app-specific routes. MCP exposes session, observe/extract, accessibility/crop, shared observe, artifact registration, and generic file selection; it exposes no app edit/execute/verify route or Slides/Canva/CapCut module.
+- [x] Implemented and fixture-verified generic shared-extension `shared_input` fill/click: exact unique CSS target, visible/unobstructed and non-disabled controls, expected current value/text, separate post-event fill readback, fresh click hit test immediately before mouse dispatch, same-root-frame/loader/URL readback, best-effort release after every attempted press, and a bounded 6–60 second overall deadline. A check/dispatch race remains; uncertain input returns an error and requires re-observation.
+- [x] Audited the app-specific MCP surface. There is no Slides/Canva/CapCut module or app-specific edit/verify route; the generic shared route does not qualify those applications.
 - [x] Recorded per-app readiness and evidence requirements in `verification-matrix.md` and the master guide. All professional-app workflow cells remain `unqualified`; the generic browser tools do not establish app support.
 - [ ] Slides editing/API route, OAuth, object/revision readback, reload/export and visual review are absent. No app-specific writes were attempted.
 - [ ] Canva Connect or Apps SDK route, account/entitlement qualification, page-lock/conflict handling and save/export verification are absent. No sync was used as a read probe.
 - [ ] CapCut Web has no implemented UI adapter or verified official timeline API route; no third-party API is substituted. Import/edit/export/playback remain unqualified.
-- [ ] Representative owned app documents/media, authenticated test accounts, and live reload/export evidence are still needed after supported routes exist. The user Chrome profile and external apps were not touched.
+- [ ] A dedicated Chrome test profile and test-account sign-in were approved. Representative Slides/Canva/CapCut documents/media and live reload/export evidence are still needed after supported routes exist; no app-specific route or write was available in this phase.
 
-This Phase 8 slice records honest gates only. It does not implement professional-app editing, app capability discovery, or live qualification; the remaining Phase 8 checklist items stay open.
+This Phase 8 slice adds only generic browser fill/click. It does not implement professional-app editing, app capability discovery, save/persistence verification, or live qualification; the app-specific Phase 8 checklist items stay open. Official vendor-doc review confirmed Slides revision checks and Canva's one-minute design-edit sessions/commit-on-sync behavior, but no corresponding authorized adapter has been added; no official general CapCut Web timeline API was confirmed.
 
 ## Phase 5 MCP stdio vertical slice — 2026-10-06
 
@@ -122,12 +123,35 @@ This Phase 8 slice records honest gates only. It does not implement professional
 - [x] Add red-first compiler and JavaScript security tests for cross-session handle rejection, no loader/ambient network/file/process globals, loop interruption, memory/output caps, and workflow limits.
 - [x] Add asynchronous MCP job admission, persisted 60-second deadline/status/checkpoints, resumable partial receipts, per-dispatch claims/counts, unknown delivery after timeout, exclusive state-directory lifetime lock, and startup recovery that preserves running checkpoints as unknown without replay. Concurrent clients need separate `CONTROLLA_STATE_DIR` values. Client disconnect does not cancel an accepted job; no workflow-cancel tool is exposed.
 - [x] Add an opt-in local-trust JavaScript worker with only an async read broker. Each call rechecks principal/session/target and claims browser dispatch before execution.
+- [x] Sol review found that an unresolved Promise bypassed the QuickJS interrupt callback. A bounded Tokio timeout now drops the active worker future; a red-first regression returns `script deadline exceeded` for `new Promise(()=>{})`.
 - [ ] OS process isolation, untrusted/production script qualification, mutation programs, effect-aware splitting, generated artifacts, and representative app/platform qualification remain blocked.
 
 ### Phase 9 — local client setup preview
 
 - [x] Add dated local stdio config examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code; mark ChatGPT local stdio unavailable: [clients.md](clients.md).
 - [x] Add read-only `guide` MCP tool for `clients` and `master` topics, requiring exact server version `0.1.0`.
+- [x] Replace the obsolete mutating workflow sample with an observe/checkpoint request and add a runnable JSON/request-shape check (`node tests/guide/check-master-example.mjs`). This is example-shape evidence only.
 - [ ] Add and qualify authenticated remote transport; do not expose unauthenticated HTTP or raw CDP.
 - [ ] Run real-client setup/workflow/cleanup acceptance for each available client and record installed version and server SHA.
 - [ ] Add canonical MCP guide resource, generated config installer, B35, and the 20-task fresh-agent usability suite.
+
+### Phase 10 — controlled comparison and optimization
+
+- [x] Preregister 30 pilot templates (six each for generic, extraction, interference, multi-tab, and design), three planned repetitions, reset/predicate rules, seeded order randomization, outcomes, analysis, and a strict no-results status; validate with the Node built-in test runner and manifest checker.
+- [ ] Build the browser task harness and deterministic reset fixtures; freeze baseline configurations and independently read-back predicates before running the pilot.
+- [ ] Execute the pilot, estimate variance, then freeze held-out IDs/split digest before examining pilot outcomes. No benchmark task has been run and no comparison result is claimed.
+- [ ] Complete the 100 held-out templates × 5 resets, 20 critical workflows × 10 resets, and AGWC ablations; publish all failures and task-clustered results.
+
+### Phase 12 — local release-candidate checks
+
+- [x] Build the host release binary and stage the macOS arm64 npm package.
+- [x] Verify Cargo archive contents/licenses, clean-prefix npm install with a path containing spaces and empty `PATH`, launcher version/help, and package metadata.
+- [x] Add and run local package-manager lifecycle smoke for install, package-version upgrade, rollback, uninstall, and preservation of an unrelated user-data sentinel.
+- [ ] Verify a genuine release-to-release binary upgrade/rollback, stale daemon/extension mismatch behavior, Windows/Linux fresh installs, signed artifacts/SBOM, and consumer install from GitHub.
+- [ ] Run final review, commit all integrated changes, and push the authorized feature branch.
+
+The lifecycle smoke uses the same local binary copied into package archives relabeled `0.1.0` and `0.1.1`; it verifies npm install/rollback mechanics and user-data preservation, not compatibility between distinct server binaries. No registry publication was performed.
+
+### Phase 11 — optional learning decision
+
+No learning experiment was run. The build plan makes this stage optional and requires it to earn its runtime cost; no controlled comparison runs or consented test traces currently exist. Keep deterministic rules as the policy and revisit learning only after the Phase 10 pilot/held-out gates produce suitable evidence. This is a deferred experiment, not a completed learning feature.

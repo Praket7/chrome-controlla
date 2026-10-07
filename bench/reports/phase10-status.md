@@ -23,10 +23,11 @@ Captured 2026-10-06. Candidate package versions and artifact integrity values ar
 |---|---|---|
 | Candidate package versions | Partial | Registry artifacts and most source commits/tags pinned; Stagehand source commit remains unavailable from package metadata |
 | Protocol/config parity | Not run | No baseline packages installed/configured |
-| 30-template pilot | Not run | Harness, prompts, and reset fixture absent |
+| 30-template pilot manifest | Preregistered and structurally validated | `../tasks/phase10-pilot.json` defines 30 templates (six per category), three planned repetitions, reset/predicate fields, seeded candidate-order randomization, outcomes, analysis rules, and the no-results boundary; `node --test bench/phase10-pilot.test.mjs` and `node scripts/check-phase10-pilot.mjs` pass. No task has been run. |
+| Pilot execution | Not run | Browser task harness and reset fixtures are absent; candidate configuration parity is not frozen, and no baseline was installed |
 | 500 held-out runs | Not run | No run data |
 | 200 critical-workflow runs | Not run | No run data |
 | AGWC ablations / statistical report | Not run | Depends on valid runs |
 | Comparison claim | Prohibited | No results support one |
 
-Phase 10 is **not complete**. This report deliberately records the minimum preregistration and pins gathered, but does not convert missing experiments into a pass.
+Phase 10 is **not complete**. The pilot manifest is a reproducible preregistration artifact, not a runnable harness or evidence. Held-out IDs and split digest must be frozen before inspecting pilot outcomes; the 100-template × 5-reset comparison and 20 critical workflows × 10 resets remain unrun.

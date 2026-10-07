@@ -42,24 +42,24 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-04 | fixture_verified | 1 | packed darwin/arm64 npm archive clean-prefix install, spaces and empty PATH; Ubuntu/macOS/Windows hosted package checks pass |
 | CC-05 | fixture_verified | 3 | SQLite journal enforces principal/session/key uniqueness, canonical request conflict, concurrent admission and one-time dispatch claim; independent fixture endpoint count stays one across replay/lost reply; unknown stays terminal |
 | CC-06 | unimplemented | 3 | none |
-| CC-07 | partial | 3 | bounded wait and durable state tested with local async fixture; no Promise/CDP/bridge worker route or reconnecting MCP client |
+| CC-07 | partial | 3/6 | Durable workflow jobs and `workflow_status` use mocked CDP; a never-settling QuickJS Promise now returns on its deadline. No live extension job dispatch, reconnecting external MCP client, or cancellation tool |
 | CC-08 | partial | 5 | synthetic Chrome 42-record extraction and policy completeness fixtures pass; representative application lists and terminal semantics remain unqualified |
 | CC-09 | partial | 2/4 | target/frame/browser revisions and stale-handle fixtures pass; Phase 4 guard compares caller-supplied identity/dependency snapshots; no authoritative app identity observer |
 | CC-10 | partial | 4 | fill checks the live value in the same page evaluation that writes; insert and every sequential key event refresh value/focus before each CDP send; navigation race fixture withholds the fill. CDP/page handlers/server effects remain non-atomic |
 | CC-11 | partial | 4 | strict-background mouse input returns `NeedsForeground`; read-only macOS observer confirms unchanged frontmost app, cursor, and pasteboard change count for one isolated Chrome text fixture; other OSes/modes and repeated interference remain unqualified |
-| CC-12 | partial | 4 | installed Chrome verifies Unicode text/caret, guarded IME composition, fail-closed marked controls, overlay refusal, and DOM drag result; OS IME UI, app-specific semantics, and canvas movement remain unqualified |
+| CC-12 | partial | 4/8 | installed Chrome verifies Unicode text/caret, guarded IME composition, fail-closed marked controls, overlay refusal, and DOM drag result; shared-input fixtures verify guarded fill/click and uncertainty readback. OS IME UI, app-specific semantics, and canvas movement remain unqualified |
 | CC-13 | fixture_verified | 2 | 1/4/8 target scheduling, blocked-target fairness, and shared-document mutation serialization fixtures |
-| CC-14 | partial | 6 | Deterministic bounded graph and fail-closed limits are fixture-verified through MCP; arbitrary JS, CPU/memory worker bounds and durable cancellation are blocked |
+| CC-14 | partial | 6 | Bounded workflow graph, QuickJS source/heap/stack/interrupt/output limits, per-call read authorization, durable checkpoints and restart recovery are fixture-verified; OS isolation, mutations, cancellation API, generated artifacts and live/browser/client qualification remain open |
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
-| CC-16 | unimplemented | 7 | none |
+| CC-16 | partial | 7 | Evidence is bound to operation/target/account/revision/time/predicate; caller-controlled evidence always returns inconclusive because no runtime-controlled independent observer exists |
 | CC-17 | partial | 9 | `docs/clients.md` records dated local config shapes; no external client or live workflow acceptance |
 | CC-18 | partial | 9 | Read-only `guide` tool serves version-matched client/master docs; canonical resource, generated examples, and B35 remain open |
 | CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
-| CC-20 | unimplemented | 10 | none |
-| CC-21 | unimplemented | 7 | none |
-| CC-22 | unimplemented | 11 | none |
-| CC-23 | partial | 6 | `workflow` MCP graph compiles observe/wait/checkpoint nodes and reports browser-operation counts; mutations, generated artifacts and durable receipts are not implemented |
-| CC-24 | unimplemented | 12 | none |
+| CC-20 | partial | 10 | Candidate pins plus a validated 30-template preregistration artifact are recorded; no pilot task or 700 planned comparison runs have executed |
+| CC-21 | partial | 7 | Local fail-closed verifier/cache mechanics and cache-signature/quarantine tests exist; no production observer, qualification suite or execution integration |
+| CC-22 | unimplemented | 11 | Optional learning deferred: no controlled benchmark or consented trace result justifies added runtime cost; deterministic rules remain the active policy |
+| CC-23 | partial | 6 | `workflow` MCP admits durable observe/wait/checkpoint/script jobs with idempotency, target/revision-bound receipts, persistent checkpoints, operation counts, and `workflow_status`; mutations, generated artifacts, session rehydration, and cross-client live recovery remain open |
+| CC-24 | partial | 12 | macOS arm64 host package builds and clean-prefix install, launcher help/version, package archive, user-data preservation, npm version upgrade/rollback/uninstall smoke pass. No distinct binary version compatibility check, signed artifact/SBOM, Windows/Linux install in this run, or consumer install from GitHub |
 | B01 | fixture_verified | 1 | direct-only/bridge-only evaluator fixture, catalog and dispatch decisions match |
 | B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
 | B03 | fixture_verified | 1 | help exits with stdin held open; state path remains absent |
@@ -86,12 +86,12 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | B24 | partial | 4 | read-only macOS observer confirms unchanged pasteboard change count in one isolated strict-background text fixture; MCP artifact registration/file selection has fixture coverage, while other platforms, repeated races, and app acceptance remain open |
 | B25 | partial | 4 | strict-background text uses CDP and one macOS snapshot confirms unchanged frontmost app/cursor; mouse returns `NeedsForeground`; other OSes/modes and repeated disruption remain open |
 | B26 | fixture_verified | 2 | crash reconciliation reports owned leftovers and preserves adopted/user tabs |
-| B27 | partial | 6 | Workflow schema rejects unknown script/module/network/file/process fields; no executable scripting surface exists, so page-prompt injection behavior in a worker is unqualified |
-| B28 | unimplemented | 7 | none |
-| B29 | unimplemented | 7 | none |
-| B30 | unimplemented | 7 | none |
+| B27 | partial | 6 | Trusted-local scripts are opt-in; worker exposes only the read-only observe broker and no filesystem/network/process globals. Page-prompt injection behavior remains unqualified. |
+| B28 | partial | 7 | Persuasive page claims and stale/unbound evidence remain inconclusive; runtime-controlled observer and app-save proof are absent |
+| B29 | partial | 7 | Artifact length/hash helper rejects truncated or corrupt bytes; no browser download/export capture route is integrated |
+| B30 | partial | 7 | Cache signature drift and non-passing verification quarantine fixture pass; no live control-semantics observer or workflow-execution integration |
 | B31 | fixture_verified | 6 | MCP workflow rejects target references whose session differs, and compiler unit checks reject cross-principal/session bindings before execution |
-| B32 | partial | 6 | Workflow step count, per-step/aggregate waits, observe limits and aggregate declared bytes are rejected above bounds; infinite-loop and memory-flood worker termination remain blocked with scripting |
+| B32 | partial | 6 | Workflow step count, per-step/aggregate waits, observe limits and aggregate declared bytes are rejected above bounds; infinite-loop, unresolved-Promise deadline, heap, stack and output limits have worker tests. In-process worker isolation remains unqualified. |
 | B33 | partial | 5 | fixture policy classifies wrong-account 404 unknown; mocked CDP preflight returns unknown and sends no scroll command; real 404/account UI remains unqualified |
 | B34 | unimplemented | 8 | none |
 | B35 | unimplemented | 9 | none; fresh-agent usability suite not run |
@@ -101,11 +101,11 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 | Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
 |---|---|---|---|---|
-| Google Slides | No edit route; generic observation only | No OAuth or Slides API adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
-| Canva | No app edit route | No Connect or Apps SDK adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
-| CapCut Web | No app UI adapter | No official timeline API route established | Session, observe/extract, accessibility/crop, generic artifact/file selection | `unqualified` |
+| Google Slides | Generic guarded shared fill/click only; no app adapter | No OAuth or Slides API adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
+| Canva | Generic guarded shared fill/click only; no app adapter | No Connect or Apps SDK adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
+| CapCut Web | Generic guarded shared fill/click only; no app adapter | No official timeline API route established | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
 
-These rows describe available code paths, not app validation. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
+These rows describe available code paths, not app validation. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 
@@ -332,6 +332,8 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | `cargo fmt --all -- --check && cargo clippy -p controlla-runtime --all-targets --locked --offline -- -D warnings` | pass | macOS 26 / Rust 1.99.0 | Formatting and runtime-target Clippy clean. |
 | `cargo test -p controlla-runtime --locked --offline --quiet` | pass | macOS 26 / Rust 1.99.0 | 30 runtime/unit/integration tests passed across 4 test groups; no failures. MCP guide call used the in-process rmcp duplex harness, not an external client. |
 | `npm run check:docs` | pass | Node.js local | Checked local Markdown links in 15 files. |
+| `node tests/guide/check-master-example.mjs` | pass | Node.js local | Parsed the master-guide JSON sample and checked its documented workflow/request fields; this does not call MCP or qualify B35. |
+| Shared `shared_input` route | pass | macOS 26 / Rust 1.99.0 | Duplex extension-protocol fixture covers event-handler-changed fill readback, stale/ambiguous refusal, click-coordinate refresh, inherited-disabled/offscreen/overlay script guards, uncertain press with release attempt, uncertain release error, and post-action identity reads. This is fixture evidence, not live Chrome extension/app acceptance. |
 | Parse fenced JSON in `docs/clients.md` and `git diff --check` | pass | Python 3 / working tree | Three client JSON config examples parse; whitespace check clean. |
 | Client acceptance | open | Not run | No Freebuff, OpenCode, Claude Code, or ChatGPT client was launched. Documentation/source schema review is not external client acceptance. |
 | Remote transport/authentication | open | Not implemented | No HTTP listener, auth, tunnel, or paired outbound bridge is present. |

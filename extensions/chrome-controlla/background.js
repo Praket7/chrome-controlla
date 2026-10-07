@@ -90,6 +90,9 @@ async function pair(endpoint, token, selectedTabIds) {
     const request = JSON.parse(event.data);
     if (request.type !== "command" || !attachedTabs.has(Number(request.target_id))) return;
     try {
+      if (!["Page.getFrameTree", "Runtime.evaluate", "Input.dispatchMouseEvent"].includes(request.method)) {
+        throw new Error("Command is outside the shared observe/input allowlist.");
+      }
       const result = await chrome.debugger.sendCommand(
         { tabId: Number(request.target_id) }, request.method, request.params || {}
       );

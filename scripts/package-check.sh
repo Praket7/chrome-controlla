@@ -67,3 +67,4 @@ printf '%s\n' 'package-check: checking npm command shim'
 # Windows .cmd under Git Bash) as an installed consumer would.
 npm exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.0' >/dev/null
 printf 'Verified host-bound npm archive (%s/%s), attribution, and clean-prefix package-local install.\n' "$(node -p 'process.platform')" "$(node -p 'process.arch')"
+node scripts/check-package-lifecycle.mjs

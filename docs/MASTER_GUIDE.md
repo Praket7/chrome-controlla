@@ -8,7 +8,7 @@ Companion documents: [research](design/research.md), [improvement requirements](
 
 Use Chrome Controlla to accomplish a browser task through a named session and exact targets. Default to a dedicated browser profile and strict background behavior when that mode supports the task. Read only the guide sections needed for the current task. Do not load every capability/schema or request full-page screenshots after every action.
 
-**Current local sequence:** discover/configure a session → select explicit targets → observe → extract declared sections when needed. This slice does not execute browser mutations or create durable jobs.
+**Current local sequence:** discover/configure a session → select explicit targets → observe/extract, submit a bounded read-only `workflow` and poll its durable receipt with `workflow_status`, or explicitly pair selected tabs in the unpacked extension for the limited `shared_input` fill/click route.
 
 One tool call can perform several actions, but completion requires evidence. Never claim “saved,” “all items,” or “exported” from a dispatch acknowledgement.
 
@@ -19,12 +19,14 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | `session` | Discover providers, inspect configured targets, connect with selected IDs, list references | Guessing the active tab, connecting without explicit target IDs |
 | `observe` | Bounded CSS/DOM fields, selected-node AX, or a pixel-budgeted PNG crop from one explicit target | Full raw DOM/tree/image; inferring off-screen completeness |
 | `extract` | Bounded extraction across caller-declared sections with stable IDs, verified expansion controls, completeness evidence, and resumable cursors | Treating absent account/count/terminal evidence as complete |
+| `workflow` | Submit bounded observe/wait/checkpoint nodes or an opt-in trusted-local read-only script | Assuming it can mutate pages or access files/network/processes |
+| `workflow_status` | Poll the operation ID for durable status, revision, and checkpoint receipts | Retrying a browser effect after an unknown outcome |
 | `guide` | Read the version-matched `clients` or `master` documentation | Assuming examples prove a client is qualified |
-| `execute`, `jobs` | Not implemented in this local slice | Do not call these tools or infer mutation/job support |
+| `shared_input` | Guarded fill/click on one explicitly paired Chrome tab with exact current value and post-action DOM readback | Rich editors, masked/trusted controls, app save/persistence, or app-specific qualification |
 
 `tools/list` carries the argument schemas. The read-only `guide` tool accepts `topic` (`clients` or `master`) and exact `server_version` (`0.1.0`); unsupported versions/topics fail clearly. It returns static Markdown, not live health or browser state. There is no canonical MCP resource in this slice.
 
-Guarded text and file-selection methods are available in the Rust browser library, but are not exposed as MCP tools in this preview. File selection accepts an opaque session-scoped artifact handle created from bounded bytes; it never accepts a caller host path. A successful result means Chrome selected the file and read back its name and size, not that the application accepted or saved it.
+`shared_input` is available only for explicitly paired extension tabs. Fill is limited to one visible, unobstructed ordinary input or textarea; click requires one visible, unobstructed exact CSS match and refreshes its hit test immediately before mouse dispatch. Both require the exact current value/text and are bounded by a 6–60 second overall deadline (default 60 seconds). Fill and click perform DOM readback after input events. A small page-change race still exists between validation and Chrome dispatch; if dispatch or release is uncertain, stop using that target and reobserve before any next input. Readback confirms DOM state and unchanged root-frame/loader/URL identity only. It does not prove application acceptance, saving, persistence, or professional-app support. File selection is exposed through `artifact_register` and `file_select`; it accepts an opaque session-scoped handle created from bounded bytes, never a caller host path. A successful result means Chrome selected the file and read back its name and size, not that the application accepted or saved it.
 
 ## 2. First installation and connection
 
@@ -37,7 +39,7 @@ The `session` tool uses `action="discover"` for provider status, `action="target
 
 `extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
 
-This preview does not implement `execute` or `jobs`. Do not use those names as if they were available.
+This preview does not implement generic `execute` or `jobs`. `workflow` and `workflow_status` provide only the bounded workflow subset described above.
 
 This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
 
@@ -81,24 +83,45 @@ Batch deterministic local work: fill known fields, apply known formatting, trave
 
 Use a stable idempotency key for one logical operation. Same request replay returns the original receipt with `replayed: true`; it does not prove the state remains unchanged today. A changed request uses a new key only after the earlier operation’s outcome is known and a new operation is intended.
 
-### Illustrative request, to be compiled into a tested fixture example
+### Read-only workflow example
+
+After `session` connect and `session` list-targets, replace the sample session and target reference with the values returned by those calls. This request performs one bounded observation and checkpoint; workflow steps do not support `fill` or `verify_value`.
 
 ```json
 {
-  "session_id": "fixture-session",
-  "idempotency_key": "fixture-form-001",
-  "target": {"target_id": "fixture-tab", "navigation_epoch": 1},
-  "workflow": {
-    "steps": [
-      {"id": "name", "op": "fill", "locator": {"label": "Name"}, "value": "Ada"},
-      {"id": "check", "op": "verify_value", "locator": {"label": "Name"}, "equals": "Ada"}
-    ]
+  "session_id": "<session_id from session connect>",
+  "idempotency_key": "guide-observe-001",
+  "target_ref": {
+    "session_id": "<session_id>",
+    "principal": "<principal>",
+    "capability_revision": 1,
+    "browser_instance_id": "<browser_instance_id>",
+    "browser_generation": 1,
+    "target_id": "<target_id>",
+    "target_revision": "<target_revision>",
+    "frame_id": "<frame_id>",
+    "frame_revision": 1,
+    "account_revision": 0,
+    "document_revision": 0
   },
-  "limits": {"deadline_ms": 10000, "max_browser_operations": 10}
+  "steps": [
+    {
+      "kind": "observe",
+      "spec": {
+        "selector": "main",
+        "fields": {"heading": "h1", "text": "body"},
+        "max_items": 10,
+        "max_text_chars": 1000,
+        "max_bytes": 4096,
+        "cursor": null
+      }
+    },
+    {"kind": "checkpoint"}
+  ]
 }
 ```
 
-This example deliberately avoids submission. The shipped version must replace illustrative handles with setup-derived handles and validate every field against the actual schema.
+Replace every target reference value with the complete object returned by `session list_targets`. This example is read-only. The retained guide-example check validates JSON and the currently documented workflow step shape; the MCP fixture separately exercises workflow calls. Neither check is B35 or fresh-agent usability acceptance.
 
 ## 7. Typing, clicking and dragging
 

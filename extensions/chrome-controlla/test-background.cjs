@@ -4,17 +4,21 @@ const vm = require("node:vm");
 
 const sockets = [];
 const detached = [];
+const debuggerCalls = [];
 let listener;
 class FakeWebSocket {
   static OPEN = 1;
   constructor(url) {
     this.url = url;
+    this.sent = [];
     this.readyState = 0;
     sockets.push(this);
     queueMicrotask(() => { this.readyState = 1; this.onopen?.(); });
   }
   send(payload) {
-    if (JSON.parse(payload).type === "hello") {
+    const message = JSON.parse(payload);
+    this.sent.push(message);
+    if (message.type === "hello") {
       queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: "ready" }) }));
     }
   }
@@ -25,6 +29,10 @@ const chrome = {
   debugger: {
     async attach() {},
     async detach({ tabId }) { detached.push(tabId); },
+    async sendCommand(target, method, params) {
+      debuggerCalls.push({ target, method, params });
+      return { accepted: true };
+    },
     onDetach: { addListener() {} },
   },
 };
@@ -45,5 +53,18 @@ function message(payload) {
   oldSocket.onclose();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(detached.length, detachCountBeforeOldClose, "an old pairing must not detach newer tabs");
-  console.log("Extension pairing-generation cleanup test passed.");
+
+  const activeSocket = sockets[1];
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "blocked", target_id: "18", method: "Browser.getVersion", params: {}
+  }) });
+  assert.equal(debuggerCalls.length, 0, "unlisted CDP methods must not reach chrome.debugger");
+  assert.match(activeSocket.sent.at(-1).error, /outside the shared observe\/input allowlist/);
+
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "allowed", target_id: "18", method: "Input.dispatchMouseEvent", params: { type: "mousePressed" }
+  }) });
+  assert.equal(debuggerCalls.length, 1);
+  assert.equal(debuggerCalls[0].method, "Input.dispatchMouseEvent");
+  console.log("Extension pairing cleanup and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

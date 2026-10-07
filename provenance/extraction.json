@@ -102,7 +102,7 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "99eefa0fb0657df3904a75d8f8f5699356e6509977718b89dfe8605283c64f43",
+      "destination_sha256": "db1b235c324d2adf8dcc568ecce8b6fed5f2eb1eee97484ca8d1b184afa822f6",
       "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification; Phase 6 records bounded QuickJS workflows, durable journal recovery, and exclusive state-directory ownership; Phase 7 records fail-closed verifier/cache mechanics without production observer integration; Phase 8 records app qualification gates; Phase 9 records local stdio guide and setup scope; Phase 10 records pinned candidate artifacts and explicitly unrun benchmark gates",
       "license": "user-provided design document; no third-party license asserted"
     },
@@ -110,7 +110,7 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "d32f709fa74c304774721c1fa80eb95d2faba85eda5b501b56a8835f7da902a3",
+      "destination_sha256": "6a55e4dfc845c37756fe9ecc6c4f514908c3a00db48d819fdb60f59dbc16c9e2",
       "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 5 documents bounded CSS/AX/PNG observation, section extraction, resumable cursors, and evidence boundaries; Phase 4 file selection remains library-only and does not claim app acceptance",
       "license": "user-provided design document; no third-party license asserted"
     }
