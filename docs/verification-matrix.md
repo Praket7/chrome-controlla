@@ -53,7 +53,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
 | CC-16 | partial | 7 | Evidence is bound to operation/target/account/revision/time/predicate; caller-controlled evidence always returns inconclusive because no runtime-controlled independent observer exists |
 | CC-17 | partial | 9 | `docs/clients.md` records dated local config shapes; no external client or live workflow acceptance |
-| CC-18 | partial | 9 | Versioned `guide` tool and `controlla://guide/{topic}/{server_version}` resources have a child-process stdio test; generated installer, newer discovery lifecycle, real clients, and B35 remain open |
+| CC-18 | partial | 9 | Versioned guide resources and child-process stdio tests cover legacy initialize and current discovery lifecycle; generated installer, full revision/transport matrix, real clients, and B35 remain open |
 | CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
 | CC-20 | partial | 10 | Validated 30-task pilot and disjoint 100-task held-out manifests, baseline lock, and analysis fixtures exist; no pilot task or held-out comparison run has executed |
 | CC-21 | partial | 7 | Local fail-closed verifier/cache mechanics and cache-signature/quarantine tests exist; no production observer, qualification suite or execution integration |
@@ -337,5 +337,6 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | Parse fenced JSON in `docs/clients.md` and `git diff --check` | pass | Python 3 / working tree | Three client JSON config examples parse; whitespace check clean. |
 | Client acceptance | open | Not run | No Freebuff, OpenCode, Claude Code, or ChatGPT client was launched. Documentation/source schema review is not external client acceptance. |
 | Remote transport/authentication | open | Not implemented | No HTTP listener, auth, tunnel, or paired outbound bridge is present. |
+| Current discovery lifecycle over packaged stdio | pass | macOS / Rust / rmcp 3.5.1 | A child process negotiated the SDK's latest protocol without `initialize`, then listed tools and versioned guide resources. This covers only the current lifecycle over local stdio, not other revisions/transports or real clients. |
 
 The client guide schema references were checked on 2026-10-06. Client binary versions were not recorded; examples are version/schema-labeled where formats differ and are not an advertised live support matrix.

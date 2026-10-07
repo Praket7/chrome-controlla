@@ -1,6 +1,7 @@
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{ClientConfig, Implementation, ProtocolVersion, ReadResourceRequestParams},
+    service::{ClientLifecycleMode, ClientServiceExt},
     transport::child_process::TokioChildProcess,
 };
 use serde_json::json;
@@ -120,6 +121,39 @@ async fn packaged_stdio_initializes_negotiates_lists_reads_and_reports_errors() 
             .await
             .is_err()
     );
+
+    client.cancel().await.unwrap();
+    std::fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[tokio::test]
+async fn packaged_stdio_supports_discovery_lifecycle_without_initialize() {
+    let state_dir = state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_controlla"));
+    command.arg("mcp").env("CONTROLLA_STATE_DIR", &state_dir);
+    let transport = TokioChildProcess::new(command).expect("spawn MCP stdio server");
+    let client = VersionedClient(ProtocolVersion::LATEST)
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::LATEST],
+            },
+        )
+        .await
+        .expect("discovery lifecycle handshake");
+
+    assert_eq!(
+        client.peer_info().unwrap().protocol_version,
+        ProtocolVersion::LATEST
+    );
+    let tools = client.list_tools(None).await.unwrap();
+    assert!(tools.tools.iter().any(|tool| tool.name == "session"));
+    assert!(tools.tools.iter().any(|tool| tool.name == "guide"));
+    let resources = client.list_resources(None).await.unwrap();
+    assert!(resources.resources.iter().any(|resource| {
+        resource.uri == format!("controlla://guide/master/{}", env!("CARGO_PKG_VERSION"))
+    }));
 
     client.cancel().await.unwrap();
     std::fs::remove_dir_all(state_dir).unwrap();
