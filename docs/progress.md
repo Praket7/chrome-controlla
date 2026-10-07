@@ -89,7 +89,7 @@ Local library verification on 2026-10-06, macOS 26 / Darwin 25.6 arm64, Rust 1.9
 
 This is a local contract and fail-closed cache-mechanics slice. The Phase 6 workflow compiler is present, but the cache is not wired to execution and no production path can issue qualification tokens. The public verifier cannot claim observed or persisted success. No CC-16, app persistence, visual quality or live cache qualification is claimed.
 
-The 2026-10-06 continuation adds field/object/state predicate evaluation gated on an opaque observer receipt and fixture-only receipt issuance. No production observer was added; caller-supplied evidence remains inconclusive and the cache remains disconnected from workflow execution.
+The 2026-10-06 continuation adds field/object/state predicate evaluation gated on an opaque observer receipt and fixture-only receipt issuance. A review of the MCP and browser session paths found no safe production readback issuer: direct/shared observation returns page DOM data, while account/document revisions are supplied by the caller. Those paths cannot establish independent application state or persistence, so they do not mint verification evidence. No production observer was added; caller-supplied evidence remains inconclusive and the cache remains disconnected from workflow execution. Focused local checks pass: the phase7 integration target (4 tests) and verifier unit tests (2 tests). Live app persistence, visual review, cache admission and the release suite remain open.
 
 ## Phase 8 app capability gate — 2026-10-06
 

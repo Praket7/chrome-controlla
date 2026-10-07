@@ -102,7 +102,7 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "49b74015173380f53e562299bb8eed6a6280da557dfaa3686e695e08f0c64f3a",
+      "destination_sha256": "4d8d6fec237ee52410762e2f409414ff9a870319fc64cc07d39c4a335a9fbb82",
       "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification; Phase 6 records bounded QuickJS workflows, durable journal recovery, and exclusive state-directory ownership; Phase 7 records fail-closed verifier/cache mechanics without production observer integration; Phase 8 records app qualification gates; Phase 9 records local stdio guide and setup scope; Phase 10 records pinned candidate artifacts and explicitly unrun benchmark gates",
       "license": "user-provided design document; no third-party license asserted"
     },

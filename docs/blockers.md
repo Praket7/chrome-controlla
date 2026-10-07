@@ -16,7 +16,7 @@ Current vendor documentation confirms that Google Slides `batchUpdate` supports 
 
 ## Phase 7 boundary
 
-- CC-16 is not passed: no runtime-controlled observer exists. Caller-set scope/observer labels are untrusted, so public verification always returns `inconclusive`; evidence includes operation/provenance and app/account bindings but does not establish observed or persisted success.
+- CC-16 is not passed: no safe production observer exists. The MCP direct/shared observe paths return page DOM data, and account/document revisions are supplied by the caller; they cannot independently establish app state or persistence. Caller-set scope/observer labels remain untrusted and public caller-evidence verification returns `inconclusive`. Test-only sealed observer receipts exercise predicate mechanics but do not establish production observer trust.
 - The cache has canonical precondition signatures and fail-closed quarantine mechanics, but there is no production suite runner to mint its opaque qualification token. Its unit-only qualification receipts are not live qualification. Cache is in-memory and not connected to Phase 6/MCP execution.
 - B28–B30 independent-ground-truth fixtures, cache cold/warm cost accounting, live app persistence, artifact download capture, visual review, and the release-suite false-completion gate remain open.
 
