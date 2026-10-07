@@ -40,7 +40,7 @@ const isolatedNpmConfig = path.join(out, '.empty.npmrc');
 await writeFile(isolatedNpmConfig, '');
 run('npm', ['pack', packageDir, '--pack-destination', out, '--json'], {
   stdio: 'pipe',
-  env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig, npm_config_userconfig: isolatedNpmConfig },
+  env: { ...process.env, NPM_CONFIG_USERCONFIG: isolatedNpmConfig, npm_config_userconfig: isolatedNpmConfig, NPM_CONFIG_ALLOW_SCRIPTS: '', npm_config_allow_scripts: '' },
 });
 await rm(isolatedNpmConfig, { force: true });
 const packageArchive = (await readdir(out)).find((name) => name.endsWith('.tgz'));

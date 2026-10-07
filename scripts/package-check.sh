@@ -34,7 +34,7 @@ node_bin=$(command -v node)
 # Isolate consumer installs from the invoking user's global npm allow-scripts policy.
 temp=$(mktemp -d "${TMPDIR:-/tmp}/controlla package.XXXXXX")
 : > "$temp/empty.npmrc"
-npm_cmd() { NPM_CONFIG_USERCONFIG="$temp/empty.npmrc" npm_config_userconfig="$temp/empty.npmrc" npm "$@"; }
+npm_cmd() { NPM_CONFIG_USERCONFIG="$temp/empty.npmrc" npm_config_userconfig="$temp/empty.npmrc" NPM_CONFIG_ALLOW_SCRIPTS='' npm_config_allow_scripts='' npm "$@"; }
 printf '%s\n' 'package-check: creating npm archive'
 trap '"$node_bin" -e '\''require("node:fs").rmSync(process.argv[1],{recursive:true,force:true})'\'' "$temp"' EXIT
 package="$PWD/packages/chrome-controlla/dist"
