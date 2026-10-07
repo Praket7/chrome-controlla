@@ -1729,6 +1729,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::path::PathBuf::from(".chrome-controlla"));
     std::fs::create_dir_all(&state_dir)?;
     let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))?;
+    journal.recover_after_restart()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

@@ -49,11 +49,28 @@ pub async fn run_script(
     let context = AsyncContext::full(&runtime)
         .await
         .map_err(|e| format!("QuickJS context failed: {e}"))?;
+    let observe_budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let result = context.async_with(async |ctx| {
         let host_broker = broker.clone();
+        let host_budget = observe_budget.clone();
         let host = Function::new(ctx.clone(), Async(move |input: String| {
             let broker = host_broker.clone();
+            let budget = host_budget.clone();
             async move {
+                let spec: WorkflowObserveSpec = match serde_json::from_str(&input) {
+                    Ok(spec) => spec,
+                    Err(_) => return serde_json::json!({"__controlla_error":"invalid brokered observe spec"}).to_string(),
+                };
+                if let Err(error) = compile_steps(vec![WorkflowStep::Observe { spec: spec.clone() }]) {
+                    return serde_json::json!({"__controlla_error":error}).to_string();
+                }
+                if budget.try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |used| used.checked_add(spec.max_bytes).filter(|total| *total <= MAX_OUTPUT_BYTES - 1024),
+                ).is_err() {
+                    return serde_json::json!({"__controlla_error":"aggregate observe byte budget exceeds workflow output limit"}).to_string();
+                }
                 match broker(input).await {
                     Ok(value) => value,
                     Err(error) => serde_json::json!({"__controlla_error":error}).to_string(),
@@ -295,14 +312,37 @@ mod tests {
     #[tokio::test]
     async fn js_worker_awaits_only_the_async_broker_api() {
         let output = run_script(
-            "return await api.observe({selector:'p'});",
+            "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null});",
             1000,
             8 * 1024 * 1024,
             broker(),
         )
         .await
         .unwrap();
-        assert_eq!(output, "{\"received\":{\"selector\":\"p\"}}");
+        assert_eq!(
+            output,
+            "{\"received\":{\"selector\":\"p\",\"fields\":{\"text\":\"p\"},\"max_items\":2,\"max_text_chars\":40,\"max_bytes\":4096,\"cursor\":null}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn js_worker_enforces_aggregate_observe_bytes_before_excess_broker_calls() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let broker: MockBroker = Arc::new(move |_| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("{}".to_owned())
+            })
+        });
+        let source = "const spec={selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:600000,cursor:null}; await api.observe(spec); await api.observe(spec); return 'bad';";
+        assert!(
+            run_script(source, 1000, 8 * 1024 * 1024, broker)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

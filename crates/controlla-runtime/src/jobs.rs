@@ -382,6 +382,17 @@ impl Journal {
         Ok(count)
     }
 
+    /// Reconcile durable records immediately after opening a journal from a prior process.
+    /// Running jobs become unknown and keep their latest checkpoint; accepted jobs are safe to
+    /// fail because the runner has not yet claimed any browser dispatch.
+    pub fn recover_after_restart(&self) -> Result<usize, JournalError> {
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        Ok(connection.execute(
+            "UPDATE operations SET status=CASE status WHEN 'running' THEN 'unknown' ELSE 'failed' END, deadline_error='process_restarted', revision=revision+1 WHERE status IN ('accepted','running')",
+            [],
+        )?)
+    }
+
     pub fn reconcile(
         &self,
         principal: &str,
