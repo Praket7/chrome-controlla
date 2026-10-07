@@ -21,7 +21,7 @@ Captured 2026-10-06. Candidate package versions and artifact integrity values ar
 
 | Work | State | Evidence |
 |---|---|---|
-| Candidate package versions | Partial | Package registry queries and artifact hashes captured; source commits remain open |
+| Candidate package versions | Partial | Registry artifacts and most source commits/tags pinned; Stagehand source commit remains unavailable from package metadata |
 | Protocol/config parity | Not run | No baseline packages installed/configured |
 | 30-template pilot | Not run | Harness, prompts, and reset fixture absent |
 | 500 held-out runs | Not run | No run data |

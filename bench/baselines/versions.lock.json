@@ -7,6 +7,7 @@
       "name": "Playwright MCP",
       "package": "@playwright/mcp",
       "version": "0.0.83",
+      "source_commit": "f183dad4a52965583e3cc1d59b88cdc279e2e57d",
       "tarball": "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.83.tgz",
       "integrity": "sha512-oNcl+Ae2/IAjhfPeP46BfIkSakfmprY+aOtkv5MjrQ4lPav4/yNtPhL0iq8SlIM90oApWgBDUxaNKvktazUKOg==",
       "status": "version-and-integrity-recorded; not installed or tested"
@@ -15,6 +16,7 @@
       "name": "Chrome DevTools MCP",
       "package": "chrome-devtools-mcp",
       "version": "1.10.1",
+      "source_commit": "e52c6b59b476c5e04d8dd9fd4bd017ba3b3d65df",
       "tarball": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.10.1.tgz",
       "integrity": "sha512-Klw6HWDqHC/XS1JwZldd2r49aUhbUJN9m9Mvcx4SEueIPXtzuQX+QelxAViobv8YUkDZ7HWDrmViR6LeYK0wAw==",
       "status": "version-and-integrity-recorded; not installed or tested"
@@ -31,6 +33,8 @@
       "name": "Browser Use",
       "package": "browser-use",
       "version": "0.13.10",
+      "source_tag": "https://github.com/browser-use/browser-use/tree/0.13.10",
+      "source_commit": "5c892e013a73e6622e6f50336e1eb0aa2c4405f2",
       "artifact": "https://files.pythonhosted.org/packages/1e/8f/51217ec63b3872fcc2cfd463f6501727e8f0dedfb33e4598a5e86ce66702/browser_use-0.13.10-py3-none-any.whl",
       "sha256": "66eb20153094f21728bc0110ada17c03a0c475df2374985d6b47e349cbd47705",
       "status": "version-and-hash-recorded; not installed or tested"
@@ -39,6 +43,8 @@
       "name": "Vercel agent-browser",
       "package": "agent-browser",
       "version": "0.38.2",
+      "source_tag": "https://github.com/vercel-labs/agent-browser/tree/v0.38.2",
+      "source_commit": "39a74c70d7759d5a6de7a22c04570bb626bbd081",
       "tarball": "https://registry.npmjs.org/agent-browser/-/agent-browser-0.38.2.tgz",
       "integrity": "sha512-b/7hvo2RrqocvybjB9kwpX12kGkxkFvtdJ4XPDoott5TLK2n3aPX+lYg7ALd+2YvPi2LrTKGzQYu/rxZC2Y7ZA==",
       "status": "version-and-integrity-recorded; not installed or tested"
