@@ -360,3 +360,11 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Full workspace tests | pass | macOS 26 / Rust 1.99.0 | 157 passed, 3 ignored (installed-Chrome-only); all configured unit and integration tests pass. |
 | Workspace Clippy and formatting | pass | macOS 26 / Rust 1.99.0 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` and `cargo fmt --all -- --check`. |
 | Offline Phase 10 fixture contract | pass | Node.js 24.19.0 | Twelve tests cover clone resets, bounded state changes, all 30 pilot task fixture shapes, independent predicates, malformed conditions, invalid result rejection, and frozen split binding. Fixture validation only; not browser/model benchmark evidence. |
+
+## Phase 12 local release candidate — 2026-10-06
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Clean-tree release-candidate assembly | pass | macOS arm64 / source commit `5ac2cb4` | `npm run prepare:release-candidate`; generated npm archive, extension archive, host-filtered Cargo SBOM, release manifest, and SHA256SUMS under `dist/release-candidate/`. Candidate is unpublished. |
+| Candidate file digests | pass | macOS arm64 | All entries in `SHA256SUMS` verified. This checks local artifact integrity, not consumer download or signature verification. |
+| Cross-platform CI | pending | GitHub Actions / source commit `5ac2cb4` | Run `37563019490`; do not claim cross-platform pass until all OS jobs complete. |
