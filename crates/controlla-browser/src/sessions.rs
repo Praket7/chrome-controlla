@@ -419,7 +419,7 @@ impl SessionRegistry {
         #[cfg(not(unix))]
         {
             let _ = (filename, bytes);
-            return Err(SessionError::ArtifactUnsupported);
+            Err(SessionError::ArtifactUnsupported)
         }
         #[cfg(unix)]
         {
