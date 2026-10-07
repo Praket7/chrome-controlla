@@ -11,7 +11,7 @@ assert.match(guide, /Shared tools use `chrome_tab_id`, not `target_ref`/);
 assert.match(guide, /has no tab-close or generic session-release tool/);
 assert.match(guide, /does not expose general `insert_text`, `key_sequence`, semantic click, or drag tools/);
 assert.match(guide, /does not open or control a native OS file picker/);
-assert.match(guide, /caller-supplied snapshot; it does not connect to Canva or independently verify session age\/page lock/);
+assert.match(guide, /use unverified caller assertions; they do not connect to Canva or independently verify identity, session age, or page lock/);
 assert.match(guide, /advances that element by one viewport/);
 assert.match(guide, /independent of the traversed rows/);
 assert.match(guide, /does not click a submit button or verify transfer, app acceptance, or persistence/);
