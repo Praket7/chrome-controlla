@@ -1,3 +1,4 @@
+pub mod apps;
 pub mod artifacts;
 pub mod cache;
 pub mod capability;

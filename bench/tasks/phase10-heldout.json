@@ -1,0 +1,1100 @@
+{
+  "schema_version": 1,
+  "status": "frozen-preregistered-no-results",
+  "registered_at": "2026-10-06",
+  "candidate_baselines": "../baselines/versions.lock.json",
+  "purpose": "Held-out controlled evaluation manifest; tasks are synthetic templates and no outcomes are recorded.",
+  "preregistration": {
+    "categories": [
+      "generic",
+      "extraction",
+      "interference",
+      "multi_tab",
+      "design"
+    ],
+    "templates_per_category": 20,
+    "held_out_repetitions_per_template": 5,
+    "critical_repetitions_per_template": 10,
+    "critical_workflows": 20,
+    "excluded_ids": [
+      "P01",
+      "P02",
+      "P03",
+      "P04",
+      "P05",
+      "P06",
+      "P07",
+      "P08",
+      "P09",
+      "P10",
+      "P11",
+      "P12",
+      "P13",
+      "P14",
+      "P15",
+      "P16",
+      "P17",
+      "P18",
+      "P19",
+      "P20",
+      "P21",
+      "P22",
+      "P23",
+      "P24",
+      "P25",
+      "P26",
+      "P27",
+      "P28",
+      "P29",
+      "P30"
+    ],
+    "primary_outcomes": [
+      "verified_success",
+      "severe_wrong_target_or_authority_violation"
+    ],
+    "noninferiority_margin_percentage_points": 2,
+    "target_model_round_trip_reduction": 0.3,
+    "target_median_wall_time_reduction": 0.25,
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 20261007,
+    "cluster_unit": "task template; resample paired task clusters, never individual runs",
+    "pairing": "Same task state, model identifier/version, prompt budget, browser build, viewport, rights and time budget across candidates; pair by task ID and repetition; randomize candidate order within pair.",
+    "reset": "Recreate and verify each synthetic initial state before each independent run; contaminated starts retained as invalid/incomplete, not excluded.",
+    "success_rule": "Every predicate requires independent state readback. Dispatch acknowledgment or agent assertion alone is not success.",
+    "failure_rule": "Timeouts, unsupported tasks, missing verification, contaminated reset, incomplete cleanup, or absent measurements are rejected as incomplete rows and retained as failures in a corrected complete run; no post-run exclusions.",
+    "analysis": "Task-clustered paired bootstrap intervals for success difference and paired log latency/call ratios; report p50/p95 latency; totals and per-run distributions for tokens, model/MCP/browser calls, retries, interventions, focus/clipboard disruption, cleanup, and cold/warm cache preparation/maintenance.",
+    "cache": "Each row labels cache_state cold or warm; report both separately, including setup/preparation and maintenance cost.",
+    "design_review": "20 design templates; human rubric outcomes and n=20 template / planned run counts reported separately from automated predicates.",
+    "safety": "Synthetic/local state only. No personal accounts, external submissions, messages, or irreversible effects.",
+    "results": null,
+    "candidate_order_randomization": {
+      "method": "Fisher-Yates using Mulberry32; initialize with x=(seed XOR task ordinal XOR repetition) mod 2^32, iterate candidates in lock order with Controlla first. For each swap draw x=(x+0x6D2B79F5)>>>0; t=Math.imul(x^(x>>>15),x|1); t^=t+Math.imul(t^(t>>>7),t|61); draw=((t^(t>>>14))>>>0)/4294967296.",
+      "seed": 20261008
+    },
+    "controlled_config": {
+      "platform": "macOS arm64",
+      "chrome": "154.0.8037.98",
+      "viewport_css_px": [
+        1440,
+        900
+      ],
+      "model": "Same exact model ID and version for all candidates; unresolved, execution blocked until recorded in a dated preregistration addendum before any run.",
+      "prompt_budget_tokens": 20000,
+      "per_run_time_budget_seconds": 120,
+      "account_state": "synthetic/local only",
+      "rights": "same read/write rights limited to the declared synthetic task fixture",
+      "baseline_versions": "exact versions and integrity values in the referenced immutable baseline lock; re-resolve immediately before execution and issue a new preregistration addendum if any pin changes",
+      "controlla_revision": "3643ddf3c67fb954298f204d15115052356e321c"
+    },
+    "cache_state_assignment": "Odd repetitions are cold and even repetitions warm for every candidate within each paired task/repetition; record cache preparation and maintenance time in every run."
+  },
+  "tasks": [
+    {
+      "id": "H001",
+      "category": "generic",
+      "critical": true,
+      "prompt": "Locate a named workspace and report its owner.",
+      "initial_state": "workspaces=[{\"id\":\"w-11\",\"name\":\"Orchid\",\"owner\":\"Mina\"},{\"id\":\"w-12\",\"name\":\"Juniper\",\"owner\":\"Ravi\"}]",
+      "reset": "Restore the declared synthetic fixture for H001 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return w-12 and Ravi; state is unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H002",
+      "category": "extraction",
+      "critical": true,
+      "prompt": "Extract every visible row including its stable key and label.",
+      "initial_state": "rows=[{\"key\":\"k1\",\"label\":\"cedar\"},{\"key\":\"k2\",\"label\":\"birch\"},{\"key\":\"k3\",\"label\":\"ash\"}]",
+      "reset": "Restore the declared synthetic fixture for H002 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return all three exact key-label pairs, no duplicates.",
+      "design_review": false
+    },
+    {
+      "id": "H003",
+      "category": "interference",
+      "critical": true,
+      "prompt": "Apply a status change only while the observed revision remains current.",
+      "initial_state": "value=\"open\"; revision=4; expected=4",
+      "reset": "Restore the declared synthetic fixture for H003 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Set closed only if revision is still 4; verify readback.",
+      "design_review": false
+    },
+    {
+      "id": "H004",
+      "category": "multi_tab",
+      "critical": true,
+      "prompt": "Read the heading from the explicitly identified third tab.",
+      "initial_state": "tabs=[\"tA:Home\",\"tB:Queue\",\"tC:Audit\"]; selected=\"tC\"",
+      "reset": "Restore the declared synthetic fixture for H004 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return Audit and tab identity tC.",
+      "design_review": false
+    },
+    {
+      "id": "H005",
+      "category": "design",
+      "critical": true,
+      "prompt": "Reorder four labeled cards to the requested sequence.",
+      "initial_state": "order=[\"C\",\"A\",\"D\",\"B\"]; target=[\"A\",\"B\",\"C\",\"D\"]",
+      "reset": "Restore the declared synthetic fixture for H005 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "State readback matches order; reviewer scores hierarchy and spacing.",
+      "design_review": true
+    },
+    {
+      "id": "H006",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Change one ticket priority while leaving a sibling ticket untouched.",
+      "initial_state": "tickets=[{\"id\":\"T-31\",\"priority\":\"low\"},{\"id\":\"T-32\",\"priority\":\"low\"}]",
+      "reset": "Restore the declared synthetic fixture for H006 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "T-31 is high and T-32 remains low.",
+      "design_review": false
+    },
+    {
+      "id": "H007",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Collect all entries through three pages with overlapping page boundaries.",
+      "initial_state": "pages=[[\"a\",\"b\"],[\"b\",\"c\"],[\"d\"]]; overlap=true",
+      "reset": "Restore the declared synthetic fixture for H007 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Unique ordered result a,b,c,d with no omission.",
+      "design_review": false
+    },
+    {
+      "id": "H008",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Preserve a human edit that arrives between observation and dispatch.",
+      "initial_state": "value=\"open\"; interference=\"human sets blocked\"",
+      "reset": "Restore the declared synthetic fixture for H008 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Refuse stale update and leave blocked intact.",
+      "design_review": false
+    },
+    {
+      "id": "H009",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Collect separate status values from two tabs without crossing results.",
+      "initial_state": "tabs={\"left\":\"ready\",\"right\":\"waiting\"}",
+      "reset": "Restore the declared synthetic fixture for H009 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return left:ready and right:waiting.",
+      "design_review": false
+    },
+    {
+      "id": "H010",
+      "category": "design",
+      "critical": false,
+      "prompt": "Align five controls to a shared vertical center line.",
+      "initial_state": "x=[40,55,30,60,45]; target=48",
+      "reset": "Restore the declared synthetic fixture for H010 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "All centers within 1px; reviewer scores visual balance.",
+      "design_review": true
+    },
+    {
+      "id": "H011",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Open the notifications panel and report its unread count.",
+      "initial_state": "panel=closed; unread=4",
+      "reset": "Restore the declared synthetic fixture for H011 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Panel is open and reported count is 4.",
+      "design_review": false
+    },
+    {
+      "id": "H012",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract table columns in the requested order while preserving nulls.",
+      "initial_state": "rows=[{\"id\":\"n1\",\"owner\":null,\"score\":8},{\"id\":\"n2\",\"owner\":\"Kai\",\"score\":null}]",
+      "reset": "Restore the declared synthetic fixture for H012 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Both rows include id,owner,score; null remains null.",
+      "design_review": false
+    },
+    {
+      "id": "H013",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Avoid activating a button after an overlay covers its hit area.",
+      "initial_state": "button=\"Publish\"; overlay=\"appears before click\"",
+      "reset": "Restore the declared synthetic fixture for H013 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No click/effect; report obstructed target.",
+      "design_review": false
+    },
+    {
+      "id": "H014",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Update two independent tabs and verify each tab-scoped result.",
+      "initial_state": "tabs={\"draft\":0,\"review\":0}",
+      "reset": "Restore the declared synthetic fixture for H014 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Both equal 1; receipts identify each tab.",
+      "design_review": false
+    },
+    {
+      "id": "H015",
+      "category": "design",
+      "critical": false,
+      "prompt": "Apply a contrast-safe accent to one selected button only.",
+      "initial_state": "colors={\"primary\":\"gray\",\"secondary\":\"gray\"}; selected=\"primary\"; target=\"#174EA6\"",
+      "reset": "Restore the declared synthetic fixture for H015 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Primary matches target and secondary remains gray; reviewer scores legibility.",
+      "design_review": true
+    },
+    {
+      "id": "H016",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Filter the inventory by a requested material and report matching SKUs.",
+      "initial_state": "items=[{\"sku\":\"A1\",\"material\":\"oak\"},{\"sku\":\"B2\",\"material\":\"steel\"},{\"sku\":\"C3\",\"material\":\"oak\"}]",
+      "reset": "Restore the declared synthetic fixture for H016 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Exact matching SKU set is A1,C3; no inventory mutation.",
+      "design_review": false
+    },
+    {
+      "id": "H017",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Continue from the cursor bound to collection C after item 40.",
+      "initial_state": "collection=\"C\"; cursor=\"C:40\"; next=[\"C41\",\"C42\"]",
+      "reset": "Restore the declared synthetic fixture for H017 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return C41,C42 only and retain collection binding.",
+      "design_review": false
+    },
+    {
+      "id": "H018",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Invalidate a saved locator after the page navigates to another record.",
+      "initial_state": "url=\"/item/1\"; epoch=3; interference=\"navigate /item/2\"",
+      "reset": "Restore the declared synthetic fixture for H018 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Reject stale target and do not mutate item 2.",
+      "design_review": false
+    },
+    {
+      "id": "H019",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Change the selected tab while preserving a read-only reference tab.",
+      "initial_state": "tabs={\"edit\":\"old\",\"reference\":\"locked\"}; selected=\"edit\"",
+      "reset": "Restore the declared synthetic fixture for H019 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "edit=new, reference=locked.",
+      "design_review": false
+    },
+    {
+      "id": "H020",
+      "category": "design",
+      "critical": false,
+      "prompt": "Place a caption below a hero image with a 20px gap.",
+      "initial_state": "image_bottom=280; caption_top=270; gap=20",
+      "reset": "Restore the declared synthetic fixture for H020 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "caption_top=300; reviewer scores hierarchy/readability.",
+      "design_review": true
+    },
+    {
+      "id": "H021",
+      "category": "generic",
+      "critical": true,
+      "prompt": "Enter an exact phrase in the global search field.",
+      "initial_state": "search=\"previous\"; target=\"quarterly review\"",
+      "reset": "Restore the declared synthetic fixture for H021 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Readback equals quarterly review exactly.",
+      "design_review": false
+    },
+    {
+      "id": "H022",
+      "category": "extraction",
+      "critical": true,
+      "prompt": "Report an incomplete result when pagination stops before the declared total.",
+      "initial_state": "total=8; observed=[\"u1\",\"u2\",\"u3\",\"u4\"]; terminal=false",
+      "reset": "Restore the declared synthetic fixture for H022 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return four observed IDs and incomplete=true.",
+      "design_review": false
+    },
+    {
+      "id": "H023",
+      "category": "interference",
+      "critical": true,
+      "prompt": "Stop a write if the active workspace changes from sandbox to review.",
+      "initial_state": "workspace=\"sandbox\"; interference=\"switch to review\"",
+      "reset": "Restore the declared synthetic fixture for H023 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Refuse action after identity change; both remain unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H024",
+      "category": "multi_tab",
+      "critical": true,
+      "prompt": "Finish a responsive tab read while another tab is stalled.",
+      "initial_state": "tabs={\"slow\":\"timeout\",\"fast\":\"42\"}",
+      "reset": "Restore the declared synthetic fixture for H024 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return fast=42; slow explicitly times out.",
+      "design_review": false
+    },
+    {
+      "id": "H025",
+      "category": "design",
+      "critical": true,
+      "prompt": "Resize a responsive preview to 720 by 480 while preserving all content.",
+      "initial_state": "frame={\"w\":360,\"h\":240,\"layers\":[\"hero\",\"cta\",\"footer\"]}",
+      "reset": "Restore the declared synthetic fixture for H025 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Dimensions match and all layers remain visible; reviewer checks clipping.",
+      "design_review": true
+    },
+    {
+      "id": "H026",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Open a customer detail card and report its region.",
+      "initial_state": "customers=[{\"id\":\"c7\",\"region\":\"west\"},{\"id\":\"c8\",\"region\":\"north\"}]",
+      "reset": "Restore the declared synthetic fixture for H026 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Card c8 is open and answer is north.",
+      "design_review": false
+    },
+    {
+      "id": "H027",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract headings and paragraph counts for each visible section.",
+      "initial_state": "sections=[{\"h\":\"Intro\",\"p\":2},{\"h\":\"Methods\",\"p\":4}]",
+      "reset": "Restore the declared synthetic fixture for H027 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return exact heading/count pairs for both sections.",
+      "design_review": false
+    },
+    {
+      "id": "H028",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Reconcile a timed-out action whose state change may already have occurred.",
+      "initial_state": "counter=0; ack=\"lost after increment\"",
+      "reset": "Restore the declared synthetic fixture for H028 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Read counter before retry; final increment count is at most one.",
+      "design_review": false
+    },
+    {
+      "id": "H029",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Sequence writes from two tabs to one shared document revision.",
+      "initial_state": "revision=7; tabs=[\"writer-A\",\"writer-B\"]",
+      "reset": "Restore the declared synthetic fixture for H029 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Writes serialize or safely conflict; no lost update.",
+      "design_review": false
+    },
+    {
+      "id": "H030",
+      "category": "design",
+      "critical": false,
+      "prompt": "Distribute five icons evenly within a 500px content rail.",
+      "initial_state": "rail=500; positions=[15,90,220,390,470]",
+      "reset": "Restore the declared synthetic fixture for H030 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Even spacing with 24px inset; reviewer scores perceived balance.",
+      "design_review": true
+    },
+    {
+      "id": "H031",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Toggle the visibility of the named saved view.",
+      "initial_state": "views=[{\"id\":\"v1\",\"name\":\"Backlog\",\"visible\":false},{\"id\":\"v2\",\"name\":\"Today\",\"visible\":true}]",
+      "reset": "Restore the declared synthetic fixture for H031 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Only Backlog becomes visible.",
+      "design_review": false
+    },
+    {
+      "id": "H032",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Read a virtualized list by scrolling until its explicit terminal marker.",
+      "initial_state": "visible=[\"v1\",\"v2\"]; subsequent=[\"v3\",\"v4\"]; terminal_after=true",
+      "reset": "Restore the declared synthetic fixture for H032 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return v1-v4 once each and cite terminal marker.",
+      "design_review": false
+    },
+    {
+      "id": "H033",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Recheck a price field after another actor updates it during editing.",
+      "initial_state": "price=20; interference=\"price becomes 24\"",
+      "reset": "Restore the declared synthetic fixture for H033 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Do not overwrite 24 using stale observation.",
+      "design_review": false
+    },
+    {
+      "id": "H034",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Return to a tab by stable ID after its visible title changes.",
+      "initial_state": "tabs={\"id\":\"t9\",\"title\":\"Before\"}; rename=\"After\"",
+      "reset": "Restore the declared synthetic fixture for H034 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Continue targeting t9 after rename; return After.",
+      "design_review": false
+    },
+    {
+      "id": "H035",
+      "category": "design",
+      "critical": false,
+      "prompt": "Establish a clear heading, subheading, and body type scale.",
+      "initial_state": "sizes={\"h\":18,\"sub\":18,\"body\":16}; target=[32,22,16]",
+      "reset": "Restore the declared synthetic fixture for H035 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Readback matches scale; reviewer scores hierarchy and readability.",
+      "design_review": true
+    },
+    {
+      "id": "H036",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Sort the table by due date ascending and report the first two IDs.",
+      "initial_state": "rows=[{\"id\":\"q1\",\"due\":\"2026-11-08\"},{\"id\":\"q2\",\"due\":\"2026-10-20\"},{\"id\":\"q3\",\"due\":\"2026-11-01\"}]",
+      "reset": "Restore the declared synthetic fixture for H036 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "First IDs are q2,q3; row data is unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H037",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract a nested menu hierarchy without flattening parent-child links.",
+      "initial_state": "tree={\"A\":[\"A1\",\"A2\"],\"B\":[\"B1\"]}",
+      "reset": "Restore the declared synthetic fixture for H037 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return exact tree structure A→A1,A2; B→B1.",
+      "design_review": false
+    },
+    {
+      "id": "H038",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Cancel a drag when the destination slot becomes occupied.",
+      "initial_state": "slot=\"empty\"; interference=\"other card occupies slot\"",
+      "reset": "Restore the declared synthetic fixture for H038 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No drop over occupied slot; original card remains intact.",
+      "design_review": false
+    },
+    {
+      "id": "H039",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Open a link in a new tab and preserve the originating tab.",
+      "initial_state": "origin=\"t1\"; destination=\"/help\"",
+      "reset": "Restore the declared synthetic fixture for H039 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "New tab reports /help; t1 remains open and selected state is known.",
+      "design_review": false
+    },
+    {
+      "id": "H040",
+      "category": "design",
+      "critical": false,
+      "prompt": "Rebuild a two-column card layout with consistent gutters.",
+      "initial_state": "columns=[260,300]; gutter=12; target_gutter=24",
+      "reset": "Restore the declared synthetic fixture for H040 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Equalized columns/gutter; reviewer checks alignment.",
+      "design_review": true
+    },
+    {
+      "id": "H041",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Select the requested checkbox without changing the adjacent option.",
+      "initial_state": "options=[{\"id\":\"email\",\"checked\":false},{\"id\":\"sms\",\"checked\":false}]",
+      "reset": "Restore the declared synthetic fixture for H041 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "email checked; sms remains unchecked.",
+      "design_review": false
+    },
+    {
+      "id": "H042",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Capture the displayed label and destination for each link.",
+      "initial_state": "links=[{\"text\":\"Guide\",\"href\":\"/guide\"},{\"text\":\"Status\",\"href\":\"/status\"}]",
+      "reset": "Restore the declared synthetic fixture for H042 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return both exact text-href pairs.",
+      "design_review": false
+    },
+    {
+      "id": "H043",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Refuse deletion when the confirmation dialog names a different record.",
+      "initial_state": "selected=\"doc-A\"; dialog=\"Delete doc-B?\"",
+      "reset": "Restore the declared synthetic fixture for H043 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No deletion; preserve both documents.",
+      "design_review": false
+    },
+    {
+      "id": "H044",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Compare matching records from two tabs and report only differences.",
+      "initial_state": "left={\"a\":1,\"b\":2}; right={\"a\":1,\"b\":3}",
+      "reset": "Restore the declared synthetic fixture for H044 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Report only b differs, preserving source tab labels.",
+      "design_review": false
+    },
+    {
+      "id": "H045",
+      "category": "design",
+      "critical": false,
+      "prompt": "Use the provided swatches to make a three-step status palette.",
+      "initial_state": "palette=[\"#999\",\"#aaa\",\"#bbb\"]; target=[\"#A8DADC\",\"#457B9D\",\"#1D3557\"]",
+      "reset": "Restore the declared synthetic fixture for H045 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Each status maps to its target; reviewer checks distinguishability.",
+      "design_review": true
+    },
+    {
+      "id": "H046",
+      "category": "generic",
+      "critical": true,
+      "prompt": "Expand the section named Billing and report its visible heading.",
+      "initial_state": "sections=[{\"name\":\"Billing\",\"expanded\":false,\"heading\":\"Invoices\"},{\"name\":\"Profile\",\"expanded\":false}]",
+      "reset": "Restore the declared synthetic fixture for H046 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Billing expanded and heading is Invoices.",
+      "design_review": false
+    },
+    {
+      "id": "H047",
+      "category": "extraction",
+      "critical": true,
+      "prompt": "Extract all checked and unchecked values from a local form.",
+      "initial_state": "fields=[{\"name\":\"alerts\",\"checked\":true},{\"name\":\"digest\",\"checked\":false}]",
+      "reset": "Restore the declared synthetic fixture for H047 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return both fields and boolean states exactly.",
+      "design_review": false
+    },
+    {
+      "id": "H048",
+      "category": "interference",
+      "critical": true,
+      "prompt": "Stop form submission if a required field changes after validation.",
+      "initial_state": "email=\"a@example.test\"; interference=\"field clears\"",
+      "reset": "Restore the declared synthetic fixture for H048 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Do not submit; report failed revalidation.",
+      "design_review": false
+    },
+    {
+      "id": "H049",
+      "category": "multi_tab",
+      "critical": true,
+      "prompt": "Close the temporary tab while retaining the original work tab.",
+      "initial_state": "tabs=[\"main\",\"temporary\"]; close=\"temporary\"",
+      "reset": "Restore the declared synthetic fixture for H049 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "temporary closed; main remains open.",
+      "design_review": false
+    },
+    {
+      "id": "H050",
+      "category": "design",
+      "critical": true,
+      "prompt": "Center a dialog in the viewport while preserving its internal padding.",
+      "initial_state": "viewport=[1200,800]; dialog={\"x\":100,\"y\":80,\"w\":600,\"h\":400,\"padding\":12}",
+      "reset": "Restore the declared synthetic fixture for H050 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Dialog centered, padding=24; reviewer checks balance.",
+      "design_review": true
+    },
+    {
+      "id": "H051",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Rename a local draft using the supplied exact title.",
+      "initial_state": "draft={\"id\":\"d9\",\"title\":\"Untitled\"}; target=\"May planning\"",
+      "reset": "Restore the declared synthetic fixture for H051 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Only d9 title changes to May planning.",
+      "design_review": false
+    },
+    {
+      "id": "H052",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Read timestamps and messages in chronological order.",
+      "initial_state": "messages=[{\"t\":\"10:02\",\"text\":\"second\"},{\"t\":\"09:58\",\"text\":\"first\"}]",
+      "reset": "Restore the declared synthetic fixture for H052 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return first then second with exact timestamps.",
+      "design_review": false
+    },
+    {
+      "id": "H053",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Discard an old search response after a newer query has been entered.",
+      "initial_state": "queries=[\"ca\",\"cat\"]; response_order=[\"cat\",\"ca\"]",
+      "reset": "Restore the declared synthetic fixture for H053 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Visible results remain for cat; stale ca response ignored.",
+      "design_review": false
+    },
+    {
+      "id": "H054",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Wait for a background tab load without redirecting the active tab.",
+      "initial_state": "active=\"front\"; background=\"loading\"",
+      "reset": "Restore the declared synthetic fixture for H054 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Report loaded background identity; front remains active.",
+      "design_review": false
+    },
+    {
+      "id": "H055",
+      "category": "design",
+      "critical": false,
+      "prompt": "Arrange a legend beside a chart without covering plotted data.",
+      "initial_state": "chart=[0,0,640,360]; legend=[500,80,180,150]",
+      "reset": "Restore the declared synthetic fixture for H055 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Legend outside plot area; reviewer checks clarity.",
+      "design_review": true
+    },
+    {
+      "id": "H056",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Clear the active filter while retaining the saved filter.",
+      "initial_state": "active=\"owner:me\"; saved=\"status:open\"",
+      "reset": "Restore the declared synthetic fixture for H056 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Active filter is empty; saved filter remains status:open.",
+      "design_review": false
+    },
+    {
+      "id": "H057",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract visible card data while distinguishing missing key from empty text.",
+      "initial_state": "cards=[{\"id\":\"a\",\"note\":\"\"},{\"id\":\"b\"}]",
+      "reset": "Restore the declared synthetic fixture for H057 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "a.note is empty string; b.note is absent.",
+      "design_review": false
+    },
+    {
+      "id": "H058",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Avoid toggling a checkbox twice when the first response is delayed.",
+      "initial_state": "checked=false; ack=\"delayed\"",
+      "reset": "Restore the declared synthetic fixture for H058 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Reconcile current state; final state checked exactly once.",
+      "design_review": false
+    },
+    {
+      "id": "H059",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Apply a filter in one tab and leave the other tab filter unchanged.",
+      "initial_state": "filters={\"t1\":\"all\",\"t2\":\"open\"}; target=\"t1\"",
+      "reset": "Restore the declared synthetic fixture for H059 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "t1=closed filter; t2 remains open.",
+      "design_review": false
+    },
+    {
+      "id": "H060",
+      "category": "design",
+      "critical": false,
+      "prompt": "Match the left edges of labels and inputs across three form rows.",
+      "initial_state": "labels_x=[20,34,26]; inputs_x=[150,150,150]",
+      "reset": "Restore the declared synthetic fixture for H060 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Labels and inputs align consistently; reviewer checks scanability.",
+      "design_review": true
+    },
+    {
+      "id": "H061",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Copy the displayed short code into the local search field.",
+      "initial_state": "code=\"K4P9\"; search=\"\"",
+      "reset": "Restore the declared synthetic fixture for H061 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Search reads K4P9 and displayed code is unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H062",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Read the selected option and all available choices from a dropdown.",
+      "initial_state": "options=[\"Small\",\"Medium\",\"Large\"]; selected=\"Medium\"",
+      "reset": "Restore the declared synthetic fixture for H062 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return selected Medium and exact three-option list.",
+      "design_review": false
+    },
+    {
+      "id": "H063",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Do not use a coordinate target after viewport resizing shifts the control.",
+      "initial_state": "target_xy=[220,180]; interference=\"viewport narrows\"",
+      "reset": "Restore the declared synthetic fixture for H063 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Reobserve/rebind target; no neighboring control activated.",
+      "design_review": false
+    },
+    {
+      "id": "H064",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Handle identical page titles using tab IDs rather than title matching.",
+      "initial_state": "tabs=[\"t1:Dashboard\",\"t2:Dashboard\"]; target=\"t2\"",
+      "reset": "Restore the declared synthetic fixture for H064 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Result binds to t2 despite duplicate titles.",
+      "design_review": false
+    },
+    {
+      "id": "H065",
+      "category": "design",
+      "critical": false,
+      "prompt": "Create consistent 16px vertical spacing between four list rows.",
+      "initial_state": "tops=[10,42,79,111]; row_h=24; gap=16",
+      "reset": "Restore the declared synthetic fixture for H065 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Each next top is 40px after prior top; reviewer scores rhythm.",
+      "design_review": true
+    },
+    {
+      "id": "H066",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Choose the requested month in the calendar without selecting a day.",
+      "initial_state": "calendar={\"month\":\"October\",\"year\":2026,\"selected_day\":null}; target=\"November 2026\"",
+      "reset": "Restore the declared synthetic fixture for H066 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Month/year match November 2026 and no day is selected.",
+      "design_review": false
+    },
+    {
+      "id": "H067",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract table totals and row values, preserving displayed formatting.",
+      "initial_state": "cells=[\"$1,200.00\",\"$80.50\"]; total=\"$1,280.50\"",
+      "reset": "Restore the declared synthetic fixture for H067 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return exact strings and independently correct total relation.",
+      "design_review": false
+    },
+    {
+      "id": "H068",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Stop a multi-field save when one field has a newer remote revision.",
+      "initial_state": "revisions={\"title\":2,\"owner\":5}; interference=\"title rev 3\"",
+      "reset": "Restore the declared synthetic fixture for H068 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No lost update; preserve latest title and report conflict.",
+      "design_review": false
+    },
+    {
+      "id": "H069",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Capture one screenshot per named tab and keep artifact mapping.",
+      "initial_state": "tabs=[\"overview\",\"settings\"]",
+      "reset": "Restore the declared synthetic fixture for H069 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Artifacts map overview to overview and settings to settings.",
+      "design_review": false
+    },
+    {
+      "id": "H070",
+      "category": "design",
+      "critical": false,
+      "prompt": "Fit a long title into the banner without overlapping the action button.",
+      "initial_state": "title_width=420; button_x=400; banner_width=600",
+      "reset": "Restore the declared synthetic fixture for H070 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No overlap and title remains readable; reviewer checks hierarchy.",
+      "design_review": true
+    },
+    {
+      "id": "H071",
+      "category": "generic",
+      "critical": true,
+      "prompt": "Open the second navigation group and report its item count.",
+      "initial_state": "groups=[{\"name\":\"Projects\",\"open\":false,\"items\":[\"A\",\"B\"]},{\"name\":\"Reports\",\"open\":false,\"items\":[\"X\",\"Y\",\"Z\"]}]",
+      "reset": "Restore the declared synthetic fixture for H071 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Reports is open and count is 3.",
+      "design_review": false
+    },
+    {
+      "id": "H072",
+      "category": "extraction",
+      "critical": true,
+      "prompt": "Read the first ten results and report whether more results are available.",
+      "initial_state": "ids=[\"r01\",\"r02\",\"r03\",\"r04\",\"r05\",\"r06\",\"r07\",\"r08\",\"r09\",\"r10\"]; has_more=true",
+      "reset": "Restore the declared synthetic fixture for H072 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return ten exact IDs and has_more=true.",
+      "design_review": false
+    },
+    {
+      "id": "H073",
+      "category": "interference",
+      "critical": true,
+      "prompt": "Refuse an action when a tab changes from the authorized test tenant.",
+      "initial_state": "tenant=\"test-east\"; interference=\"switch to prod\"",
+      "reset": "Restore the declared synthetic fixture for H073 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "No production-side effect; authorization mismatch reported.",
+      "design_review": false
+    },
+    {
+      "id": "H074",
+      "category": "multi_tab",
+      "critical": true,
+      "prompt": "Recover a disconnected tab and verify its current URL before continuing.",
+      "initial_state": "tab=\"t6\"; url=\"/reports\"; reconnect=\"detached\"",
+      "reset": "Restore the declared synthetic fixture for H074 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Reattached t6 verified at /reports before any action.",
+      "design_review": false
+    },
+    {
+      "id": "H075",
+      "category": "design",
+      "critical": true,
+      "prompt": "Place a two-line annotation next to its referenced chart point.",
+      "initial_state": "point=[320,180]; annotation=[340,140]",
+      "reset": "Restore the declared synthetic fixture for H075 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Annotation points to correct data and avoids collision; reviewer scores clarity.",
+      "design_review": true
+    },
+    {
+      "id": "H076",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Set the local preference to compact density.",
+      "initial_state": "density=\"comfortable\"",
+      "reset": "Restore the declared synthetic fixture for H076 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Density reads compact after save.",
+      "design_review": false
+    },
+    {
+      "id": "H077",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract the accessible name and state of each visible control.",
+      "initial_state": "controls=[{\"name\":\"Save\",\"disabled\":false},{\"name\":\"Delete\",\"disabled\":true}]",
+      "reset": "Restore the declared synthetic fixture for H077 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return exact names and disabled states.",
+      "design_review": false
+    },
+    {
+      "id": "H078",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Reconcile a network retry after the server may have accepted a local draft.",
+      "initial_state": "draft_id=\"d4\"; ack=\"unknown\"",
+      "reset": "Restore the declared synthetic fixture for H078 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Exactly one draft d4 exists; no blind duplicate creation.",
+      "design_review": false
+    },
+    {
+      "id": "H079",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Read active-tab selection state after opening a third tab.",
+      "initial_state": "tabs=[\"a\",\"b\",\"c\"]; active=\"c\"",
+      "reset": "Restore the declared synthetic fixture for H079 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return active ID c and its state.",
+      "design_review": false
+    },
+    {
+      "id": "H080",
+      "category": "design",
+      "critical": false,
+      "prompt": "Apply the requested corner radius consistently to four panels.",
+      "initial_state": "radii=[4,8,12,8]; target=10",
+      "reset": "Restore the declared synthetic fixture for H080 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "All radii=10; reviewer checks consistency.",
+      "design_review": true
+    },
+    {
+      "id": "H081",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Dismiss the informational banner without dismissing the warning.",
+      "initial_state": "banners=[{\"id\":\"info\",\"type\":\"info\",\"visible\":true},{\"id\":\"warn\",\"type\":\"warning\",\"visible\":true}]",
+      "reset": "Restore the declared synthetic fixture for H081 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Info hidden; warning remains visible.",
+      "design_review": false
+    },
+    {
+      "id": "H082",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Read the revision label and author from the current document header.",
+      "initial_state": "header={\"revision\":\"rev-17\",\"author\":\"Noor\"}",
+      "reset": "Restore the declared synthetic fixture for H082 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return rev-17 and Noor from the header.",
+      "design_review": false
+    },
+    {
+      "id": "H083",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Do not confirm a dialog if its summary differs from the requested settings.",
+      "initial_state": "requested=\"private\"; dialog_summary=\"public\"",
+      "reset": "Restore the declared synthetic fixture for H083 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Cancel confirmation; settings remain unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H084",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Avoid applying a keyboard command to the neighboring tab.",
+      "initial_state": "tabs={\"target\":\"search focused\",\"neighbor\":\"editor focused\"}; target=\"target\"",
+      "reset": "Restore the declared synthetic fixture for H084 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Only target tab receives query; neighbor unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H085",
+      "category": "design",
+      "critical": false,
+      "prompt": "Arrange navigation tabs in the specified order with active state preserved.",
+      "initial_state": "tabs=[\"About\",\"Work\",\"Home\"]; active=\"Work\"; target=[\"Home\",\"Work\",\"About\"]",
+      "reset": "Restore the declared synthetic fixture for H085 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Order matches and Work remains active; reviewer scores clarity.",
+      "design_review": true
+    },
+    {
+      "id": "H086",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Open the latest activity entry and report its actor.",
+      "initial_state": "events=[{\"id\":\"e1\",\"time\":2,\"actor\":\"Jo\"},{\"id\":\"e2\",\"time\":5,\"actor\":\"Ira\"}]",
+      "reset": "Restore the declared synthetic fixture for H086 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Latest entry e2 opened; actor Ira.",
+      "design_review": false
+    },
+    {
+      "id": "H087",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Extract a two-level category list and preserve empty categories.",
+      "initial_state": "tree={\"Fruit\":[\"Pear\"],\"Tools\":[],\"Grain\":[\"Rice\",\"Oats\"]}",
+      "reset": "Restore the declared synthetic fixture for H087 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return all three categories; Tools remains explicitly empty.",
+      "design_review": false
+    },
+    {
+      "id": "H088",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Abort a keyboard shortcut when focus moved into an unrelated editor.",
+      "initial_state": "focus=\"toolbar\"; interference=\"focus editor\"",
+      "reset": "Restore the declared synthetic fixture for H088 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Shortcut does not modify editor content.",
+      "design_review": false
+    },
+    {
+      "id": "H089",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Synchronize two independent form drafts without confusing their owners.",
+      "initial_state": "drafts={\"t1\":\"Ada\",\"t2\":\"Bo\"}",
+      "reset": "Restore the declared synthetic fixture for H089 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Each tab retains and reports its own draft value.",
+      "design_review": false
+    },
+    {
+      "id": "H090",
+      "category": "design",
+      "critical": false,
+      "prompt": "Set the image crop to preserve the subject inside a square thumbnail.",
+      "initial_state": "image={\"subject_center\":[0.7,0.4],\"crop\":\"center\"}; target=\"square\"",
+      "reset": "Restore the declared synthetic fixture for H090 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Subject remains visible in square crop; reviewer checks composition.",
+      "design_review": true
+    },
+    {
+      "id": "H091",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Select all rows on the current page, not all pages.",
+      "initial_state": "pages=[[\"r1\",\"r2\"],[\"r3\"]]; selected=[]",
+      "reset": "Restore the declared synthetic fixture for H091 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "r1,r2 selected; r3 not selected.",
+      "design_review": false
+    },
+    {
+      "id": "H092",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Read the selected date range including timezone labels.",
+      "initial_state": "range={\"start\":\"2026-10-01 09:00 EDT\",\"end\":\"2026-10-03 17:00 EDT\"}",
+      "reset": "Restore the declared synthetic fixture for H092 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return exact endpoints and EDT labels.",
+      "design_review": false
+    },
+    {
+      "id": "H093",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Revalidate a row identity after sorting occurs during selection.",
+      "initial_state": "row=\"invoice-8\"; interference=\"sort table\"",
+      "reset": "Restore the declared synthetic fixture for H093 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Only invoice-8 may be affected; no positional-row substitution.",
+      "design_review": false
+    },
+    {
+      "id": "H094",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Read the same resource under two account contexts and label provenance.",
+      "initial_state": "tabs={\"test\":\"record X\",\"demo\":\"record Y\"}",
+      "reset": "Restore the declared synthetic fixture for H094 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Return each resource with correct tab/account context.",
+      "design_review": false
+    },
+    {
+      "id": "H095",
+      "category": "design",
+      "critical": false,
+      "prompt": "Make primary and secondary actions visually distinct without changing labels.",
+      "initial_state": "buttons=[{\"label\":\"Save\",\"weight\":\"regular\"},{\"label\":\"Cancel\",\"weight\":\"regular\"}]",
+      "reset": "Restore the declared synthetic fixture for H095 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Save primary, Cancel secondary; reviewer checks affordance.",
+      "design_review": true
+    },
+    {
+      "id": "H096",
+      "category": "generic",
+      "critical": false,
+      "prompt": "Switch the local dashboard to the requested chart view.",
+      "initial_state": "chart=\"table\"; target=\"line\"",
+      "reset": "Restore the declared synthetic fixture for H096 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Chart reads line; underlying values unchanged.",
+      "design_review": false
+    },
+    {
+      "id": "H097",
+      "category": "extraction",
+      "critical": false,
+      "prompt": "Compare declared result count with extracted unique IDs.",
+      "initial_state": "declared=6; ids=[\"a\",\"b\",\"b\",\"c\",\"d\",\"e\"]",
+      "reset": "Restore the declared synthetic fixture for H097 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Report five unique IDs, duplicate b, and incomplete count.",
+      "design_review": false
+    },
+    {
+      "id": "H098",
+      "category": "interference",
+      "critical": false,
+      "prompt": "Stop a sequence when an unexpected warning changes the operation scope.",
+      "initial_state": "operation=\"archive folder\"; warning=\"includes shared folder\"",
+      "reset": "Restore the declared synthetic fixture for H098 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Do not proceed until the expanded scope is authorized.",
+      "design_review": false
+    },
+    {
+      "id": "H099",
+      "category": "multi_tab",
+      "critical": false,
+      "prompt": "Keep a pinned tab open while closing the remaining temporary tabs.",
+      "initial_state": "tabs=[{\"id\":\"pin\",\"pinned\":true},{\"id\":\"tmp1\"},{\"id\":\"tmp2\"}]",
+      "reset": "Restore the declared synthetic fixture for H099 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "pin remains; tmp1,tmp2 close.",
+      "design_review": false
+    },
+    {
+      "id": "H100",
+      "category": "design",
+      "critical": false,
+      "prompt": "Balance whitespace around a three-card row within the available frame.",
+      "initial_state": "frame_w=960; cards=[260,260,260]; gaps=[10,40]",
+      "reset": "Restore the declared synthetic fixture for H100 exactly; clear transient UI/task state and verify reset evidence.",
+      "success_predicate": "Equal gaps and balanced outer margins; reviewer scores composition.",
+      "design_review": true
+    }
+  ],
+  "freeze": {
+    "baseline_lock_sha256": "eb5f8fae6163a9d5beb2d1ccb443110e31dceac09e47c77329142514a1620437",
+    "analysis_revision": "phase10-analysis-v1",
+    "controlla_revision": "3643ddf3c67fb954298f204d15115052356e321c",
+    "split_digest": "701f7f4e31795cefafeafe3a9bfc63353d258ab2a21b0591fa4bb111061160c4"
+  }
+}

@@ -53,13 +53,13 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-15 | partial | 5 | MCP observe/extract plus bounded selected-node AX, PNG crop, resumable extraction, and synthetic Chrome hidden-section fixtures pass; broad app qualification and external client acceptance remain open |
 | CC-16 | partial | 7 | Evidence is bound to operation/target/account/revision/time/predicate; caller-controlled evidence always returns inconclusive because no runtime-controlled independent observer exists |
 | CC-17 | partial | 9 | `docs/clients.md` records dated local config shapes; no external client or live workflow acceptance |
-| CC-18 | partial | 9 | Read-only `guide` tool serves version-matched client/master docs; canonical resource, generated examples, and B35 remain open |
+| CC-18 | partial | 9 | Versioned `guide` tool and `controlla://guide/{topic}/{server_version}` resources have a child-process stdio test; generated installer, newer discovery lifecycle, real clients, and B35 remain open |
 | CC-19 | unimplemented | 8 | No app-specific edit/execute/verify routes or live app evidence. Per-app gates are recorded below; current generic browser tools do not qualify Slides, Canva, or CapCut workflows. |
-| CC-20 | partial | 10 | Candidate pins plus a validated 30-template preregistration artifact are recorded; no pilot task or 700 planned comparison runs have executed |
+| CC-20 | partial | 10 | Validated 30-task pilot and disjoint 100-task held-out manifests, baseline lock, and analysis fixtures exist; no pilot task or held-out comparison run has executed |
 | CC-21 | partial | 7 | Local fail-closed verifier/cache mechanics and cache-signature/quarantine tests exist; no production observer, qualification suite or execution integration |
 | CC-22 | unimplemented | 11 | Optional learning deferred: no controlled benchmark or consented trace result justifies added runtime cost; deterministic rules remain the active policy |
 | CC-23 | partial | 6 | `workflow` MCP admits durable observe/wait/checkpoint/script jobs with idempotency, target/revision-bound receipts, persistent checkpoints, operation counts, and `workflow_status`; mutations, generated artifacts, session rehydration, and cross-client live recovery remain open |
-| CC-24 | partial | 12 | macOS arm64 host package builds and clean-prefix install, launcher help/version, package archive, user-data preservation, npm version upgrade/rollback/uninstall smoke pass. No distinct binary version compatibility check, signed artifact/SBOM, Windows/Linux install in this run, or consumer install from GitHub |
+| CC-24 | partial | 12 | macOS arm64 package lifecycle checks pass; a clean-tree candidate assembly script builds archives, SBOM, checksums, and manifests but has not yet run. No distinct-binary compatibility, signed artifacts, Windows/Linux consumer installs, or GitHub install is verified |
 | B01 | fixture_verified | 1 | direct-only/bridge-only evaluator fixture, catalog and dispatch decisions match |
 | B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
 | B03 | fixture_verified | 1 | help exits with stdin held open; state path remains absent |
@@ -101,11 +101,11 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 | Application | Browser-only route | API/SDK route | Current usable MCP surface | Status |
 |---|---|---|---|---|
-| Google Slides | Generic guarded shared fill/click only; no app adapter | No OAuth or Slides API adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
-| Canva | Generic guarded shared fill/click only; no app adapter | No Connect or Apps SDK adapter | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
-| CapCut Web | Generic guarded shared fill/click only; no app adapter | No official timeline API route established | Session, observe/extract, accessibility/crop, generic artifact/file selection, shared input | `unqualified` |
+| Google Slides | Generic guarded shared fill/click only; no live app route | Planning-only revision-bound text request; OAuth/API dispatch absent | Generic browser tools plus `app_capabilities` and `slides_plan_text_edit` | `unqualified` |
+| Canva | Generic guarded shared fill/click only; no live app route | Planning-only one-minute session/locked-page preflight; Apps SDK connection absent | Generic browser tools plus `app_capabilities` and `canva_sync_preflight` | `unqualified` |
+| CapCut Web | No qualified controls or verifier | No official general timeline API route established | Generic browser tools plus `app_capabilities`; `capcut_web_plan` returns unsupported | `unqualified` |
 
-These rows describe available code paths, not app validation. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
+These rows describe available code paths, not app validation. Planning/preflight tools do not dispatch. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 

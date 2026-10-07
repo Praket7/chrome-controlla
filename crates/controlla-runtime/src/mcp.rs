@@ -6,7 +6,10 @@ use controlla_browser::{
         IdentityRevisions, ProviderGrants, SessionMode, SessionRegistry, SessionSpec, TargetRef,
     },
 };
-use rmcp::{ServiceExt, handler::server::wrapper::Parameters, tool, tool_router};
+use rmcp::{
+    ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler,
+    tool_router,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
@@ -155,6 +158,44 @@ struct FileSelectArgs {
 struct GuideArgs {
     topic: String,
     server_version: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct AppCapabilitiesArgs {
+    app: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SlidesPlanArgs {
+    principal: String,
+    account_id: String,
+    presentation_id: String,
+    required_revision_id: String,
+    operation: String,
+    expected_text: Option<String>,
+    new_text: Option<String>,
+    start_index: Option<usize>,
+    end_index: Option<usize>,
+    object_id: Option<String>,
+    text: Option<String>,
+    insertion_index: Option<usize>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CanvaPlanArgs {
+    principal: String,
+    account_id: String,
+    design_id: String,
+    page_id: String,
+    revision: String,
+    page_type: String,
+    locked: bool,
+    opened_at_ms: u64,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct CapCutPlanArgs {
+    operation: String,
 }
 
 struct LiveSession {
@@ -803,7 +844,7 @@ async fn shared_frame_identity(
     Ok((id.to_owned(), loader.to_owned(), url.to_owned()))
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl App {
     #[tool(
         name = "workflow",
@@ -1958,6 +1999,238 @@ impl App {
             "content":content
         })))
     }
+
+    #[tool(
+        name = "app_capabilities",
+        description = "Read app-specific route gates for Google Slides, Canva, or CapCut Web. This is preflight only and does not connect to or edit an app."
+    )]
+    async fn app_capabilities(
+        &self,
+        Parameters(args): Parameters<AppCapabilitiesArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let app = match args.app.as_str() {
+            "google_slides" => crate::apps::App::GoogleSlides,
+            "canva" => crate::apps::App::Canva,
+            "capcut_web" => crate::apps::App::CapCutWeb,
+            _ => return Err(invalid("app must be google_slides, canva, or capcut_web")),
+        };
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "app": app,
+            "live_qualified": false,
+            "capabilities": crate::apps::capabilities(app),
+            "side_effects": false
+        })))
+    }
+
+    #[tool(
+        name = "slides_plan_text_edit",
+        description = "Build a revision-bound Google Slides text-edit API request without dispatching it. OAuth, exact live account/document checks, journaling, independent readback, and persistence verification are not connected."
+    )]
+    async fn slides_plan_text_edit(
+        &self,
+        Parameters(args): Parameters<SlidesPlanArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let binding = crate::apps::SlidesBinding {
+            principal: args.principal,
+            account_id: args.account_id,
+            presentation_id: args.presentation_id,
+            required_revision_id: args.required_revision_id,
+        };
+        let edit = match args.operation.as_str() {
+            "replace_range" => crate::apps::SlidesTextEdit::ReplaceRange {
+                object_id: args
+                    .object_id
+                    .ok_or_else(|| invalid("replace_range requires object_id"))?,
+                start_index: args
+                    .start_index
+                    .ok_or_else(|| invalid("replace_range requires start_index"))?,
+                end_index: args
+                    .end_index
+                    .ok_or_else(|| invalid("replace_range requires end_index"))?,
+                expected_text: args.expected_text.ok_or_else(|| {
+                    invalid("replace_range requires expected_text for precondition")
+                })?,
+                new_text: args
+                    .new_text
+                    .ok_or_else(|| invalid("replace_range requires new_text"))?,
+            },
+            "insert_into_object" => crate::apps::SlidesTextEdit::InsertIntoObject {
+                object_id: args
+                    .object_id
+                    .ok_or_else(|| invalid("insert_into_object requires object_id"))?,
+                text: args
+                    .text
+                    .ok_or_else(|| invalid("insert_into_object requires text"))?,
+                insertion_index: args
+                    .insertion_index
+                    .ok_or_else(|| invalid("insert_into_object requires insertion_index"))?,
+            },
+            _ => {
+                return Err(invalid(
+                    "operation must be replace_range or insert_into_object",
+                ));
+            }
+        };
+        let plan = crate::apps::plan_slides_text_edit(&binding, edit).map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"planned_not_dispatched",
+            "plan":plan,
+            "evidence":[],
+            "app_acceptance":"not_established"
+        })))
+    }
+
+    #[tool(
+        name = "canva_sync_preflight",
+        description = "Validate a Canva app-session snapshot before a potential sync. Sync is treated as an external write; this tool never opens a Canva session or calls sync."
+    )]
+    async fn canva_sync_preflight(
+        &self,
+        Parameters(args): Parameters<CanvaPlanArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let page_type = match args.page_type.as_str() {
+            "absolute" => crate::apps::CanvaPageType::Absolute,
+            "unsupported" => crate::apps::CanvaPageType::Unsupported,
+            _ => return Err(invalid("page_type must be absolute or unsupported")),
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid(error.to_string()))?
+            .as_millis() as u64;
+        let snapshot = crate::apps::CanvaSessionSnapshot {
+            principal: args.principal,
+            account_id: args.account_id,
+            design_id: args.design_id,
+            page_id: args.page_id,
+            revision: args.revision,
+            page_type,
+            locked: args.locked,
+            opened_at_ms: args.opened_at_ms,
+        };
+        let plan = crate::apps::plan_canva_sync(&snapshot, now_ms).map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status":"preflight_only",
+            "plan":plan,
+            "evidence":[],
+            "app_acceptance":"not_established"
+        })))
+    }
+
+    #[tool(
+        name = "capcut_web_plan",
+        description = "Check whether a bounded CapCut Web recipe is currently available. Operations remain unsupported until a live versioned control map and independent verifier are qualified."
+    )]
+    async fn capcut_web_plan(
+        &self,
+        Parameters(args): Parameters<CapCutPlanArgs>,
+    ) -> rmcp::handler::server::wrapper::Json<Value> {
+        let result = crate::apps::capcut_web_plan(&args.operation);
+        rmcp::handler::server::wrapper::Json(json!({
+            "operation":args.operation,
+            "status":"unsupported",
+            "reason":result.err().unwrap_or("operation requires live qualification"),
+            "side_effects":false
+        }))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for App {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Use session discovery and explicit target selection. Read the versioned guide resource for client setup and operating details.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        let resources = ["clients", "master"]
+            .into_iter()
+            .map(|topic| {
+                let uri = guide_resource_uri(topic, env!("CARGO_PKG_VERSION"));
+                let (guide_version, content) = guide_content(topic).expect("known guide topic");
+                rmcp::model::Resource::new(uri, format!("Chrome Controlla {topic} guide"))
+                    .with_title(format!("Chrome Controlla {topic} guide"))
+                    .with_description(format!(
+                        "Read-only {guide_version} instructions for server version {}",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .with_mime_type("text/markdown")
+                    .with_size(content.len() as u64)
+            })
+            .collect();
+        Ok(rmcp::model::ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let Some((topic, version)) = parse_guide_resource_uri(&request.uri) else {
+            return Err(rmcp::ErrorData::resource_not_found(
+                "guide resource is unavailable",
+                None,
+            ));
+        };
+        if version != env!("CARGO_PKG_VERSION") {
+            return Err(rmcp::ErrorData::resource_not_found(
+                "guide resource is unavailable for this server version",
+                None,
+            ));
+        }
+        let Some((_guide_version, content)) = guide_content(topic) else {
+            return Err(rmcp::ErrorData::resource_not_found(
+                "guide topic is unavailable",
+                None,
+            ));
+        };
+        let contents = rmcp::model::ResourceContents::text(content, request.uri)
+            .with_mime_type("text/markdown");
+        Ok(rmcp::model::ReadResourceResponse::Complete(
+            rmcp::model::ReadResourceResult::new(vec![contents]),
+        ))
+    }
+}
+
+fn guide_resource_uri(topic: &str, server_version: &str) -> String {
+    format!("controlla://guide/{topic}/{server_version}")
+}
+
+fn parse_guide_resource_uri(uri: &str) -> Option<(&str, &str)> {
+    let suffix = uri.strip_prefix("controlla://guide/")?;
+    let (topic, version) = suffix.split_once('/')?;
+    if topic.is_empty() || version.is_empty() || version.contains('/') {
+        return None;
+    }
+    Some((topic, version))
+}
+
+fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
+    match topic {
+        "clients" => Some((
+            "clients-2026-10-06-v1",
+            include_str!("../../../docs/clients.md"),
+        )),
+        "master" => Some((
+            "master-2026-10-06-v1",
+            include_str!("../../../docs/MASTER_GUIDE.md"),
+        )),
+        _ => None,
+    }
 }
 
 fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
@@ -2201,6 +2474,10 @@ mod tests {
         assert!(names.contains(&"file_select"));
         assert!(names.contains(&"shared_observe"));
         assert!(names.contains(&"guide"));
+        assert!(names.contains(&"app_capabilities"));
+        assert!(names.contains(&"slides_plan_text_edit"));
+        assert!(names.contains(&"canva_sync_preflight"));
+        assert!(names.contains(&"capcut_web_plan"));
         let guide = client
             .call_tool(
                 CallToolRequestParams::new("guide").with_arguments(
@@ -2240,6 +2517,10 @@ mod tests {
             "shared_observe",
             "workflow",
             "guide",
+            "app_capabilities",
+            "slides_plan_text_edit",
+            "canva_sync_preflight",
+            "capcut_web_plan",
         ] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -2252,6 +2533,39 @@ mod tests {
                 "{name} has required fields"
             );
         }
+        let app_caps = client
+            .call_tool(
+                CallToolRequestParams::new("app_capabilities")
+                    .with_arguments(json!({"app":"google_slides"}).as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        let app_caps = app_caps.structured_content.unwrap();
+        assert_eq!(app_caps["live_qualified"], false);
+        assert_eq!(app_caps["side_effects"], false);
+        let plan = client
+            .call_tool(
+                CallToolRequestParams::new("slides_plan_text_edit").with_arguments(
+                    json!({
+                        "principal":"p", "account_id":"a", "presentation_id":"d",
+                        "required_revision_id":"r", "operation":"replace_range",
+                        "object_id":"shape1", "start_index":1,"end_index":6,
+                        "expected_text":"Draft", "new_text":"Final"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let plan = plan.structured_content.unwrap();
+        assert_eq!(plan["status"], "planned_not_dispatched");
+        assert_eq!(
+            plan["plan"]["request_body"]["writeControl"]["requiredRevisionId"],
+            "r"
+        );
+        assert_eq!(plan["evidence"], json!([]));
         let file_select_schema = listed
             .tools
             .iter()

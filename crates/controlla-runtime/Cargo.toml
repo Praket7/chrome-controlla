@@ -21,7 +21,7 @@ schemars = "=1.2.2"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "futures"] }
 
 [dev-dependencies]
-rmcp = { version = "=3.5.1", features = ["client"] }
+rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
 futures-util = "=0.3.34"
 tokio-tungstenite = "=0.28.0"
 

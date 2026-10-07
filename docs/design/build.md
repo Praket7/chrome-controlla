@@ -213,8 +213,8 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 - [x] Enforce the script deadline around pending async JavaScript as well as active bytecode; a never-settling Promise regression returns an error and releases the worker future.
 - [x] Implement typed bounded graph/script IR and a fresh-context QuickJS worker. Its only host function is an asynchronous, per-call reauthorized read broker; scripts are local-trust-only and disabled unless `CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1`. QuickJS is in-process and its API limits are not an OS/process security boundary; untrusted and production scripts remain gated pending process isolation and platform qualification.
 - [x] Add bounded asynchronous MCP admission, a 60-second durable job deadline, resumable `workflow_status`, persistent checkpoints/partial receipts, pre-dispatch operation claims/counting, unknown delivery after timeout, and receipts bound to operation, target, and revisions. Startup takes an exclusive state-directory lifetime lock before recovery: accepted/not-sent work fails and running work becomes unknown while preserving checkpoints; browser effects are never retried. Script broker calls reserve their declared output budget against the workflow-wide cap before dispatch. Client disconnect does not cancel an accepted job; there is no workflow-cancel tool. Receipts currently contain an empty workflow-artifact list.
-- [ ] Add dependency-scoped invalidation and effect-aware splitting. Start with rules, not RL.
-- [ ] Compare fixed batch, code mode, and guarded compiler on fixtures; profile local overhead before optimizing Rust internals.
+- [x] Add dependency-scoped invalidation and effect-aware splitting as deterministic planning rules. The fixture covers direct/transitive dependents and isolates non-read effects; declared effects remain hints, not proof that page code has no side effects.
+- [x] Add a deterministic fixture comparison for fixed batching, bounded code, and compiler boundaries. It reports operation/recovery counts only; browser overhead and wall-clock profiling remain open.
 - [x] Commit the Phase 6 implementation and review fixes (`3271bb6`, bounded deterministic workflows; `5ce2100`, async receipts; `dc16a0d`, aggregate output and restart recovery; `1831f9a`, journal ownership lock).
 
 **Gate:** a useful deterministic read graph and gated trusted-local JavaScript path are implemented through the stdio MCP server. The in-process QuickJS worker is not qualified as an OS security boundary, so untrusted/production script execution remains blocked. Arbitrary writes, mutation batching, workflow-generated artifacts, dependency-scoped invalidation, effect-aware splitting, and cross-platform process isolation are not claimed.
@@ -226,13 +226,15 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 **Interfaces:** `verify(operation_binding, predicate, evidence) -> VerificationResult`; `qualify(definition, observed_suite) -> opaque QualificationToken`; `insert(token)`; `lookup(workflow_id, current_definition, now) -> QualifiedWorkflow | Miss | Quarantined`; `quarantine(id, reason)`.
 
 - [ ] Test persuasive fake success, old screenshot, wrong revision, stale save, truncated download and changed control semantics with independent ground truth.
-- [ ] Implement outcome field/object/state verification from runtime-controlled independent evidence. Caller-supplied evidence currently always returns `inconclusive`; visual predicates also remain inconclusive.
+- [ ] Implement a production outcome observer for independent field/object/state evidence. The local verifier now evaluates predicates only after a sealed runtime-observer receipt; its issuer exists only in tests, so caller-supplied evidence remains `inconclusive` and production observations cannot pass. Visual predicates remain inconclusive.
 - [x] Bind evidence claims to operation/provenance ID, principal/session/target/app/account/revision, observer label, time and predicate hash. These fields do not establish observer trust.
 - [x] Implement the canonical cache contract and in-memory quarantine/expiry mechanics. Insert/unquarantine requires an opaque successful training/validation token; no production observer or suite runner can mint one yet, so production cache admission is unavailable.
 - [ ] Validate cold/warm performance and include preparation/recovery costs. Current fixture tests establish lookup behavior only; a historical success never authorizes a present mutation.
 - [x] Commit `feat: verify outcomes and retire stale workflows` (local fixture implementation; release gate remains open).
 
 **Gate:** no release-suite false completion; visual/aesthetic uncertainty is preserved, not coerced into pass.
+
+**Pre-live app contracts (2026-10-06):** typed Slides revision-bound text-request planning, Canva exact-identity/session-age/locked-page sync preflight, and explicit unsupported CapCut planning are exposed through read-only MCP tools. They do not connect to vendor APIs or mutate a browser. Acceptance briefs and separate correctness/visual rubrics are present under `apps/`; all live evidence remains pending.
 
 ## Phase 8 — qualify professional web-app workflows
 
@@ -257,14 +259,14 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** identical operation/result semantics across supported transports; `guide(topic, server_version) -> GuideSection`; versioned client config generators.
 
-**Current local slice (2026-10-06):** `docs/clients.md` records local stdio examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code, plus ChatGPT's local-stdio limitation. A read-only `guide` tool serves `clients` and `master` Markdown for exact server version `0.1.0`. These are documentation/configuration checks only. No authenticated remote endpoint, canonical resource, generated config installer, external client acceptance, or B35 usability result exists; keep those gates open.
+**Current local slice (2026-10-06):** `docs/clients.md` records local stdio examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code, plus ChatGPT's local-stdio limitation. A read-only `guide` tool and canonical `controlla://guide/{topic}/{server_version}` resources serve `clients` and `master` Markdown for exact server version `0.1.0`; the pinned rmcp SDK exercises the packaged stdio process, latest legacy initialize negotiation, resource list/read, tool schemas, and invalid requests. These are documentation/configuration/protocol checks only. No authenticated remote endpoint, external client acceptance, or B35 usability result exists; keep those gates open.
 
-- [ ] Implement supported MCP protocol negotiation and transport behavior against pinned SDK conformance tests. Do not mix “latest” protocol semantics with legacy initialization assumptions.
+- [ ] Expand protocol conformance across every advertised revision and transport; the stdio check covers the latest revision that still uses `initialize`, not the newer per-request discovery lifecycle. Do not mix “latest” protocol semantics with legacy initialization assumptions.
 - [ ] Add authenticated remote endpoint, principal/audience-bound authorization and optional paired outbound local bridge. No public unauthenticated browser control; validate tenant and target binding.
 - [x] Record dated local stdio setup examples for Freebuff/Codebuff, OpenCode v1/v2, Claude Code, and ChatGPT's local-process limitation in `docs/clients.md`; examples are schema-checked but installed client versions and client acceptance remain open.
-- [ ] Generate release-specific client instructions and verify actual client versions. Do not assume every platform has the same config nesting or local process support.
+- [x] Generate dated client-specific configuration examples with per-client state isolation and validate their shapes against the checked-in schemas. Installed versions and client acceptance remain open; do not assume every platform has the same config nesting or local process support.
 - [ ] In each available real client, run session setup, observation, guarded edit, long job, reconnect/reconcile, structured result/artifact and cleanup. Record client version and server SHA. A raw JSON-RPC smoke alone does not qualify a client.
-- [ ] Turn the companion master-guide draft into exact runnable documentation and generate shared facts from registry/schema. A version-bound read-only `guide` tool now serves `clients` and `master`; canonical resource, generated facts, and short bootstrap instructions in session/tool responses remain open.
+- [ ] Turn the companion master-guide draft into exact runnable documentation and generate shared facts from registry/schema. Version-bound `guide` tool and `controlla://guide/{topic}/{server_version}` resources serve `clients` and `master`; generated facts and short bootstrap instructions in session/tool responses remain open.
 - [ ] Run B35 and the 20-task fresh-agent usability suite. Fix tool ambiguity, missing recovery instructions and invented flags rather than adding a larger wall of prose.
 - [ ] Commit `feat: qualify MCP clients and ship executable master guide`.
 
@@ -305,6 +307,7 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 - [ ] Run necessary full integration/security/package/docs checks on the release commit. Use actual platform runners for cross-platform claims.
 - [x] Test clean-prefix installation, package-version upgrade/rollback, uninstall, and unrelated user-data preservation on the current host. This is npm lifecycle mechanics only, using one binary copied under two package version labels.
+- [x] Prepare the local release-candidate bundle path: host package and extension archives, runtime dependency SBOM, artifact checksums, support matrix, release notes, and rollback instructions. The bundle remains unpublished and must be generated from a clean release commit.
 - [ ] Test distinct release-binary upgrade/rollback, stale daemon/extension mismatch, Windows/Linux installation, and compatibility. No credential/browser-profile deletion on uninstall without explicit request.
 - [ ] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims.
 - [ ] Prepare a release candidate with reproducible artifacts. Create/push to the authorized new repository; never push Chrome Controlla changes into Comptrol by accident.

@@ -2,6 +2,8 @@
 
 ## Phase 8 app workflow gates
 
+Planning-only MCP tools now build revision-bound Slides text requests and validate caller-declared Canva session preconditions. `capcut_web_plan` remains explicitly unsupported until a live versioned control map and independent verifier exist. The per-app briefs under `apps/` are acceptance specifications, not results. No vendor app is connected and none of these tools edits a document.
+
 | Application | Current state | Exact gate before claiming workflow support |
 |---|---|---|
 | Google Slides | `unqualified`; MCP has no edit/execute route and no Slides API adapter | Add an explicitly authorized OAuth route or browser-only adapter; bind presentation/object IDs and revisions; read back structure; reload/export and inspect affected slides. Keep API-assisted and browser-only evidence separate. |
@@ -72,5 +74,9 @@ External-client live qualification and platform-specific interference observatio
 
 ## Phase 9 local setup boundary
 
-- Dated local stdio snippets and the read-only `guide` tool are documentation/configuration evidence only. The master guide has a read-only workflow example and a local JSON/request-shape check; neither is B35 or the 20-task fresh-agent suite. No external Freebuff, OpenCode, Claude Code, or ChatGPT client was run. ChatGPT local stdio is unavailable. This branch has no remote HTTP listener, authentication, canonical guide resource, paired outbound bridge, or browser-side capability for external client acceptance. Do not expose the loopback CDP endpoint.
+- Dated local stdio snippets and the read-only `guide` tool/resource are documentation/configuration evidence only. The pinned rmcp child-process test verifies initialize negotiation, resource list/read, schemas, and invalid requests, but does not qualify newer discovery lifecycle behavior or an external client. The master guide has a read-only workflow example and local JSON/request-shape checks; neither is B35 or the 20-task fresh-agent suite. No external Freebuff, OpenCode, Claude Code, or ChatGPT client was run. ChatGPT local stdio is unavailable. There is no remote HTTP listener, authentication, paired outbound bridge, or external-client acceptance. Do not expose the loopback CDP endpoint.
 - The current [Streamable HTTP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) requires Origin validation and specifies per-request protocol metadata/version behavior; remote operation also needs real authentication and tenant/target binding. These are not covered by local stdio or the guide example check.
+
+## Phase 10 preregistration boundary
+
+- The 30-task pilot and disjoint 100-task held-out manifest, task-clustered analysis, and rejection rules are checked locally. The manifest is still bound to the prior source revision and must be rebound to the reviewed implementation commit before any results are accepted. Baseline versions are candidate pins only; supported configurations and model identity/version remain unresolved. No benchmark task, pilot, held-out comparison, or AGWC ablation has run.

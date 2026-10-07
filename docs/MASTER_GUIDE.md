@@ -24,7 +24,7 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | `guide` | Read the version-matched `clients` or `master` documentation | Assuming examples prove a client is qualified |
 | `shared_input` | Guarded fill/click on one explicitly paired Chrome tab with exact current value and post-action DOM readback | Rich editors, masked/trusted controls, app save/persistence, or app-specific qualification |
 
-`tools/list` carries the argument schemas. The read-only `guide` tool accepts `topic` (`clients` or `master`) and exact `server_version` (`0.1.0`); unsupported versions/topics fail clearly. It returns static Markdown, not live health or browser state. There is no canonical MCP resource in this slice.
+`tools/list` carries the argument schemas. The read-only `guide` tool accepts `topic` (`clients` or `master`) and exact `server_version` (`0.1.0`); unsupported versions/topics fail clearly. It returns static Markdown, not live health or browser state. The same two documents are exposed as read-only resources at `controlla://guide/{topic}/{server_version}` and listed as version-specific concrete URIs.
 
 `shared_input` is available only for explicitly paired extension tabs. Fill is limited to one visible, unobstructed ordinary input or textarea; click requires one visible, unobstructed exact CSS match and refreshes its hit test immediately before mouse dispatch. Both require the exact current value/text and are bounded by a 6–60 second overall deadline (default 60 seconds). Fill and click perform DOM readback after input events. A small page-change race still exists between validation and Chrome dispatch; if dispatch or release is uncertain, stop using that target and reobserve before any next input. Readback confirms DOM state and unchanged root-frame/loader/URL identity only. It does not prove application acceptance, saving, persistence, or professional-app support. File selection is exposed through `artifact_register` and `file_select`; it accepts an opaque session-scoped handle created from bounded bytes, never a caller host path. A successful result means Chrome selected the file and read back its name and size, not that the application accepted or saved it.
 
@@ -41,11 +41,11 @@ The `session` tool uses `action="discover"` for provider status, `action="target
 
 This preview does not implement generic `execute` or `jobs`. `workflow` and `workflow_status` provide only the bounded workflow subset described above.
 
-This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
+This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). A host-bound local npm package can be staged with `scripts/package-build.sh` and installed from `packages/chrome-controlla/dist`; the guide there shows the command and package-local executable path. Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
 
 The release installer must show: package/server version, Chrome version, transport, effective state directory, session modes, and guide version. Run the packaged doctor once when setup fails. A health result distinguishes configuration, process reachability, authenticated extension round trip, authorization and qualified operation support.
 
-Client-specific local config snippets and their checked schema variants are in [clients.md](clients.md). Config examples were compared to current docs/source on 2026-10-06; no installed client was live-tested. ChatGPT local stdio is unavailable, and this repository has no authenticated remote route.
+Client-specific local config snippets, versioned config generation, and their checked schema variants are in [clients.md](clients.md). Config examples were compared to current docs/source on 2026-10-06; no installed client was live-tested. ChatGPT local stdio is unavailable, and this repository has no authenticated remote route.
 
 Do not copy auth cookies from the user’s regular Chrome profile. For a dedicated profile, let the user sign in normally. Pause for CAPTCHA, MFA or a site permission requirement, preserving session identity.
 
@@ -177,7 +177,7 @@ Download/export requires a completion event plus file checks: expected type, non
 
 ## 13. Design-app recipes
 
-**Current availability:** this preview has no Slides, Canva, or CapCut edit/execute/verify route. The recipes below describe qualification requirements only; they are not runnable integrations. Generic observation or file selection does not establish an app edit, save, or export. Check the per-app rows in `docs/verification-matrix.md`; if a requested change needs an app mutation, report it unsupported until a route and its evidence gates are qualified.
+**Current availability:** `app_capabilities`, `slides_plan_text_edit`, and `canva_sync_preflight` are planning/preflight only; they make no app connection or mutation. `capcut_web_plan` returns unsupported until its controls and verifier are qualified. There is no Slides, Canva, or CapCut edit/execute/verify route. The recipes below describe qualification requirements only; they are not runnable integrations. Generic observation or file selection does not establish an app edit, save, or export. Check the per-app rows in `docs/verification-matrix.md`; if a requested change needs an app mutation, report it unsupported until a route and its evidence gates are qualified.
 
 ### Google Slides
 

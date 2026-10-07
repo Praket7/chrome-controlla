@@ -136,6 +136,63 @@ pub struct WorkflowGraph {
     pub steps: Vec<WorkflowStep>,
 }
 
+/// Declared effects are scheduling hints, never proof that a page is side-effect free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectClass {
+    ReadOnly,
+    Reversible,
+    External,
+    AuthorityBoundary,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedStep {
+    pub id: String,
+    pub dependencies: Vec<String>,
+    pub effect: EffectClass,
+}
+
+/// Returns step IDs whose declared inputs changed, including their dependent steps.
+pub fn invalidated_steps(steps: &[PlannedStep], changed: &[String]) -> Vec<String> {
+    let mut invalid: std::collections::BTreeSet<String> = changed.iter().cloned().collect();
+    let mut result = Vec::new();
+    loop {
+        let newly_invalid: Vec<_> = steps
+            .iter()
+            .filter(|step| !invalid.contains(&step.id))
+            .filter(|step| step.dependencies.iter().any(|key| invalid.contains(key)))
+            .map(|step| step.id.clone())
+            .collect();
+        if newly_invalid.is_empty() {
+            break;
+        }
+        for id in newly_invalid {
+            invalid.insert(id.clone());
+            result.push(id);
+        }
+    }
+    result
+}
+
+/// Groups adjacent declared read-only steps. Every other effect is isolated.
+pub fn effect_aware_batches(steps: &[PlannedStep]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < steps.len() {
+        let end = if steps[start].effect == EffectClass::ReadOnly {
+            (start + 1..steps.len())
+                .find(|&index| steps[index].effect != EffectClass::ReadOnly)
+                .unwrap_or(steps.len())
+        } else {
+            start + 1
+        };
+        batches.push(start..end);
+        start = end;
+    }
+    batches
+}
+
 pub fn compile_steps(steps: Vec<WorkflowStep>) -> Result<WorkflowGraph, String> {
     compile(serde_json::json!({"steps":steps}))
 }
@@ -455,5 +512,58 @@ mod tests {
         assert!(validate_binding("s1", "s2", "p", "p").is_err());
         assert!(validate_binding("s1", "s1", "p1", "p2").is_err());
         assert!(validate_binding("s1", "s1", "p", "p").is_ok());
+    }
+
+    #[test]
+    fn fixture_planner_invalidates_only_dependents_and_splits_effect_boundaries() {
+        let steps = vec![
+            PlannedStep {
+                id: "read_account".into(),
+                dependencies: vec!["account".into()],
+                effect: EffectClass::ReadOnly,
+            },
+            PlannedStep {
+                id: "read_rows".into(),
+                dependencies: vec!["account".into(), "rows".into()],
+                effect: EffectClass::ReadOnly,
+            },
+            PlannedStep {
+                id: "format".into(),
+                dependencies: vec!["read_rows".into()],
+                effect: EffectClass::ReadOnly,
+            },
+            PlannedStep {
+                id: "submit".into(),
+                dependencies: vec!["format".into()],
+                effect: EffectClass::External,
+            },
+            PlannedStep {
+                id: "confirm".into(),
+                dependencies: vec!["submit".into()],
+                effect: EffectClass::Unknown,
+            },
+            PlannedStep {
+                id: "audit".into(),
+                dependencies: vec!["unrelated_counter".into()],
+                effect: EffectClass::ReadOnly,
+            },
+        ];
+        assert_eq!(
+            invalidated_steps(&steps, &["rows".into()]),
+            ["read_rows", "format", "submit", "confirm"]
+        );
+        assert_eq!(effect_aware_batches(&steps), [0..3, 3..4, 4..5, 5..6]);
+        // Fixture-only comparison: same six logical steps, with deterministic round-trip counts.
+        let fixed_batch_calls = 1;
+        let bounded_code_calls = 1;
+        let guarded_compiler_calls = effect_aware_batches(&steps).len();
+        assert_eq!(
+            (
+                fixed_batch_calls,
+                bounded_code_calls,
+                guarded_compiler_calls
+            ),
+            (1, 1, 4)
+        );
     }
 }
