@@ -1,0 +1,52 @@
+{
+  "captured_at": "2026-10-06",
+  "purpose": "Candidate versions for a future fair controlled comparison. These packages have not been installed or run against the Controlla suite.",
+  "platform": "macOS arm64; Chrome 154.0.8037.98 for planned browser runs",
+  "baselines": [
+    {
+      "name": "Playwright MCP",
+      "package": "@playwright/mcp",
+      "version": "0.0.83",
+      "tarball": "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.83.tgz",
+      "integrity": "sha512-oNcl+Ae2/IAjhfPeP46BfIkSakfmprY+aOtkv5MjrQ4lPav4/yNtPhL0iq8SlIM90oApWgBDUxaNKvktazUKOg==",
+      "status": "version-and-integrity-recorded; not installed or tested"
+    },
+    {
+      "name": "Chrome DevTools MCP",
+      "package": "chrome-devtools-mcp",
+      "version": "1.10.1",
+      "tarball": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.10.1.tgz",
+      "integrity": "sha512-Klw6HWDqHC/XS1JwZldd2r49aUhbUJN9m9Mvcx4SEueIPXtzuQX+QelxAViobv8YUkDZ7HWDrmViR6LeYK0wAw==",
+      "status": "version-and-integrity-recorded; not installed or tested"
+    },
+    {
+      "name": "Stagehand",
+      "package": "@browserbasehq/stagehand",
+      "version": "4.1.0",
+      "tarball": "https://registry.npmjs.org/@browserbasehq/stagehand/-/stagehand-4.1.0.tgz",
+      "integrity": "sha512-PJikMBVoaCRh6TFD7GcmeISmsMq4IwUu1BD5FOsGUVDUxrVqZomWa6W6dF+a/zu4xRZu2Z2xX1nXVMDaCuZWsw==",
+      "status": "version-and-integrity-recorded; not installed or tested"
+    },
+    {
+      "name": "Browser Use",
+      "package": "browser-use",
+      "version": "0.13.10",
+      "artifact": "https://files.pythonhosted.org/packages/1e/8f/51217ec63b3872fcc2cfd463f6501727e8f0dedfb33e4598a5e86ce66702/browser_use-0.13.10-py3-none-any.whl",
+      "sha256": "66eb20153094f21728bc0110ada17c03a0c475df2374985d6b47e349cbd47705",
+      "status": "version-and-hash-recorded; not installed or tested"
+    },
+    {
+      "name": "Vercel agent-browser",
+      "package": "agent-browser",
+      "version": "0.38.2",
+      "tarball": "https://registry.npmjs.org/agent-browser/-/agent-browser-0.38.2.tgz",
+      "integrity": "sha512-b/7hvo2RrqocvybjB9kwpX12kGkxkFvtdJ4XPDoott5TLK2n3aPX+lYg7ALd+2YvPi2LrTKGzQYu/rxZC2Y7ZA==",
+      "status": "version-and-integrity-recorded; not installed or tested"
+    }
+  ],
+  "missing_tracks": [
+    "OpenAI Computer / ChatGPT browser tools",
+    "Claude Chrome and Cowork"
+  ],
+  "warning": "Do not treat candidate pins as a benchmark, run, or performance result. Re-resolve and lock exact supported configuration immediately before any preregistered run."
+}
