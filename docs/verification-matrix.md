@@ -324,6 +324,8 @@ The selected JavaScript candidate is pinned `rquickjs 0.14.0`, verified with a r
 
 ## Phase 9 local client setup preview — 2026-10-06
 
+Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20f3ac23dc5a8e3adddff639adf3daf58619f3a5`.
+
 | Check | Result | Environment | Evidence |
 |---|---|---|---|
 | Red-first MCP guide contract | pass | macOS 26 / Rust 1.99.0 | Before implementation, the stdio handler test failed because `tools/list` did not include `guide`; after implementation, the same test confirms listing, version-matched content, and rejection of a stale server version. |
