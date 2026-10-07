@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_ASSETS: usize = 5;
-const MAX_CAPTIONS: usize = 4;
+const MAX_CAPTIONS: usize = 3;
 const MAX_ID_LEN: usize = 80;
 const MAX_TEXT_BYTES: usize = 500;
+const MIN_AUDIO_GAIN_MILLIDB: i32 = -60_000;
+const MAX_AUDIO_GAIN_MILLIDB: i32 = 6_000;
 
 #[derive(
     Clone,
@@ -59,12 +61,33 @@ pub struct Caption {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
+pub struct AudioTrack {
+    pub asset_id: String,
+    pub source_in_ms: u64,
+    pub source_out_ms: u64,
+    pub timeline_start_ms: u64,
+    /// Gain expressed in milli-decibels; this is a plan value, not app evidence.
+    pub gain_millidb: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
+pub struct EndCard {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub background_hex: String,
+    pub text_hex: String,
+    pub font_size_px: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 pub struct CapCutRecipe {
     pub assets: Vec<LicensedAsset>,
     pub clips: Vec<VideoClip>,
     pub captions: Vec<Caption>,
-    pub narration_asset_id: String,
-    pub music_asset_id: String,
+    pub narration: AudioTrack,
+    pub music: AudioTrack,
+    pub end_card: EndCard,
     pub width: u32,
     pub height: u32,
 }
@@ -86,8 +109,9 @@ pub struct CapCutTimelinePlan {
     pub duration_ms: u64,
     pub clips: Vec<TimelineClipPlan>,
     pub captions: Vec<Caption>,
-    pub narration_asset_id: String,
-    pub music_asset_id: String,
+    pub narration: AudioTrack,
+    pub music: AudioTrack,
+    pub end_card: EndCard,
     /// Preparation output only. This must never be treated as app execution evidence.
     pub qualification: String,
 }
@@ -135,15 +159,15 @@ pub fn compile_capcut_recipe(recipe: &CapCutRecipe) -> Result<CapCutTimelinePlan
     if uses.len() != expected.len() || expected.iter().any(|kind| !uses.contains(kind)) {
         return Err("assets must include each required shot, narration, and music role once");
     }
-    let narration = assets
-        .get(recipe.narration_asset_id.as_str())
+    let narration_asset = assets
+        .get(recipe.narration.asset_id.as_str())
         .filter(|asset| asset.expected_use == AssetUse::Narration && asset.audio_tracks > 0)
         .ok_or("narration ID must identify an asset with an audio track")?;
-    let music = assets
-        .get(recipe.music_asset_id.as_str())
+    let music_asset = assets
+        .get(recipe.music.asset_id.as_str())
         .filter(|asset| asset.expected_use == AssetUse::Music && asset.audio_tracks > 0)
         .ok_or("music ID must identify an asset with an audio track")?;
-    if recipe.narration_asset_id == recipe.music_asset_id {
+    if recipe.narration.asset_id == recipe.music.asset_id {
         return Err("narration and music must be separate assets");
     }
 
@@ -184,8 +208,21 @@ pub fn compile_capcut_recipe(recipe: &CapCutRecipe) -> Result<CapCutTimelinePlan
     if !(20_000..=30_000).contains(&cursor) {
         return Err("compiled video duration must be between 20 and 30 seconds");
     }
-    if narration.duration_ms < cursor || music.duration_ms < cursor {
-        return Err("narration and music assets must cover the complete timeline");
+    for (track, asset) in [
+        (&recipe.narration, narration_asset),
+        (&recipe.music, music_asset),
+    ] {
+        if track.source_in_ms >= track.source_out_ms
+            || track.source_out_ms > asset.duration_ms
+            || track.source_out_ms - track.source_in_ms != cursor
+            || track.timeline_start_ms != 0
+            || !(MIN_AUDIO_GAIN_MILLIDB..=MAX_AUDIO_GAIN_MILLIDB).contains(&track.gain_millidb)
+        {
+            return Err("audio trims must cover the timeline and use bounded gain levels");
+        }
+    }
+    if recipe.music.gain_millidb > recipe.narration.gain_millidb - 6_000 {
+        return Err("music level must remain at least 6 dB below narration");
     }
 
     if recipe.captions.len() != MAX_CAPTIONS
@@ -198,7 +235,6 @@ pub fn compile_capcut_recipe(recipe: &CapCutRecipe) -> Result<CapCutTimelinePlan
                 "Find shade during peak heat.",
                 "Drink water and take a cool break.",
                 "Check on a neighbor.",
-                "Plan ahead. Look out for each other.",
             ]
     {
         return Err("caption copy and order must exactly match the approved brief");
@@ -216,6 +252,22 @@ pub fn compile_capcut_recipe(recipe: &CapCutRecipe) -> Result<CapCutTimelinePlan
         }
         previous_end = caption.end_ms;
     }
+    if recipe.end_card.text != "Plan ahead. Look out for each other."
+        || recipe.end_card.text.len() > MAX_TEXT_BYTES
+        || recipe.end_card.start_ms < previous_end
+        || recipe.end_card.end_ms != cursor
+        || recipe.end_card.start_ms >= recipe.end_card.end_ms
+        || recipe.end_card.end_ms - recipe.end_card.start_ms < 1_000
+        || !valid_hex_color(&recipe.end_card.background_hex)
+        || !valid_hex_color(&recipe.end_card.text_hex)
+        || contrast_ratio(&recipe.end_card.background_hex, &recipe.end_card.text_hex)
+            .is_none_or(|ratio| ratio < 4.5)
+        || !(24..=120).contains(&recipe.end_card.font_size_px)
+    {
+        return Err(
+            "visual end card must use the exact copy, fit the final interval, and have bounded styling",
+        );
+    }
 
     Ok(CapCutTimelinePlan {
         title: "Three Ways to Stay Cooler This Week".into(),
@@ -224,8 +276,9 @@ pub fn compile_capcut_recipe(recipe: &CapCutRecipe) -> Result<CapCutTimelinePlan
         duration_ms: cursor,
         clips,
         captions: recipe.captions.clone(),
-        narration_asset_id: recipe.narration_asset_id.clone(),
-        music_asset_id: recipe.music_asset_id.clone(),
+        narration: recipe.narration.clone(),
+        music: recipe.music.clone(),
+        end_card: recipe.end_card.clone(),
         qualification: "offline_plan_only".into(),
     })
 }
@@ -240,6 +293,43 @@ fn valid_id(value: &str) -> bool {
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn contrast_ratio(background: &str, foreground: &str) -> Option<f64> {
+    fn luminance(color: &str) -> Option<f64> {
+        let bytes = color.as_bytes();
+        if bytes.len() != 7 || bytes[0] != b'#' {
+            return None;
+        }
+        let mut channels = [0.0; 3];
+        for (index, channel) in channels.iter_mut().enumerate() {
+            let start = 1 + index * 2;
+            let value = u8::from_str_radix(std::str::from_utf8(&bytes[start..start + 2]).ok()?, 16)
+                .ok()? as f64
+                / 255.0;
+            *channel = if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            };
+        }
+        Some(0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2])
+    }
+
+    let background = luminance(background)?;
+    let foreground = luminance(foreground)?;
+    let (lighter, darker) = if background >= foreground {
+        (background, foreground)
+    } else {
+        (foreground, background)
+    };
+    Some((lighter + 0.05) / (darker + 0.05))
 }
 
 #[cfg(test)]
@@ -310,14 +400,29 @@ mod tests {
                     start_ms: 15_200,
                     end_ms: 21_500,
                 },
-                Caption {
-                    text: "Plan ahead. Look out for each other.".into(),
-                    start_ms: 22_000,
-                    end_ms: 23_000,
-                },
             ],
-            narration_asset_id: "asset-3".into(),
-            music_asset_id: "asset-4".into(),
+            narration: AudioTrack {
+                asset_id: "asset-3".into(),
+                source_in_ms: 0,
+                source_out_ms: 23_000,
+                timeline_start_ms: 0,
+                gain_millidb: 0,
+            },
+            music: AudioTrack {
+                asset_id: "asset-4".into(),
+                source_in_ms: 0,
+                source_out_ms: 23_000,
+                timeline_start_ms: 0,
+                gain_millidb: -18_000,
+            },
+            end_card: EndCard {
+                text: "Plan ahead. Look out for each other.".into(),
+                start_ms: 22_000,
+                end_ms: 23_000,
+                background_hex: "#142B3A".into(),
+                text_hex: "#FFFFFF".into(),
+                font_size_px: 48,
+            },
             width: 1920,
             height: 1080,
         }
@@ -329,10 +434,9 @@ mod tests {
         assert_eq!(plan.duration_ms, 23_000);
         assert_eq!(plan.title, "Three Ways to Stay Cooler This Week");
         assert_eq!(plan.clips[2].timeline_end_ms, 23_000);
-        assert_eq!(
-            plan.captions[3].text,
-            "Plan ahead. Look out for each other."
-        );
+        assert_eq!(plan.end_card.text, "Plan ahead. Look out for each other.");
+        assert_eq!(plan.music.gain_millidb, -18_000);
+        assert_eq!(plan.narration.source_out_ms, 23_000);
         assert_eq!(plan.qualification, "offline_plan_only");
     }
 
@@ -358,7 +462,33 @@ mod tests {
         recipe.clips[1].timeline_start_ms += 1;
         assert!(compile_capcut_recipe(&recipe).is_err());
         let mut recipe = valid_recipe();
-        recipe.captions[3].end_ms = 23_001;
+        recipe.end_card.end_ms = 23_001;
+        assert!(compile_capcut_recipe(&recipe).is_err());
+    }
+
+    #[test]
+    fn rejects_audio_without_full_trim_or_quiet_bed_and_unstyled_end_card() {
+        let mut recipe = valid_recipe();
+        recipe.music.source_out_ms = 22_999;
+        assert!(compile_capcut_recipe(&recipe).is_err());
+        let mut recipe = valid_recipe();
+        recipe.music.gain_millidb = -5_000;
+        assert!(compile_capcut_recipe(&recipe).is_err());
+        let mut recipe = valid_recipe();
+        recipe.end_card.background_hex = "navy".into();
+        assert!(compile_capcut_recipe(&recipe).is_err());
+    }
+
+    #[test]
+    fn rejects_too_short_or_low_contrast_end_card() {
+        let mut recipe = valid_recipe();
+        recipe.end_card.start_ms = 22_999;
+        assert!(compile_capcut_recipe(&recipe).is_err());
+        let mut recipe = valid_recipe();
+        recipe.end_card.start_ms = 23_001;
+        assert!(compile_capcut_recipe(&recipe).is_err());
+        let mut recipe = valid_recipe();
+        recipe.end_card.text_hex = "#142B3A".into();
         assert!(compile_capcut_recipe(&recipe).is_err());
     }
 }

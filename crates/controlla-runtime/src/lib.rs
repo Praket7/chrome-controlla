@@ -5,6 +5,7 @@ pub mod canva;
 pub mod capability;
 pub mod capcut_recipe;
 pub mod doctor;
+pub mod http_auth;
 pub mod jobs;
 pub mod mcp;
 pub mod slides_deck;

@@ -15,6 +15,8 @@ use std::time::Duration;
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
+const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SessionArgs {
     action: String,
@@ -211,8 +213,8 @@ struct AppCapabilitiesArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SlidesDeckPlanArgs {
-    principal: String,
     account_id: String,
     presentation_id: String,
     required_revision_id: String,
@@ -221,9 +223,49 @@ struct SlidesDeckPlanArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CanvaDesignPlanArgs {
-    binding: crate::canva::CanvaPlanBinding,
-    session: crate::canva::CanvaSession,
+    binding: CanvaPlanBindingArgs,
+    session: CanvaSessionArgs,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CanvaIdentityArgs {
+    account_id: String,
+    workspace_id: String,
+    design_id: String,
+}
+
+impl From<CanvaIdentityArgs> for crate::canva::CanvaIdentity {
+    fn from(args: CanvaIdentityArgs) -> Self {
+        Self {
+            principal: LOCAL_STDIO_PRINCIPAL.into(),
+            account_id: args.account_id,
+            workspace_id: args.workspace_id,
+            design_id: args.design_id,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CanvaPlanBindingArgs {
+    identity: CanvaIdentityArgs,
+    session_id: String,
+    expected_version: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CanvaSessionArgs {
+    identity: CanvaIdentityArgs,
+    session_id: String,
+    current_version: String,
+    opened_at_ms: u64,
+    expires_at_ms: u64,
+    page_type: crate::apps::CanvaPageType,
+    locked: bool,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -232,8 +274,8 @@ struct CapCutRecipePlanArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SlidesPlanArgs {
-    principal: String,
     account_id: String,
     presentation_id: String,
     required_revision_id: String,
@@ -248,8 +290,8 @@ struct SlidesPlanArgs {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CanvaPlanArgs {
-    principal: String,
     account_id: String,
     design_id: String,
     page_id: String,
@@ -331,7 +373,7 @@ async fn run_workflow_job(
     reference: TargetRef,
     graph: crate::workflow::WorkflowGraph,
 ) {
-    const PRINCIPAL: &str = "local-stdio";
+    const PRINCIPAL: &str = LOCAL_STDIO_PRINCIPAL;
     if !jobs
         .start(PRINCIPAL, &session_id, &operation_id)
         .unwrap_or(false)
@@ -403,7 +445,12 @@ async fn run_workflow_job(
                 let index = completed.lock().await.len();
                 let correlation = format!("{operation_id}:script:{index}");
                 let claim = jobs
-                    .record_dispatch("local-stdio", &session_id, &operation_id, &correlation)
+                    .record_dispatch(
+                        LOCAL_STDIO_PRINCIPAL,
+                        &session_id,
+                        &operation_id,
+                        &correlation,
+                    )
                     .map_err(|e| e.to_string())?;
                 if !claim.acquired {
                     return Err("operation dispatch could not be claimed".into());
@@ -417,7 +464,7 @@ async fn run_workflow_job(
                     &completed.lock().await,
                     None,
                 );
-                jobs.checkpoint("local-stdio", &session_id, &operation_id, pending)
+                jobs.checkpoint(LOCAL_STDIO_PRINCIPAL, &session_id, &operation_id, pending)
                     .map_err(|e| e.to_string())?;
                 let step_deadline = deadline
                     .min(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
@@ -438,7 +485,7 @@ async fn run_workflow_job(
                 {
                     Ok(Ok(observation)) => {
                         jobs.acknowledge_dispatch(
-                            "local-stdio",
+                            LOCAL_STDIO_PRINCIPAL,
                             &session_id,
                             &operation_id,
                             &correlation,
@@ -456,7 +503,7 @@ async fn run_workflow_job(
                             &done,
                             None,
                         );
-                        jobs.checkpoint("local-stdio", &session_id, &operation_id, receipt)
+                        jobs.checkpoint(LOCAL_STDIO_PRINCIPAL, &session_id, &operation_id, receipt)
                             .map_err(|e| e.to_string())?;
                         serde_json::to_string(&observation).map_err(|e| e.to_string())
                     }
@@ -470,8 +517,12 @@ async fn run_workflow_job(
                             &completed.lock().await,
                             Some(&error.to_string()),
                         );
-                        let _ =
-                            jobs.mark_unknown("local-stdio", &session_id, &operation_id, receipt);
+                        let _ = jobs.mark_unknown(
+                            LOCAL_STDIO_PRINCIPAL,
+                            &session_id,
+                            &operation_id,
+                            receipt,
+                        );
                         Err("browser operation delivery is unknown".into())
                     }
                     Err(_) => {
@@ -484,8 +535,12 @@ async fn run_workflow_job(
                             &completed.lock().await,
                             Some("step outcome unknown after timeout"),
                         );
-                        let _ =
-                            jobs.mark_unknown("local-stdio", &session_id, &operation_id, receipt);
+                        let _ = jobs.mark_unknown(
+                            LOCAL_STDIO_PRINCIPAL,
+                            &session_id,
+                            &operation_id,
+                            receipt,
+                        );
                         Err("browser operation delivery is unknown after timeout".into())
                     }
                 }
@@ -1023,7 +1078,7 @@ impl App {
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let operation = self
             .jobs
-            .get("local-stdio", &args.session_id, &args.operation_id)
+            .get(LOCAL_STDIO_PRINCIPAL, &args.session_id, &args.operation_id)
             .map_err(|error| invalid(error.to_string()))?
             .ok_or_else(|| invalid("unknown operation_id for this session"))?;
         Ok(rmcp::handler::server::wrapper::Json(
@@ -1227,7 +1282,7 @@ impl App {
                             mode: SessionMode::Shared,
                             selected_target_ids: target_ids.clone(),
                         },
-                        "local-stdio",
+                        LOCAL_STDIO_PRINCIPAL,
                     )
                     .map_err(|e| invalid(format!("shared session denied: {e:?}")))?;
                 let provider = controlla_browser::providers::SharedExtensionProvider::bind(
@@ -1429,7 +1484,7 @@ impl App {
                             mode: SessionMode::DirectCdp,
                             selected_target_ids: target_ids.clone(),
                         },
-                        "local-stdio",
+                        LOCAL_STDIO_PRINCIPAL,
                     )
                     .map_err(|e| invalid(format!("session denied: {e:?}")))?;
                 registry
@@ -2135,7 +2190,7 @@ impl App {
         Parameters(args): Parameters<SlidesPlanArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let binding = crate::apps::SlidesBinding {
-            principal: args.principal,
+            principal: LOCAL_STDIO_PRINCIPAL.into(),
             account_id: args.account_id,
             presentation_id: args.presentation_id,
             required_revision_id: args.required_revision_id,
@@ -2202,7 +2257,7 @@ impl App {
             .map_err(|error| invalid(error.to_string()))?
             .as_millis() as u64;
         let snapshot = crate::apps::CanvaSessionSnapshot {
-            principal: args.principal,
+            principal: LOCAL_STDIO_PRINCIPAL.into(),
             account_id: args.account_id,
             design_id: args.design_id,
             page_id: args.page_id,
@@ -2246,7 +2301,7 @@ impl App {
         Parameters(args): Parameters<SlidesDeckPlanArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let binding = crate::apps::SlidesBinding {
-            principal: args.principal,
+            principal: LOCAL_STDIO_PRINCIPAL.into(),
             account_id: args.account_id,
             presentation_id: args.presentation_id,
             required_revision_id: args.required_revision_id,
@@ -2278,8 +2333,22 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| invalid(error.to_string()))?
             .as_millis() as u64;
-        let plan = crate::canva::plan_heat_ready_design(&args.binding, &args.session, now_ms)
-            .map_err(invalid)?;
+        let binding = crate::canva::CanvaPlanBinding {
+            identity: args.binding.identity.into(),
+            session_id: args.binding.session_id,
+            expected_version: args.binding.expected_version,
+        };
+        let session = crate::canva::CanvaSession {
+            identity: args.session.identity.into(),
+            session_id: args.session.session_id,
+            current_version: args.session.current_version,
+            opened_at_ms: args.session.opened_at_ms,
+            expires_at_ms: args.session.expires_at_ms,
+            page_type: args.session.page_type,
+            locked: args.session.locked,
+        };
+        let plan =
+            crate::canva::plan_heat_ready_design(&binding, &session, now_ms).map_err(invalid)?;
         Ok(rmcp::handler::server::wrapper::Json(json!({
             "status":"planned_not_dispatched",
             "plan":plan,
@@ -2568,7 +2637,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, validate_loopback_ws};
+    use super::{App, LOCAL_STDIO_PRINCIPAL, validate_loopback_ws};
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
@@ -2742,6 +2811,26 @@ mod tests {
                 "{name} has required fields"
             );
         }
+        for name in [
+            "slides_plan_text_edit",
+            "slides_deck_plan",
+            "canva_sync_preflight",
+            "canva_design_plan",
+        ] {
+            let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(
+                !schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("principal"),
+                "{name} must not accept transport identity as an argument"
+            );
+            if name == "canva_design_plan" {
+                let nested = serde_json::to_string(&schema).unwrap();
+                assert!(!nested.contains("principal"));
+            }
+        }
         let app_caps = client
             .call_tool(
                 CallToolRequestParams::new("app_capabilities")
@@ -2781,12 +2870,13 @@ mod tests {
         let deck = client
             .call_tool(
                 CallToolRequestParams::new("slides_deck_plan").with_arguments(
-                    json!({"principal":"p","account_id":"a","presentation_id":"deck-1","required_revision_id":"rev-1","asserted_existing_slide_ids":["existing-slide"],"asserted_existing_object_ids":["existing-slide","placeholder-title","placeholder-body"]})
+                    json!({"account_id":"a","presentation_id":"deck-1","required_revision_id":"rev-1","asserted_existing_slide_ids":["existing-slide"],"asserted_existing_object_ids":["existing-slide","placeholder-title","placeholder-body"]})
                         .as_object().unwrap().clone(),
                 ),
             )
             .await.unwrap().structured_content.unwrap();
         assert_eq!(deck["status"], "planned_not_dispatched");
+        assert_eq!(deck["plan"]["principal"], "local-stdio");
         assert_eq!(deck["plan"]["slide_titles"].as_array().unwrap().len(), 10);
         assert_eq!(deck["side_effects"], false);
         assert_eq!(deck["preconditions_authoritative"], false);
@@ -2794,18 +2884,37 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let canva_identity =
-            json!({"principal":"p","account_id":"a","workspace_id":"w","design_id":"d"});
+        let canva_identity = json!({"account_id":"a","workspace_id":"w","design_id":"d"});
         let canva = client.call_tool(CallToolRequestParams::new("canva_design_plan").with_arguments(
             json!({
                 "binding":{"identity":canva_identity,"session_id":"s","expected_version":"v"},
-                "session":{"identity":{"principal":"p","account_id":"a","workspace_id":"w","design_id":"d"},"session_id":"s","current_version":"v","opened_at_ms":now_ms-1000,"expires_at_ms":now_ms+30_000,"page_type":"absolute","locked":false}
+                "session":{"identity":{"account_id":"a","workspace_id":"w","design_id":"d"},"session_id":"s","current_version":"v","opened_at_ms":now_ms-1000,"expires_at_ms":now_ms+30_000,"page_type":"absolute","locked":false}
             }).as_object().unwrap().clone(),
         )).await.unwrap().structured_content.unwrap();
         assert_eq!(canva["status"], "planned_not_dispatched");
         assert_eq!(canva["plan"]["pages"].as_array().unwrap().len(), 5);
         assert_eq!(canva["preconditions_authoritative"], false);
         assert_eq!(canva["plan"]["sync_candidate"]["effect"], "advisory_only");
+        assert_eq!(
+            canva["plan"]["sync_candidate"]["identity"]["principal"],
+            "local-stdio"
+        );
+        let spoofed_canva = client.call_tool(CallToolRequestParams::new("canva_design_plan").with_arguments(
+            json!({
+                "binding":{"identity":{"principal":"attacker","account_id":"a","workspace_id":"w","design_id":"d"},"session_id":"s","expected_version":"v"},
+                "session":{"identity":{"principal":"attacker","account_id":"a","workspace_id":"w","design_id":"d"},"session_id":"s","current_version":"v","opened_at_ms":now_ms-1000,"expires_at_ms":now_ms+30_000,"page_type":"absolute","locked":false}
+            }).as_object().unwrap().clone(),
+        )).await;
+        assert!(
+            spoofed_canva.is_err() || {
+                let result = spoofed_canva.unwrap();
+                result.is_error.unwrap_or(false)
+                    || result.structured_content.is_some_and(|value| {
+                        value["plan"]["sync_candidate"]["identity"]["principal"]
+                            == LOCAL_STDIO_PRINCIPAL
+                    })
+            }
+        );
         let roles = [
             "shade_shot",
             "water_rest_shot",
@@ -2828,10 +2937,12 @@ mod tests {
             "captions":[
                 {"text":"Find shade during peak heat.","start_ms":500,"end_ms":6500},
                 {"text":"Drink water and take a cool break.","start_ms":7200,"end_ms":14500},
-                {"text":"Check on a neighbor.","start_ms":15200,"end_ms":21500},
-                {"text":"Plan ahead. Look out for each other.","start_ms":22000,"end_ms":23000}
+                {"text":"Check on a neighbor.","start_ms":15200,"end_ms":21500}
             ],
-            "narration_asset_id":"asset-3","music_asset_id":"asset-4","width":1920,"height":1080
+            "narration":{"asset_id":"asset-3","source_in_ms":0,"source_out_ms":23000,"timeline_start_ms":0,"gain_millidb":0},
+            "music":{"asset_id":"asset-4","source_in_ms":0,"source_out_ms":23000,"timeline_start_ms":0,"gain_millidb":-18000},
+            "end_card":{"text":"Plan ahead. Look out for each other.","start_ms":22000,"end_ms":23000,"background_hex":"#142B3A","text_hex":"#FFFFFF","font_size_px":48},
+            "width":1920,"height":1080
         });
         let capcut = client
             .call_tool(
@@ -2848,7 +2959,7 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("slides_plan_text_edit").with_arguments(
                     json!({
-                        "principal":"p", "account_id":"a", "presentation_id":"d",
+                        "account_id":"a", "presentation_id":"d",
                         "required_revision_id":"r", "operation":"replace_range",
                         "object_id":"shape1", "start_index":1,"end_index":6,
                         "expected_text":"Draft", "new_text":"Final"
@@ -2862,11 +2973,36 @@ mod tests {
             .unwrap();
         let plan = plan.structured_content.unwrap();
         assert_eq!(plan["status"], "planned_not_dispatched");
+        assert_eq!(plan["plan"]["principal"], "local-stdio");
         assert_eq!(
             plan["plan"]["request_body"]["writeControl"]["requiredRevisionId"],
             "r"
         );
         assert_eq!(plan["evidence"], json!([]));
+        let spoofed_slides = client
+            .call_tool(
+                CallToolRequestParams::new("slides_plan_text_edit").with_arguments(
+                    json!({
+                        "principal":"attacker", "account_id":"a", "presentation_id":"d",
+                        "required_revision_id":"r", "operation":"replace_range",
+                        "object_id":"shape1", "start_index":1,"end_index":6,
+                        "expected_text":"Draft", "new_text":"Final"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await;
+        assert!(
+            spoofed_slides.is_err() || {
+                let result = spoofed_slides.unwrap();
+                result.is_error.unwrap_or(false)
+                    || result
+                        .structured_content
+                        .is_some_and(|value| value["plan"]["principal"] == LOCAL_STDIO_PRINCIPAL)
+            }
+        );
         let file_select_schema = listed
             .tools
             .iter()

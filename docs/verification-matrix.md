@@ -109,7 +109,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 
 These rows describe available code paths, not app validation. Planning/preflight tools do not dispatch. `shared_input` is fixture-verified only. No live documents, accounts, or media were used. A file-selection result only establishes browser selection; it does not show app acceptance, saved persistence, or export quality.
 
-The offline Slides, Canva, and CapCut planning tools each passed focused unit tests and the local stdio roundtrip. See [Phase 8 offline planner evidence](review/phase8-offline-planners.md). This adds deterministic preparation only; it does not change any app's `unqualified` status or close the Phase 8 execution, persistence, export, and quality gates.
+The offline Slides, Canva, and CapCut planning tools each passed focused unit tests and the local stdio roundtrip. CapCut now rejects end cards shorter than one second or with text contrast below 4.5:1; Slides/Canva planner principal labels are server-owned and forged request fields are covered by the stdio regression. See [Phase 8 offline planner evidence](review/phase8-offline-planners.md). This adds deterministic preparation only; it does not change any app's `unqualified` status or close the Phase 8 execution, persistence, export, and quality gates.
 
 ## Phase 0 review 1 corrective rerun — 2026-10-06 11:25–11:26 UTC
 
