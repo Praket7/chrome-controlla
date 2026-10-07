@@ -21,6 +21,7 @@ Captured 2026-10-06. Candidate package versions and artifact integrity values ar
 
 | Work | State | Evidence |
 |---|---|---|
+| Offline fixture contract | Verified locally | `node --test bench/analysis/offline-task-harness.test.mjs` passes reset, safe-operation, and independent predicate-readback fixtures. This is contract validation only; it is not pilot execution or browser/model comparison evidence. |
 | Candidate package versions | Partial | Registry artifacts and most source commits/tags pinned; Stagehand source commit remains unavailable from package metadata |
 | Protocol/config parity | Not run | No baseline packages installed/configured |
 | 30-template pilot manifest | Preregistered and structurally validated | `../tasks/phase10-pilot.json` defines 30 templates (six per category), three planned repetitions, reset/predicate fields, seeded candidate-order randomization, outcomes, analysis rules, and the no-results boundary; `node --test bench/phase10-pilot.test.mjs` and `node scripts/check-phase10-pilot.mjs` pass. No task has been run. |

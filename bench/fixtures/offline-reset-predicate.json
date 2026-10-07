@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "kind": "offline-fixture-only",
+  "id": "reset-predicate-contract-v1",
+  "initial_state": {
+    "records": [
+      { "id": "record-A", "status": "queued" },
+      { "id": "record-B", "status": "queued" }
+    ],
+    "task_log": [],
+    "counter": 2
+  },
+  "reset": { "strategy": "clone-initial-state" },
+  "actions": [
+    { "op": "set", "path": "/records/0/status", "value": "ready" },
+    { "op": "append", "path": "/task_log", "value": "updated record-A" },
+    { "op": "increment", "path": "/counter", "by": 1 }
+  ],
+  "predicates": [
+    { "id": "target-updated", "op": "equals", "path": "/records/0/status", "expected": "ready" },
+    { "id": "sibling-unchanged", "op": "unchanged", "path": "/records/1/status" },
+    { "id": "single-log-entry", "op": "equals", "path": "/task_log", "expected": ["updated record-A"] },
+    { "id": "counter-incremented", "op": "equals", "path": "/counter", "expected": 3 }
+  ]
+}
