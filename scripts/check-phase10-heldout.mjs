@@ -39,6 +39,7 @@ export function validateHeldout(manifest, lock) {
   if (critical !== 20) errors.push(`critical workflows=${critical}, expected 20`);
   for (const category of cats) { const n = (manifest?.tasks ?? []).filter((t) => t.category === category && t.critical).length; if (n !== 4) errors.push(`${category} must contain four critical workflows`); }
   if (manifest?.candidate_baselines !== '../baselines/versions.lock.json') errors.push('baseline lock reference changed');
+  if (manifest?.preregistration?.controlled_config?.controlla_revision !== manifest?.freeze?.controlla_revision) errors.push('controlled configuration and freeze must bind the same Controlla revision');
   const lockHash = createHash('sha256').update(JSON.stringify(lock, null, 2) + '\n').digest('hex');
   if (manifest?.freeze?.baseline_lock_sha256 !== lockHash) errors.push('baseline lock digest mismatch');
   if (manifest?.freeze?.analysis_revision !== 'phase10-analysis-v1' || !/^[0-9a-f]{40}$/.test(manifest?.freeze?.controlla_revision ?? '')) errors.push('analysis or Controlla revision is not frozen');

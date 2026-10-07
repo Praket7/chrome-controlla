@@ -15,6 +15,12 @@ test('held-out manifest is frozen, disjoint from pilot, and has exact strata', (
   assert.equal(new Set(manifest.tasks.map((t) => t.id)).size, 100);
 });
 
+test('controlled config and freeze bind the same candidate source revision', () => {
+  const conflicting = structuredClone(manifest);
+  conflicting.preregistration.controlled_config.controlla_revision = '3643ddf3c67fb954298f204d15115052356e321c';
+  assert.ok(validateHeldout(conflicting, lock).includes('controlled configuration and freeze must bind the same Controlla revision'));
+});
+
 function fixture() {
   const m = { tasks: [{ id: 'H001', critical: false }], preregistration: { bootstrap_resamples: 200, bootstrap_seed: 11, noninferiority_margin_percentage_points: 2 }, freeze: { split_digest: 'fixture', controlla_revision: 'sha' } };
   const candidates = ['Controlla', 'Baseline'];
