@@ -148,6 +148,12 @@ struct ArtifactRegisterArgs {
     bytes: Vec<u8>,
 }
 
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct ArtifactVerifyArgs {
+    session_id: String,
+    artifact_handle: String,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(untagged)]
 enum FileSelectLocator {
@@ -311,6 +317,7 @@ struct LiveSession {
     connection: Arc<controlla_browser::BrowserConnection>,
     registry: Mutex<SessionRegistry>,
     handle: controlla_browser::sessions::SessionHandle,
+    artifact_expectations: Mutex<BTreeMap<String, crate::artifacts::ArtifactExpectation>>,
 }
 
 struct SharedLiveSession {
@@ -1179,9 +1186,59 @@ impl App {
             .await
             .put_artifact_bytes(&s.handle, &args.filename, &args.bytes)
             .map_err(|e| invalid(format!("artifact registration failed: {e:?}")))?;
+        let expectation = crate::artifacts::ArtifactExpectation::from_bytes(&args.bytes);
+        s.artifact_expectations
+            .lock()
+            .await
+            .insert(metadata.handle.opaque_id().to_owned(), expectation.clone());
         Ok(rmcp::handler::server::wrapper::Json(json!({
             "handle": metadata.handle, "filename": metadata.filename, "size": metadata.size,
-            "evidence": "registered in the ephemeral principal/session-scoped store"
+            "sha256": expectation.sha256,
+            "evidence": "registered bytes and expected digest retained in the ephemeral principal/session-scoped store"
+        })))
+    }
+
+    #[tool(
+        name = "artifact_verify",
+        description = "Re-read a registered artifact through its opaque principal/session-scoped handle and compare its bytes with the digest captured at registration. Verifies local staging integrity only; does not prove app acceptance, persistence, or download origin."
+    )]
+    async fn artifact_verify(
+        &self,
+        Parameters(args): Parameters<ArtifactVerifyArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let s = self
+            .sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown session_id"))?;
+        if !self.owns_session(&s) {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let handle: controlla_browser::sessions::ArtifactHandle =
+            serde_json::from_value(json!(args.artifact_handle))
+                .map_err(|_| invalid("artifact_handle is invalid"))?;
+        let expected = s
+            .artifact_expectations
+            .lock()
+            .await
+            .get(handle.opaque_id())
+            .cloned()
+            .ok_or_else(|| invalid("artifact expectation is unavailable for this session"))?;
+        let registry = s.registry.lock().await;
+        let bytes = registry
+            .read_artifact_bytes(&s.handle, &handle)
+            .map_err(|error| invalid(format!("artifact readback failed: {error:?}")))?;
+        let actual = crate::artifacts::ArtifactExpectation::from_bytes(&bytes);
+        let matched = actual == expected;
+        Ok(rmcp::handler::server::wrapper::Json(json!({
+            "status": if matched { "passed" } else { "failed" },
+            "expected": {"byte_length": expected.byte_length, "sha256": expected.sha256},
+            "actual": {"byte_length": actual.byte_length, "sha256": actual.sha256},
+            "evidence": "runtime re-read the opaque artifact handle and computed its byte length and SHA-256",
+            "scope": "local_artifact_integrity_only",
+            "app_acceptance_or_persistence_verified": false
         })))
     }
 
@@ -1579,6 +1636,7 @@ impl App {
                         connection,
                         registry: Mutex::new(registry),
                         handle,
+                        artifact_expectations: Mutex::new(BTreeMap::new()),
                     }),
                 );
                 Ok(rmcp::handler::server::wrapper::Json(
@@ -2567,7 +2625,7 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
             include_str!("../../../docs/clients.md"),
         )),
         "master" => Some((
-            "master-2026-10-07-v4",
+            "master-2026-10-07-v5",
             include_str!("../../../docs/MASTER_GUIDE.md"),
         )),
         _ => None,
@@ -2921,6 +2979,7 @@ mod tests {
         assert!(names.contains(&"accessibility"));
         assert!(names.contains(&"screenshot_crop"));
         assert!(names.contains(&"artifact_register"));
+        assert!(names.contains(&"artifact_verify"));
         assert!(names.contains(&"file_select"));
         assert!(names.contains(&"shared_observe"));
         assert!(names.contains(&"guide"));
@@ -2964,12 +3023,12 @@ mod tests {
             .unwrap()
             .structured_content
             .unwrap();
-        assert_eq!(master_guide["guide_version"], "master-2026-10-07-v4");
+        assert_eq!(master_guide["guide_version"], "master-2026-10-07-v5");
         assert!(
             master_guide["content"]
                 .as_str()
                 .unwrap()
-                .contains("master-2026-10-07-v4")
+                .contains("master-2026-10-07-v5")
         );
         let stale_guide = client
             .call_tool(
@@ -2989,6 +3048,7 @@ mod tests {
             "accessibility",
             "screenshot_crop",
             "artifact_register",
+            "artifact_verify",
             "file_select",
             "shared_observe",
             "workflow",
@@ -3422,6 +3482,78 @@ mod tests {
                 "fixture.txt"
             );
             let artifact_handle = artifact.structured_content.as_ref().unwrap()["handle"].clone();
+            assert_eq!(
+                artifact.structured_content.as_ref().unwrap()["sha256"],
+                "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+            );
+            let verified = client
+                .call_tool(
+                    CallToolRequestParams::new("artifact_verify").with_arguments(args(json!({
+                        "session_id":session_id,
+                        "artifact_handle":artifact_handle.clone()
+                    }))),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(verified["status"], "passed");
+            assert_eq!(verified["scope"], "local_artifact_integrity_only");
+            assert_eq!(verified["app_acceptance_or_persistence_verified"], false);
+            assert_eq!(verified["expected"], verified["actual"]);
+            let artifact_id = artifact_handle
+                .as_str()
+                .unwrap()
+                .strip_prefix("artifact_")
+                .unwrap();
+            let staged_file = std::env::temp_dir()
+                .join(format!("controlla-artifact-{artifact_id}"))
+                .join("fixture.txt");
+            assert!(staged_file.is_file(), "registered artifact file must exist");
+            std::fs::write(&staged_file, b"h").unwrap();
+            let truncated = client
+                .call_tool(
+                    CallToolRequestParams::new("artifact_verify").with_arguments(args(json!({
+                        "session_id":session_id,
+                        "artifact_handle":artifact_handle.clone()
+                    }))),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(truncated["status"], "failed");
+            assert_eq!(truncated["expected"]["byte_length"], 2);
+            assert_eq!(truncated["actual"]["byte_length"], 1);
+
+            let second_session = client
+                .call_tool(
+                    CallToolRequestParams::new("session").with_arguments(args(json!({
+                        "action":"connect",
+                        "provider":"explicit_cdp",
+                        "target_ids":["tab-1"]
+                    }))),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap()["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_ne!(second_session, session_id);
+            let cross_session = client
+                .call_tool(
+                    CallToolRequestParams::new("artifact_verify").with_arguments(args(json!({
+                        "session_id":second_session,
+                        "artifact_handle":artifact_handle.clone()
+                    }))),
+                )
+                .await;
+            assert!(
+                cross_session.is_err() || cross_session.unwrap().is_error.unwrap_or(false),
+                "an artifact handle must not verify in another session"
+            );
             let before_missing_marker = client
                 .call_tool(
                     CallToolRequestParams::new("file_select").with_arguments(args(json!({

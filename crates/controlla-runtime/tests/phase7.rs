@@ -120,4 +120,8 @@ fn artifact_validation_rejects_truncated_download() {
     assert!(correct.matches(b"correct"));
     assert!(!correct.matches(b"corrupt"));
     assert!(!correct.matches(b"corre"));
+    let registered = ArtifactExpectation::from_bytes(b"correct");
+    assert_eq!(registered, correct);
+    assert!(!registered.matches(b"corrupt"));
+    assert!(!registered.matches(b"corre"));
 }

@@ -102,7 +102,7 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "9a65a4a905cb3acb14ba23905b362c56c245c19849f19e038e100c5a6a9172d1",
+      "destination_sha256": "7e74bd5a981535a1dd1fef24e53cb4db6ab669bc2652da80072c6ce0017d9f32",
       "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 3 local 12-second QuickJS Promise coverage, Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, authenticated loopback HTTP process smoke, OpenCode stdio discovery-only evidence, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest candidate, three-platform clean-prefix installs and CI boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },
@@ -110,7 +110,7 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "7b91135c7504efcab6dea2d1d50ba5223b2ef0e2596e48ff56fe8db83dbe2ab0",
+      "destination_sha256": "9186448f52a4cca6b695b15368bf65abcdedd8c013560f6dc87970280952ff8d",
       "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3",
       "license": "user-provided design document; no third-party license asserted"
     }

@@ -1,6 +1,6 @@
 # Local MCP client setup
 
-Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1.0`. Client setup formats checked against upstream documentation/source on 2026-10-06; client binary versions and live client acceptance are not recorded by this guide.
+Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1.0`. Client setup formats checked against upstream documentation/source on 2026-10-06. OpenCode 1.18.5 completed one read-only guide call using a generated v1 config and local Qwen 2.5 7B; this is a narrow tool-call check, not full client acceptance. See `verification-matrix.md` for the bounded evidence and remaining client gates.
 
 This preview runs MCP over local stdio only. Build the executable, then replace `/ABS/PATH/TO/controlla` below with its absolute path (normally `target/release/controlla`); the MCP command is `controlla mcp`. Do not point a client at an HTTP endpoint: this branch has no remote listener or authentication. Each concurrently running client process needs a unique absolute `CONTROLLA_STATE_DIR`; the server locks this directory before journal recovery. To enable permissioned Chrome auto-connect, set `COMPTROL_CHROME_AUTO_CONNECT=1` in the client configuration and enable Chrome Remote Debugging at `chrome://inspect/#remote-debugging`. Chrome may ask for consent. Alternatively, configure an explicitly approved loopback CDP WebSocket using `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT`; never expose that endpoint outside loopback.
 

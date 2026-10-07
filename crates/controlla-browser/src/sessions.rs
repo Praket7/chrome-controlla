@@ -482,6 +482,36 @@ impl SessionRegistry {
             .ok_or(SessionError::ArtifactNotFound)
     }
 
+    /// Read the bounded bytes behind a principal/session-scoped opaque handle.
+    /// The caller must compare them with an expectation captured independently
+    /// of this read; this only verifies the local staged artifact, not app state.
+    pub fn read_artifact_bytes(
+        &self,
+        session: &SessionHandle,
+        handle: &ArtifactHandle,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.validate_clipboard_session(session)?;
+        let item = self
+            .artifacts
+            .get(&session.id)
+            .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .ok_or(SessionError::ArtifactNotFound)?;
+        let mut file = std::fs::File::open(&item.path).map_err(|_| SessionError::ArtifactIo)?;
+        let mut bytes = Vec::with_capacity(item.metadata.size);
+        use std::io::Read;
+        file.by_ref()
+            .take((MAX_ARTIFACT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SessionError::ArtifactIo)?;
+        if bytes.is_empty() {
+            return Err(SessionError::ArtifactEmpty);
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(SessionError::ArtifactTooLarge);
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn artifact_path_for(
         &self,
         session_id: &str,
@@ -1197,6 +1227,12 @@ mod tests {
             .put_artifact_bytes(&alice, "payload.txt", b"hello")
             .unwrap();
         assert_eq!(artifact.size, 5);
+        assert_eq!(
+            registry
+                .read_artifact_bytes(&alice, &artifact.handle)
+                .unwrap(),
+            b"hello"
+        );
         assert_eq!(
             registry
                 .artifact_metadata(&alice, &artifact.handle)

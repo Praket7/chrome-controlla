@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: local Phase 9 setup preview `master-2026-10-07-v4`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
+Version: local Phase 9 setup preview `master-2026-10-07-v5`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -21,8 +21,11 @@ One tool call can perform several actions, but completion requires evidence. Nev
 | `extract` | Bounded extraction across caller-declared sections with stable IDs, verified expansion controls, completeness evidence, and resumable cursors | Treating absent account/count/terminal evidence as complete |
 | `workflow` | Submit bounded observe/wait/checkpoint nodes or an opt-in trusted-local read-only script with one bounded inline artifact return | Assuming it can mutate pages or access files/network/processes |
 | `workflow_status` | Poll the operation ID for durable status, revision, and checkpoint receipts | Retrying a browser effect after an unknown outcome |
+| `artifact_verify` | Re-read a registered opaque artifact handle and check bytes against its registration-time size and SHA-256 | Inferring that bytes came from an app download or that the app accepted/saved them |
 | `guide` | Read the version-matched `clients` or `master` documentation | Assuming examples prove a client is qualified |
 | `shared_input` | Guarded fill/click on one explicitly paired Chrome tab with exact current value and post-action DOM readback | Rich editors, masked/trusted controls, app save/persistence, or app-specific qualification |
+
+`artifact_verify` takes `session_id` and the handle from `artifact_register`. It re-reads the session-scoped staged file and compares byte length and SHA-256 with the registration-time receipt. A pass verifies local staging integrity only; it does not identify a download source or prove transfer, app acceptance, or saved persistence.
 
 The MCP initialize instructions include registered tool names from the same runtime router used by `tools/list`; use `tools/list` for current argument schemas. The descriptive tool table here is human-maintained. The read-only `guide` tool accepts `topic` (`clients` or `master`) and exact `server_version` (`0.1.0`); unsupported versions/topics fail clearly. It returns static Markdown, not live health or browser state. The same two documents are exposed as read-only resources at `controlla://guide/{topic}/{server_version}` and listed as version-specific concrete URIs.
 
@@ -209,7 +212,7 @@ A script is not permission to execute arbitrary shell commands, read credentials
 
 Upload only authorized artifacts to the intended account/document. File selection, bytes transferred, app acceptance and saved persistence are distinct stages. Verify the stage needed by the user’s request.
 
-This preview has no download or export tool. `artifact_register` plus `file_select` only selects bytes in a page file input, and an inline workflow artifact only returns bounded bytes. Neither route captures downloads or verifies app acceptance/persistence. When a future qualified export route exists, require a completion event plus file type/size/checksum and content or playability checks; never expose arbitrary host paths remotely.
+This preview has no download or export tool. `artifact_register` plus `file_select` only selects bytes in a page file input, and an inline workflow artifact only returns bounded bytes. `artifact_verify` re-reads the staged file and compares its size/SHA-256 with the registration-time receipt; it does not capture downloads or verify app acceptance/persistence. When a future qualified export route exists, require a completion event plus file type/size/checksum and content or playability checks; never expose arbitrary host paths remotely.
 
 ## 13. Design-app recipes
 
