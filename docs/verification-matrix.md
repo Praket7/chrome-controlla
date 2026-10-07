@@ -61,7 +61,7 @@ Phase 0 establishes the repository only. CC/B statuses below reflect evidence fr
 | CC-21 | partial | 7 | Local fail-closed verifier/cache mechanics and cache-signature/quarantine tests exist; no production observer, qualification suite or execution integration |
 | CC-22 | unimplemented | 11 | Optional learning deferred: no controlled benchmark or consented trace result justifies added runtime cost; deterministic rules remain the active policy |
 | CC-23 | partial | 6 | `workflow` MCP admits durable observe/wait/checkpoint/script jobs with idempotency, target/revision-bound receipts, persistent checkpoints, operation counts, `workflow_status`, and 12 KiB max inline artifacts for trusted-local scripts; arbitrary mutations, file-backed/download artifacts, session rehydration, and cross-client live recovery remain open |
-| CC-24 | partial | 12 | macOS arm64 package lifecycle checks pass; the harness now supports distinct-binary upgrade/rollback with installed executable digest assertions, but that path remains unrun. No live client/server compatibility, signed artifacts, Windows/Linux consumer installs, or GitHub install is verified |
+| CC-24 | partial | 12 | macOS arm64 distinct-binary package upgrade/rollback passes with installed executable SHA-256 checks and user-data preservation. No live client/server compatibility, signed artifacts, Windows/Linux consumer installs, or GitHub install is verified |
 | B01 | fixture_verified | 1 | direct-only/bridge-only evaluator fixture, catalog and dispatch decisions match |
 | B02 | fixture_verified | 1 | updated policy revision with revoked grant is denied on reevaluation |
 | B03 | fixture_verified | 1 | help exits with stdin held open; state path remains absent |
@@ -371,6 +371,12 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 
 | Check | Result | Environment | Evidence / boundary |
 |---|---|---|---|
-| Clean-tree release-candidate assembly | pass | macOS arm64 / source commit `2f4fb06` | `npm run prepare:release-candidate`; generated npm archive, extension archive, host-filtered Cargo SBOM, release manifest, and SHA256SUMS under `dist/release-candidate/`. Candidate is unpublished. |
+| Clean-tree release-candidate assembly | pass | macOS arm64 / source commit `5e2914f` | `npm run prepare:release-candidate`; generated npm archive, extension archive, host-filtered Cargo SBOM, release manifest, and SHA256SUMS under `dist/release-candidate/`. Candidate is unpublished. |
 | Candidate file digests | pass | macOS arm64 | All entries in `SHA256SUMS` verified. This checks local artifact integrity, not consumer download or signature verification. |
 | Cross-platform build/package CI | pass | GitHub Actions / source commit `2f4fb06` | Run `37564319202` passed Rust format, Clippy, workspace tests, host package build, and package checks on Windows, macOS, and Linux. No published consumer install was performed. |
+
+## Phase 12 distinct-binary lifecycle — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Distinct-binary package lifecycle | pass | macOS arm64; old source `2f4fb06`, candidate source `b0a7c7c` | Separate binaries were packed as package `0.1.0` and `0.1.1`; install, upgrade, rollback, uninstall and user-data preservation passed with installed executable digest assertions. Full hashes and command: [lifecycle evidence](review/phase12-binary-lifecycle.md). Not an MCP client/server compatibility test. |
