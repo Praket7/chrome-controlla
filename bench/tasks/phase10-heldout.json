@@ -85,7 +85,7 @@
       "account_state": "synthetic/local only",
       "rights": "same read/write rights limited to the declared synthetic task fixture",
       "baseline_versions": "exact versions and integrity values in the referenced immutable baseline lock; re-resolve immediately before execution and issue a new preregistration addendum if any pin changes",
-      "controlla_revision": "9b336e1eedc74fa2efab6197fb93c7e35fd3fe3a"
+      "controlla_revision": "b0a7c7c1634a993523c69577289d20ac2f97ff93"
     },
     "cache_state_assignment": "Odd repetitions are cold and even repetitions warm for every candidate within each paired task/repetition; record cache preparation and maintenance time in every run."
   },
@@ -1094,7 +1094,7 @@
   "freeze": {
     "baseline_lock_sha256": "75b3ad3f2f69855ccb0da68df4c8426d245bb1bf3b175994769776697c3eef68",
     "analysis_revision": "phase10-analysis-v1",
-    "controlla_revision": "9b336e1eedc74fa2efab6197fb93c7e35fd3fe3a",
-    "split_digest": "dc40fed57a0f0f3e398d9a0c194a11f926792a6e64a65d71f90781c83765f2ab"
+    "controlla_revision": "b0a7c7c1634a993523c69577289d20ac2f97ff93",
+    "split_digest": "b14d325e932a540ca8f66e58efb43bb8732d75c7676329269e3987ba039e08e8"
   }
 }
