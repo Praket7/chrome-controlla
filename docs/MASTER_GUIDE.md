@@ -1,6 +1,6 @@
 # Chrome Controlla — master usage guide contract
 
-Version: local Phase 9 setup preview `master-2026-10-06-v2`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
+Version: local Phase 9 setup preview `master-2026-10-06-v3`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).
 
@@ -32,16 +32,33 @@ The MCP initialize instructions include registered tool names from the same runt
 
 Run `cargo run -p controlla-runtime -- mcp` from the repository during development, or configure the built `controlla` binary with `mcp` as the MCP client's stdio command. `help`, `doctor`, and `schema` remain separate CLI commands. Configure one connection route in the server process:
 
+Portable server entry (put it in the client-specific MCP server collection in [clients.md](clients.md); replace both absolute paths):
+
+```json
+{"command":"/ABS/PATH/TO/controlla","args":["mcp"],"env":{"CONTROLLA_STATE_DIR":"/ABS/PATH/TO/controlla-state/client-a","COMPTROL_CHROME_AUTO_CONNECT":"1"}}
+```
+
 - **Explicit endpoint:** set `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT=ws://127.0.0.1:<port>/devtools/browser/<id>`. The endpoint must be an explicitly configured loopback WebSocket. The server rejects credentials and non-loopback hosts. This enables only the Direct CDP provider; it does not enable the shared-extension provider.
 - **Chrome permissioned auto-connect:** set `COMPTROL_CHROME_AUTO_CONNECT=1`, then enable Remote Debugging in Chrome at `chrome://inspect/#remote-debugging`. Chrome may show its native Allow prompt on connection; the server does not bypass that prompt.
 
-The `session` tool uses `action="discover"` for provider status, `action="targets"` to connect and report exact current target IDs/revisions, `action="connect"` with the explicitly selected `target_ids`, and `action="list_targets"` with the returned `session_id` to receive revision-bound `target_ref` values. Connecting can trigger Chrome's native consent flow. Tool calls do not choose the first tab or infer a target from title/order. `observe` and `extract` require a returned target reference and revalidate it against the session and current browser graph.
+The `session` schema accepts `action` as a string, so use only these values. Direct CDP: call `discover`; call `targets` with `provider:"explicit_cdp"`; call `connect` with the exact selected IDs returned by `targets`; then call `list_targets` with the returned session ID. It returns complete revision-bound `target_ref` values for Direct CDP `observe`, `extract`, and `workflow`. These are MCP tool arguments (the client supplies the JSON-RPC wrapper):
 
-`extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
+```json
+{"action":"discover"}
+{"action":"targets","provider":"explicit_cdp"}
+{"action":"connect","provider":"explicit_cdp","target_ids":["<exact target id from targets>"]}
+{"action":"list_targets","session_id":"<session id from connect>"}
+```
 
-This preview does not implement generic `execute` or `jobs`. `workflow` and `workflow_status` provide only the bounded workflow subset described above.
+For an existing tab through the extension, read its decimal ID in the extension popup and call `pair_shared` with only that ID. Follow the returned endpoint/token instructions in the popup, then call `accept_shared` with the returned session ID and `list_shared_targets`. Shared tools use `chrome_tab_id`, not `target_ref`; only `shared_observe` and limited `shared_input` fill/click are supported. Extraction and workflow are Direct CDP only. Pairing never selects all tabs. Connecting can trigger Chrome's native consent flow. Tool calls do not choose a target by title or order. `tools/list` schemas are authoritative when a server version differs from this guide.
+
+`extract` takes caller-declared `sections`, each with its own container, record selector, stable ID field, account marker, independently authoritative `expected_count`, and container-scoped terminal marker. `container` must identify the element that actually scrolls; each extraction step scans its currently rendered subtree and then advances that element by one viewport. The operation repeats this bounded scan/scroll cycle up to `max_steps`, deduplicating by stable ID so recycled rows are not counted twice. Optional expansion controls must be explicitly declared and verified before extraction. Deterministic per-section record/byte budgets and a global deadline apply. Single-use cursors bind to the target, revisions, and extraction spec, expire, and retain at most a bounded amount of state. Skipped/truncated sections report missing coverage. Completeness requires every section to satisfy the browser library's evidence rules.
+
+This preview does not implement generic `execute` or `jobs`. `workflow` and `workflow_status` provide only the bounded workflow subset described above. There is no `jobs.wait`; supported `session` actions are `discover`, `targets`, `connect`, `list_targets`, `pair_shared`, `accept_shared`, `list_shared_targets`, and `release_shared`.
 
 Trusted-local scripts are default-off and run in-process; they are not an OS isolation boundary. A script may return one artifact as {kind:"artifact",filename:"summary.json",media_type:"application/json",bytes:[123,125]}. Only application/json, application/pdf, image/png, and text/plain are accepted; the basename must be safe and bytes must contain 1–12 KiB. `workflow_status` returns the bytes as a JSON uint8 array with SHA-256 and operation/principal/session binding. No file is written or download handle created.
+
+These are different flows: returning an inline artifact produces bytes in the workflow receipt; selecting a file in a page requires `artifact_register` with the file bytes, then `file_select` with its returned handle and a complete current Direct CDP target reference. Selection uses the page's existing `<input type="file">`; it does not open or control a native OS file picker. Selection proves only file-input selection/name/size readback, not upload, app acceptance, or saving. Neither route accepts an arbitrary host path. If an app requires native picker interaction or native foreground access, stop and report it unsupported; do not switch modes silently.
 
 This preview does not claim a released package or generated installer. For local setup, build the executable and use its absolute path in the client configuration examples in [clients.md](clients.md). A host-bound local npm package can be staged with `scripts/package-build.sh` and installed from `packages/chrome-controlla/dist`; the guide there shows the command and package-local executable path. Do not assume a package named `chrome-controlla` is published or that `latest` is reproducible.
 
@@ -53,33 +70,31 @@ Do not copy auth cookies from the user’s regular Chrome profile. For a dedicat
 
 ## 3. Choose a mode
 
-| Need | Mode | Behavior |
+| Route available in this preview | Select it when | Boundary |
 |---|---|---|
-| User wants to keep working | Dedicated strict background | No OS focus, cursor or clipboard changes; explicit failure if task requires them |
-| Unattended workload with qualified app | Dedicated headless | No visible window; app/media support checked |
-| User wants to watch or interact | Dedicated foreground allowed | May show/activate browser within the granted task |
-| Existing logged-in tab is necessary | Shared attachment | Explicit selected tab grants; stop on relevant user changes |
-| Remote client and isolated environment | Remote browser | Pairing, tenant/account binding and artifact transfer required |
+| Direct CDP to explicitly configured/permissioned Chrome | The user has configured a local loopback endpoint or enabled Chrome permissioned auto-connect | Chrome may show native consent; this server does not launch its own dedicated/headless profile. Cross-platform OS focus/cursor/clipboard guarantees are unqualified. |
+| Shared extension | The user wants one or more already-open tabs and explicitly selects their decimal IDs in the extension popup | Pairing grants only those tabs. Shared mode exposes bounded observation and guarded fill/click; it is not isolated from the user. |
+| Remote browser or remote MCP | Never for this build | No authenticated remote endpoint or remote browser route exists. |
 
-Do not silently switch from background to foreground. A background browser may still have page-internal focus; that does not authorize OS focus changes. A shared tab is not protected against the human, other extensions or remote collaborators.
+Do not describe the current MCP as providing dedicated headless/foreground launch modes: it connects to configured Chrome or explicitly paired tabs. Do not silently switch tabs or routes. A background server process does not prove native OS focus/cursor/clipboard behavior was qualified.
 
 ## 4. Targets, ownership and accounts
 
-Use handles returned by this session. A handle binds browser/profile, tab/target, navigation epoch and frame; app edits also bind document and account. Similar titles, tab indexes, active tab and copied coordinates are not sufficient identity.
+For Direct CDP, use the complete `target_ref` returned by `session` action `list_targets`; it binds session, browser generation, target and frame revisions. Shared extension tools instead take the explicitly paired `chrome_tab_id`. Similar titles, tab indexes, active tab and copied coordinates are not sufficient identity. This preview does not independently establish app account or document identity; do not treat caller-supplied account markers/revisions as independent verification.
 
 After navigation, reload, reconnection or frame replacement, obtain a fresh handle. Before writing in a multi-account app, verify the intended tenant/account and document. A URL containing `/u/2/` is not proof of the correct account; a 404 is not an empty data collection.
 
-Record tabs as owned, borrowed, or adopted. Cleanup can close only owned temporary tabs with unchanged ownership. If the user takes over an owned tab or keeps an output open, preserve it. Report any leftover resource and reason.
+Record tabs as owned, borrowed, or adopted. This preview has no tab-close or generic session-release tool. `session` action `release_shared` only detaches this server's debugger attachments; it does not close the Chrome tab. Stop the MCP process to end Direct CDP; Chrome tabs/windows remain open. Never close borrowed/user tabs. Preserve tabs the user takes over or wants to keep.
 
 ## 5. Observe efficiently
 
-Start with a targeted semantic observation: relevant form, table, object panel or text region. Include role/name, enabled state, frame, freshness, and disambiguating context. Request a visual crop when layout/canvas appearance matters. Use a broader snapshot only when the smaller observation cannot identify the next action.
+Direct CDP `observe` reads caller-selected CSS fields with item/text/byte bounds; `accessibility` returns a bounded partial Chrome accessibility tree for one CSS-selected node; `screenshot_crop` returns a bounded crop. These are separate tools with different schemas. This preview has no universal semantic locator or full-page snapshot tool. Use exact returned target references, and request a crop when visual appearance matters.
 
 Respect `truncated`, `cursor`, `partial` and omitted-field metadata. A snapshot is evidence at a point in time. It is not a reusable permission or a permanent element identifier.
 
 ## 6. Execute and verify
 
-Provide the goal’s actual success condition. Examples: input has the requested value; record exists in the specified account; saved document contains object IDs and text after reload; exported media is playable with the requested duration. If the user requested only a draft, do not publish it as part of verification.
+Provide the goal's actual success condition. This preview can read DOM state and the paired extension's guarded fill/click DOM readback, but has no independent app-save verifier. It can observe a draft field value; it cannot establish account-level persistence, an exported file, or media playability. If the user requested only a draft, do not publish it as part of verification.
 
 Batch deterministic local work: fill known fields, apply known formatting, traverse a read-only list. Split at ambiguity, changed account, external submission, shared-document conflict or a necessary user decision. The runtime can wait for the right event without another model turn.
 
@@ -87,7 +102,7 @@ Use a stable idempotency key for one logical operation. Same request replay retu
 
 ### Read-only workflow example
 
-After `session` connect and `session` list-targets, replace the sample session and target reference with the values returned by those calls. This request performs one bounded observation and checkpoint; workflow steps do not support `fill` or `verify_value`.
+After the Direct CDP sequence in §2, replace the sample session and target reference with the complete values returned by `connect` and `list_targets`. This request is for the `workflow` tool and performs one bounded observation and checkpoint; workflow steps do not support `fill` or `verify_value`.
 
 ```json
 {
@@ -123,19 +138,38 @@ After `session` connect and `session` list-targets, replace the sample session a
 }
 ```
 
-Replace every target reference value with the complete object returned by `session list_targets`. This example is read-only. The retained guide-example check validates JSON and the currently documented workflow step shape; the MCP fixture separately exercises workflow calls. Neither check is B35 or fresh-agent usability acceptance.
+Replace every target reference value with the complete object returned by `session` action `list_targets`; angle-bracket strings are instructions, not literal values. This example is read-only and is not a separate `execute` tool. The local guide check validates JSON/request shape, not browser behavior or fresh-agent usability.
 
-## 7. Typing, clicking and dragging
+### Extract and resume bounded results
 
-- `fill`: replace an ordinary field efficiently, with input/change semantics qualified for that control.
-- `insert_text`: insert text without claiming a full physical key sequence.
-- `key_sequence`: sequential key/input behavior in one call; use for event-sensitive controls. Start at the fastest qualified delay and verify the result; do not repeatedly retype after an uncertain action.
+`extract` takes top-level `session_id`, a complete `target_ref`, `sections`, and aggregate `max_records`/`max_bytes`. Each section also has its own `max_steps`, `max_records`, `max_text_chars`, and `max_bytes`. `container` is the CSS selector for the scrollable element itself (often `[role=\"list\"]` or an app-specific pane, not necessarily `main`); each step scans that container's rendered descendants and advances its `scrollTop` by at most `clientHeight`. Choose `expected_count` only from an authoritative source independent of the traversed rows, such as a separately verified app total; a count read from the same partial list is not independent evidence. On a partial result, use only that section's returned cursor with the same section ID and unchanged extraction spec. Both per-section and aggregate limits apply. If the cursor is missing, stale, expired, or rejected, reobserve identity/state before starting a new extraction.
 
-Handle Unicode graphemes, IME and contenteditable explicitly. Check field selection and caret behavior before replacing rich text. A changed value may trigger autosave or network effects.
+This is the `extract` tool argument shape (replace the target reference with the entire object returned by `list_targets`; the placeholder strings are instructional):
 
-Click by semantic locator when possible. Coordinates require current viewport geometry and target hit testing. Drag requires source, destination and a postcondition such as order or object position. Never reuse coordinates after scroll/zoom/layout change without revalidation.
+```json
+{
+  "session_id":"<session id>",
+  "target_ref":{"session_id":"<session id>","principal":"<principal>","capability_revision":1,"browser_instance_id":"<browser instance>","browser_generation":1,"target_id":"<target id>","target_revision":"<revision>","frame_id":"<frame id>","frame_revision":1,"account_revision":0,"document_revision":0},
+  "sections":[{"section_id":"tasks","spec":{"container":"main","record":"[data-id]","fields":{"title":".title"},"id_field":"data-id","max_steps":4,"max_records":20,"max_text_chars":4000,"max_bytes":8192,"expected_count":42,"account_marker":["[data-account]","test-account"],"terminal_selector":"[data-end=true]","expand":[],"cursor":null}}],
+  "max_records":20,"max_bytes":8192,"timeout_ms":10000
+}
+```
 
-The internal clipboard is isolated task data. It is not the operating-system clipboard. Do not use native paste in strict background mode unless the route’s tested guarantee supports it.
+If a partial response includes a cursor for `tasks`, repeat with the same target and section spec and replace only `cursor` with that returned token. Inspect missing coverage and truncation. If there is no cursor, it cannot resume through this tool.
+
+### File selection request shape
+
+`file_select` requires a complete current Direct CDP `target_ref`, a registered `artifact_handle`, and a caller-declared `account_marker` pair `[selector, expected_text]`. The MCP schema lists each allowed locator object, and the server rejects unknown locator fields. `locator` accepts one identity: `{"selector":"#upload-input"}`, `{"role":"button","name":"Choose file"}`, `{"label":"Upload"}`, `{"placeholder":"File"}`, `{"text":"Upload"}`, `{"test_id":"upload"}`, `{"alt_text":"Upload"}`, `{"href_contains":"upload"}`, or `{"backend_node_id":123}`. For file selection, identify the actual `<input type=\"file\">`, usually with a CSS selector. This only selects the registered bytes into that input; it does not click a submit button or verify transfer, app acceptance, or persistence.
+
+```json
+{"session_id":"<session id>","target_ref":{"session_id":"<session id>","principal":"<principal>","capability_revision":1,"browser_instance_id":"<browser instance>","browser_generation":1,"target_id":"<target id>","target_revision":"<revision>","frame_id":"<frame id>","frame_revision":1,"account_revision":0,"document_revision":0},"locator":{"selector":"input[type='file']"},"artifact_handle":"<handle from artifact_register>","account_marker":["[data-account]","test-account"]}
+```
+
+## 7. Input supported by this preview
+
+The installed catalog does not expose general `insert_text`, `key_sequence`, semantic click, or drag tools. Direct CDP `workflow` supports only its documented read/checkpoint steps. The separate explicitly paired extension tool `shared_input` supports only a guarded fill of one visible, unobstructed ordinary input/textarea or guarded click on one exact CSS match, with caller-supplied current-value/text precondition and bounded deadline. Call `tools/list` for its exact required arguments; never invent a locator shape or use a Direct CDP `target_ref` where the tool requires `chrome_tab_id`.
+
+These actions do not establish app save/persistence, and a page can still change in the narrow validation-to-dispatch interval. For event-sensitive input, IME, contenteditable, canvas, drag, or native clipboard behavior, this preview has no qualified route; report it unsupported instead of guessing input events. Internal artifact bytes are not the operating-system clipboard. Strict background never authorizes native paste.
 
 ## 8. Extract data completely
 
@@ -151,11 +185,11 @@ If expansion is blocked or the deadline arrives, return the rows obtained with `
 
 ## 9. Long work, cancellation and uncertainty
 
-An operation exceeding the short response budget returns `accepted` or `running` and an operation ID. Use `jobs.wait` with a cursor and bounded wait. Do not poll rapidly. Resume from durable checkpoints after client disconnect.
+An operation exceeding the short response budget returns `accepted` or `running` and an operation ID. This server has no `jobs.wait`; `workflow_status` has no cursor or wait duration. Call `workflow_status` with the original `session_id` and returned `operation_id`, waiting briefly between calls. It returns the latest durable status/checkpoint. Do not resubmit a workflow just because the first call timed out.
 
 Cancellation stops future steps as soon as supported. It cannot retract a request the remote site has already processed. If delivery may have happened, return `unknown` or reconcile it. Never equate timeout with “nothing happened.”
 
-For `unknown_outcome`: inspect the original operation; query the app receipt or exact intended state; match identity/revision; retry only after proving the effect absent or through a qualified idempotent endpoint. Preserve uncertainty if duplicate effects cannot be distinguished.
+For an unknown workflow outcome, call `workflow_status` for the original operation and inspect its latest checkpoint, target/revisions and delivery. This preview has no app-specific independent observer, so the receipt cannot prove a saved application result. Do not retry a possibly dispatched effect unless an authorized independent read proves it absent or a qualified endpoint guarantees idempotency; otherwise preserve `unknown` and request human reconciliation.
 
 ## 10. Multiple tabs and user interference
 
@@ -175,7 +209,7 @@ A script is not permission to execute arbitrary shell commands, read credentials
 
 Upload only authorized artifacts to the intended account/document. File selection, bytes transferred, app acceptance and saved persistence are distinct stages. Verify the stage needed by the user’s request.
 
-Download/export requires a completion event plus file checks: expected type, nonzero size, checksum where useful, and content/playability validation. A job ID is not an exported file. Use artifact IDs scoped to the current principal; never expose arbitrary host paths remotely.
+This preview has no download or export tool. `artifact_register` plus `file_select` only selects bytes in a page file input, and an inline workflow artifact only returns bounded bytes. Neither route captures downloads or verifies app acceptance/persistence. When a future qualified export route exists, require a completion event plus file type/size/checksum and content or playability checks; never expose arbitrary host paths remotely.
 
 ## 13. Design-app recipes
 
@@ -187,7 +221,7 @@ Identify presentation/account; obtain current object/revision data; choose quali
 
 ### Canva
 
-Identify design/page and supported operation. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. For an app editing session, respect its lifetime and page locks. `sync` can write as well as refresh; do not invoke it as an innocent read after making unwanted edits. Verify the design and exported render.
+Identify design/page and supported operation. The current `canva_sync_preflight` validates a caller-supplied snapshot; it does not connect to Canva or independently verify session age/page lock. Connect APIs, autofill and Apps SDK editing have distinct scopes and entitlements. `sync` can write as well as refresh. In this preview, do not call `sync`; no edit/persist/export route exists.
 
 ### CapCut Web
 

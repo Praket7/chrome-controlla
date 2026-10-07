@@ -1092,9 +1092,9 @@
     }
   ],
   "freeze": {
-    "baseline_lock_sha256": "eb5f8fae6163a9d5beb2d1ccb443110e31dceac09e47c77329142514a1620437",
+    "baseline_lock_sha256": "75b3ad3f2f69855ccb0da68df4c8426d245bb1bf3b175994769776697c3eef68",
     "analysis_revision": "phase10-analysis-v1",
     "controlla_revision": "9b336e1eedc74fa2efab6197fb93c7e35fd3fe3a",
-    "split_digest": "020cc88256ec908b771021f1306969cd8a891e5879efbad3a7c84806b8f3f1df"
+    "split_digest": "dc40fed57a0f0f3e398d9a0c194a11f926792a6e64a65d71f90781c83765f2ab"
   }
 }

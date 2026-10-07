@@ -240,6 +240,43 @@ mod tests {
         }
     }
 
+    // Ground truth is held separately from the candidate's page claim. This observer is
+    // test-only; production still has no trusted app-state or persistence observer.
+    struct GroundTruthFixture {
+        state: Value,
+        revision: String,
+        observed_at_ms: u64,
+    }
+
+    impl TrustedObserver for GroundTruthFixture {
+        fn observe(
+            &self,
+            binding: &EvidenceBinding,
+            predicate: &Predicate,
+        ) -> Option<ObserverEvidence> {
+            let evidence = Evidence {
+                operation_id: binding.operation_id.clone(),
+                provenance_id: binding.provenance_id.clone(),
+                principal: binding.principal.clone(),
+                session: binding.session.clone(),
+                target: binding.target.clone(),
+                revision: self.revision.clone(),
+                app_signature: binding.app_signature.clone(),
+                account_id: binding.account_id.clone(),
+                observer: "independent-offline-fixture".into(),
+                observed_at_ms: self.observed_at_ms,
+                predicate_hash: predicate.fingerprint(),
+                scope: EvidenceScope::IndependentState,
+                state: self.state.clone(),
+            };
+            let bytes = serde_json::to_vec(&evidence).ok()?;
+            Some(ObserverEvidence {
+                evidence,
+                receipt: receipt(&bytes),
+            })
+        }
+    }
+
     fn binding() -> EvidenceBinding {
         EvidenceBinding {
             operation_id: "op".into(),
@@ -342,6 +379,72 @@ mod tests {
         );
         assert_eq!(
             verify(&binding(), 150, 100, &predicate, &evidence(&predicate)),
+            Verification::Inconclusive
+        );
+    }
+
+    #[test]
+    fn offline_ground_truth_catches_fake_save_and_control_semantic_drift() {
+        let saved = Predicate::field_eq("document.title", json!("Saved"));
+        let binding = binding();
+        let mut persuasive_claim = evidence(&saved);
+        persuasive_claim.state = json!({"document":{"title":"Saved"}});
+        assert_eq!(
+            verify(&binding, 150, 100, &saved, &persuasive_claim),
+            Verification::Inconclusive
+        );
+        assert_eq!(
+            verify_observed(
+                &GroundTruthFixture {
+                    state: json!({"document":{"title":"Draft"}}),
+                    revision: "r1".into(),
+                    observed_at_ms: 140,
+                },
+                &binding,
+                150,
+                100,
+                &saved,
+            ),
+            Verification::Failed
+        );
+
+        let publish = Predicate::field_eq("controls.publish.action", json!("publish"));
+        assert_eq!(
+            verify_observed(
+                &GroundTruthFixture {
+                    state: json!({"controls":{"publish":{"label":"Publish","action":"delete"}}}),
+                    revision: "r1".into(),
+                    observed_at_ms: 140,
+                },
+                &binding,
+                150,
+                100,
+                &publish,
+            ),
+            Verification::Failed
+        );
+    }
+
+    #[test]
+    fn offline_ground_truth_rejects_old_evidence_and_revision_drift() {
+        let predicate = Predicate::field_eq("document.title", json!("Saved"));
+        let binding = binding();
+        let old_revision = GroundTruthFixture {
+            state: json!({"document":{"title":"Saved"}}),
+            revision: "r0".into(),
+            observed_at_ms: 140,
+        };
+        assert_eq!(
+            verify_observed(&old_revision, &binding, 150, 100, &predicate),
+            Verification::Inconclusive
+        );
+        let stale_observation = GroundTruthFixture {
+            revision: "r1".into(),
+            observed_at_ms: 0,
+            ..old_revision
+        };
+        assert_eq!(
+            verify_observed(&stale_observation, &binding, 150, 100, &predicate),
             Verification::Inconclusive
         );
     }

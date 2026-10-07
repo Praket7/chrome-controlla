@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDir = path.join(root, 'packages/chrome-controlla/dist');
+const digest = async (file) => createHash('sha256').update(await readFile(file)).digest('hex');
 const temp = await mkdtemp(path.join(os.tmpdir(), 'controlla-lifecycle-'));
 const isolatedNpmConfig = path.join(temp, 'empty.npmrc');
 await writeFile(isolatedNpmConfig, '');
@@ -32,9 +34,22 @@ try {
   await writeFile(sentinel, 'user data survives package lifecycle checks');
 
   const archives = [];
+  const previousBinary = process.env.CONTROLLA_PREVIOUS_BINARY;
+  const currentBinary = process.env.CONTROLLA_CURRENT_BINARY;
+  assert.equal(Boolean(previousBinary), Boolean(currentBinary), 'provide both distinct binary paths or neither');
+  const binaryName = process.platform === 'win32' ? 'controlla-core.exe' : 'controlla-core';
+  let binaryDigests;
+  if (previousBinary && currentBinary) {
+    binaryDigests = [await digest(previousBinary), await digest(currentBinary)];
+    assert.notEqual(binaryDigests[0], binaryDigests[1], 'upgrade smoke requires distinct server binaries');
+  }
   for (const version of ['0.1.0', '0.1.1']) {
     const staged = path.join(temp, `package-${version}`);
     await cp(packageDir, staged, { recursive: true });
+    if (binaryDigests) {
+      const source = version === '0.1.0' ? previousBinary : currentBinary;
+      await cp(source, path.join(staged, 'bin', binaryName));
+    }
     const manifestPath = path.join(staged, 'package.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
     manifest.version = version;
@@ -46,9 +61,14 @@ try {
   const prefix = path.join(temp, 'install prefix');
   const installedManifest = path.join(prefix, 'node_modules/chrome-controlla/package.json');
   const installedLauncher = path.join(prefix, 'node_modules/chrome-controlla/bin/controlla.cjs');
+  const installedBinary = path.join(prefix, 'node_modules/chrome-controlla/bin', binaryName);
   const checkVersion = async (expected) => {
     const installed = JSON.parse(await readFile(installedManifest, 'utf8'));
     assert.equal(installed.version, expected, `expected installed package ${expected}, got ${installed.version}`);
+    if (binaryDigests) {
+      const expectedBinary = expected === '0.1.0' ? binaryDigests[0] : binaryDigests[1];
+      assert.equal(await digest(installedBinary), expectedBinary, `installed ${expected} binary must match its staged source`);
+    }
     assert.match(run(process.execPath, [installedLauncher, '--help']), /Usage: controlla/);
     assert.equal(await readFile(sentinel, 'utf8'), 'user data survives package lifecycle checks');
   };
@@ -63,7 +83,8 @@ try {
   run('npm', ['uninstall', '--prefix', prefix, 'chrome-controlla', '--no-audit', '--no-fund']);
   await assert.rejects(readFile(installedManifest), { code: 'ENOENT' });
   assert.equal(await readFile(sentinel, 'utf8'), 'user data survives package lifecycle checks');
-  console.log(`Verified packed install, upgrade, rollback, uninstall, and user-data preservation (${process.platform}/${process.arch}).`);
+  const binaryNote = binaryDigests ? `distinct binary digests ${binaryDigests[0]} → ${binaryDigests[1]}` : 'same binary in both package versions';
+  console.log(`Verified packed install, upgrade, rollback, uninstall, and user-data preservation (${process.platform}/${process.arch}; ${binaryNote}).`);
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

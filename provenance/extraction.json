@@ -102,16 +102,16 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "9b2f478e44c969c754ed2fc529faf6e348d98734895a118aec1c1773861199a5",
-      "edits": "updated relative link and document placement; reconciled Phase 0/1 checklist with progress and CI evidence; recorded Phase 2 implementation/review evidence, Phase 3 journal coverage, Phase 4/5 implementation and fixture verification; Phase 6 records bounded QuickJS workflows, durable journal recovery, and exclusive state-directory ownership; Phase 7 records fail-closed verifier/cache mechanics without production observer integration; Phase 8 records app qualification gates; Phase 9 records local stdio guide and setup scope; Phase 10 records pinned candidate artifacts and explicitly unrun benchmark gates",
+      "destination_sha256": "6c78c33f5b0a834fe2cee2ca2c2019b2bce80e75ec066042b405724a067a66f2",
+      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 6 constrained workflows, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions plus 20/20 pre-live B35 guide/schema results, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 local unpublished candidate/cross-platform CI boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "c05481d95813a7a96f67991cd89a16d42d07f5e5dabf8d2bb5d64250598b6dfd",
-      "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 5 documents bounded CSS/AX/PNG observation, section extraction, resumable cursors, and evidence boundaries; Phase 4 file selection remains library-only and does not claim app acceptance",
+      "destination_sha256": "d804d4b517074b22d825bea80e4d7d4fb6a1751f7cac3727bbbdebf9c6bea462",
+      "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],

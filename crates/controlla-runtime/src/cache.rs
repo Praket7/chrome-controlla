@@ -333,6 +333,10 @@ mod tests {
                 ..baseline.clone()
             },
             WorkflowDefinition {
+                revision: "rev-8".into(),
+                ..baseline.clone()
+            },
+            WorkflowDefinition {
                 input_schema: json!({"title":"number"}),
                 ..baseline.clone()
             },
@@ -350,6 +354,10 @@ mod tests {
             },
             WorkflowDefinition {
                 read_write_footprint: vec!["document.body".into()],
+                ..baseline.clone()
+            },
+            WorkflowDefinition {
+                read_write_footprint: vec!["controls.publish:delete".into()],
                 ..baseline.clone()
             },
             WorkflowDefinition {
@@ -429,6 +437,16 @@ mod tests {
         ));
         assert!(matches!(
             cache.lookup("save-document", &definition, 2_000),
+            CacheLookup::Quarantined(_)
+        ));
+
+        admit(&mut cache, definition.clone());
+        let old_revision = WorkflowDefinition {
+            revision: "rev-6".into(),
+            ..definition.clone()
+        };
+        assert!(matches!(
+            cache.lookup("save-document", &old_revision, 2_000),
             CacheLookup::Quarantined(_)
         ));
 

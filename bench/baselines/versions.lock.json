@@ -27,7 +27,9 @@
       "version": "4.1.0",
       "tarball": "https://registry.npmjs.org/@browserbasehq/stagehand/-/stagehand-4.1.0.tgz",
       "integrity": "sha512-PJikMBVoaCRh6TFD7GcmeISmsMq4IwUu1BD5FOsGUVDUxrVqZomWa6W6dF+a/zu4xRZu2Z2xX1nXVMDaCuZWsw==",
-      "status": "version-and-integrity-recorded; not installed or tested"
+      "status": "exact package version/integrity and tagged source commit recorded; not installed or tested",
+      "source_tag": "https://github.com/browserbase/stagehand/tree/@browserbasehq/stagehand@4.1.0",
+      "source_commit": "cd7b230778cf92269e4cb90e80d97f5113781c51"
     },
     {
       "name": "Browser Use",

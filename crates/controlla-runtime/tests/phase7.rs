@@ -119,9 +119,5 @@ fn artifact_validation_rejects_truncated_download() {
     };
     assert!(correct.matches(b"correct"));
     assert!(!correct.matches(b"corrupt"));
-    let expected = ArtifactExpectation {
-        byte_length: 8,
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-    };
-    assert!(!expected.matches(b"short"));
+    assert!(!correct.matches(b"corre"));
 }

@@ -158,3 +158,27 @@ async fn packaged_stdio_supports_discovery_lifecycle_without_initialize() {
     client.cancel().await.unwrap();
     std::fs::remove_dir_all(state_dir).unwrap();
 }
+
+#[tokio::test]
+async fn packaged_stdio_negotiates_each_rmcp_revision_with_initialize() {
+    for version in ProtocolVersion::known_up_to(&ProtocolVersion::LATEST_WITH_INITIALIZE) {
+        let state_dir = state_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_controlla"));
+        command.arg("mcp").env("CONTROLLA_STATE_DIR", &state_dir);
+        let transport = TokioChildProcess::new(command).expect("spawn MCP stdio server");
+        let client = VersionedClient(version.clone())
+            .serve(transport)
+            .await
+            .unwrap_or_else(|error| panic!("initialize negotiation for {version}: {error}"));
+        assert_eq!(
+            client.peer_info().unwrap().protocol_version,
+            *version,
+            "stdio server must negotiate advertised revision {version}"
+        );
+        let tools = client.list_tools(None).await.unwrap();
+        assert!(tools.tools.iter().any(|tool| tool.name == "guide"));
+        client.cancel().await.unwrap();
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+}

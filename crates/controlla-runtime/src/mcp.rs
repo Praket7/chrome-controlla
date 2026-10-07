@@ -145,11 +145,56 @@ struct ArtifactRegisterArgs {
     bytes: Vec<u8>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(untagged)]
+enum FileSelectLocator {
+    RoleName(RoleNameLocator),
+    Label(LabelLocator),
+    Placeholder(PlaceholderLocator),
+    Text(TextLocator),
+    TestId(TestIdLocator),
+    AltText(AltTextLocator),
+    HrefContains(HrefContainsLocator),
+    Selector(SelectorLocator),
+    BackendNodeId(BackendNodeIdLocator),
+}
+
+macro_rules! locator_string_input {
+    ($name:ident, $field:ident) => {
+        #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        struct $name {
+            $field: String,
+        }
+    };
+}
+
+locator_string_input!(LabelLocator, label);
+locator_string_input!(PlaceholderLocator, placeholder);
+locator_string_input!(TextLocator, text);
+locator_string_input!(TestIdLocator, test_id);
+locator_string_input!(AltTextLocator, alt_text);
+locator_string_input!(HrefContainsLocator, href_contains);
+locator_string_input!(SelectorLocator, selector);
+
+#[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RoleNameLocator {
+    role: String,
+    name: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BackendNodeIdLocator {
+    backend_node_id: i64,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct FileSelectArgs {
     session_id: String,
     target_ref: TargetRefInput,
-    locator: Value,
+    locator: FileSelectLocator,
     artifact_handle: String,
     account_marker: (String, String),
 }
@@ -748,8 +793,9 @@ async fn run_file_select(s: Arc<LiveSession>, args: FileSelectArgs) -> Result<Va
     if s.handle.mode != SessionMode::DirectCdp || reference.principal != s.handle.principal {
         return Err("file selection requires the matching direct CDP session".into());
     }
+    let locator_value = serde_json::to_value(args.locator).map_err(|e| e.to_string())?;
     let locator =
-        controlla_browser::Locator::from_value(&args.locator).map_err(|e| e.to_string())?;
+        controlla_browser::Locator::from_value(&locator_value).map_err(|e| e.to_string())?;
     let handle: controlla_browser::sessions::ArtifactHandle =
         serde_json::from_value(json!(args.artifact_handle))
             .map_err(|_| "artifact_handle is invalid".to_owned())?;
@@ -2643,6 +2689,37 @@ mod tests {
             file_select_schema["required"]
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "account_marker"))
+        );
+        let mut locator_schema = &file_select_schema["properties"]["locator"];
+        if let Some(reference) = locator_schema["$ref"].as_str() {
+            let name = reference.strip_prefix("#/$defs/").unwrap();
+            locator_schema = &file_select_schema["$defs"][name];
+        }
+        let locator_options = locator_schema["anyOf"]
+            .as_array()
+            .or_else(|| locator_schema["oneOf"].as_array())
+            .expect("locator schema enumerates its supported object forms");
+        assert!(locator_options.iter().any(|option| {
+            let option = option["$ref"]
+                .as_str()
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .map_or(option, |name| &file_select_schema["$defs"][name]);
+            option["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "selector"))
+        }));
+        assert!(
+            serde_json::from_value::<super::FileSelectLocator>(json!({
+                "selector":"input[type=file]",
+                "unrecognized":"ignored"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<super::FileSelectLocator>(json!({
+                "selector":"input[type=file]"
+            }))
+            .is_ok()
         );
         let result = client
             .call_tool(
