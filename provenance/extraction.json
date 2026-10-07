@@ -102,7 +102,7 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "5da758bdf473f3e263d4b4655755dd7e1e43b9db94bb99326f586c40c6a9bc5e",
+      "destination_sha256": "770f4cd958a50beb4d92f7ba6103f3432d0561e9544bfc360518a69fa0358c5f",
       "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, and authenticated loopback HTTP implementation/tests, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest 13c64e3 candidate and Windows/macOS/Ubuntu CI boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },

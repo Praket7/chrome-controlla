@@ -149,7 +149,7 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 - [x] Add owned/borrowed/adopted tab ledger and cleanup receipts. Preserve user tabs and changed ownership, including after crashes.
 - [x] Use per-target actors plus declared shared-resource locks. Run 1/4/8-tab fixture tests; prove a hung page does not stall all tabs.
 - [ ] Qualify platform focus/cursor/clipboard behavior with an independent observer. Unsupported platform/mode cells remain unqualified.
-- [ ] Commit `feat: isolate Chrome sessions and track tab ownership`.
+- [x] Commit `feat: isolate Chrome sessions and track tab ownership` (`f0fd586`, reviewed and pushed; hosted CI passed).
 
 **Gate:** correct target identity and cleanup, with honest platform boundaries. Headless Chrome availability is not headless Canva/CapCut qualification.
 
