@@ -102,7 +102,7 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "6e78df2faae77d991601919f958e8fc1833364976b77c5e65be6c91d247b426c",
+      "destination_sha256": "6b94708286d88c24f7925a1689b7ee8f4b15822ff5ab390781940a8a8d7f2b87",
       "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 3 local 12-second QuickJS Promise coverage, Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, and authenticated loopback HTTP implementation/tests, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest 13c64e3 candidate and Windows/macOS/Ubuntu CI boundaries",
       "license": "user-provided design document; no third-party license asserted"
     },

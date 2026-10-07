@@ -235,6 +235,10 @@ Sol independently approved the Phase 2 code diff after reviewing launch cancella
 
 Sol approved the local journal gate after reviewing two correction rounds. Tests cover owner-scoped durable replay, concurrent admission and one-time dispatch claims, fixture send counting, crash-before-send uncertainty, acknowledged-delivery preservation, pre-send failure, bounded wait, and persisted deadlines. This is not an MCP jobs tool or live browser execution: B18/B19 remain partial for real Promise, worker cancellation, and CDP/extension routes.
 
+## Phase 3 restart-before-dispatch correction — 2026-10-07
+
+The new red-first `startup_recovery_keeps_running_job_not_sent_when_dispatch_was_never_claimed` regression failed against the prior behavior (`running/unknown`), then passed after recovery was keyed to persisted delivery state. The focused `jobs` integration suite passes 18/18: real subprocess kills before dispatch recover as `failed/not_sent`, and after a dispatch claim recover as `unknown` and reject replay. Additional coverage preserves acknowledged `sent` delivery, leaves completed operations untouched, and expires running/not-sent work as failed. This verifies journal boundaries only; no live Chrome dispatch process was stopped.
+
 ## Phase 4 local guard primitives — 2026-10-06
 
 | Check | Result | Environment | Evidence |

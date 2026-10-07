@@ -2238,17 +2238,8 @@ impl App {
                 env!("CARGO_PKG_VERSION")
             )));
         }
-        let (guide_version, content) = match args.topic.as_str() {
-            "clients" => (
-                "clients-2026-10-06-v1",
-                include_str!("../../../docs/clients.md"),
-            ),
-            "master" => (
-                "master-2026-10-06-v2",
-                include_str!("../../../docs/MASTER_GUIDE.md"),
-            ),
-            _ => return Err(invalid("topic must be clients or master")),
-        };
+        let (guide_version, content) =
+            guide_content(&args.topic).ok_or_else(|| invalid("topic must be clients or master"))?;
         Ok(rmcp::handler::server::wrapper::Json(json!({
             "server_version":env!("CARGO_PKG_VERSION"),
             "guide_version":guide_version,
@@ -2576,7 +2567,7 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
             include_str!("../../../docs/clients.md"),
         )),
         "master" => Some((
-            "master-2026-10-06-v2",
+            "master-2026-10-06-v3",
             include_str!("../../../docs/MASTER_GUIDE.md"),
         )),
         _ => None,
@@ -2947,6 +2938,29 @@ mod tests {
         let guide = guide.structured_content.unwrap();
         assert_eq!(guide["server_version"], env!("CARGO_PKG_VERSION"));
         assert!(guide["content"].as_str().unwrap().contains("OpenCode v2"));
+        let master_guide = client
+            .call_tool(
+                CallToolRequestParams::new("guide").with_arguments(
+                    json!({
+                        "topic":"master",
+                        "server_version":env!("CARGO_PKG_VERSION")
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(master_guide["guide_version"], "master-2026-10-06-v3");
+        assert!(
+            master_guide["content"]
+                .as_str()
+                .unwrap()
+                .contains("master-2026-10-06-v3")
+        );
         let stale_guide = client
             .call_tool(
                 CallToolRequestParams::new("guide").with_arguments(

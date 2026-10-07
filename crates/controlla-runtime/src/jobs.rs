@@ -374,21 +374,19 @@ impl Journal {
     /// Call only after this process has recovered a database from a prior runtime; dispatched effects stay uncertain.
     pub fn recover_uncertain(&self, principal: &str, session: &str) -> Result<usize, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
-        let mut count = connection.execute(
-            "UPDATE operations SET status='unknown', deadline_error=CASE WHEN deadline_at_ms<=?3 THEN 'deadline_exceeded' ELSE deadline_error END, revision=revision+1 WHERE principal=?1 AND session=?2 AND status='running'",
+        Ok(connection.execute(
+            "UPDATE operations SET status=CASE WHEN status='running' AND delivery!='not_sent' THEN 'unknown' ELSE 'failed' END, deadline_error=CASE WHEN deadline_at_ms<=?3 THEN 'deadline_exceeded' ELSE 'process_restarted' END, revision=revision+1 WHERE principal=?1 AND session=?2 AND status IN ('accepted','running')",
             params![principal, session, now_ms() as i64],
-        )?;
-        count += connection.execute("UPDATE operations SET status='failed', deadline_error='deadline_exceeded', revision=revision+1 WHERE principal=?1 AND session=?2 AND status='accepted' AND deadline_at_ms<=?3", params![principal, session, now_ms() as i64])?;
-        Ok(count)
+        )?)
     }
 
     /// Reconcile durable records immediately after opening a journal from a prior process.
-    /// Running jobs become unknown and keep their latest checkpoint; accepted jobs are safe to
-    /// fail because the runner has not yet claimed any browser dispatch.
+    /// Jobs before dispatch fail as not sent; claimed jobs become unknown and keep their
+    /// latest checkpoint because a browser effect may have begun.
     pub fn recover_after_restart(&self) -> Result<usize, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
         Ok(connection.execute(
-            "UPDATE operations SET status=CASE status WHEN 'running' THEN 'unknown' ELSE 'failed' END, deadline_error='process_restarted', revision=revision+1 WHERE status IN ('accepted','running')",
+            "UPDATE operations SET status=CASE WHEN status='running' AND delivery!='not_sent' THEN 'unknown' ELSE 'failed' END, deadline_error='process_restarted', revision=revision+1 WHERE status IN ('accepted','running')",
             [],
         )?)
     }
@@ -512,6 +510,6 @@ fn expire_one(
     session: &str,
     id: &str,
 ) -> Result<(), JournalError> {
-    connection.execute("UPDATE operations SET status=CASE status WHEN 'accepted' THEN 'failed' ELSE 'unknown' END, deadline_error='deadline_exceeded', delivery=CASE status WHEN 'accepted' THEN 'not_sent' ELSE delivery END, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('accepted','running') AND deadline_at_ms<=?4", params![id, principal, session, now_ms() as i64])?;
+    connection.execute("UPDATE operations SET status=CASE WHEN status='accepted' OR delivery='not_sent' THEN 'failed' ELSE 'unknown' END, deadline_error='deadline_exceeded', delivery=CASE WHEN status='accepted' THEN 'not_sent' ELSE delivery END, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('accepted','running') AND deadline_at_ms<=?4", params![id, principal, session, now_ms() as i64])?;
     Ok(())
 }
