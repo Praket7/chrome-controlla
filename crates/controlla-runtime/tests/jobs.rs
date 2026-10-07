@@ -348,6 +348,154 @@ fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
 }
 
 #[test]
+fn subprocess_kill_recovers_running_job_without_replaying_effects() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let root = std::env::temp_dir().join(format!(
+        "controlla-crash-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let ready = root.join("ready");
+    let effects = root.join("effects");
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "crash_worker", "--nocapture"])
+        .env("CONTROLLA_CRASH_STATE", &state)
+        .env("CONTROLLA_CRASH_READY", &ready)
+        .env("CONTROLLA_CRASH_EFFECTS", &effects)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            std::fs::remove_dir_all(&root).unwrap();
+            panic!("crash worker exited before dispatch checkpoint: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(&root).unwrap();
+        panic!("crash worker did not reach its in-flight dispatch before timeout");
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let effect_count = std::fs::read_to_string(&effects).unwrap().lines().count();
+    assert_eq!(
+        effect_count, 2,
+        "both claimed fixture effects were sent once"
+    );
+
+    let journal = Journal::open(state.join("operations.sqlite")).unwrap();
+    assert_eq!(journal.recover_after_restart().unwrap(), 1);
+    let operation_id = std::fs::read_to_string(&ready).unwrap();
+    let operation = journal
+        .get("p", "s", &operation_id)
+        .unwrap()
+        .expect("operation survives process termination");
+    assert_eq!(operation.status, JobStatus::Unknown);
+    assert_eq!(operation.delivery, Delivery::Unknown);
+    assert_eq!(operation.dispatch_count, 2);
+    assert_eq!(operation.result.unwrap()["completed_steps"], 1);
+    assert!(
+        journal
+            .record_dispatch("p", "s", &operation.id, "retry-after-restart")
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&effects).unwrap().lines().count(),
+        effect_count,
+        "journal recovery and rejected replay do not repeat fixture effects"
+    );
+
+    drop(journal);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn crash_worker() {
+    use std::io::Write;
+
+    let (Ok(state), Ok(ready), Ok(effects)) = (
+        std::env::var("CONTROLLA_CRASH_STATE"),
+        std::env::var("CONTROLLA_CRASH_READY"),
+        std::env::var("CONTROLLA_CRASH_EFFECTS"),
+    ) else {
+        return;
+    };
+    let journal = Journal::open(std::path::Path::new(&state).join("operations.sqlite")).unwrap();
+    let admission = journal
+        .admit(
+            "p",
+            "s",
+            "crash-key",
+            &json!({"steps":["observe","observe"]}),
+        )
+        .unwrap();
+    assert!(journal.start("p", "s", &admission.operation.id).unwrap());
+
+    let first = journal
+        .record_dispatch("p", "s", &admission.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&effects)
+        .unwrap()
+        .write_all(b"effect\n")
+        .unwrap();
+    journal
+        .acknowledge_dispatch("p", "s", &admission.operation.id, "step-0")
+        .unwrap();
+    journal
+        .checkpoint(
+            "p",
+            "s",
+            &admission.operation.id,
+            json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
+        )
+        .unwrap();
+
+    let second = journal
+        .record_dispatch("p", "s", &admission.operation.id, "step-1")
+        .unwrap();
+    assert!(second.acquired);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&effects)
+        .unwrap()
+        .write_all(b"effect\n")
+        .unwrap();
+    let mut ready_file = std::fs::File::create(format!("{ready}.tmp")).unwrap();
+    ready_file
+        .write_all(admission.operation.id.as_bytes())
+        .unwrap();
+    ready_file.sync_all().unwrap();
+    std::fs::rename(format!("{ready}.tmp"), ready).unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[test]
 fn crash_after_claim_before_transport_is_unknown_and_not_retried() {
     let path = temp_db();
     let journal = Journal::open(&path).unwrap();

@@ -16,6 +16,7 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
+const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SessionArgs {
@@ -1839,8 +1840,9 @@ impl App {
                 r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
             )
         } else {
+            let unsafe_predicate = SHARED_CLICK_UNSAFE_PREDICATE;
             format!(
-                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe=['password','hidden','file','submit','reset','image'].includes(t)||(e instanceof HTMLButtonElement&&e.type==='submit'),disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');if(!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};return {{ok:true,x,y}};}})()"#
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');if(!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};return {{ok:true,x,y}};}})()"#
             )
         };
         let (preflight, mut action_error) = match tokio::time::timeout_at(
@@ -2737,12 +2739,36 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, LOCAL_STDIO_PRINCIPAL, validate_loopback_ws};
+    use super::{App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, validate_loopback_ws};
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn shared_click_guard_allows_implicit_submit_only_outside_forms() {
+        let runtime = rquickjs::Runtime::new().unwrap();
+        let context = rquickjs::Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(
+                "globalThis.HTMLInputElement=class {}; globalThis.HTMLButtonElement=class {};",
+            )
+            .unwrap();
+            let unsafe_for = |tag: &str, kind: &str, in_form: bool| {
+                let form = if in_form { "{}" } else { "null" };
+                let script = format!(
+                    "(()=>{{const e=Object.assign(new {tag}(),{{type:{kind:?},form:{form}}});const t=e.type||'';return {SHARED_CLICK_UNSAFE_PREDICATE};}})()"
+                );
+                ctx.eval::<bool, _>(script).unwrap()
+            };
+            assert!(!unsafe_for("HTMLButtonElement", "submit", false));
+            assert!(unsafe_for("HTMLButtonElement", "submit", true));
+            assert!(unsafe_for("HTMLButtonElement", "reset", true));
+            assert!(unsafe_for("HTMLInputElement", "password", false));
+            assert!(!unsafe_for("HTMLInputElement", "submit", false));
+        });
+    }
 
     #[tokio::test]
     async fn configured_principal_scopes_planners_and_journal_reads() {
@@ -4043,7 +4069,11 @@ mod tests {
                 expressions[0].contains("matches(':disabled')"),
                 "fill must reject inherited disabled state"
             );
-            assert!(expressions[7].contains("HTMLButtonElement&&e.type==='submit'"));
+            assert!(
+                expressions[7].contains("!!e.form")
+                    && expressions[7].contains("['submit','reset'].includes(t)"),
+                "click must block submit/reset controls only when they can act on a form"
+            );
             assert!(expressions[7].contains("matches(':disabled')"));
         }
         client.cancel().await.unwrap();
