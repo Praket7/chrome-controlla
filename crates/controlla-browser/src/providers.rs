@@ -533,7 +533,16 @@ impl SharedExtensionProvider {
         &mut self,
         registry: &mut SessionRegistry,
     ) -> Result<SharedExtensionSession, ProviderError> {
-        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        self.accept_with_timeout(registry, STARTUP_TIMEOUT).await
+    }
+
+    /// Accept within a bounded user-pairing window, independently of MCP calls.
+    pub async fn accept_with_timeout(
+        &mut self,
+        registry: &mut SessionRegistry,
+        timeout: Duration,
+    ) -> Result<SharedExtensionSession, ProviderError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let (stream, peer) = tokio::time::timeout(remaining, self.listener.accept())
@@ -544,8 +553,9 @@ impl SharedExtensionProvider {
                     "non-loopback client rejected".into(),
                 ));
             }
-            let mut socket = accept_async(stream)
+            let mut socket = tokio::time::timeout_at(deadline, accept_async(stream))
                 .await
+                .map_err(|_| ProviderError::Extension("extension handshake timed out".into()))?
                 .map_err(|error| ProviderError::Extension(error.to_string()))?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let message = tokio::time::timeout(remaining, socket.next())

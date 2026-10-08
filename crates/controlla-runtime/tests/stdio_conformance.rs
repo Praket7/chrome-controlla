@@ -107,6 +107,16 @@ async fn packaged_stdio_initializes_negotiates_lists_reads_and_reports_errors() 
         let schema = serde_json::to_value(&tool.input_schema).unwrap();
         assert_eq!(schema["type"], "object", "{} schema root", tool.name);
         assert!(schema["properties"].is_object(), "{} schema", tool.name);
+        let output_schema = tool
+            .output_schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} output schema is advertised", tool.name));
+        let output_schema = serde_json::to_value(output_schema).unwrap();
+        assert_eq!(
+            output_schema["type"], "object",
+            "{} output schema root",
+            tool.name
+        );
     }
     assert!(
         client

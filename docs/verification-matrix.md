@@ -456,3 +456,25 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | OpenCode stdio connection to current candidate | pass, connection only | OpenCode 1.18.5; local candidate SHA-256 `c88a29cb183524b32a66181e0612938314b73e3a3f1c7813d1d3c71962c60878` | An isolated generated v1 config connected to the release binary; auto-connect was omitted to avoid opening remote debugging. No tool action was called. Existing OpenCode config was not changed. |
 
 The current guide distinguishes Direct CDP AX/crop/extraction from the paired extension's `shared_observe` and `shared_input` routes. No extension source changed in this follow-up.
+
+## Current Codex MCP connection diagnostic — 2026-10-07
+
+The rows below retain the initial direct-entry failure. The subsequent Hotload route and live check supersede that connection status.
+
+| Check | Result | Environment | Evidence |
+|---|---|---|---|
+| Configured command/state path | pass | Codex Desktop config | `~/.codex/config.toml` points to this checkout's `target/release/controlla mcp` and `/Users/pcg/.chrome-controlla/codex-chat-phase6-12`. |
+| Host-loaded Controlla tools | blocked | Current Codex task | Hotload reports `connection closed: initialize response`; no direct Controlla namespace is exposed. |
+| Standalone stdio initialize + tool discovery | pass | Release candidate, exact configured state path | After stopping the Codex-launched child, a standalone stdio client received an initialize response and `tools/list` with 20 tools. This excludes a general binary/protocol failure but does not prove Codex-hosted connection health. |
+| Hotload refresh | queued | Codex Desktop | `hotload_reload_server({})` returned `reloaded=true`, `verified=true`, `refresh=queued_for_next_active_turn`. No browser action was run. |
+
+## Codex Hotload and sequential shared-tab pairing — 2026-10-07
+
+| Check | Result | Evidence |
+|---|---|---|
+| MCP tool loading | pass | Local Hotload loaded 20 current Controlla tools; `guide` and `session discover` returned through this task. The duplicate direct server entry is disabled. |
+| Red-first pairing regression | pass | Before the fix, `shared_pairing_accepts_extension_before_followup_tool_call` timed out because `pair_shared` did not begin accepting. After the fix, the extension can complete its hello before `accept_shared`, and an early acceptance check returns promptly. |
+| Local validation | pass | `cargo test --workspace --locked --offline`: 190 passed, 0 failed, 3 Chrome-required tests ignored by default. `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`, the extension background fixture, provenance validation, documentation link check, and `git diff --check` passed. Release binary rebuilt successfully. |
+| Independent review | pass | GPT-6 Sol reviewed the pairing task lifecycle, ownership, cancellation, and security checks; no blocker found. |
+| Sequential live pairing | pass | Loaded Chrome Controlla Shared Tab Bridge 0.1.0 paired only tab `1649771543` using the popup; the corrected release server returned `accepted: true` after the popup had completed. No concurrent waiting tool call was needed. |
+| Live target and observation | pass | `list_shared_targets` returned only tab `1649771543` and `https://classroom.google.com/c/ODI2NTQ5Mjc1ODU3`; `shared_observe` returned `Classroom / testing` with the same root frame, loader, and URL before and after. No write was sent. |

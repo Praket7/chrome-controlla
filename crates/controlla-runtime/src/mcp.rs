@@ -321,10 +321,36 @@ struct LiveSession {
 }
 
 struct SharedLiveSession {
-    provider: Option<controlla_browser::providers::SharedExtensionProvider>,
+    pairing: Option<
+        tokio::task::JoinHandle<
+            Result<
+                (
+                    SessionRegistry,
+                    controlla_browser::providers::SharedExtensionSession,
+                ),
+                controlla_browser::providers::ProviderError,
+            >,
+        >,
+    >,
     connection: Option<controlla_browser::providers::SharedExtensionSession>,
-    registry: SessionRegistry,
+    registry: Option<SessionRegistry>,
     handle: controlla_browser::sessions::SessionHandle,
+}
+
+impl SharedLiveSession {
+    fn registry(&self) -> Result<&SessionRegistry, rmcp::ErrorData> {
+        self.registry
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))
+    }
+}
+
+impl Drop for SharedLiveSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.pairing.take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1415,7 +1441,7 @@ impl App {
                         self.principal.to_string(),
                     )
                     .map_err(|e| invalid(format!("shared session denied: {e:?}")))?;
-                let provider = controlla_browser::providers::SharedExtensionProvider::bind(
+                let mut provider = controlla_browser::providers::SharedExtensionProvider::bind(
                     &mut registry,
                     &handle,
                 )
@@ -1426,16 +1452,22 @@ impl App {
                 self.shared_sessions.lock().await.insert(
                     session_id.clone(),
                     Arc::new(Mutex::new(SharedLiveSession {
-                        provider: Some(provider),
+                        pairing: Some(tokio::spawn(async move {
+                            let connection = provider
+                                .accept_with_timeout(&mut registry, Duration::from_secs(300))
+                                .await?;
+                            Ok((registry, connection))
+                        })),
                         connection: None,
-                        registry,
+                        registry: None,
                         handle,
                     })),
                 );
                 Ok(rmcp::handler::server::wrapper::Json(json!({
                     "session_id":session_id, "target_ids":target_ids,
                     "endpoint":pairing.endpoint, "one_session_token":pairing.token,
-                    "next":"Call session action accept_shared, then use the unpacked Chrome extension popup to check exactly these tab IDs, enter endpoint and token, and pair. This extension route uses chrome.debugger and does not require Chrome DevTools remote debugging to be enabled.",
+                    "pairing_expires_in_seconds":300,
+                    "next":"The listener is already running. In the extension popup check exactly these tab IDs, enter endpoint and token, and attach. Then call accept_shared to confirm. It returns accepted:false while waiting. Chrome DevTools remote debugging need not be enabled.",
                     "identity":"Chrome tab IDs are not Direct CDP target references"
                 })))
             }
@@ -1455,25 +1487,31 @@ impl App {
                 if shared.handle.principal != self.principal.as_ref() {
                     return Err(invalid("session is not owned by this server principal"));
                 }
-                if shared.connection.is_some() {
-                    return Err(invalid("shared extension session is already accepted"));
+                if shared.connection.is_none() {
+                    let task = shared.pairing.as_mut().ok_or_else(|| {
+                        invalid("pairing ended; create a fresh pair_shared session")
+                    })?;
+                    let outcome = match tokio::time::timeout(Duration::from_millis(100), task).await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            return Ok(rmcp::handler::server::wrapper::Json(json!({
+                                "session_id":id, "accepted":false, "status":"waiting_for_extension",
+                                "next":"Attach the selected tabs in the extension popup, then call accept_shared again."
+                            })));
+                        }
+                    };
+                    shared.pairing = None;
+                    let (registry, connection) = outcome
+                        .map_err(|e| invalid(e.to_string()))?
+                        .map_err(|e| invalid(e.to_string()))?;
+                    shared.registry = Some(registry);
+                    shared.connection = Some(connection);
                 }
-                let mut provider = shared
-                    .provider
-                    .take()
-                    .ok_or_else(|| invalid("shared pairing is no longer pending"))?;
-                let connection = match provider.accept(&mut shared.registry).await {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        shared.provider = Some(provider);
-                        return Err(invalid(error.to_string()));
-                    }
-                };
-                shared.connection = Some(connection);
                 Ok(rmcp::handler::server::wrapper::Json(json!({
                     "session_id":id, "accepted":true,
                     "target_ids":shared.connection.as_ref().unwrap().selected_targets(),
-                    "next":"Call list_shared_targets to inventory selected tabs or shared_observe for a bounded read. Extraction and input remain Direct CDP only."
+                    "next":"Use list_shared_targets, shared_observe, or guarded shared_input. App save/persistence and Direct CDP extraction are not established by pairing."
                 })))
             }
             "list_shared_targets" => {
@@ -1500,7 +1538,7 @@ impl App {
                 for target_id in connection.selected_targets() {
                     let frame_tree = connection
                         .command(
-                            &shared.registry,
+                            shared.registry()?,
                             &shared.handle,
                             target_id,
                             "Page.getFrameTree",
@@ -1538,7 +1576,10 @@ impl App {
                         .map_err(|e| invalid(e.to_string()))?;
                 }
                 shared.connection = None;
-                shared.provider = None;
+                if let Some(task) = shared.pairing.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
                 drop(shared);
                 self.shared_sessions.lock().await.remove(id);
                 Ok(rmcp::handler::server::wrapper::Json(json!({
@@ -1778,7 +1819,7 @@ impl App {
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
         let before = shared_frame_identity(
             connection,
-            &shared.registry,
+            shared.registry()?,
             &shared.handle,
             &args.chrome_tab_id,
         )
@@ -1787,7 +1828,7 @@ impl App {
         let params = observation_command(&spec).map_err(|e| invalid(e.to_string()))?;
         let response = connection
             .command(
-                &shared.registry,
+                shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
                 "Runtime.evaluate",
@@ -1797,7 +1838,7 @@ impl App {
             .map_err(|e| invalid(e.to_string()))?;
         let after = shared_frame_identity(
             connection,
-            &shared.registry,
+            shared.registry()?,
             &shared.handle,
             &args.chrome_tab_id,
         )
@@ -1881,7 +1922,7 @@ impl App {
             action_deadline,
             shared_frame_identity(
                 connection,
-                &shared.registry,
+                shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
             ),
@@ -1906,7 +1947,7 @@ impl App {
         let (preflight, mut action_error) = match tokio::time::timeout_at(
             action_deadline,
             connection.command(
-                &shared.registry,
+                shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
                 "Runtime.evaluate",
@@ -1949,7 +1990,7 @@ impl App {
                 match tokio::time::timeout_at(
                     action_deadline,
                     connection.command(
-                        &shared.registry,
+                        shared.registry()?,
                         &shared.handle,
                         &args.chrome_tab_id,
                         "Runtime.evaluate",
@@ -1989,7 +2030,7 @@ impl App {
                 let refreshed = tokio::time::timeout_at(
                     action_deadline,
                     connection.command(
-                        &shared.registry,
+                        shared.registry()?,
                         &shared.handle,
                         &args.chrome_tab_id,
                         "Runtime.evaluate",
@@ -2022,7 +2063,7 @@ impl App {
                         let press = tokio::time::timeout_at(
                             action_deadline,
                             connection.command(
-                                &shared.registry,
+                                shared.registry()?,
                                 &shared.handle,
                                 &args.chrome_tab_id,
                                 "Input.dispatchMouseEvent",
@@ -2035,7 +2076,7 @@ impl App {
                         let release = tokio::time::timeout_at(
                             recovery_deadline,
                             connection.command(
-                                &shared.registry,
+                                shared.registry()?,
                                 &shared.handle,
                                 &args.chrome_tab_id,
                                 "Input.dispatchMouseEvent",
@@ -2076,7 +2117,7 @@ impl App {
                 let postcondition_json =
                     serde_json::to_string(postcondition).map_err(|e| invalid(e.to_string()))?;
                 match tokio::time::timeout_at(action_deadline, connection.command(
-                    &shared.registry, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
+                    shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
                     json!({"expression":format!(r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return false}};if(es.length!==1)return false;const e=es[0],current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');return e.isConnected&&current==={postcondition_json};}})()"#),"returnByValue":true,"awaitPromise":false}),
                 )).await {
                     Ok(Ok(readback)) if readback.pointer("/result/value") == Some(&Value::Bool(true)) => {}
@@ -2093,7 +2134,7 @@ impl App {
             deadline,
             shared_frame_identity(
                 connection,
-                &shared.registry,
+                shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
             ),
@@ -2537,6 +2578,33 @@ impl ServerHandler for App {
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(bootstrap_instructions())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut tools = Self::tool_router().list_all();
+        for tool in &mut tools {
+            if let Some(schema) = &mut tool.output_schema {
+                let schema = Arc::make_mut(schema);
+                if !schema.contains_key("type") {
+                    schema.insert("type".to_owned(), Value::String("object".to_owned()));
+                }
+            }
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
     }
 
     async fn list_resources(
@@ -4234,6 +4302,85 @@ mod tests {
         }
         client.cancel().await.unwrap();
         let _ = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_pairing_accepts_extension_before_followup_tool_call() {
+        use super::{Duration, Parameters, SessionArgs};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        let app = App::default();
+        let pair = app
+            .session(Parameters(SessionArgs {
+                action: "pair_shared".into(),
+                provider: None,
+                session_id: None,
+                target_ids: Some(vec!["123".into()]),
+            }))
+            .await
+            .unwrap()
+            .0;
+        let waiting = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.session(Parameters(SessionArgs {
+                action: "accept_shared".into(),
+                provider: None,
+                session_id: Some(pair["session_id"].as_str().unwrap().into()),
+                target_ids: None,
+            })),
+        )
+        .await
+        .expect("status must not block the extension UI")
+        .unwrap()
+        .0;
+        assert_eq!(waiting["accepted"], false);
+        // A sequential client must be able to finish the popup before calling accept_shared.
+        let mut socket = tokio::time::timeout(Duration::from_secs(1), async {
+            let (mut socket, _) = connect_async(pair["endpoint"].as_str().unwrap())
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello", "token":pair["one_session_token"],
+                "extension_version":env!("CARGO_PKG_VERSION"), "targets":["123"]})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let ready = socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(ready.to_text().unwrap()).unwrap()["type"],
+                "ready"
+            );
+            socket
+        })
+        .await
+        .expect("pair_shared must listen without a concurrent accept_shared call");
+        let id = pair["session_id"].as_str().unwrap().to_owned();
+        let accepted = app
+            .session(Parameters(SessionArgs {
+                action: "accept_shared".into(),
+                provider: None,
+                session_id: Some(id.clone()),
+                target_ids: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(accepted["accepted"], true);
+        app.session(Parameters(SessionArgs {
+            action: "release_shared".into(),
+            provider: None,
+            session_id: Some(id),
+            target_ids: None,
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(Message::Close(_))) | None
+        ));
     }
 
     #[tokio::test]
