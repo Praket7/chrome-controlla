@@ -30,8 +30,8 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/session.rs",
       "destination_path": "crates/controlla-browser/src/session.rs",
       "source_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
-      "destination_sha256": "4d963dc59b9ed3c93e320065565f4496c861c8c4fa7a4fcc91ba86a383c8e23a",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests.",
+      "destination_sha256": "e5e62c2a0a61923a2402baf91e818cb126037ce16be20ad1fa18e2168840f3ad",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests; native host discovery now identifies Chrome Controlla registration and defers live availability to MCP inventory evidence.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -110,8 +110,8 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "5e60256bf01c0a1be9cbfa0951fe4f17a4b057c8315edfe84859d4c0971a8a29",
-      "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3; Clarify immediately listening shared-tab pairing and nonblocking acceptance status.",
+      "destination_sha256": "0830fbd2c32c14f7d64b565fbc1fa498669f4f60d5256eeed8b9ea03d2f8dfff",
+      "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3; immediately listening shared-tab pairing and nonblocking acceptance status; current shared accessibility and changed-state click semantics with fixture/live evidence boundaries; native host one-time registration and tab discovery; bounded child-process script worker with remaining OS-isolation caveat.; Phase 4/5 native bridge setup is authoritative with one-time install, reload, exact tab discovery/pairing/acceptance, live discovery evidence, and explicit fixture-only reconnect/status boundary; native shared-tab setup passes discover_shared_tabs.snapshot.host_id with exact IDs to pair_shared, documents 100-tab truncation, 15-second freshness, and fixture/local-only host binding, pair-error, serialized cleanup evidence",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],

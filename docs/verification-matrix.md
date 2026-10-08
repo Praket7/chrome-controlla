@@ -1,5 +1,23 @@
 # Verification matrix
 
+## Native shared-tab bridge — local gate, 2026-10-07
+
+| Check | Result | Evidence / boundary |
+|---|---|---|
+| Native messaging extension protocol | fixture pass | `node extensions/chrome-controlla/test-background.cjs` covers startup/reconnect through Chrome alarms, read-only tab discovery, exact selected-tab attach, command allowlist, independent native/popup ownership, overlap refusal, and release. It does not prove installed Chrome connection. |
+| Native host protocol | focused pass | `cargo test -p controlla-runtime --lib native_host::tests --locked --offline` covers bounded framing, loopback/expiry/private-file guards, and inventory before pairing. Host atomically claims each pairing file, bounds the provider upgrade, and returns to inventory after failed or closed sessions. |
+| Child script worker | focused pass | `cargo test -p controlla-runtime --test script_worker --locked --offline` covers brokered reads, deadline kill, and recovery. QuickJS heap/stack limits do not impose OS RSS/CPU limits. |
+| Installed extension and real Chrome | native transport connected; attach pending | A screenshot showed Chrome's native-host-forbidden error. OCR of the installed extension ID found `bhgfjpbajecihfbgaikampminappgodh`; the first host manifest had `i` after `bhgf` and was corrected to `j`. Chrome then launched the release native host with that exact extension origin; its private mode-0600 tab inventory refreshed, and the live Hotload MCP `session discover` returned `companion_extension.available=true` from a fresh inventory. The old manual WebSocket port was expired. No tab was selected, attached, or changed in this check. One native shared session can select multiple tabs; an additional simultaneous session uses the manual popup fallback. |
+
+## Current direct-Chrome Promise and shared-route gate — 2026-10-07
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| 12-second Promise resolve/reject and external navigation | pass, direct CDP only | macOS 26 arm64; installed Chrome 154.0.8037.98 | Ignored installed-Chrome test measured both resolve and reject within 11.8–15 seconds. A second CDP connection observed a synchronous marker from the pending evaluation before navigating; the pending call settled without its delayed value, the new URL/title appeared, and the old target reference became stale. Sol approved after the dispatch barrier. This does not qualify the shared extension, live MCP job route, or process-kill recovery. |
+| Shared selected-node AX | fixture pass; live pending | Rust 1.99.0; local duplex extension fixture | `shared_accessibility` scopes one CSS node to a selected tab/principal, checks frame/loader/URL before and after, enforces a whole-call deadline and output byte budget; the shared WebSocket rejects messages over 1 MiB before JSON parsing. Oversized-hello and stalled-request tests pass. No real extension AX call is claimed yet. |
+| Shared click changed-state verifier | fixture pass; live pending | Rust 1.99.0; local duplex extension fixture | Click requires a separate unique DOM node whose bounded observed value changes to the exact requested postcondition. An unchanged state now fails. This proves DOM readback only, not app save/persistence. |
+| Workspace checks | pass | macOS 26 arm64; Rust 1.99.0 | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked` passed after the route and transport edits: 191 tests passed, 4 installed-Chrome tests ignored by default. The new installed-Chrome Promise test was run separately and passed. |
+
 ## Phase 7 review-fix verification — 2026-10-06
 
 | Check | Result | Environment | Evidence / boundary |
@@ -478,3 +496,15 @@ The rows below retain the initial direct-entry failure. The subsequent Hotload r
 | Independent review | pass | GPT-6 Sol reviewed the pairing task lifecycle, ownership, cancellation, and security checks; no blocker found. |
 | Sequential live pairing | pass | Loaded Chrome Controlla Shared Tab Bridge 0.1.0 paired only tab `1649771543` using the popup; the corrected release server returned `accepted: true` after the popup had completed. No concurrent waiting tool call was needed. |
 | Live target and observation | pass | `list_shared_targets` returned only tab `1649771543` and `https://classroom.google.com/c/ODI2NTQ5Mjc1ODU3`; `shared_observe` returned `Classroom / testing` with the same root frame, loader, and URL before and after. No write was sent. |
+
+## Native bridge discovery verification — 2026-10-08
+
+| Check | Result | Environment | Evidence / boundary |
+|---|---|---|---|
+| Corrected extension origin | pass | Installed Chrome + local native host | Chrome showed extension ID `bhgfjpbajecihfbgaikampminappgodh`; the native-host manifest was corrected to that exact origin after the prior launch rejection. |
+| Native host and private inventory | pass | Installed Chrome + local native host | After the rebuilt release binary and unpacked extension were reloaded, Chrome launched the registered native host. `discover_shared_tabs` returned a fresh inventory with a host ID, 51 tabs, and `truncated:false`. |
+| MCP companion discovery | pass | Current Hotload MCP revision 4, `session discover` | Fresh inventory produced `companion_extension.available=true`. This establishes discovery and host reachability only. |
+| Native route attachment or command | not run | Same installation | No selected tab was attached and no browser command was sent over the native route. |
+| Alarm reconnect and popup native status | fixture only | Extension background/popup fixtures | Local fixtures cover alarm-based reconnection after worker suspension and status rendering. These behaviors have not been verified in the installed extension. |
+
+The native path is the documented default: one-time `controlla install-bridge <exact-extension-id>`, reload the unpacked extension, `discover_shared_tabs`, pass `snapshot.host_id` and exact selected tab IDs to `pair_shared`, then `accept_shared`. Discovery is capped at 100 HTTP(S) tabs and reports `snapshot.truncated`; snapshots expire after 15 seconds. Single-host process fixtures exercise host-specific pairing and fresh inventory; extension fixtures exercise serialized release and cleanup, and a provider fixture rejects an authenticated pair error. Cross-profile interleaving, MCP host-change rejection, and host-error delivery through `accept_shared` have code review only and remain untested end to end. No live native-route attachment or command has been performed. Popup endpoint/token pairing is a fallback only when the native host is unavailable or busy.

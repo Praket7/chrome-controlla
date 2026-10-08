@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 
 pub const MAX_STEPS: usize = 20;
 pub const MAX_WAIT_MS: u64 = 10_000;
@@ -20,18 +21,127 @@ pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_GENERATED_ARTIFACT_BYTES: usize = 12 * 1024;
 pub const MIN_SCRIPT_HEAP_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SCRIPT_HEAP_BYTES: usize = 128 * 1024 * 1024;
+const MAX_WORKER_FRAME_BYTES: usize = MAX_OUTPUT_BYTES * 6 + 16_384;
+const MAX_WORKER_REQUEST_BYTES: usize = MAX_SCRIPT_BYTES * 6 + 8192;
+const SCRIPT_WORKER_ARG: &str = "--__controlla-script-worker";
+
+pub fn script_worker_executable() -> Result<std::path::PathBuf, String> {
+    let current = std::env::current_exe().map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    if let Some(binary) = current
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|directory| directory.join("controlla"))
+        .filter(|path| path.is_file())
+    {
+        return Ok(binary);
+    }
+    Ok(current)
+}
 pub type ScriptBroker = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
 >;
 
-/// Runs trusted local JavaScript in a fresh QuickJS context. This is an in-process
-/// resource-bounded interpreter, not an OS security boundary; callers must gate scripts.
-pub async fn run_script(
+/// Evaluates one script in the worker process. The caller must supply only a
+/// trusted executable and keep browser authorization in the broker callback.
+pub async fn run_script_isolated(
+    executable: &std::path::Path,
     source: &str,
     timeout_ms: u64,
     heap_limit: usize,
     broker: ScriptBroker,
 ) -> Result<String, String> {
+    validate_script_bounds(source, timeout_ms, heap_limit)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut child = tokio::process::Command::new(executable)
+        .arg(SCRIPT_WORKER_ARG)
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("script worker failed to start: {error}"))?;
+    let input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "script worker stdin unavailable".to_owned())?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| "script worker stdout unavailable".to_owned())?;
+    let run = async {
+        let mut input = tokio::io::BufWriter::new(input);
+        let mut output = tokio::io::BufReader::new(output);
+        write_worker_input(
+            &mut input,
+            &WorkerInput::Run {
+                source: source.to_owned(),
+                timeout_ms,
+                heap_limit,
+            },
+        )
+        .await?;
+        loop {
+            let line = read_worker_line(&mut output, MAX_WORKER_FRAME_BYTES)
+                .await?
+                .ok_or_else(|| "script worker exited without a result".to_owned())?;
+            let message: WorkerOutput = serde_json::from_str(&line)
+                .map_err(|error| format!("invalid script worker response: {error}"))?;
+            match message {
+                WorkerOutput::Observe { id, spec } => {
+                    let result = broker(spec).await;
+                    write_worker_input(&mut input, &WorkerInput::BrokerReply { id, result })
+                        .await?;
+                }
+                WorkerOutput::Done { result } => {
+                    let status = child
+                        .wait()
+                        .await
+                        .map_err(|error| format!("script worker wait failed: {error}"))?;
+                    if !status.success() {
+                        return Err("script worker exited unsuccessfully".into());
+                    }
+                    return result;
+                }
+            }
+        }
+    };
+    match tokio::time::timeout_at(deadline, run).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            Err("script deadline exceeded".into())
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkerInput {
+    Run {
+        source: String,
+        timeout_ms: u64,
+        heap_limit: usize,
+    },
+    BrokerReply {
+        id: u64,
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkerOutput {
+    Observe { id: u64, spec: String },
+    Done { result: Result<String, String> },
+}
+
+fn validate_script_bounds(source: &str, timeout_ms: u64, heap_limit: usize) -> Result<(), String> {
     if source.is_empty() || source.len() > MAX_SCRIPT_BYTES {
         return Err(format!("script must contain 1..={MAX_SCRIPT_BYTES} bytes"));
     }
@@ -41,6 +151,164 @@ pub async fn run_script(
     if !(MIN_SCRIPT_HEAP_BYTES..=MAX_SCRIPT_HEAP_BYTES).contains(&heap_limit) {
         return Err("script heap limit exceeds workflow bound".into());
     }
+    Ok(())
+}
+
+async fn write_worker_input(
+    input: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &WorkerInput,
+) -> Result<(), String> {
+    let encoded = serde_json::to_vec(message).map_err(|error| error.to_string())?;
+    if encoded.len() + 1 > MAX_WORKER_FRAME_BYTES {
+        return Err("script worker frame exceeds limit".into());
+    }
+    input
+        .write_all(&encoded)
+        .await
+        .map_err(|error| error.to_string())?;
+    input
+        .write_all(b"\n")
+        .await
+        .map_err(|error| error.to_string())?;
+    input
+        .flush()
+        .await
+        .map_err(|error| format!("script worker write failed: {error}"))
+}
+
+async fn read_worker_line(
+    input: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Option<String>, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = input
+            .fill_buf()
+            .await
+            .map_err(|error| format!("script worker read failed: {error}"))?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err("script worker returned a truncated frame".into())
+            };
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if bytes.len() + count > limit {
+            return Err("script worker frame exceeds limit".into());
+        }
+        let done = available[count - 1] == b'\n';
+        bytes.extend_from_slice(&available[..count]);
+        input.consume(count);
+        if done {
+            bytes.pop();
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| "script worker returned invalid UTF-8".into());
+        }
+    }
+}
+
+/// Hidden CLI entry point for the bounded QuickJS child. Browser operations
+/// are requests over stdio; this process has no session or browser credentials.
+pub fn run_script_worker() -> Result<(), String> {
+    let input = std::io::stdin();
+    let mut line = String::new();
+    read_sync_worker_line(&mut input.lock(), &mut line, MAX_WORKER_REQUEST_BYTES)?;
+    let WorkerInput::Run {
+        source,
+        timeout_ms,
+        heap_limit,
+    } = serde_json::from_str(&line).map_err(|error| format!("invalid worker request: {error}"))?
+    else {
+        return Err("worker expected a run request".into());
+    };
+    let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let broker: ScriptBroker = Arc::new(move |spec| {
+        let id = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let output = std::io::stdout();
+            let mut output = output.lock();
+            serde_json::to_writer(&mut output, &WorkerOutput::Observe { id, spec })
+                .map_err(|error| error.to_string())?;
+            use std::io::Write;
+            output
+                .write_all(b"\n")
+                .and_then(|_| output.flush())
+                .map_err(|error| error.to_string())?;
+            let input = std::io::stdin();
+            let mut line = String::new();
+            read_sync_worker_line(&mut input.lock(), &mut line, MAX_WORKER_FRAME_BYTES)?;
+            match serde_json::from_str::<WorkerInput>(&line).map_err(|error| error.to_string())? {
+                WorkerInput::BrokerReply {
+                    id: reply_id,
+                    result,
+                } if reply_id == id => result,
+                _ => Err("worker received an invalid broker reply".into()),
+            }
+        })
+    });
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?
+        .block_on(run_script_in_process(
+            &source, timeout_ms, heap_limit, broker,
+        ));
+    let output = std::io::stdout();
+    let mut output = output.lock();
+    serde_json::to_writer(&mut output, &WorkerOutput::Done { result })
+        .map_err(|error| error.to_string())?;
+    use std::io::Write;
+    output
+        .write_all(b"\n")
+        .and_then(|_| output.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn read_sync_worker_line(
+    input: &mut impl std::io::BufRead,
+    line: &mut String,
+    limit: usize,
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = input
+            .fill_buf()
+            .map_err(|error| format!("worker input failed: {error}"))?;
+        if available.is_empty() {
+            return Err("worker input ended".into());
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if bytes.len() + count > limit {
+            return Err("worker frame exceeds limit".into());
+        }
+        let done = available[count - 1] == b'\n';
+        bytes.extend_from_slice(&available[..count]);
+        input.consume(count);
+        if done {
+            bytes.pop();
+            break;
+        }
+    }
+    *line = String::from_utf8(bytes).map_err(|_| "worker frame is not UTF-8".to_owned())?;
+    Ok(())
+}
+
+/// Runs trusted local JavaScript inside the worker process's QuickJS context.
+async fn run_script_in_process(
+    source: &str,
+    timeout_ms: u64,
+    heap_limit: usize,
+    broker: ScriptBroker,
+) -> Result<String, String> {
+    validate_script_bounds(source, timeout_ms, heap_limit)?;
     let runtime = AsyncRuntime::new().map_err(|e| format!("QuickJS initialization failed: {e}"))?;
     runtime.set_memory_limit(heap_limit).await;
     runtime.set_max_stack_size(1024 * 1024).await;
@@ -448,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_worker_awaits_only_the_async_broker_api() {
-        let output = run_script(
+        let output = run_script_in_process(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null});",
             1000,
             8 * 1024 * 1024,
@@ -464,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_worker_returns_fulfilled_async_promise_from_broker() {
-        let output = run_script(
+        let output = run_script_in_process(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).then(value=>value.received.selector);",
             1000,
             8 * 1024 * 1024,
@@ -483,7 +751,7 @@ mod tests {
                 Ok(format!("{{\"received\":{input}}}"))
             })
         });
-        let output = run_script(
+        let output = run_script_in_process(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).then(value=>value.received.selector);",
             15_000,
             8 * 1024 * 1024,
@@ -496,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_worker_propagates_rejected_async_promise_from_broker() {
-        let caught = run_script(
+        let caught = run_script_in_process(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null}).catch(error=>error.message);",
             1000,
             8 * 1024 * 1024,
@@ -506,7 +774,7 @@ mod tests {
         .unwrap();
         assert_eq!(caught, "\"broker rejected\"");
 
-        let uncaught = run_script(
+        let uncaught = run_script_in_process(
             "return await api.observe({selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:4096,cursor:null});",
             1000,
             8 * 1024 * 1024,
@@ -529,7 +797,7 @@ mod tests {
         });
         let source = "const spec={selector:'p',fields:{text:'p'},max_items:2,max_text_chars:40,max_bytes:600000,cursor:null}; await api.observe(spec); await api.observe(spec); return 'bad';";
         assert!(
-            run_script(source, 1000, 8 * 1024 * 1024, broker)
+            run_script_in_process(source, 1000, 8 * 1024 * 1024, broker)
                 .await
                 .is_err()
         );
@@ -539,12 +807,12 @@ mod tests {
     #[tokio::test]
     async fn js_worker_interrupts_loops_and_enforces_memory_and_output_limits() {
         assert!(
-            run_script("while(true){}", 20, 8 * 1024 * 1024, broker())
+            run_script_in_process("while(true){}", 20, 8 * 1024 * 1024, broker())
                 .await
                 .is_err()
         );
         assert!(
-            run_script(
+            run_script_in_process(
                 "return 'x'.repeat(4_000_000);",
                 1000,
                 2 * 1024 * 1024,
@@ -554,7 +822,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            run_script(
+            run_script_in_process(
                 "return 'x'.repeat(70_000);",
                 1000,
                 8 * 1024 * 1024,
@@ -569,7 +837,7 @@ mod tests {
     async fn js_worker_deadline_cancels_a_never_settling_promise() {
         let result = tokio::time::timeout(
             Duration::from_millis(150),
-            run_script(
+            run_script_in_process(
                 "return await new Promise(()=>{});",
                 20,
                 8 * 1024 * 1024,
@@ -620,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_worker_has_no_ambient_module_network_file_or_process_access() {
-        let globals = run_script(
+        let globals = run_script_in_process(
             "return [typeof process,typeof fetch,typeof Deno,typeof require,typeof api].join(',');",
             1000,
             8 * 1024 * 1024,
@@ -633,7 +901,7 @@ mod tests {
             "\"undefined,undefined,undefined,undefined,object\""
         );
         assert!(
-            run_script(
+            run_script_in_process(
                 "await import('node:fs'); return 'bad';",
                 1000,
                 8 * 1024 * 1024,
@@ -643,7 +911,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            run_script(
+            run_script_in_process(
                 "return await api.observe({selector:'p',session_id:'other'});",
                 1000,
                 8 * 1024 * 1024,

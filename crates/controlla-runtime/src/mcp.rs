@@ -24,6 +24,7 @@ struct SessionArgs {
     provider: Option<String>,
     session_id: Option<String>,
     target_ids: Option<Vec<String>>,
+    host_id: Option<String>,
 }
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 struct TargetRefInput {
@@ -89,6 +90,14 @@ struct SharedObserveArgs {
     spec: ObserveInput,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct SharedAccessibilityArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    selector: String,
+    max_bytes: usize,
+    timeout_ms: Option<u64>,
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SharedInputArgs {
     session_id: String,
     chrome_tab_id: String,
@@ -96,6 +105,7 @@ struct SharedInputArgs {
     action: String,
     expected_value: String,
     value: String,
+    postcondition_selector: Option<String>,
     postcondition: Option<String>,
     timeout_ms: Option<u64>,
 }
@@ -597,18 +607,24 @@ async fn run_workflow_job(
         });
         let timeout_ms = remaining.min(crate::workflow::MAX_JOB_DEADLINE_MS);
         let heap_limit = 8 * 1024 * 1024;
-        let worker = tokio::task::spawn_blocking(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?
-                .block_on(crate::workflow::run_script(
-                    &source, timeout_ms, heap_limit, broker,
-                ))
-        })
-        .await;
+        let worker_executable = crate::workflow::script_worker_executable();
+        let worker = match worker_executable {
+            Ok(executable) => {
+                crate::workflow::run_script_isolated(
+                    &executable,
+                    &source,
+                    timeout_ms,
+                    heap_limit,
+                    broker,
+                )
+                .await
+            }
+            Err(error) => Err(format!(
+                "could not resolve script worker executable: {error}"
+            )),
+        };
         match worker {
-            Ok(Ok(output)) => {
+            Ok(output) => {
                 let artifact = match crate::workflow::validate_script_artifact(
                     &output,
                     &script_operation_id,
@@ -677,7 +693,7 @@ async fn run_workflow_job(
                     receipt,
                 );
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 if script_jobs
                     .get(
                         principal_ref.as_ref(),
@@ -739,14 +755,6 @@ async fn run_workflow_job(
                     &script_session_id,
                     &script_operation_id,
                     receipt,
-                );
-            }
-            Err(error) => {
-                let _ = script_jobs.fail(
-                    principal_ref.as_ref(),
-                    &script_session_id,
-                    &script_operation_id,
-                    json!({"status":"failed","error":error.to_string()}),
                 );
             }
         }
@@ -1095,7 +1103,7 @@ async fn shared_frame_identity(
 impl App {
     #[tool(
         name = "workflow",
-        description = "Compile and run a bounded deterministic workflow graph. Trusted-local JavaScript is opt-in via CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1; scripts have no filesystem/network/process access and remain in-process."
+        description = "Compile and run a bounded deterministic workflow graph. Trusted-local JavaScript is opt-in via CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1; QuickJS runs in a bounded child process with brokered reads only."
     )]
     async fn workflow(
         &self,
@@ -1409,9 +1417,17 @@ impl App {
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         let action = args.action.as_str();
         match action {
+            "discover_shared_tabs" => {
+                let snapshot = crate::native_setup::read_tabs().map_err(invalid)?;
+                Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "transport":"native_extension",
+                    "snapshot":snapshot,
+                    "next":"Pass this snapshot's host_id and exact numeric tab IDs to pair_shared. Listing does not attach to tabs."
+                })))
+            }
             "pair_shared" => {
                 let target_ids = args.target_ids.ok_or_else(|| invalid(
-                    "target_ids must explicitly select decimal Chrome tab IDs from the extension popup",
+                    "target_ids must explicitly select decimal Chrome tab IDs from discover_shared_tabs",
                 ))?;
                 if target_ids.is_empty()
                     || target_ids.iter().any(|id| {
@@ -1449,7 +1465,55 @@ impl App {
                 .map_err(|e| invalid(e.to_string()))?;
                 let pairing = provider.pairing().clone();
                 let session_id = handle.id.clone();
-                self.shared_sessions.lock().await.insert(
+                let mut shared_sessions = self.shared_sessions.lock().await;
+                let host_registered = crate::native_setup::host_registered();
+                let native_busy = !shared_sessions.is_empty();
+                let native_snapshot = if !native_busy && host_registered {
+                    crate::native_setup::read_tabs().ok()
+                } else {
+                    None
+                };
+                if let Some(requested_host) = args.host_id.as_deref() {
+                    let current = native_snapshot.as_ref().ok_or_else(|| {
+                        invalid(
+                            "the selected native host has no fresh tab inventory; rediscover tabs",
+                        )
+                    })?;
+                    if current["host_id"].as_str() != Some(requested_host) {
+                        return Err(invalid(
+                            "native host changed since discovery; rediscover tabs before pairing",
+                        ));
+                    }
+                }
+                let native_bridge = args.host_id.is_some();
+                if let Some(snapshot) = native_snapshot.filter(|_| native_bridge) {
+                    let tabs = snapshot["tabs"]
+                        .as_array()
+                        .ok_or_else(|| invalid("native tab inventory is invalid"))?;
+                    if target_ids.iter().any(|id| {
+                        !tabs.iter().any(|tab| {
+                            tab["id"]
+                                .as_u64()
+                                .is_some_and(|tab_id| tab_id.to_string() == *id)
+                        })
+                    }) {
+                        return Err(invalid(
+                            "target_ids must be present in the fresh native tab inventory",
+                        ));
+                    }
+                    let host_id = snapshot["host_id"]
+                        .as_str()
+                        .ok_or_else(|| invalid("native tab inventory has no host ID"))?;
+                    crate::native_setup::write_pairing(
+                        host_id,
+                        &pairing.endpoint,
+                        &pairing.token,
+                        &target_ids,
+                        &session_id,
+                    )
+                    .map_err(invalid)?;
+                }
+                shared_sessions.insert(
                     session_id.clone(),
                     Arc::new(Mutex::new(SharedLiveSession {
                         pairing: Some(tokio::spawn(async move {
@@ -1463,11 +1527,14 @@ impl App {
                         handle,
                     })),
                 );
+                drop(shared_sessions);
                 Ok(rmcp::handler::server::wrapper::Json(json!({
                     "session_id":session_id, "target_ids":target_ids,
-                    "endpoint":pairing.endpoint, "one_session_token":pairing.token,
+                    "endpoint":pairing.endpoint,
+                    "one_session_token":pairing.token,
+                    "native_bridge":native_bridge,
                     "pairing_expires_in_seconds":300,
-                    "next":"The listener is already running. In the extension popup check exactly these tab IDs, enter endpoint and token, and attach. Then call accept_shared to confirm. It returns accepted:false while waiting. Chrome DevTools remote debugging need not be enabled.",
+                    "next":if native_bridge { "The native bridge is pairing the selected tabs. Call accept_shared to confirm; it returns accepted:false while waiting." } else if native_busy { "The native bridge handles one shared session at a time. For this additional session, use the extension popup with the returned endpoint and token, then call accept_shared." } else { "For native pairing, call discover_shared_tabs and pass its host_id. Otherwise use the popup's manual endpoint and token, then call accept_shared." },
                     "identity":"Chrome tab IDs are not Direct CDP target references"
                 })))
             }
@@ -1497,14 +1564,24 @@ impl App {
                         Err(_) => {
                             return Ok(rmcp::handler::server::wrapper::Json(json!({
                                 "session_id":id, "accepted":false, "status":"waiting_for_extension",
-                                "next":"Attach the selected tabs in the extension popup, then call accept_shared again."
+                                "next":"Complete the native bridge or popup fallback shown by pair_shared, then call accept_shared again."
                             })));
                         }
                     };
                     shared.pairing = None;
-                    let (registry, connection) = outcome
-                        .map_err(|e| invalid(e.to_string()))?
-                        .map_err(|e| invalid(e.to_string()))?;
+                    let (registry, connection) = match outcome {
+                        Ok(Ok(ready)) => ready,
+                        Ok(Err(error)) => {
+                            drop(shared);
+                            self.shared_sessions.lock().await.remove(id);
+                            return Err(invalid(error.to_string()));
+                        }
+                        Err(error) => {
+                            drop(shared);
+                            self.shared_sessions.lock().await.remove(id);
+                            return Err(invalid(error.to_string()));
+                        }
+                    };
                     shared.registry = Some(registry);
                     shared.connection = Some(connection);
                 }
@@ -1569,12 +1646,11 @@ impl App {
                 if shared.handle.principal != self.principal.as_ref() {
                     return Err(invalid("session is not owned by this server principal"));
                 }
-                if let Some(connection) = shared.connection.as_mut() {
-                    connection
-                        .release()
-                        .await
-                        .map_err(|e| invalid(e.to_string()))?;
-                }
+                let release_error = if let Some(connection) = shared.connection.as_mut() {
+                    connection.release().await.err()
+                } else {
+                    None
+                };
                 shared.connection = None;
                 if let Some(task) = shared.pairing.take() {
                     task.abort();
@@ -1582,12 +1658,27 @@ impl App {
                 }
                 drop(shared);
                 self.shared_sessions.lock().await.remove(id);
+                if let Some(error) = release_error {
+                    return Err(invalid(format!(
+                        "shared session retired after close failed: {error}"
+                    )));
+                }
                 Ok(rmcp::handler::server::wrapper::Json(json!({
                     "session_id":id,"released":true,"effect":"released this provider's debugger attachments"
                 })))
             }
             "discover" => {
                 let mut providers = list_sessions();
+                if let Some(extension) = providers
+                    .iter_mut()
+                    .find(|p| p.provider == SessionProvider::CompanionExtension)
+                {
+                    extension.available = crate::native_setup::host_registered()
+                        && crate::native_setup::read_tabs().is_ok();
+                    if extension.available {
+                        extension.reason = "native host and fresh extension tab inventory observed; select exact tab IDs with discover_shared_tabs".to_owned();
+                    }
+                }
                 if let Some(explicit) = providers
                     .iter_mut()
                     .find(|p| p.provider == SessionProvider::ExplicitCdp)
@@ -1724,7 +1815,7 @@ impl App {
                 ))
             }
             _ => Err(invalid(
-                "action must be pair_shared, accept_shared, list_shared_targets, release_shared, discover, targets, connect, or list_targets",
+                "action must be discover_shared_tabs, pair_shared, accept_shared, list_shared_targets, release_shared, discover, targets, connect, or list_targets",
             )),
         }
     }
@@ -1872,6 +1963,127 @@ impl App {
     }
 
     #[tool(
+        name = "shared_accessibility",
+        description = "Return the bounded partial accessibility node for one CSS-selected node in an explicitly paired Chrome tab. The root frame, loader, and URL must remain unchanged during the read. The full operation has a 1–60 second deadline."
+    )]
+    async fn shared_accessibility(
+        &self,
+        Parameters(args): Parameters<SharedAccessibilityArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        if args.selector.trim().is_empty()
+            || args.selector.len() > 512
+            || args.selector.contains('\0')
+            || !(4096..=262_144).contains(&args.max_bytes)
+        {
+            return Err(invalid(
+                "selector or accessibility byte budget is out of bounds",
+            ));
+        }
+        let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 60_000));
+        let result = tokio::time::timeout(timeout, async {
+            let shared = self
+                .shared_sessions
+                .lock()
+                .await
+                .get(&args.session_id)
+                .cloned()
+                .ok_or_else(|| invalid("unknown shared session_id"))?;
+            let shared = shared.lock().await;
+            if shared.handle.principal != self.principal.as_ref() {
+                return Err(invalid("session is not owned by this server principal"));
+            }
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            let registry = shared.registry()?;
+            let before =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await
+                    .map_err(invalid)?;
+            let document = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "DOM.getDocument",
+                    json!({"depth":0,"pierce":false}),
+                )
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            let root = document
+                .get("root")
+                .and_then(|v| v["nodeId"].as_u64())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| invalid("DOM.getDocument omitted root nodeId"))?;
+            let selector = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "DOM.querySelector",
+                    json!({"nodeId":root,"selector":args.selector}),
+                )
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            let node_id = selector
+                .get("nodeId")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .ok_or_else(|| invalid("accessibility selector matched no DOM node"))?;
+            let response = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Accessibility.getPartialAXTree",
+                    json!({"nodeId":node_id,"fetchRelatives":false}),
+                )
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            // Fail closed if the parsed CDP result already exceeds the caller's budget.
+            if serde_json::to_vec(&response)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX)
+                > args.max_bytes
+            {
+                return Err(invalid("AX response exceeds requested byte budget"));
+            }
+            let after =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await
+                    .map_err(invalid)?;
+            if before != after {
+                return Err(invalid(
+                    "shared target navigated during accessibility read; result discarded as stale",
+                ));
+            }
+            let nodes = response
+                .get("nodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("accessibility response omitted nodes"))?;
+            let result = json!({
+                "chrome_tab_id":args.chrome_tab_id,
+                "nodes":nodes.iter().take(1).cloned().collect::<Vec<_>>(),
+                "truncated":nodes.len()>1,
+                "missing":if nodes.len()>1 { vec!["AX response exceeded the selected-node bound and was truncated"] } else { vec![] },
+                "shared_frame_identity":{"frame_id":before.0,"loader_id":before.1,"freshness":"same root frame, loader, and URL before and after this read"}
+            });
+            if serde_json::to_vec(&result)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX)
+                > args.max_bytes
+            {
+                return Err(invalid("AX byte budget cannot fit selected-node metadata"));
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|_| invalid("shared accessibility deadline exceeded"))??;
+        Ok(rmcp::handler::server::wrapper::Json(result))
+    }
+
+    #[tool(
         name = "shared_input",
         description = "Perform one guarded fill or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value/text; enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
     )]
@@ -1891,12 +2103,16 @@ impl App {
             return Err(invalid("shared input action must be fill or click"));
         }
         if args.action == "click"
-            && args
+            && (args.postcondition_selector.as_ref().is_none_or(|selector| {
+                selector.trim().is_empty() || selector.len() > 512 || selector.contains('\0')
+            }) || args
                 .postcondition
                 .as_ref()
-                .is_none_or(|value| value.len() > 16_384)
+                .is_none_or(|value| value.len() > 16_384))
         {
-            return Err(invalid("click requires a bounded exact postcondition"));
+            return Err(invalid(
+                "click requires a bounded postcondition selector and exact value",
+            ));
         }
         let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(60_000).clamp(6_000, 60_000));
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1933,6 +2149,9 @@ impl App {
         let selector = serde_json::to_string(&args.selector).map_err(|e| invalid(e.to_string()))?;
         let expected =
             serde_json::to_string(&args.expected_value).map_err(|e| invalid(e.to_string()))?;
+        let postcondition_selector =
+            serde_json::to_string(args.postcondition_selector.as_deref().unwrap_or_default())
+                .map_err(|e| invalid(e.to_string()))?;
         let expression = if args.action == "fill" {
             let value = serde_json::to_string(&args.value).map_err(|e| invalid(e.to_string()))?;
             format!(
@@ -1940,8 +2159,11 @@ impl App {
             )
         } else {
             let unsafe_predicate = SHARED_CLICK_UNSAFE_PREDICATE;
+            let postcondition = args.postcondition.as_deref().unwrap_or_default();
+            let postcondition_json =
+                serde_json::to_string(postcondition).map_err(|e| invalid(e.to_string()))?;
             format!(
-                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');if(!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};return {{ok:true,x,y}};}})()"#
+                r#"(()=>{{let es,ps;try{{es=[...document.querySelectorAll({selector})];ps=[...document.querySelectorAll({postcondition_selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1||ps.length!==1)return {{ok:false,reason:es.length!==1?(es.length?'ambiguous':'no_match'):(ps.length?'postcondition_ambiguous':'postcondition_no_match')}};const e=es[0],p=ps[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??''),postcondition_before=(p instanceof HTMLInputElement||p instanceof HTMLTextAreaElement||p instanceof HTMLSelectElement)?p.value:(p.innerText??'');if(p===e||!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||p.hasAttribute('data-masked')||p.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(typeof current!=='string'||current.length>16384)return {{ok:false,reason:'click_text_too_large'}};if(typeof postcondition_before!=='string'||postcondition_before.length>16384)return {{ok:false,reason:'postcondition_text_too_large'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};const postcondition_before_is_desired=postcondition_before==={postcondition_json};if(postcondition_before_is_desired)return {{ok:false,reason:'postcondition_already_satisfied'}};return {{ok:true,x,y,postcondition_before_is_desired}};}})()"#
             )
         };
         let (preflight, mut action_error) = match tokio::time::timeout_at(
@@ -2026,6 +2248,7 @@ impl App {
                 observed_value = observed;
             }
         } else if action_error.is_none() {
+            let mut postcondition_before_is_desired = false;
             if let Some((_x, _y)) = preflight["x"].as_f64().zip(preflight["y"].as_f64()) {
                 let refreshed = tokio::time::timeout_at(
                     action_deadline,
@@ -2057,6 +2280,13 @@ impl App {
                         "click target changed before dispatch: {}",
                         refreshed["reason"].as_str().unwrap_or("unverifiable")
                     ));
+                }
+                if action_error.is_none() && refreshed["postcondition_before_is_desired"] != false {
+                    action_error = Some("click postcondition baseline was unverifiable".into());
+                }
+                if action_error.is_none() {
+                    postcondition_before_is_desired =
+                        refreshed["postcondition_before_is_desired"] == true;
                 }
                 if action_error.is_none() {
                     if let Some((x, y)) = refreshed["x"].as_f64().zip(refreshed["y"].as_f64()) {
@@ -2116,11 +2346,16 @@ impl App {
             if action_error.is_none() {
                 let postcondition_json =
                     serde_json::to_string(postcondition).map_err(|e| invalid(e.to_string()))?;
+                let before_json = serde_json::to_string(&postcondition_before_is_desired)
+                    .map_err(|e| invalid(e.to_string()))?;
+                let readback_expression = format!(
+                    r#"(()=>{{let es;try{{es=[...document.querySelectorAll({postcondition_selector})]}}catch(_){{return {{ok:false}}}};if(es.length!==1)return {{ok:false}};const e=es[0],current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');return {{ok:e.isConnected&&typeof current==='string'&&current.length<=16384&&current==={postcondition_json}&&{before_json}===false}};}})()"#
+                );
                 match tokio::time::timeout_at(action_deadline, connection.command(
                     shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
-                    json!({"expression":format!(r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return false}};if(es.length!==1)return false;const e=es[0],current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??'');return e.isConnected&&current==={postcondition_json};}})()"#),"returnByValue":true,"awaitPromise":false}),
+                    json!({"expression":readback_expression,"returnByValue":true,"awaitPromise":false}),
                 )).await {
-                    Ok(Ok(readback)) if readback.pointer("/result/value") == Some(&Value::Bool(true)) => {}
+                    Ok(Ok(readback)) if readback.pointer("/result/value/ok") == Some(&Value::Bool(true)) => {}
                     Ok(Ok(_)) => action_error = Some("click postcondition did not match; effect may have occurred".into()),
                     Ok(Err(error)) => action_error = Some(format!("click postcondition readback failed; effect may have occurred: {error}")),
                     Err(_) => action_error = Some("click postcondition deadline exceeded; effect may have occurred".into()),
@@ -3724,7 +3959,8 @@ mod tests {
             .unwrap();
         let artifact_operation = artifact_start["operation_id"].as_str().unwrap().to_owned();
         let mut artifact_status = Value::Null;
-        for _ in 0..50 {
+        let artifact_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < artifact_deadline {
             artifact_status = client
                 .call_tool(
                     CallToolRequestParams::new("workflow_status").with_arguments(args(json!({
@@ -3738,7 +3974,7 @@ mod tests {
             if artifact_status["status"] == "completed" {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(artifact_status["status"], "completed", "{artifact_status}");
         let artifact = &artifact_status["result"]["artifacts"][0];
@@ -4007,6 +4243,99 @@ mod tests {
         assert!(observed.get("target_ref").is_none());
         assert!(serde_json::to_vec(&observed).unwrap().len() <= 4096);
 
+        let ax = client.call_tool(CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
+            "session_id":session_id,"chrome_tab_id":"123","selector":"#selected","max_bytes":8192
+        }))));
+        let ax_replies = async {
+            for (method, result) in [
+                (
+                    "Page.getFrameTree",
+                    json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}}),
+                ),
+                ("DOM.getDocument", json!({"root":{"nodeId":1}})),
+                ("DOM.querySelector", json!({"nodeId":2})),
+                (
+                    "Accessibility.getPartialAXTree",
+                    json!({"nodes":[{"nodeId":"7","role":{"value":"button"}}]}),
+                ),
+                (
+                    "Page.getFrameTree",
+                    json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}}),
+                ),
+            ] {
+                let request: Value = serde_json::from_str(
+                    extension.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], method);
+                if method == "Accessibility.getPartialAXTree" {
+                    assert_eq!(request["params"]["fetchRelatives"], false);
+                    assert_eq!(request["params"]["nodeId"], 2);
+                }
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (ax, ()) = tokio::join!(ax, ax_replies);
+        let ax = ax.unwrap().structured_content.unwrap();
+        assert_eq!(ax["nodes"][0]["nodeId"], "7");
+        assert_eq!(ax["shared_frame_identity"]["loader_id"], "doc-1");
+        assert!(serde_json::to_vec(&ax).unwrap().len() <= 8192);
+
+        let oversized_ax = client.call_tool(CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
+            "session_id":session_id,"chrome_tab_id":"123","selector":"#selected","max_bytes":4096
+        }))));
+        let oversized_ax_replies = async {
+            for (method, result) in [
+                (
+                    "Page.getFrameTree",
+                    json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}}),
+                ),
+                ("DOM.getDocument", json!({"root":{"nodeId":1}})),
+                ("DOM.querySelector", json!({"nodeId":2})),
+                (
+                    "Accessibility.getPartialAXTree",
+                    json!({"nodes":[{"name":{"value":"x".repeat(5000)}}]}),
+                ),
+            ] {
+                let request: Value = serde_json::from_str(
+                    extension.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], method);
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (oversized_ax, ()) = tokio::join!(oversized_ax, oversized_ax_replies);
+        assert!(oversized_ax.is_err() || oversized_ax.unwrap().is_error.unwrap_or(false));
+
+        let timed_ax = client.call_tool(CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
+            "session_id":session_id,"chrome_tab_id":"123","selector":"#selected","max_bytes":8192,"timeout_ms":1000
+        }))));
+        let first_ax_request = async {
+            let request: Value =
+                serde_json::from_str(extension.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "Page.getFrameTree");
+            request
+        };
+        let (timed_ax, first_ax_request) = tokio::join!(timed_ax, first_ax_request);
+        assert!(timed_ax.is_err() || timed_ax.unwrap().is_error.unwrap_or(false));
+        extension.send(Message::Text(json!({"type":"result","id":first_ax_request["id"],"result":{"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}}}).to_string().into())).await.unwrap();
+
         let stale_observe = client
             .call_tool(CallToolRequestParams::new("shared_observe").with_arguments(observe_args()));
         let navigation_replies = async {
@@ -4131,16 +4460,20 @@ mod tests {
                             json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener"}}}),
                             json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
                             json!({"result":{"type":"object","value":{"ok":false,"reason":"ambiguous"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
-                            json!({"result":{"type":"boolean","value":true}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":false,"value":"Pending"}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"value":"Saved"}}}),
                             json!({"result":{"type":"object","value":{"ok":true}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
                             json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
                         ];
                         let result = outcomes
                             .get(eval_index)
@@ -4157,12 +4490,12 @@ mod tests {
                         ));
                         if request["params"]["type"] == "mousePressed" {
                             mouse_presses += 1;
-                            if mouse_presses == 2 {
+                            if mouse_presses == 3 {
                                 json!({"error":"fixture uncertain dispatch"})
                             } else {
                                 json!({"result":{}})
                             }
-                        } else if mouse_presses == 3 {
+                        } else if mouse_presses == 4 {
                             json!({"error":"fixture uncertain release"})
                         } else {
                             json!({"result":{}})
@@ -4181,6 +4514,21 @@ mod tests {
                     .unwrap();
             }
         });
+        let missing_postcondition_selector = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                }))),
+            )
+            .await;
+        assert!(
+            missing_postcondition_selector.is_err()
+                || missing_postcondition_selector
+                    .unwrap()
+                    .is_error
+                    .unwrap_or(false)
+        );
         let fill = |expected_value: &str| {
             client.call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
@@ -4203,9 +4551,19 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
                     "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
-                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                    "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
                 }))),
             )
+            .await;
+        assert!(
+            clicked.is_err() || clicked.unwrap().is_error.unwrap_or(false),
+            "unchanged independently selected state must not verify a click"
+        );
+        let clicked = client
+            .call_tool(CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
+                "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
+            }))))
             .await
             .unwrap();
         assert!(clicked.structured_content.unwrap()["verified"] == true);
@@ -4213,7 +4571,7 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
                     "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
-                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                    "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
                 }))),
             )
             .await;
@@ -4222,7 +4580,7 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
                     "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
-                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                    "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
                 }))),
             )
             .await;
@@ -4231,7 +4589,7 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
                     "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
-                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                    "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
                 }))),
             )
             .await;
@@ -4240,7 +4598,7 @@ mod tests {
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
                     "session_id":session_id,"chrome_tab_id":"123","selector":"button.save",
-                    "action":"click","expected_value":"Save","value":"","postcondition":"Saved"
+                    "action":"click","expected_value":"Save","value":"","postcondition_selector":"#save-state","postcondition":"Saved"
                 }))),
             )
             .await;
@@ -4256,7 +4614,7 @@ mod tests {
                     .iter()
                     .filter(|method| method.as_str() == "Input.dispatchMouseEvent")
                     .count(),
-                6,
+                8,
                 "attempt a mouse release even when the press acknowledgement is uncertain"
             );
             assert_eq!(
@@ -4269,7 +4627,7 @@ mod tests {
             );
             assert_eq!(
                 *frame_reads.lock().unwrap(),
-                18,
+                20,
                 "every attempted action performs a post-action identity read"
             );
             assert_eq!(
@@ -4277,7 +4635,7 @@ mod tests {
                     .iter()
                     .filter(|method| method.as_str() == "Runtime.evaluate")
                     .count(),
-                16
+                18
             );
             let expressions = expressions.lock().unwrap();
             assert!(
@@ -4299,6 +4657,10 @@ mod tests {
                 "click must block submit/reset controls only when they can act on a form"
             );
             assert!(expressions[7].contains("matches(':disabled')"));
+            assert!(expressions[6].contains("#save-state"));
+            assert!(expressions[6].contains("postcondition_before"));
+            assert!(expressions[8].contains("current.length<=16384"));
+            assert!(expressions[8].contains("===false"));
         }
         client.cancel().await.unwrap();
         let _ = server_task.await.unwrap();
@@ -4316,6 +4678,7 @@ mod tests {
                 provider: None,
                 session_id: None,
                 target_ids: Some(vec!["123".into()]),
+                host_id: None,
             }))
             .await
             .unwrap()
@@ -4327,6 +4690,7 @@ mod tests {
                 provider: None,
                 session_id: Some(pair["session_id"].as_str().unwrap().into()),
                 target_ids: None,
+                host_id: None,
             })),
         )
         .await
@@ -4364,6 +4728,7 @@ mod tests {
                 provider: None,
                 session_id: Some(id.clone()),
                 target_ids: None,
+                host_id: None,
             }))
             .await
             .unwrap()
@@ -4374,6 +4739,7 @@ mod tests {
             provider: None,
             session_id: Some(id),
             target_ids: None,
+            host_id: None,
         }))
         .await
         .unwrap();

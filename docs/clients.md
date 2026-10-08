@@ -2,7 +2,22 @@
 
 Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1.0`. Client setup formats checked against upstream documentation/source on 2026-10-06. OpenCode 1.18.5 completed one read-only guide call using a generated v1 config and local Qwen 2.5 7B; this is a narrow tool-call check, not full client acceptance. See `verification-matrix.md` for the bounded evidence and remaining client gates.
 
-This preview runs MCP over local stdio only. Build the executable, then replace `/ABS/PATH/TO/controlla` below with its absolute path (normally `target/release/controlla`); the MCP command is `controlla mcp`. Do not point a client at an HTTP endpoint: this branch has no remote listener or authentication. Each concurrently running client process needs a unique absolute `CONTROLLA_STATE_DIR`; the server locks this directory before journal recovery. To enable permissioned Chrome auto-connect, set `COMPTROL_CHROME_AUTO_CONNECT=1` in the client configuration and enable Chrome Remote Debugging at `chrome://inspect/#remote-debugging`. Chrome may ask for consent. Alternatively, configure an explicitly approved loopback CDP WebSocket using `COMPTROL_ALLOW_DIRECT_CDP=1` and `COMPTROL_CDP_ENDPOINT`; never expose that endpoint outside loopback.
+MCP runs over local stdio by default. Build the executable, then use its absolute path (normally `target/release/controlla`); the command is `controlla mcp`. The optional HTTP server is authenticated and loopback-only. Each concurrently running MCP process needs a unique absolute `CONTROLLA_STATE_DIR`. Shared-tab control uses Chrome's native messaging bridge; it does not use a remote debugging port.
+
+## One-time Chrome bridge setup
+
+1. In Chrome, open `chrome://extensions`, enable Developer mode, and load `extensions/chrome-controlla` with **Load unpacked**.
+2. Copy the extension ID shown on that page. It is specific to this installation; do not reuse an ID from another machine or a documentation example.
+3. Build/install the `controlla` executable, then register the native host once with that exact ID: `controlla install-bridge YOUR_EXTENSION_ID`.
+4. Reload the extension on `chrome://extensions`. Keep Chrome and the MCP server running.
+
+In MCP, call `session` with `action: "discover_shared_tabs"`. Select one or more IDs from `snapshot.tabs` and pass those `target_ids` plus `snapshot.host_id` to `session` with `action: "pair_shared"`; this creates **one session for all selected tabs** over the native bridge. Then call `session` with `action: "accept_shared"` and its returned `session_id`. If you omit `host_id`, pairing uses the manual popup fallback. Discovery includes at most 100 eligible tabs; when `snapshot.truncated` is `true`, later tabs are omitted. Listing does not attach to tabs.
+
+The popup's endpoint/token form is used when `host_id` is omitted, including when the native host is unavailable or busy. Start `pair_shared` without `host_id`, select the same exact IDs in the extension popup, and enter the returned loopback endpoint and one-session token there; then call `accept_shared`. Treat the token as sensitive and do not put it into client configuration or documentation.
+
+Pairing trusts the MCP client that supplies the tab IDs: use it only through a client you trust. Chrome displays its debugger indicator for attached tabs; separate browser-side per-tab approval beyond that indicator has not been established.
+
+Live qualification is narrow: Chrome has launched the registered host and MCP has read its fresh tab inventory. A separate popup pairing completed one bounded live read-only observation. Attachment and browser commands through the native route, writes, app acceptance/persistence, and broad client compatibility are not yet live-qualified.
 
 Generate the dated config shape for a client with `node integrations/generate-config.mjs <client> /absolute/path/to/controlla /absolute/path/to/state-root`. Supported IDs are `freebuff`, `opencode-v1`, `opencode-v2`, and `claude`; OpenCode versions have different nesting. Each output gives that client its own state subdirectory. These versioned templates are configuration examples, not proof that an installed client accepts them. ChatGPT is intentionally omitted because this preview has neither local-stdio support there nor an authenticated remote endpoint.
 
@@ -21,7 +36,6 @@ The current Codebuff source reads `.agents/mcp.json` (project, parent, then home
       "command": "/ABS/PATH/TO/controlla",
       "args": ["mcp"],
       "env": {
-        "COMPTROL_CHROME_AUTO_CONNECT": "1",
         "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/freebuff"
       }
     }
@@ -44,7 +58,6 @@ The v1 config puts named servers directly under `mcp` and uses `enabled`:
       "command": ["/ABS/PATH/TO/controlla", "mcp"],
       "enabled": true,
       "environment": {
-        "COMPTROL_CHROME_AUTO_CONNECT": "1",
         "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/opencode-v1"
       }
     }
@@ -65,7 +78,6 @@ The v2 config nests named servers under `mcp.servers`; servers connect unless `d
         "type": "local",
         "command": ["/ABS/PATH/TO/controlla", "mcp"],
         "environment": {
-          "COMPTROL_CHROME_AUTO_CONNECT": "1",
           "CONTROLLA_STATE_DIR": "/ABS/PATH/TO/controlla-state/opencode-v2"
         }
       }
@@ -81,7 +93,7 @@ Use the schema matching the installed OpenCode major version; v1 and v2 config n
 Register a user-scope local stdio process:
 
 ```sh
-claude mcp add --env 'COMPTROL_CHROME_AUTO_CONNECT=1' --env 'CONTROLLA_STATE_DIR=/ABS/PATH/TO/controlla-state/claude' --transport stdio --scope user chrome-controlla -- '/ABS/PATH/TO/controlla' mcp
+claude mcp add --env 'CONTROLLA_STATE_DIR=/ABS/PATH/TO/controlla-state/claude' --transport stdio --scope user chrome-controlla -- '/ABS/PATH/TO/controlla' mcp
 claude mcp get chrome-controlla
 ```
 

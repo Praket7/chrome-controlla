@@ -163,10 +163,10 @@ fn now_ms() -> u128 {
 }
 
 /// Discover local browser surfaces without connecting to anything.
-/// Check registration only; this is not a Controlla command transport.
+/// Registration alone does not prove a live extension round trip.
 fn native_bridge_registered() -> bool {
     #[allow(unused_variables)]
-    let host_id = "comptrol_browser_bridge";
+    let host_id = "chrome_controlla_bridge";
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -189,7 +189,7 @@ fn native_bridge_registered() -> bool {
         std::process::Command::new("reg")
             .args([
                 "query",
-                "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\comptrol_browser_bridge",
+                "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\chrome_controlla_bridge",
                 "/ve",
             ])
             .output()
@@ -227,14 +227,13 @@ pub fn list_sessions() -> Vec<BrowserSession> {
         },
         BrowserSession {
             provider: SessionProvider::CompanionExtension,
-            // Comptrol's local HTTP API has no external command-enqueue route.
-            // Registration alone therefore cannot make this provider connectable.
+            // Registration alone cannot prove the extension is connected.
             available: false,
             reason: if companion_registered {
-                "Comptrol Browser Bridge native host is registered, but Controlla has no command transport adapter for it; use the separate shared-extension pairing route or configure an explicitly permissioned CDP route"
+                "Chrome Controlla native host is registered; use discover_shared_tabs for a fresh extension round trip before selecting tab IDs"
                     .to_owned()
             } else {
-                "Comptrol Browser Bridge native host is not registered, and Controlla has no command transport adapter for it"
+                "Chrome Controlla native host is not registered; run controlla install-bridge with the exact extension ID"
                     .to_owned()
             },
             signed_in_capable: true,
@@ -280,8 +279,7 @@ pub fn select_provider(needs_signed_in: bool) -> Result<SessionProvider, String>
     if needs_signed_in {
         let extension = get(SessionProvider::CompanionExtension);
         let permissioned = get(SessionProvider::PermissionedAutoConnect);
-        // Select only a provider with an implemented, currently available
-        // transport. A registered Comptrol native host alone is not one.
+        // Registration alone is not a live extension round trip or a tab grant.
         if let Some(provider) =
             preferred_signed_in_provider(extension.available, permissioned.available)
         {
@@ -511,13 +509,13 @@ mod tests {
     }
 
     #[test]
-    fn native_host_registration_is_not_a_controlla_transport() {
+    fn registration_alone_is_not_a_live_extension_round_trip() {
         let companion = list_sessions()
             .into_iter()
             .find(|session| session.provider == SessionProvider::CompanionExtension)
             .expect("companion provider is listed");
         assert!(!companion.available);
-        assert!(companion.reason.contains("no command transport adapter"));
+        assert!(companion.reason.contains("native host"));
     }
 
     #[test]

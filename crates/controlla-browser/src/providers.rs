@@ -18,10 +18,16 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
-use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+#[cfg(test)]
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::{
+    WebSocketStream, accept_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 static NEXT_PROFILE_SUFFIX: AtomicU64 = AtomicU64::new(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const SHARED_MESSAGE_LIMIT: usize = 1_048_576;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -553,10 +559,16 @@ impl SharedExtensionProvider {
                     "non-loopback client rejected".into(),
                 ));
             }
-            let mut socket = tokio::time::timeout_at(deadline, accept_async(stream))
-                .await
-                .map_err(|_| ProviderError::Extension("extension handshake timed out".into()))?
-                .map_err(|error| ProviderError::Extension(error.to_string()))?;
+            let mut socket_config = WebSocketConfig::default();
+            socket_config.max_message_size = Some(SHARED_MESSAGE_LIMIT);
+            socket_config.max_frame_size = Some(SHARED_MESSAGE_LIMIT);
+            let mut socket = tokio::time::timeout_at(
+                deadline,
+                accept_async_with_config(stream, Some(socket_config)),
+            )
+            .await
+            .map_err(|_| ProviderError::Extension("extension handshake timed out".into()))?
+            .map_err(|error| ProviderError::Extension(error.to_string()))?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let message = tokio::time::timeout(remaining, socket.next())
                 .await
@@ -573,6 +585,20 @@ impl SharedExtensionProvider {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             };
+            if hello["type"] == "pair_error"
+                && hello["token"]
+                    .as_str()
+                    .is_some_and(|token| constant_time_eq(token, &self.pairing.token))
+            {
+                return Err(ProviderError::Extension(
+                    hello["error"]
+                        .as_str()
+                        .unwrap_or("extension could not attach selected tabs")
+                        .chars()
+                        .take(256)
+                        .collect(),
+                ));
+            }
             let Some(target_values) = hello["targets"].as_array() else {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
@@ -2350,6 +2376,224 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
+    async fn real_chrome_cdp_promise_settles_and_navigation_cancels_pending_evaluation() {
+        use crate::sessions::{IndependentTargetObserver, ProviderGrants};
+        struct FixtureObserver;
+        impl IndependentTargetObserver for FixtureObserver {
+            fn verify_unchanged(
+                &self,
+                _: &crate::sessions::CleanupObservation,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let provider = DedicatedChromeProvider::new(executable);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "real-chrome-promise-fixture",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(
+                &mut registry,
+                &handle,
+                "data:text/html,<title>promise</title>",
+            )
+            .await
+            .unwrap();
+        session.process.preserve_on_drop = false;
+        let connection = session.connection().clone();
+        let target_id = session.target_id().to_owned();
+        let target = connection
+            .targets
+            .read()
+            .await
+            .targets
+            .get(&target_id)
+            .cloned()
+            .unwrap();
+        let eval = |expression: &str| json!({"expression":expression,"awaitPromise":true,"returnByValue":true});
+        let started = tokio::time::Instant::now();
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(15),
+            connection.target_command(
+                &target_id,
+                target.generation,
+                &target.revision,
+                "Runtime.evaluate",
+                eval("new Promise(r=>setTimeout(()=>r('resolved'),12000))"),
+            ),
+        )
+        .await
+        .expect("12-second resolve exceeded safe timeout")
+        .unwrap();
+        assert!(
+            (Duration::from_millis(11_800)..=Duration::from_secs(15)).contains(&started.elapsed()),
+            "resolve duration was {:?}",
+            started.elapsed()
+        );
+        assert_eq!(resolved["result"]["value"], "resolved");
+
+        let started = tokio::time::Instant::now();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(15),
+            connection.target_command(
+                &target_id,
+                target.generation,
+                &target.revision,
+                "Runtime.evaluate",
+                eval("new Promise((_,r)=>setTimeout(()=>r(new Error('rejected')),12000))"),
+            ),
+        )
+        .await
+        .expect("12-second rejection exceeded safe timeout")
+        .unwrap();
+        assert!(
+            (Duration::from_millis(11_800)..=Duration::from_secs(15)).contains(&started.elapsed()),
+            "reject duration was {:?}",
+            started.elapsed()
+        );
+        assert!(
+            rejected["exceptionDetails"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rejected"),
+            "unexpected rejection response: {rejected}"
+        );
+
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = connection
+                    .frames
+                    .read()
+                    .await
+                    .frames
+                    .values()
+                    .find(|frame| frame.target_id == target_id)
+                {
+                    break frame.id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial frame was not observed");
+        let original_ref = connection
+            .capture_target_ref(&registry, &handle, &target_id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+
+        // This second CDP connection models an external Chrome/user navigation;
+        // it deliberately avoids the browser crate's per-target actor.
+        let external = BrowserConnection::connect(&session.endpoint).await.unwrap();
+        let attached = external
+            .command(
+                None,
+                "Target.attachToTarget",
+                json!({"targetId":target_id,"flatten":true}),
+            )
+            .await
+            .unwrap();
+        let external_session = attached["sessionId"].as_str().unwrap().to_owned();
+
+        let pending_connection = connection.clone();
+        let pending_target = target.clone();
+        let pending_target_id = target_id.clone();
+        let pending = tokio::spawn(async move {
+            pending_connection
+                .target_command(
+                    &pending_target_id,
+                    pending_target.generation,
+                    &pending_target.revision,
+                    "Runtime.evaluate",
+                    eval("(()=>{window.__phase3PendingStarted='started';return new Promise(r=>setTimeout(()=>r('too-late'),12000))})()"),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let marker = external.command(
+                    Some(external_session.clone()), "Runtime.evaluate",
+                    json!({"expression":"window.__phase3PendingStarted||null","returnByValue":true}),
+                ).await;
+                if marker.is_ok_and(|value| value["result"]["value"] == "started") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("pending evaluation was not observed in Chrome before navigation");
+        let navigated = tokio::time::timeout(
+            Duration::from_secs(3),
+            external.command(
+                Some(external_session.clone()),
+                "Page.navigate",
+                json!({"url":"data:text/html,%3Ctitle%3Enavigated%3C/title%3E"}),
+            ),
+        )
+        .await
+        .expect("external navigation exceeded safe timeout");
+        assert!(
+            navigated.is_ok(),
+            "navigation was blocked behind pending evaluation: {navigated:?}"
+        );
+        let pending_result = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .expect("pending evaluation did not settle after navigation")
+            .unwrap();
+        assert!(
+            pending_result.is_err() || pending_result.unwrap()["result"]["value"] != "too-late"
+        );
+        let state = tokio::time::timeout(Duration::from_secs(3), external.command(
+            Some(external_session), "Runtime.evaluate",
+            json!({"expression":"({url:location.href,title:document.title})","returnByValue":true}),
+        )).await.expect("post-navigation observation exceeded safe timeout").unwrap();
+        assert_eq!(state["result"]["value"]["title"], "navigated");
+        assert!(
+            state["result"]["value"]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:text/html,")
+        );
+        let stale = connection
+            .target_ref_command(
+                &registry,
+                &original_ref,
+                "real-chrome-promise-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                eval("document.title"),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(crate::BrowserError::StaleReference(_))),
+            "pre-navigation reference remained usable: {stale:?}"
+        );
+        let outcome = session
+            .shutdown(&mut registry, Some(&FixtureObserver))
+            .await;
+        assert!(
+            outcome.cleanup_error.is_none(),
+            "Chrome fixture cleanup failed: {:?}",
+            outcome.cleanup_error
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
     async fn real_chrome_extracts_virtualized_phase5_fixture_and_guards_wrong_account() {
         use crate::{
             observe::{Completeness, ExtractionSpec},
@@ -2621,6 +2865,45 @@ list.addEventListener('scroll',render);render();
     }
 
     #[tokio::test]
+    async fn shared_extension_reports_authenticated_native_pair_error() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (result, ()) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"pair_error","token":pairing.token,"error":"debugger attach failed"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        assert!(
+            matches!(result, Err(ProviderError::Extension(error)) if error == "debugger attach failed")
+        );
+    }
+
+    #[tokio::test]
     async fn shared_extension_authenticates_selected_targets_and_routes_commands() {
         use crate::sessions::ProviderGrants;
         use serde_json::json;
@@ -2699,6 +2982,39 @@ list.addEventListener('scroll',render);render();
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn shared_extension_rejects_oversized_inbound_message_before_parsing() {
+        use crate::sessions::ProviderGrants;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let endpoint = provider.pairing().endpoint.clone();
+        let (accepted, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(3), provider.accept(&mut registry)),
+            async {
+                let (mut socket, _) = connect_async(&endpoint).await.unwrap();
+                let oversized = "x".repeat(SHARED_MESSAGE_LIMIT + 1);
+                let _ = socket.send(Message::Text(oversized.into())).await;
+            }
+        );
+        assert!(accepted.unwrap().is_err());
     }
 
     #[tokio::test]

@@ -12,13 +12,15 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
 rusqlite = { version = "=0.38.0", features = ["bundled"] }
-tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 getrandom = "=0.3.4"
 thiserror = "=2.0.20"
 
 rmcp = { version = "=3.5.1", features = ["transport-io", "transport-streamable-http-server", "macros"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 schemars = "=1.2.2"
+futures-util = "=0.3.34"
+tokio-tungstenite = "=0.28.0"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "futures"] }
 
 [dev-dependencies]
