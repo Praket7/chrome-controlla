@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
 const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+const SHARED_TYPE_GUARD_FUNCTION: &str = r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'};}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'};const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'};return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true};}"#;
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SessionArgs {
@@ -1084,6 +1085,17 @@ struct SharedTypeGuard<'a> {
     deadline: tokio::time::Instant,
 }
 
+const SHARED_TYPE_INTER_CHARACTER_DELAY: Duration = Duration::from_millis(60);
+
+fn shared_typing_minimum_duration(character_count: usize) -> Duration {
+    SHARED_TYPE_INTER_CHARACTER_DELAY.saturating_mul(
+        character_count
+            .saturating_sub(1)
+            .try_into()
+            .unwrap_or(u32::MAX),
+    )
+}
+
 async fn shared_type_guard(
     connection: &controlla_browser::providers::SharedExtensionSession,
     registry: &SessionRegistry,
@@ -1099,7 +1111,7 @@ async fn shared_type_guard(
             "Runtime.callFunctionOn",
             json!({
                 "objectId":guard.object_id,
-                "functionDeclaration":r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'}}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'}const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'}if(e.value!==expected)return {ok:false,reason:'stale_value'}if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'}return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true}}"#,
+                "functionDeclaration":SHARED_TYPE_GUARD_FUNCTION,
                 "arguments":[{"value":guard.selector},{"value":guard.expected},{"value":guard.final_check}],
                 "returnByValue":true
             }),
@@ -2179,7 +2191,7 @@ impl App {
 
     #[tool(
         name = "shared_input",
-        description = "Perform guarded fill, nonempty sequential ASCII typing, or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value; typing retains the matched DOM object, requires a focused ordinary text field with a collapsed caret at its end, and rechecks object identity and value around each key dispatch and at readback. A key release gets at most one bounded retry, but any uncertain dispatch/release is an error. Enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
+        description = "Perform guarded fill, nonempty sequential ASCII typing, or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value; typing retains the matched DOM object, requires a focused ordinary text field with a collapsed caret at its end, rechecks object identity and value around each key dispatch and at readback, and waits a fixed 60 ms between characters. Typing is refused before dispatch if its minimum paced duration cannot fit the action budget. This sends CDP key events, not OS hardware input or IME, and must not be used to bypass app security or bot checks. A key release gets at most one bounded retry, but any uncertain dispatch/release is an error. Enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
     )]
     async fn shared_input(
         &self,
@@ -2219,6 +2231,17 @@ impl App {
             ));
         }
         let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(60_000).clamp(6_000, 60_000));
+        if args.action == "type" {
+            let minimum_duration = shared_typing_minimum_duration(args.value.chars().count());
+            let action_budget = timeout.saturating_sub(Duration::from_secs(5));
+            if minimum_duration >= action_budget {
+                return Err(invalid(format!(
+                    "paced sequential typing needs at least {} ms, exceeding the {} ms action budget",
+                    minimum_duration.as_millis(),
+                    action_budget.as_millis()
+                )));
+            }
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         let action_deadline = deadline - Duration::from_secs(5);
         let recovery_deadline = deadline - Duration::from_secs(2);
@@ -2372,7 +2395,23 @@ impl App {
             }
             if action_error.is_none() {
                 let object_id = object_id.unwrap();
-                for character in args.value.chars() {
+                for (index, character) in args.value.chars().enumerate() {
+                    if index > 0 {
+                        let pace_deadline =
+                            tokio::time::Instant::now() + SHARED_TYPE_INTER_CHARACTER_DELAY;
+                        if tokio::time::timeout_at(
+                            std::cmp::min(pace_deadline, action_deadline),
+                            tokio::time::sleep_until(pace_deadline),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            action_error = Some(
+                                "typing pace deadline exceeded before next key dispatch; earlier characters may have been entered".into(),
+                            );
+                            break;
+                        }
+                    }
                     let checked = shared_type_guard(
                         connection,
                         shared.registry()?,
@@ -3447,7 +3486,10 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, validate_loopback_ws};
+    use super::{
+        App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
+        shared_typing_minimum_duration, validate_loopback_ws,
+    };
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
@@ -3475,6 +3517,18 @@ mod tests {
             assert!(unsafe_for("HTMLButtonElement", "reset", true));
             assert!(unsafe_for("HTMLInputElement", "password", false));
             assert!(!unsafe_for("HTMLInputElement", "submit", false));
+        });
+    }
+
+    #[test]
+    fn shared_type_guard_is_valid_javascript() {
+        let runtime = rquickjs::Runtime::new().unwrap();
+        let context = rquickjs::Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                "globalThis.sharedTypeGuard = {SHARED_TYPE_GUARD_FUNCTION};"
+            ))
+            .unwrap();
         });
     }
 
@@ -4870,6 +4924,8 @@ mod tests {
         let expressions = Arc::new(StdMutex::new(Vec::new()));
         let mouse_events = Arc::new(StdMutex::new(Vec::new()));
         let key_events = Arc::new(StdMutex::new(Vec::new()));
+        let key_down_times = Arc::new(StdMutex::new(Vec::new()));
+        let replace_after_first_char = Arc::new(StdMutex::new(true));
         let type_identity_calls = Arc::new(StdMutex::new(Vec::new()));
         let key_failures = Arc::new(StdMutex::new(std::collections::BTreeMap::from([
             ("keyDown:d".to_owned(), 1usize),
@@ -4883,6 +4939,8 @@ mod tests {
         let expressions_server = expressions.clone();
         let mouse_events_server = mouse_events.clone();
         let key_events_server = key_events.clone();
+        let key_down_times_server = key_down_times.clone();
+        let replace_after_first_char_server = replace_after_first_char.clone();
         let type_identity_calls_server = type_identity_calls.clone();
         let key_failures_server = key_failures.clone();
         let release_object_failures_server = release_object_failures.clone();
@@ -4952,8 +5010,10 @@ mod tests {
                         let arguments = params["arguments"].as_array().unwrap();
                         let expected = arguments[1]["value"].as_str().unwrap();
                         if arguments[2]["value"] == true {
-                            json!({"result":{"type":"object","value":{"ok":true,"value":"oldx"}}})
-                        } else if expected == "oldx" {
+                            json!({"result":{"type":"object","value":{"ok":true,"value":expected}}})
+                        } else if expected == "oldx"
+                            && *replace_after_first_char_server.lock().unwrap()
+                        {
                             json!({"result":{"type":"object","value":{"ok":false,"reason":"target_replaced"}}})
                         } else {
                             json!({"result":{"type":"object","value":{"ok":true}}})
@@ -4992,6 +5052,12 @@ mod tests {
                         key_events_server.lock().unwrap().push(params.clone());
                         let ty = params["type"].as_str().unwrap();
                         let key = params["key"].as_str().or(params["text"].as_str()).unwrap();
+                        if ty == "keyDown" {
+                            key_down_times_server
+                                .lock()
+                                .unwrap()
+                                .push(std::time::Instant::now());
+                        }
                         let failure_key = format!("{ty}:{key}");
                         let mut failures = key_failures_server.lock().unwrap();
                         if let Some(remaining) = failures.get_mut(&failure_key).filter(|n| **n > 0)
@@ -5129,6 +5195,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(typed.structured_content.unwrap()["observed_value"], "oldx");
+        *replace_after_first_char.lock().unwrap() = false;
+        let before_paced_keydowns = key_down_times.lock().unwrap().len();
+        let paced = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":"xy"
+                }))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paced.structured_content.unwrap()["observed_value"], "oldxy");
+        {
+            let key_down_times = key_down_times.lock().unwrap();
+            let paced_key_downs = &key_down_times[before_paced_keydowns..];
+            assert_eq!(paced_key_downs.len(), 2);
+            assert!(
+                paced_key_downs[1].duration_since(paced_key_downs[0])
+                    >= std::time::Duration::from_millis(60),
+                "actual dispatched keyDown events must have the fixed minimum spacing"
+            );
+        }
+        *replace_after_first_char.lock().unwrap() = true;
         let stopped_after_interference = client
             .call_tool(
                 CallToolRequestParams::new("shared_input").with_arguments(args(json!({
@@ -5159,6 +5248,44 @@ mod tests {
             seen.lock().unwrap().len(),
             before_empty_type,
             "empty typing dispatches nothing"
+        );
+        let before_over_deadline_type = seen.lock().unwrap().len();
+        let over_deadline_type = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":"x".repeat(100),"timeout_ms":6000
+                }))),
+            )
+            .await;
+        assert!(
+            over_deadline_type.is_err(),
+            "paced typing whose minimum duration cannot fit must be refused"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before_over_deadline_type,
+            "deadline preflight rejects before any browser command"
+        );
+        assert_eq!(
+            shared_typing_minimum_duration(2),
+            std::time::Duration::from_millis(60),
+            "one fixed 60 ms delay separates adjacent characters"
+        );
+        assert_eq!(
+            shared_typing_minimum_duration(1),
+            std::time::Duration::ZERO,
+            "single-character input needs no inter-character delay"
+        );
+        assert_eq!(
+            shared_typing_minimum_duration(17),
+            std::time::Duration::from_millis(960),
+            "17 characters fit within the 1 second action budget at the 6 second minimum timeout"
+        );
+        assert_eq!(
+            shared_typing_minimum_duration(18),
+            std::time::Duration::from_millis(1020),
+            "18 characters exceed the 1 second action budget at the 6 second minimum timeout"
         );
         for key in ["d", "c", "u", "v"] {
             if key == "v" {
@@ -5203,7 +5330,7 @@ mod tests {
             );
             assert_eq!(
                 *frame_reads.lock().unwrap(),
-                32,
+                34,
                 "every attempted action performs a post-action identity read"
             );
             assert_eq!(
@@ -5211,7 +5338,7 @@ mod tests {
                     .iter()
                     .filter(|method| method.as_str() == "Runtime.evaluate")
                     .count(),
-                24
+                25
             );
             let keys = key_events.lock().unwrap();
             assert_eq!(
@@ -5258,7 +5385,7 @@ mod tests {
                 "repeated keyUp failure stops after the bounded retry"
             );
             let identity_calls = type_identity_calls.lock().unwrap();
-            assert_eq!(identity_calls.len(), 13);
+            assert_eq!(identity_calls.len(), 18);
             assert!(identity_calls.iter().all(|call| {
                 call["objectId"] == "input-object"
                     && call["functionDeclaration"]
@@ -5277,7 +5404,7 @@ mod tests {
                     .iter()
                     .filter(|expression| expression.contains("shared_type_handle"))
                     .count(),
-                6
+                7
             );
             assert!(
                 expressions[0].contains("document.elementFromPoint"),
