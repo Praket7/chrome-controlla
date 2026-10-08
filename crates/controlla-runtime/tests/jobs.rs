@@ -113,6 +113,33 @@ fn admission_is_scoped_durable_and_conflicts_on_changed_request() {
 }
 
 #[test]
+fn completion_allows_no_dispatch_but_rejects_unacknowledged_dispatch() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+
+    let local = journal.admit("p", "s", "local", &json!({})).unwrap();
+    assert!(journal.start("p", "s", &local.operation.id).unwrap());
+    let completed = journal
+        .complete("p", "s", &local.operation.id, json!({"value":1}))
+        .unwrap();
+    assert_eq!(completed.status, JobStatus::Completed);
+    assert_eq!(completed.delivery, Delivery::NotSent);
+
+    let uncertain = journal.admit("p", "s", "uncertain", &json!({})).unwrap();
+    let claim = journal
+        .record_dispatch("p", "s", &uncertain.operation.id, "send")
+        .unwrap();
+    assert!(claim.acquired);
+    assert!(
+        journal
+            .complete("p", "s", &uncertain.operation.id, json!({"value":1}))
+            .is_err()
+    );
+    cleanup(&path);
+}
+
+#[test]
 fn workflow_checkpoint_survives_reopen_and_each_browser_dispatch_is_claimed() {
     let path = temp_db();
     cleanup(&path);

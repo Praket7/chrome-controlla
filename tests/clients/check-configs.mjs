@@ -21,7 +21,6 @@ assert.deepEqual(entries[0], {
   command: binary,
   args: ['mcp'],
   env: {
-    COMPTROL_CHROME_AUTO_CONNECT: '1',
     CONTROLLA_STATE_DIR: `${state}/freebuff`,
   },
 });
@@ -30,7 +29,6 @@ assert.deepEqual(entries[1], {
   command: [binary, 'mcp'],
   enabled: true,
   environment: {
-    COMPTROL_CHROME_AUTO_CONNECT: '1',
     CONTROLLA_STATE_DIR: `${state}/opencode-v1`,
   },
 });
@@ -38,7 +36,6 @@ assert.deepEqual(entries[2], {
   type: 'local',
   command: [binary, 'mcp'],
   environment: {
-    COMPTROL_CHROME_AUTO_CONNECT: '1',
     CONTROLLA_STATE_DIR: `${state}/opencode-v2`,
   },
 });

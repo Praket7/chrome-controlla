@@ -315,7 +315,7 @@ impl Journal {
         let encoded = result.map(|v| serde_json::to_string(&v)).transpose()?;
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status=?4, result=?5, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?6 AND (?4!='completed' OR delivery='sent')", params![id, principal, session, status.as_str(), encoded, now_ms() as i64])?;
+        let changed = connection.execute("UPDATE operations SET status=?4, result=?5, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?6 AND (?4!='completed' OR delivery IN ('not_sent','sent'))", params![id, principal, session, status.as_str(), encoded, now_ms() as i64])?;
         if changed == 0 {
             expire_one(&connection, principal, session, id)?;
             return Err(JournalError::InvalidTransition("completion"));

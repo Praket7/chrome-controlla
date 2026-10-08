@@ -21,7 +21,6 @@ export const configs = {
           command: binary,
           args: ['mcp'],
           env: {
-            COMPTROL_CHROME_AUTO_CONNECT: '1',
             CONTROLLA_STATE_DIR: path.join(state, 'freebuff'),
           },
         },
@@ -41,7 +40,6 @@ export const configs = {
           command: [binary, 'mcp'],
           enabled: true,
           environment: {
-            COMPTROL_CHROME_AUTO_CONNECT: '1',
             CONTROLLA_STATE_DIR: path.join(state, 'opencode-v1'),
           },
         },
@@ -61,7 +59,6 @@ export const configs = {
             type: 'local',
             command: [binary, 'mcp'],
             environment: {
-              COMPTROL_CHROME_AUTO_CONNECT: '1',
               CONTROLLA_STATE_DIR: path.join(state, 'opencode-v2'),
             },
           },
@@ -74,7 +71,7 @@ export const configs = {
     schemaVersion: 'claude-code-stdio-2026-10-06-v1',
     format: 'shell',
     make: (binary, state) =>
-      `claude mcp add --env ${shellQuote('COMPTROL_CHROME_AUTO_CONNECT=1')} --env ${shellQuote(`CONTROLLA_STATE_DIR=${path.join(state, 'claude')}`)} --transport stdio --scope user chrome-controlla -- ${shellQuote(binary)} mcp\nclaude mcp get chrome-controlla`,
+      `claude mcp add --env ${shellQuote(`CONTROLLA_STATE_DIR=${path.join(state, 'claude')}`)} --transport stdio --scope user chrome-controlla -- ${shellQuote(binary)} mcp\nclaude mcp get chrome-controlla`,
   },
 };
 
