@@ -242,6 +242,21 @@ function message(payload) {
   }) });
   assert.equal(debuggerCalls.length, callsBeforeBlocked + 1);
   assert.equal(debuggerCalls.at(-1).method, "Input.dispatchMouseEvent");
+  const callsBeforeTyping = debuggerCalls.length;
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "allowed-key", target_id: "18", method: "Input.dispatchKeyEvent",
+    params: { type: "char", text: "x", unmodifiedText: "x" }
+  }) });
+  assert.equal(debuggerCalls.length, callsBeforeTyping + 1, "shared typing dispatch is allowed on an attached tab");
+  assert.equal(debuggerCalls.at(-1).method, "Input.dispatchKeyEvent");
+  assert.equal(activeSocket.sent.at(-1).id, "allowed-key");
+  for (const method of ["Runtime.callFunctionOn", "Runtime.releaseObject"]) {
+    await activeSocket.onmessage({ data: JSON.stringify({
+      type: "command", id: `allowed-${method}`, target_id: "18", method, params: {}
+    }) });
+    assert.equal(debuggerCalls.at(-1).method, method, `shared typing identity method ${method} is allowed`);
+    assert.equal(activeSocket.sent.at(-1).id, `allowed-${method}`);
+  }
   activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "old-manual-result", target_id: "18", method: "Runtime.evaluate", params: { awaitResult: true }
   }) });

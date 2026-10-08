@@ -1075,6 +1075,96 @@ async fn verify_file_select_marker(
     }
 }
 
+struct SharedTypeGuard<'a> {
+    tab_id: &'a str,
+    object_id: &'a str,
+    selector: &'a str,
+    expected: &'a str,
+    final_check: bool,
+    deadline: tokio::time::Instant,
+}
+
+async fn shared_type_guard(
+    connection: &controlla_browser::providers::SharedExtensionSession,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    guard: SharedTypeGuard<'_>,
+) -> Result<Value, String> {
+    let response = tokio::time::timeout_at(
+        guard.deadline,
+        connection.command(
+            registry,
+            handle,
+            guard.tab_id,
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId":guard.object_id,
+                "functionDeclaration":r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'}}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'}const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'}if(e.value!==expected)return {ok:false,reason:'stale_value'}if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'}return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true}}"#,
+                "arguments":[{"value":guard.selector},{"value":guard.expected},{"value":guard.final_check}],
+                "returnByValue":true
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| "typing guard deadline exceeded".to_owned())?
+    .map_err(|error| error.to_string())?;
+    Ok(response
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+async fn shared_release_key(
+    connection: &controlla_browser::providers::SharedExtensionSession,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    key_up: &Value,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let mut first_error = None;
+    for attempt in 0..2 {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(
+                first_error.unwrap_or_else(|| "key release recovery deadline expired".into())
+            );
+        }
+        let attempt_deadline = std::cmp::min(now + Duration::from_millis(250), deadline);
+        let result = tokio::time::timeout_at(
+            attempt_deadline,
+            connection.command(
+                registry,
+                handle,
+                tab_id,
+                "Input.dispatchKeyEvent",
+                key_up.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| "release acknowledgement timed out".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        match (attempt, result) {
+            (0, Ok(_)) => return Ok(()),
+            (1, Ok(_)) => {
+                return Err(format!(
+                    "initial key release was uncertain; bounded retry was acknowledged: {}",
+                    first_error.unwrap_or_default()
+                ));
+            }
+            (0, Err(error)) => first_error = Some(error),
+            (1, Err(error)) => {
+                return Err(format!(
+                    "key release remained uncertain after one bounded retry: {}; {error}",
+                    first_error.unwrap_or_default()
+                ));
+            }
+            _ => unreachable!(),
+        }
+    }
+    unreachable!()
+}
+
 async fn shared_frame_identity(
     connection: &controlla_browser::providers::SharedExtensionSession,
     registry: &SessionRegistry,
@@ -2089,7 +2179,7 @@ impl App {
 
     #[tool(
         name = "shared_input",
-        description = "Perform one guarded fill or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value/text; enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
+        description = "Perform guarded fill, nonempty sequential ASCII typing, or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value; typing retains the matched DOM object, requires a focused ordinary text field with a collapsed caret at its end, and rechecks object identity and value around each key dispatch and at readback. A key release gets at most one bounded retry, but any uncertain dispatch/release is an error. Enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
     )]
     async fn shared_input(
         &self,
@@ -2103,8 +2193,18 @@ impl App {
         {
             return Err(invalid("selector and values exceed shared input bounds"));
         }
-        if args.action != "fill" && args.action != "click" {
-            return Err(invalid("shared input action must be fill or click"));
+        if args.action != "fill" && args.action != "type" && args.action != "click" {
+            return Err(invalid("shared input action must be fill, type, or click"));
+        }
+        if args.action == "type" && !args.value.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+            return Err(invalid(
+                "shared sequential typing supports ASCII only; use fill for Unicode text",
+            ));
+        }
+        if args.action == "type" && args.value.is_empty() {
+            return Err(invalid(
+                "shared sequential typing requires nonempty ASCII text",
+            ));
         }
         if args.action == "click"
             && (args.postcondition_selector.as_ref().is_none_or(|selector| {
@@ -2161,6 +2261,10 @@ impl App {
             format!(
                 r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
             )
+        } else if args.action == "type" {
+            format!(
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{node:null,identityRoute:'shared_type_handle'}}}};return {{node:es.length===1?es[0]:null,identityRoute:'shared_type_handle'}};}})()"#
+            )
         } else {
             let unsafe_predicate = SHARED_CLICK_UNSAFE_PREDICATE;
             let postcondition = args.postcondition.as_deref().unwrap_or_default();
@@ -2170,6 +2274,7 @@ impl App {
                 r#"(()=>{{let es,ps;try{{es=[...document.querySelectorAll({selector})];ps=[...document.querySelectorAll({postcondition_selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1||ps.length!==1)return {{ok:false,reason:es.length!==1?(es.length?'ambiguous':'no_match'):(ps.length?'postcondition_ambiguous':'postcondition_no_match')}};const e=es[0],p=ps[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??''),postcondition_before=(p instanceof HTMLInputElement||p instanceof HTMLTextAreaElement||p instanceof HTMLSelectElement)?p.value:(p.innerText??'');if(p===e||!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||p.hasAttribute('data-masked')||p.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(typeof current!=='string'||current.length>16384)return {{ok:false,reason:'click_text_too_large'}};if(typeof postcondition_before!=='string'||postcondition_before.length>16384)return {{ok:false,reason:'postcondition_text_too_large'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};const postcondition_before_is_desired=postcondition_before==={postcondition_json};if(postcondition_before_is_desired)return {{ok:false,reason:'postcondition_already_satisfied'}};return {{ok:true,x,y,postcondition_before_is_desired}};}})()"#
             )
         };
+        let mut typing_object_id = None;
         let (preflight, mut action_error) = match tokio::time::timeout_at(
             action_deadline,
             connection.command(
@@ -2177,16 +2282,24 @@ impl App {
                 &shared.handle,
                 &args.chrome_tab_id,
                 "Runtime.evaluate",
-                json!({"expression":expression,"returnByValue":true,"awaitPromise":false}),
+                json!({"expression":expression,"returnByValue":args.action!="type","awaitPromise":false}),
             ),
         )
         .await
         {
+            Ok(Ok(response)) if args.action == "type" => {
+                typing_object_id = response
+                    .pointer("/result/objectId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if typing_object_id.is_some() {
+                    (json!({"ok":true}), None)
+                } else {
+                    (Value::Null, Some("typing identity handle could not be created".into()))
+                }
+            }
             Ok(Ok(response)) => (
-                response
-                    .pointer("/result/value")
-                    .cloned()
-                    .unwrap_or(Value::Null),
+                response.pointer("/result/value").cloned().unwrap_or(Value::Null),
                 None,
             ),
             Ok(Err(error)) => (
@@ -2198,7 +2311,7 @@ impl App {
                 Some("shared input deadline exceeded; effect may have occurred".into()),
             ),
         };
-        if action_error.is_none() && preflight["ok"] != true {
+        if args.action != "type" && action_error.is_none() && preflight["ok"] != true {
             action_error = Some(format!(
                 "shared input refused: {}",
                 preflight["reason"].as_str().unwrap_or("unverifiable")
@@ -2250,6 +2363,243 @@ impl App {
                 }
             } else {
                 observed_value = observed;
+            }
+        } else if args.action == "type" {
+            let mut expected_value = args.expected_value.clone();
+            let object_id = typing_object_id.as_deref();
+            if action_error.is_none() && object_id.is_none() {
+                action_error = Some("typing identity handle is unavailable".into());
+            }
+            if action_error.is_none() {
+                let object_id = object_id.unwrap();
+                for character in args.value.chars() {
+                    let checked = shared_type_guard(
+                        connection,
+                        shared.registry()?,
+                        &shared.handle,
+                        SharedTypeGuard {
+                            tab_id: &args.chrome_tab_id,
+                            object_id,
+                            selector: &args.selector,
+                            expected: &expected_value,
+                            final_check: false,
+                            deadline: action_deadline,
+                        },
+                    )
+                    .await;
+                    let checked = match checked {
+                        Ok(value) => value,
+                        Err(error) => {
+                            action_error = Some(format!(
+                                "typing guard failed; effect may have occurred: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    if checked["ok"] != true {
+                        action_error = Some(format!(
+                            "sequential typing stopped: {}",
+                            checked["reason"].as_str().unwrap_or("unverifiable")
+                        ));
+                        break;
+                    }
+                    let key = character.to_string();
+                    let key_up = json!({"type":"keyUp","key":key});
+                    let key_down = tokio::time::timeout_at(
+                        action_deadline,
+                        connection.command(
+                            shared.registry()?,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            "Input.dispatchKeyEvent",
+                            json!({"type":"keyDown","key":key}),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "key down deadline exceeded; effect may have occurred".to_owned())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    if let Err(error) = key_down {
+                        let recovery = shared_release_key(
+                            connection,
+                            shared.registry()?,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            &key_up,
+                            recovery_deadline,
+                        )
+                        .await
+                        .err()
+                        .map(|failure| format!("; key-up recovery uncertain: {failure}"))
+                        .unwrap_or_default();
+                        action_error = Some(format!(
+                            "key down outcome uncertain; key release attempted: {error}{recovery}"
+                        ));
+                        break;
+                    }
+                    let checked_down = shared_type_guard(
+                        connection,
+                        shared.registry()?,
+                        &shared.handle,
+                        SharedTypeGuard {
+                            tab_id: &args.chrome_tab_id,
+                            object_id,
+                            selector: &args.selector,
+                            expected: &expected_value,
+                            final_check: false,
+                            deadline: action_deadline,
+                        },
+                    )
+                    .await;
+                    let checked_down = match checked_down {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let recovery = shared_release_key(
+                                connection,
+                                shared.registry()?,
+                                &shared.handle,
+                                &args.chrome_tab_id,
+                                &key_up,
+                                recovery_deadline,
+                            )
+                            .await
+                            .err()
+                            .map(|failure| format!("; key-up recovery uncertain: {failure}"))
+                            .unwrap_or_default();
+                            action_error = Some(format!(
+                                "typing revalidation failed; key release attempted: {error}{recovery}"
+                            ));
+                            break;
+                        }
+                    };
+                    if checked_down["ok"] != true {
+                        let reason = checked_down["reason"].as_str().unwrap_or("unverifiable");
+                        let recovery = shared_release_key(
+                            connection,
+                            shared.registry()?,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            &key_up,
+                            recovery_deadline,
+                        )
+                        .await
+                        .err()
+                        .map(|failure| format!("; key-up recovery uncertain: {failure}"))
+                        .unwrap_or_default();
+                        action_error = Some(format!(
+                            "sequential typing stopped before character dispatch: {reason}{recovery}"
+                        ));
+                        break;
+                    }
+                    let typed = tokio::time::timeout_at(
+                        action_deadline,
+                        connection.command(
+                            shared.registry()?,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            "Input.dispatchKeyEvent",
+                            json!({"type":"char","text":key,"unmodifiedText":key}),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        "character event deadline exceeded; effect may have occurred".to_owned()
+                    })
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    if let Err(error) = typed {
+                        let recovery = shared_release_key(
+                            connection,
+                            shared.registry()?,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            &key_up,
+                            recovery_deadline,
+                        )
+                        .await
+                        .err()
+                        .map(|failure| format!("; key-up recovery uncertain: {failure}"))
+                        .unwrap_or_default();
+                        action_error = Some(format!(
+                            "character event outcome uncertain; key release attempted: {error}{recovery}"
+                        ));
+                        break;
+                    }
+                    expected_value.push(character);
+                    if let Err(error) = shared_release_key(
+                        connection,
+                        shared.registry()?,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        &key_up,
+                        recovery_deadline,
+                    )
+                    .await
+                    {
+                        action_error = Some(format!(
+                            "key release outcome uncertain after bounded retry; stop and reobserve: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            if action_error.is_none() {
+                let object_id = object_id.unwrap();
+                match shared_type_guard(
+                    connection,
+                    shared.registry()?,
+                    &shared.handle,
+                    SharedTypeGuard {
+                        tab_id: &args.chrome_tab_id,
+                        object_id,
+                        selector: &args.selector,
+                        expected: &expected_value,
+                        final_check: true,
+                        deadline: action_deadline,
+                    },
+                )
+                .await
+                {
+                    Ok(value)
+                        if value["ok"] == true
+                            && value["value"].as_str() == Some(&expected_value) =>
+                    {
+                        observed_value = expected_value;
+                    }
+                    Ok(_) => {
+                        action_error = Some("sequential typing post-event identity/value/caret readback did not match; effect may have occurred".into());
+                        observed_value = String::new();
+                    }
+                    Err(error) => {
+                        action_error = Some(format!(
+                            "sequential typing post-event readback failed; effect may have occurred: {error}"
+                        ));
+                        observed_value = String::new();
+                    }
+                }
+            } else {
+                observed_value = String::new();
+            }
+            if let Some(object_id) = typing_object_id {
+                let released = tokio::time::timeout_at(
+                    recovery_deadline,
+                    connection.command(
+                        shared.registry()?,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        "Runtime.releaseObject",
+                        json!({"objectId":object_id}),
+                    ),
+                )
+                .await
+                .map_err(|_| "typing handle cleanup timed out".to_owned())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                if let Err(error) = released {
+                    let cleanup_error = format!("typing handle cleanup failed: {error}");
+                    if let Some(action_error) = action_error.as_mut() {
+                        action_error.push_str(&format!("; {cleanup_error}"));
+                    } else {
+                        action_error = Some(cleanup_error);
+                    }
+                }
             }
         } else if action_error.is_none() {
             let mut postcondition_before_is_desired = false;
@@ -2932,7 +3282,7 @@ fn guide_content(topic: &str) -> Option<(&'static str, &'static str)> {
             include_str!("../../../docs/clients.md"),
         )),
         "master" => Some((
-            "master-2026-10-07-v5",
+            "master-2026-10-08-v6",
             include_str!("../../../docs/MASTER_GUIDE.md"),
         )),
         _ => None,
@@ -3414,12 +3764,12 @@ mod tests {
             .unwrap()
             .structured_content
             .unwrap();
-        assert_eq!(master_guide["guide_version"], "master-2026-10-07-v5");
+        assert_eq!(master_guide["guide_version"], "master-2026-10-08-v6");
         assert!(
             master_guide["content"]
                 .as_str()
                 .unwrap()
-                .contains("master-2026-10-07-v5")
+                .contains("master-2026-10-08-v6")
         );
         let stale_guide = client
             .call_tool(
@@ -4519,10 +4869,23 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let expressions = Arc::new(StdMutex::new(Vec::new()));
         let mouse_events = Arc::new(StdMutex::new(Vec::new()));
+        let key_events = Arc::new(StdMutex::new(Vec::new()));
+        let type_identity_calls = Arc::new(StdMutex::new(Vec::new()));
+        let key_failures = Arc::new(StdMutex::new(std::collections::BTreeMap::from([
+            ("keyDown:d".to_owned(), 1usize),
+            ("char:c".to_owned(), 1usize),
+            ("keyUp:u".to_owned(), 1usize),
+            ("keyUp:v".to_owned(), 2usize),
+        ])));
+        let release_object_failures = Arc::new(StdMutex::new(0usize));
         let frame_reads = Arc::new(StdMutex::new(0usize));
         let seen_server = seen.clone();
         let expressions_server = expressions.clone();
         let mouse_events_server = mouse_events.clone();
+        let key_events_server = key_events.clone();
+        let type_identity_calls_server = type_identity_calls.clone();
+        let key_failures_server = key_failures.clone();
+        let release_object_failures_server = release_object_failures.clone();
         let frame_reads_server = frame_reads.clone();
         let extension_task = tokio::spawn(async move {
             let mut eval_index = 0;
@@ -4537,38 +4900,73 @@ mod tests {
                         json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"}}})
                     }
                     "Runtime.evaluate" => {
-                        expressions_server
+                        let expression =
+                            request["params"]["expression"].as_str().unwrap().to_owned();
+                        expressions_server.lock().unwrap().push(expression.clone());
+                        if expression.contains("shared_type_handle") {
+                            json!({"result":{"type":"object","objectId":"input-object"}})
+                        } else if expression.contains("route:'sequential_type_readback'") {
+                            json!({"result":{"type":"object","value":{"ok":true,"route":"sequential_type_readback","value":"oldx"}}})
+                        } else if expression.contains("route:'sequential_type'") {
+                            if expression.contains("\"oldx\"") {
+                                json!({"result":{"type":"object","value":{"ok":false,"route":"sequential_type","reason":"stale_value"}}})
+                            } else {
+                                json!({"result":{"type":"object","value":{"ok":true,"route":"sequential_type","value":"old"}}})
+                            }
+                        } else {
+                            let outcomes = [
+                                json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener"}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"reason":"ambiguous"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"value":"Pending"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"value":"Saved"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
+                                json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
+                            ];
+                            let result = outcomes.get(eval_index).cloned().unwrap_or_else(
+                                || json!({"result":{"type":"boolean","value":true}}),
+                            );
+                            eval_index += 1;
+                            result
+                        }
+                    }
+                    "Runtime.callFunctionOn" => {
+                        let params = request["params"].clone();
+                        type_identity_calls_server
                             .lock()
                             .unwrap()
-                            .push(request["params"]["expression"].as_str().unwrap().to_owned());
-                        let outcomes = [
-                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
-                            json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener"}}}),
-                            json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
-                            json!({"result":{"type":"object","value":{"ok":false,"reason":"ambiguous"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":false,"value":"Pending"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"value":"Saved"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
-                            json!({"result":{"type":"object","value":{"ok":true,"x":14.0,"y":15.0,"postcondition_before_is_desired":false}}}),
-                        ];
-                        let result = outcomes
-                            .get(eval_index)
-                            .cloned()
-                            .unwrap_or_else(|| json!({"result":{"type":"boolean","value":true}}));
-                        eval_index += 1;
-                        result
+                            .push(params.clone());
+                        let arguments = params["arguments"].as_array().unwrap();
+                        let expected = arguments[1]["value"].as_str().unwrap();
+                        if arguments[2]["value"] == true {
+                            json!({"result":{"type":"object","value":{"ok":true,"value":"oldx"}}})
+                        } else if expected == "oldx" {
+                            json!({"result":{"type":"object","value":{"ok":false,"reason":"target_replaced"}}})
+                        } else {
+                            json!({"result":{"type":"object","value":{"ok":true}}})
+                        }
+                    }
+                    "Runtime.releaseObject" => {
+                        let mut failures = release_object_failures_server.lock().unwrap();
+                        if *failures > 0 {
+                            *failures -= 1;
+                            json!({"error":"fixture cleanup error"})
+                        } else {
+                            json!({"result":{}})
+                        }
                     }
                     "Input.dispatchMouseEvent" => {
                         mouse_events_server.lock().unwrap().push((
@@ -4585,6 +4983,21 @@ mod tests {
                             }
                         } else if mouse_presses == 4 {
                             json!({"error":"fixture uncertain release"})
+                        } else {
+                            json!({"result":{}})
+                        }
+                    }
+                    "Input.dispatchKeyEvent" => {
+                        let params = request["params"].clone();
+                        key_events_server.lock().unwrap().push(params.clone());
+                        let ty = params["type"].as_str().unwrap();
+                        let key = params["key"].as_str().or(params["text"].as_str()).unwrap();
+                        let failure_key = format!("{ty}:{key}");
+                        let mut failures = key_failures_server.lock().unwrap();
+                        if let Some(remaining) = failures.get_mut(&failure_key).filter(|n| **n > 0)
+                        {
+                            *remaining -= 1;
+                            json!({"error":format!("fixture uncertain {failure_key}")})
                         } else {
                             json!({"result":{}})
                         }
@@ -4694,6 +5107,81 @@ mod tests {
             uncertain_release.is_err(),
             "a lost release acknowledgement remains an error"
         );
+        let unsupported_unicode = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":"λ"
+                }))),
+            )
+            .await;
+        assert!(
+            unsupported_unicode.is_err(),
+            "sequential key events are ASCII only"
+        );
+        let typed = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":"x"
+                }))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed.structured_content.unwrap()["observed_value"], "oldx");
+        let stopped_after_interference = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":"xy"
+                }))),
+            )
+            .await;
+        assert!(
+            stopped_after_interference.is_err()
+                || stopped_after_interference
+                    .unwrap()
+                    .is_error
+                    .unwrap_or(false),
+            "typing stops when the exact value changes between characters"
+        );
+        let before_empty_type = seen.lock().unwrap().len();
+        let empty_type = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                    "action":"type","expected_value":"old","value":""
+                }))),
+            )
+            .await;
+        assert!(empty_type.is_err(), "empty sequential typing is rejected");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before_empty_type,
+            "empty typing dispatches nothing"
+        );
+        for key in ["d", "c", "u", "v"] {
+            if key == "v" {
+                *release_object_failures.lock().unwrap() = 1;
+            }
+            let failed = client
+                .call_tool(
+                    CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                        "session_id":session_id,"chrome_tab_id":"123","selector":"input[name='title']",
+                        "action":"type","expected_value":"old","value":key
+                    }))),
+                )
+                .await;
+            assert!(
+                failed.is_err(),
+                "uncertain {key} event never reports verified typing"
+            );
+            if key == "v" {
+                let message = format!("{failed:?}");
+                assert!(message.contains("key release remained uncertain"));
+                assert!(message.contains("typing handle cleanup failed"));
+            }
+        }
         extension_task.abort();
         {
             let methods = seen.lock().unwrap();
@@ -4715,7 +5203,7 @@ mod tests {
             );
             assert_eq!(
                 *frame_reads.lock().unwrap(),
-                20,
+                32,
                 "every attempted action performs a post-action identity read"
             );
             assert_eq!(
@@ -4723,9 +5211,74 @@ mod tests {
                     .iter()
                     .filter(|method| method.as_str() == "Runtime.evaluate")
                     .count(),
-                18
+                24
+            );
+            let keys = key_events.lock().unwrap();
+            assert_eq!(
+                &keys[..6],
+                &[
+                    json!({"type":"keyDown","key":"x"}),
+                    json!({"type":"char","text":"x","unmodifiedText":"x"}),
+                    json!({"type":"keyUp","key":"x"}),
+                    json!({"type":"keyDown","key":"x"}),
+                    json!({"type":"char","text":"x","unmodifiedText":"x"}),
+                    json!({"type":"keyUp","key":"x"})
+                ],
+                "sequential typing stops before the next character when its guard changes"
+            );
+            assert!(
+                keys.windows(2).any(|events| events
+                    == [
+                        json!({"type":"keyDown","key":"d"}),
+                        json!({"type":"keyUp","key":"d"})
+                    ]),
+                "uncertain keyDown triggers a release attempt"
+            );
+            assert!(
+                keys.windows(3).any(|events| events
+                    == [
+                        json!({"type":"keyDown","key":"c"}),
+                        json!({"type":"char","text":"c","unmodifiedText":"c"}),
+                        json!({"type":"keyUp","key":"c"})
+                    ]),
+                "uncertain character dispatch triggers a release attempt"
+            );
+            assert_eq!(
+                keys.iter()
+                    .filter(|event| event == &&json!({"type":"keyUp","key":"u"}))
+                    .count(),
+                2,
+                "uncertain keyUp gets one bounded retry but remains an error"
+            );
+            assert_eq!(
+                keys.iter()
+                    .filter(|event| event == &&json!({"type":"keyUp","key":"v"}))
+                    .count(),
+                2,
+                "repeated keyUp failure stops after the bounded retry"
+            );
+            let identity_calls = type_identity_calls.lock().unwrap();
+            assert_eq!(identity_calls.len(), 13);
+            assert!(identity_calls.iter().all(|call| {
+                call["objectId"] == "input-object"
+                    && call["functionDeclaration"]
+                        .as_str()
+                        .unwrap()
+                        .contains("es[0]!==e")
+            }));
+            assert!(
+                identity_calls
+                    .iter()
+                    .any(|call| call["arguments"][1]["value"] == "oldx")
             );
             let expressions = expressions.lock().unwrap();
+            assert_eq!(
+                expressions
+                    .iter()
+                    .filter(|expression| expression.contains("shared_type_handle"))
+                    .count(),
+                6
+            );
             assert!(
                 expressions[0].contains("document.elementFromPoint"),
                 "fill must reject covered controls"

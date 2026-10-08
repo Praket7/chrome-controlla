@@ -135,7 +135,8 @@ async function dispatchCommand(request, authorizedTabs, respond) {
     return;
   }
   try {
-    if (!["Page.getFrameTree", "Runtime.evaluate", "Input.dispatchMouseEvent",
+    if (!["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+      "Input.dispatchMouseEvent", "Input.dispatchKeyEvent",
       "DOM.getDocument", "DOM.querySelector", "Accessibility.getPartialAXTree"].includes(request.method)) {
       throw new Error("Command is outside the shared observe/input allowlist.");
     }
