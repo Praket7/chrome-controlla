@@ -102,8 +102,8 @@
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "7e74bd5a981535a1dd1fef24e53cb4db6ab669bc2652da80072c6ce0017d9f32",
-      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 3 local 12-second QuickJS Promise coverage, Phase 6 constrained workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, authenticated loopback HTTP process smoke, OpenCode stdio discovery-only evidence, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest candidate, three-platform clean-prefix installs and CI boundaries",
+      "destination_sha256": "6295fdb5eaaa348d692b475f0e25f39d623c72793e2550d63ee6d4f4fe22de6e",
+      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 3 local 12-second QuickJS Promise coverage, Phase 6 bounded child-process workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, authenticated loopback HTTP process smoke, OpenCode stdio discovery-only evidence, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest candidate, three-platform clean-prefix installs and CI boundaries; updated Phase 6 sandbox caveat to match the bounded child-process implementation",
       "license": "user-provided design document; no third-party license asserted"
     },
     {

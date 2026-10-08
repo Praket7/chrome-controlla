@@ -46,6 +46,7 @@ struct ObserveInput {
     fields: BTreeMap<String, String>,
     max_items: usize,
     max_text_chars: usize,
+    #[schemars(range(min = 4096, max = 1_000_000))]
     max_bytes: usize,
     cursor: Option<String>,
 }
@@ -3269,6 +3270,48 @@ mod tests {
         let server_task = tokio::spawn(async move { server.waiting().await });
         let client = ().serve(client_io).await.unwrap();
         let listed = client.list_tools(None).await.unwrap();
+        for name in ["observe", "shared_observe"] {
+            let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            let spec_ref = schema["properties"]["spec"]["$ref"]
+                .as_str()
+                .expect("observe spec is described by a schema definition");
+            let spec_name = spec_ref.rsplit('/').next().unwrap();
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_bytes"]["minimum"], 4096,
+                "{name} schema must reject byte budgets below the runtime minimum"
+            );
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_bytes"]["maximum"], 1_000_000,
+                "{name} schema must reject byte budgets above the runtime maximum"
+            );
+        }
+        let workflow = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "workflow")
+            .unwrap();
+        let workflow_schema = serde_json::to_value(&workflow.input_schema).unwrap();
+        let workflow_observe_variant = workflow_schema["$defs"]["WorkflowStep"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "observe")
+            .expect("workflow schema includes an observe variant");
+        let workflow_spec_ref = workflow_observe_variant["properties"]["spec"]["$ref"]
+            .as_str()
+            .expect("workflow observe spec is described by a schema definition");
+        let workflow_spec_name = workflow_spec_ref.rsplit('/').next().unwrap();
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_bytes"]["minimum"],
+            4096,
+            "workflow schema must match observation's runtime minimum"
+        );
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_bytes"]["maximum"],
+            1_000_000,
+            "workflow schema must match observation's runtime maximum"
+        );
         let names = listed
             .tools
             .iter()

@@ -369,6 +369,7 @@ pub struct WorkflowObserveSpec {
     pub fields: std::collections::BTreeMap<String, String>,
     pub max_items: usize,
     pub max_text_chars: usize,
+    #[schemars(range(min = 4096, max = 1_000_000))]
     pub max_bytes: usize,
     pub cursor: Option<String>,
 }
