@@ -31,7 +31,7 @@ pub fn script_worker_executable() -> Result<std::path::PathBuf, String> {
     if let Some(binary) = current
         .parent()
         .and_then(std::path::Path::parent)
-        .map(|directory| directory.join("controlla"))
+        .map(|directory| directory.join(format!("controlla{}", std::env::consts::EXE_SUFFIX)))
         .filter(|path| path.is_file())
     {
         return Ok(binary);
@@ -703,6 +703,16 @@ mod tests {
 
     fn rejecting_broker() -> MockBroker {
         Arc::new(|_| Box::pin(async { Err("broker rejected".to_owned()) }))
+    }
+
+    #[test]
+    fn script_worker_uses_the_cli_binary() {
+        let executable = script_worker_executable().unwrap();
+        assert_eq!(
+            executable.file_name().unwrap().to_string_lossy(),
+            format!("controlla{}", std::env::consts::EXE_SUFFIX)
+        );
+        assert!(executable.is_file());
     }
 
     fn delayed_broker() -> MockBroker {
