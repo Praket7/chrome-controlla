@@ -44,10 +44,13 @@ struct TargetRefInput {
 struct ObserveInput {
     selector: String,
     fields: BTreeMap<String, String>,
+    #[schemars(range(min = 1, max = 500))]
     max_items: usize,
+    #[schemars(range(min = 1, max = 10_000))]
     max_text_chars: usize,
     #[schemars(range(min = 4096, max = 1_000_000))]
     max_bytes: usize,
+    #[schemars(length(max = 256))]
     cursor: Option<String>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -3278,12 +3281,32 @@ mod tests {
                 .expect("observe spec is described by a schema definition");
             let spec_name = spec_ref.rsplit('/').next().unwrap();
             assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_items"]["minimum"], 1,
+                "{name} schema must reject an empty observation item budget"
+            );
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_items"]["maximum"], 500,
+                "{name} schema must match the browser observation item limit"
+            );
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_text_chars"]["minimum"], 1,
+                "{name} schema must reject an empty observation text budget"
+            );
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["max_text_chars"]["maximum"], 10_000,
+                "{name} schema must match the browser observation text limit"
+            );
+            assert_eq!(
                 schema["$defs"][spec_name]["properties"]["max_bytes"]["minimum"], 4096,
                 "{name} schema must reject byte budgets below the runtime minimum"
             );
             assert_eq!(
                 schema["$defs"][spec_name]["properties"]["max_bytes"]["maximum"], 1_000_000,
                 "{name} schema must reject byte budgets above the runtime maximum"
+            );
+            assert_eq!(
+                schema["$defs"][spec_name]["properties"]["cursor"]["maxLength"], 256,
+                "{name} schema must match the browser cursor limit"
             );
         }
         let workflow = listed
@@ -3303,14 +3326,36 @@ mod tests {
             .expect("workflow observe spec is described by a schema definition");
         let workflow_spec_name = workflow_spec_ref.rsplit('/').next().unwrap();
         assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_items"]["maximum"], 500,
+            "workflow schema must match the browser observation item limit"
+        );
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_text_chars"]["maximum"],
+            10_000,
+            "workflow schema must match the browser observation text limit"
+        );
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_items"]["minimum"], 1,
+            "workflow schema must reject an empty observation item budget"
+        );
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["max_text_chars"]["minimum"],
+            1,
+            "workflow schema must reject an empty observation text budget"
+        );
+        assert_eq!(
+            workflow_schema["$defs"][workflow_spec_name]["properties"]["cursor"]["maxLength"], 256,
+            "workflow schema must match the browser cursor limit"
+        );
+        assert_eq!(
             workflow_schema["$defs"][workflow_spec_name]["properties"]["max_bytes"]["minimum"],
             4096,
             "workflow schema must match observation's runtime minimum"
         );
         assert_eq!(
             workflow_schema["$defs"][workflow_spec_name]["properties"]["max_bytes"]["maximum"],
-            1_000_000,
-            "workflow schema must match observation's runtime maximum"
+            998_976,
+            "workflow schema must reserve its 1024-byte result envelope"
         );
         let names = listed
             .tools

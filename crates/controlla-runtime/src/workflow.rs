@@ -367,10 +367,13 @@ async fn run_script_in_process(
 pub struct WorkflowObserveSpec {
     pub selector: String,
     pub fields: std::collections::BTreeMap<String, String>,
+    #[schemars(range(min = 1, max = 500))]
     pub max_items: usize,
+    #[schemars(range(min = 1, max = 10_000))]
     pub max_text_chars: usize,
-    #[schemars(range(min = 4096, max = 1_000_000))]
+    #[schemars(range(min = 4096, max = 998_976))]
     pub max_bytes: usize,
+    #[schemars(length(max = 256))]
     pub cursor: Option<String>,
 }
 
@@ -625,14 +628,14 @@ pub fn compile(request: Value) -> Result<WorkflowGraph, String> {
                     || spec.fields.is_empty()
                     || spec.fields.len() > 32
                     || spec.max_items == 0
-                    || spec.max_items > 1000
+                    || spec.max_items > 500
                     || spec.max_text_chars == 0
-                    || spec.max_text_chars > 100_000
-                    || !(4096..=MAX_OUTPUT_BYTES).contains(&spec.max_bytes)
+                    || spec.max_text_chars > 10_000
+                    || !(4096..=MAX_OUTPUT_BYTES - 1024).contains(&spec.max_bytes)
                     || spec
                         .cursor
                         .as_ref()
-                        .is_some_and(|cursor| cursor.len() > 4096)
+                        .is_some_and(|cursor| cursor.len() > 256)
                     || spec.fields.iter().any(|(name, selector)| {
                         name.is_empty()
                             || name.len() > 64
@@ -937,16 +940,22 @@ mod tests {
     fn bounded_workflow_compiles_and_rejects_escape_and_resource_limits() {
         let valid = json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"text":"p"},"max_items":2,"max_text_chars":40,"max_bytes":4096,"cursor":null}},{"kind":"wait","ms":10},{"kind":"checkpoint"}]});
         assert!(compile(valid).is_ok());
+        assert!(compile(json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":500,"max_text_chars":10000,"max_bytes":4096,"cursor":"x".repeat(256)}}]})).is_ok());
+        assert!(compile(json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":998976,"cursor":null}}]})).is_ok());
         for invalid in [
             json!({"steps":[{"kind":"script","source":"x"},{"kind":"checkpoint"}]}),
             json!({"steps":[{"kind":"script","source":"x".repeat(MAX_SCRIPT_BYTES+1)}]}),
             json!({"steps":(0..22).map(|_|json!({"kind":"checkpoint"})).collect::<Vec<_>>()}),
             json!({"steps":[{"kind":"wait","ms":10001}]}),
             json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":1001,"max_text_chars":40,"max_bytes":4096,"cursor":null}}]}),
+            json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":501,"max_text_chars":40,"max_bytes":4096,"cursor":null}}]}),
+            json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":10001,"max_bytes":4096,"cursor":null}}]}),
+            json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":4096,"cursor":"x".repeat(257)}}]}),
             json!({"steps":[{"kind":"checkpoint","module":"node:fs"}]}),
             json!({"steps":[{"kind":"checkpoint","network":"fetch"}]}),
             json!({"steps":[{"kind":"checkpoint","process":"spawn"}]}),
             json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":1000001,"cursor":null}}]}),
+            json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":998977,"cursor":null}}]}),
             json!({"steps":[{"kind":"wait","ms":10000},{"kind":"wait","ms":10000},{"kind":"wait","ms":10000},{"kind":"wait","ms":1}]}),
             json!({"steps":[{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":600000,"cursor":null}},{"kind":"observe","spec":{"selector":"p","fields":{"x":"p"},"max_items":2,"max_text_chars":40,"max_bytes":400000,"cursor":null}}]}),
         ] {
