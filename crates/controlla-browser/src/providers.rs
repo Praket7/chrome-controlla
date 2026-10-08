@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::{
     WebSocketStream, accept_async_with_config,
