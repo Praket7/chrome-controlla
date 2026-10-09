@@ -1,5 +1,15 @@
 # Blockers and external dependencies
 
+## V3 release blockers — 2026-10-09
+
+- The v3 implementation plan is partial. Browser-mode parity, full near-page workflow batching, real 1,000-character typing/event qualification, live user-interference and multi-client races, and crash/reconnect stress still need real-browser evidence.
+- WebMCP descriptor and schema checks exist, but selected-tab discovery and invocation are not integrated. Keep the route fail-closed and do not claim WebMCP automation support.
+- Freebuff, OpenCode, Claude Code, Codex, ChatGPT Desktop, and generic MCP config contracts are checked. Real end-to-end client smokes remain unverified except for the separately recorded narrow OpenCode guide call; that does not qualify a v3 workflow.
+- Upload/download and authenticated persistence have browser/file-selection fixtures only; app acceptance and saved state remain unqualified.
+- No controlled real competitor results are available. The release gate must continue to reject broad “best” claims.
+- Multi-step workflows lease each mutation step but do not hold an exclusive transaction lease across the full workflow; cross-client changes between steps must continue to fail through revision-bound references. No live concurrent-agent qualification is claimed.
+- The lease table is process-local. The current v3 shared-tab route uses one local Chrome namespace; coordination across separate server processes or multiple Chrome instances is not qualified.
+
 ## Source-audit repair follow-up — 2026-10-08
 
 - The local A1–A8 repair set passes workspace, Clippy, extension, package, documentation, provenance, client, app, benchmark, dependency, and isolated installed-Chrome checks. The four installed-Chrome runs use disposable headless profiles; they do not establish the paired extension/MCP route.

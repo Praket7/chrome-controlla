@@ -16,7 +16,8 @@ for (const client of ['freebuff', 'opencode', 'claude-code', 'codex', 'chatgpt-d
   const entry = matrix.clients[client];
   assert.ok(entry, `missing client ${client}`);
   assert.ok(['stdio-mcp', 'packaged-local-plugin'].includes(entry.contract));
-  assert.equal(entry.status, 'qualified');
+  assert.equal(entry.contractStatus, 'verified');
+  assert.equal(entry.liveSmokeStatus, 'unverified');
 }
 assert.equal(matrix.qualificationPolicy.generatedEvidenceMaySupportBestClaim, false);
 assert.equal(matrix.qualificationPolicy.realClientSmokeRequiredForPublicCompatibilityClaim, true);

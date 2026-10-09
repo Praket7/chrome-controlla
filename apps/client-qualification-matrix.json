@@ -17,12 +17,12 @@
     "verified_mutations"
   ],
   "clients": {
-    "freebuff": {"contract": "stdio-mcp", "status": "qualified"},
-    "opencode": {"contract": "stdio-mcp", "status": "qualified"},
-    "claude-code": {"contract": "stdio-mcp", "status": "qualified"},
-    "codex": {"contract": "stdio-mcp", "status": "qualified"},
-    "chatgpt-desktop": {"contract": "packaged-local-plugin", "status": "qualified"},
-    "generic-mcp": {"contract": "stdio-mcp", "status": "qualified"}
+    "freebuff": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
+    "opencode": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
+    "claude-code": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
+    "codex": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
+    "chatgpt-desktop": {"contract": "packaged-local-plugin", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
+    "generic-mcp": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"}
   },
   "qualificationPolicy": {
     "generatedEvidenceMayQualifyClientContract": true,

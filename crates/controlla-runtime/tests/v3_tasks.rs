@@ -1,6 +1,7 @@
 use controlla_runtime::v3_tasks::{
     EvidenceReceipt, ExpandedStep, FormField, PageToolDescriptor, PageToolEffect, PageToolRoute,
-    RepeatAction, TaskPrimitive, route_page_tool, validate_page_tool_result,
+    RepeatAction, TaskPrimitive, route_page_tool, validate_page_tool_input,
+    validate_page_tool_result,
 };
 use serde_json::json;
 
@@ -102,4 +103,32 @@ fn page_tool_output_and_evidence_are_bounded() {
     assert!(receipt.url.len() <= 2048);
     assert_eq!(receipt.snippet.chars().count(), 2000);
     assert_eq!(receipt.affected_controls.len(), 64);
+}
+
+#[test]
+fn page_tool_input_is_checked_against_a_bounded_schema_subset() {
+    let schema = json!({
+        "type":"object",
+        "properties":{"query":{"type":"string","minLength":1,"maxLength":40}},
+        "required":["query"],
+        "additionalProperties":false
+    });
+    assert!(validate_page_tool_input(
+        &schema,
+        &json!({"query":"school closures"})
+    ));
+    assert!(!validate_page_tool_input(&schema, &json!({})));
+    assert!(!validate_page_tool_input(&schema, &json!({"query":3})));
+    assert!(!validate_page_tool_input(
+        &schema,
+        &json!({"query":"x","admin":true})
+    ));
+    assert!(!validate_page_tool_input(
+        &json!({"type":"object","anyOf":[]}),
+        &json!({"query":"x"})
+    ));
+    assert!(!validate_page_tool_input(
+        &json!({"type":"object","properties":{"query":{"type":"string","maxLength":"40"}},"required":["query"],"additionalProperties":false}),
+        &json!({"query":"x"})
+    ));
 }

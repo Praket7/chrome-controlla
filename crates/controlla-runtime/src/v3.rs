@@ -183,15 +183,13 @@ impl LeaseTable {
         ttl_ms: u64,
     ) -> Result<TargetLease, TargetLease> {
         self.expire(now_ms);
-        if let Some(existing) = self.leases.get(&target)
-            && existing.owner != owner
-        {
+        if let Some(existing) = self.leases.get(&target) {
             return Err(existing.clone());
         }
         let lease = TargetLease {
             owner: owner.to_owned(),
             acquired_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(250, 30_000)),
+            expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(250, 120_000)),
         };
         self.leases.insert(target, lease.clone());
         Ok(lease)

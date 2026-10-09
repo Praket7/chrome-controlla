@@ -5,7 +5,7 @@ const RECONNECT_MAX_MS = 60000;
 const RECONNECT_ALARM = "controlla-native-reconnect";
 const MAX_BATCH_ACTIONS = 64;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-  "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "DOM.getDocument", "DOM.querySelector", "Accessibility.getPartialAXTree"]);
+  "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "Accessibility.getPartialAXTree"]);
 let nativePort;
 let nativeReady = false;
 let nativeError;
@@ -137,7 +137,7 @@ async function dispatchBatch(request, isAuthorized, respond) {
   const receipts = [];
   for (let index = 0; index < actions.length; index++) {
     const action = actions[index];
-    if (!action || typeof action.method !== "string" || action.method.length > 128 || (action.target_id !== undefined && Number(action.target_id) !== tabId)) {
+    if (!action || typeof action.method !== "string" || action.method.length > 128 || (action.target_id !== undefined && Number(action.target_id) !== tabId) || (action.stop_on_not_ok !== undefined && typeof action.stop_on_not_ok !== "boolean")) {
       respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: "Invalid batch action or target mismatch." }); return;
     }
     let settled;
@@ -146,6 +146,7 @@ async function dispatchBatch(request, isAuthorized, respond) {
     if (settled?.error) receipt.error = settled.error; else receipt.result = settled?.result;
     receipts.push(receipt);
     if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: settled.error }); return; }
+    if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
   }
   respond({ type: "batch_result", id: request.id, result: { receipts, completed: actions.length, stopped_before: null, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt } });
 }

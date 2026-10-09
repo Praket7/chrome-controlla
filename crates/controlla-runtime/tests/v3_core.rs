@@ -85,11 +85,23 @@ fn target_leases_serialize_same_tab_without_blocking_other_tabs() {
         tab_id: "2".into(),
     };
     assert!(leases.acquire(tab_a.clone(), "codex", 100, 1_000).is_ok());
+    assert!(leases.acquire(tab_a.clone(), "codex", 100, 1_000).is_err());
     assert!(leases.acquire(tab_a.clone(), "claude", 101, 1_000).is_err());
     assert!(leases.acquire(tab_b.clone(), "claude", 101, 1_000).is_ok());
     assert_eq!(leases.owner(&tab_a, 200).as_deref(), Some("codex"));
     assert!(leases.release(&tab_a, "codex"));
     assert!(leases.acquire(tab_a, "claude", 201, 1_000).is_ok());
+}
+
+#[test]
+fn target_lease_can_cover_the_maximum_single_action_deadline() {
+    let mut leases = LeaseTable::default();
+    let target = TargetKey {
+        browser_id: "chrome".into(),
+        tab_id: "1".into(),
+    };
+    let lease = leases.acquire(target, "codex", 100, 120_000).unwrap();
+    assert_eq!(lease.expires_at_ms, 120_100);
 }
 
 #[test]

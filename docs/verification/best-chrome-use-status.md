@@ -2,6 +2,16 @@
 
 This file records implementation and evidence status without converting missing evidence into a product claim.
 
+## V3 implementation status — 2026-10-09
+
+V3 implementation is partial. The current branch has a six-tool MCP surface, mode/typing/interference/lease/reconnect primitives, guarded selected-tab extension batches, actual CDP FastKeys batches, IME composition and commit dispatch, deterministic task expansions, and a fail-closed v3 claim gate. Local tests qualify those code paths and contracts only.
+
+The extension batch path now requires the negotiated capability, reauthorizes each selected-tab action, bounds each request to 64 actions and the shared message limit, and stops on the first failed guard. FastKeys submits real CDP key events without an intentional 60 ms delay. Its current path batches at most 16 characters per host round trip; partial receipts that may include prior key dispatch return `unknown`, and workflows stop on `unknown` or `not_dispatched`. Shared target leases use one server-wide extension namespace plus the observed tab ID, preventing session aliases from bypassing same-tab exclusion. Each action is bounded to 60 seconds and holds a 120-second target lease; an `unknown` result retains the lease through expiry. A workflow does not hold an exclusive lease across all steps, so safe interleaving depends on each subsequent revision-bound ref rejecting drift. This is not yet a general near-page DOM workflow executor or a 1,000-character real-browser performance qualification. IME dispatch uses composition and commit operations followed by a runtime readback; OS-level IME behavior remains unqualified.
+
+The v3 client matrix verifies generated configuration and adapter contracts for Freebuff, OpenCode, Claude Code, Codex, ChatGPT Desktop, and generic MCP. It explicitly records real-client smoke status as unverified. The WebMCP descriptor route and bounded schema validator are unit-tested, but browser discovery and invocation are not wired into the selected-tab MCP route. Headless stress covers eight isolated real Chrome profiles locally and in the new Ubuntu lane; it does not establish full headed-background parity or crash/reconnect recovery.
+
+The v3 plan remains open for real user-interference and multi-client browser races, complete mode/typing event semantics, app-level authenticated persistence and file acceptance, live client qualification, integrated WebMCP execution, and controlled competitor runs. The broad superiority gate remains blocked without complete real competitor evidence.
+
 ## Implemented engine foundations
 
 - execution telemetry and compact runtime metrics

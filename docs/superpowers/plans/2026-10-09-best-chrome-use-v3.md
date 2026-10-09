@@ -10,6 +10,23 @@
 
 **Spec:** `docs/design/best-chrome-use-v2.md` plus this plan's research-driven v3 deltas.
 
+## Execution ledger — 2026-10-09
+
+This ledger supersedes the initial unchecked template only where it cites current executable evidence. The plan is **partially implemented; v3 is not complete or release-qualified**.
+
+| Workstream | State | Evidence / remaining gate |
+|---|---|---|
+| Browser modes, interaction epochs, leases, reconnect | Partial | Policy/runtime primitives and contract tests exist. Leases key shared targets by the server-wide shared-extension namespace and tab ID, so session aliases cannot bypass them. Same-client overlapping mutations are rejected; each act has a 60-second bound, its lease lasts 120 seconds, and unknown outcomes retain the lease through expiry. Workflows lease each mutation separately, not transactionally across the whole sequence; fresh refs must reject interleaving drift. Cross-mode live parity, process-crash lease recovery, and hostile concurrent-client browser tests remain open. |
+| Near-page batching and typing | Partial | The selected-tab extension batch transport now has a bounded action count, per-action authorization, early stop, and a Rust FastKeys caller. Partial receipts distinguish a first guard rejection from a batch that already sent keys; workflows stop on unknown/not-dispatched actions. FastKeys has no intentional delay and uses one host batch per up to 16 characters. General DOM workflow batching, 1,000-character real-page latency/event qualification, and the complete event semantics matrix remain open. |
+| IME | Partial | MCP v3 dispatches composition, commit, and readback operations; focused unit contracts pass. Real OS IME and application-specific composition qualification remain open. |
+| Compact tool surface | Contract verified | `tools/list` contract requires six tools; packaged MCP discovery is checked by `scripts/package-check.sh`. |
+| Client adapters | Config contract verified | `npm run check:v3` covers six config contracts. The matrix now labels live client smokes `unverified`; no broad live qualification is claimed. |
+| Work/research primitives | Partial | Deterministic task expansions and bounded evidence receipts have tests. Full authenticated multi-tab research, persistent app forms, and upload/download acceptance are not qualified. |
+| WebMCP | Partial | Descriptor routing and a fail-closed bounded input-schema validator have unit coverage. Discovery and invocation are not connected to the live selected-tab MCP route. |
+| Headless/background recovery | Partial | An ignored real-Chrome stress test opens and closes eight isolated headless profiles; Ubuntu CI now has a headless/background stress lane. Crash/reconnect injection and headed-background user-interference parity remain open. |
+| Competitor evidence and release gate | Blocked on external measurements | Harness contracts and fail-closed claim tests pass. No controlled real competitor results exist; broad superiority claims remain disabled. |
+| Full verification | In progress | See `docs/verification/best-chrome-use-status.md` and `docs/verification-matrix.md`; hosted CI must pass on the pushed head. |
+
 ## Global Constraints
 
 - Preserve explicit selected-tab authority and never broaden mutation rights implicitly.

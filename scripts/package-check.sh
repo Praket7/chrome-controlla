@@ -78,12 +78,12 @@ printf '%s\n' 'package-check: checking npm command shim'
 # npm exec selects and launches the platform-appropriate command shim (including
 # Windows .cmd under Git Bash) as an installed consumer would.
 npm_cmd exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.0' >/dev/null
-printf '%s\n' 'package-check: checking packaged ChatGPT plugin MCP startup and compact v2 tool discovery'
+printf '%s\n' 'package-check: checking packaged ChatGPT plugin MCP startup and compact v3 tool discovery'
 plugin_request="$temp/plugin-request.jsonl"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$plugin_request"
 plugin_output=$(CONTROLLA_STATE_DIR="$temp/plugin-state" "$node_bin" "$installed_client" --server "$node_bin" --server-arg "$plugin_launch" --timeout-ms 30000 < "$plugin_request")
-printf '%s\n' "$plugin_output" | grep -F '"browser_session"' >/dev/null
-printf '%s\n' "$plugin_output" | grep -F '"browser_snapshot"' >/dev/null
-printf '%s\n' "$plugin_output" | grep -F '"browser_verify"' >/dev/null
+for tool in browser snapshot act workflow extract verify; do
+    printf '%s\n' "$plugin_output" | grep -F "\"$tool\"" >/dev/null
+done
 printf 'Verified host-bound npm archive (%s/%s), attribution, clean-prefix install, and local compact MCP plugin startup.\n' "$(node -p 'process.platform')" "$(node -p 'process.arch')"
 node scripts/check-package-lifecycle.mjs

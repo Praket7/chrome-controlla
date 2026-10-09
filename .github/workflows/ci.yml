@@ -9,6 +9,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  headless-background-stress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/google-chrome.deb && sudo apt-get update && sudo apt-get install -y /tmp/google-chrome.deb
+      - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
+      - run: for run in {1..8}; do node extensions/chrome-controlla/test-background.cjs; done
+        shell: bash
   rust:
     strategy:
       fail-fast: false

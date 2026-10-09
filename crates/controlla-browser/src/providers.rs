@@ -739,6 +739,7 @@ impl SharedExtensionProvider {
                 capability_revision: self.capability_revision,
                 browser_instance_id: self.browser_instance_id,
                 selected_targets: targets,
+                batch_execution: hello["batch_execution"] == true,
                 next_command_id: AtomicU64::new(1),
                 scheduler: crate::scheduler::TargetScheduler::default(),
                 reader_task: Some(reader_task),
@@ -756,10 +757,18 @@ pub struct SharedExtensionSession {
     capability_revision: u64,
     browser_instance_id: u128,
     selected_targets: BTreeSet<String>,
+    batch_execution: bool,
     next_command_id: AtomicU64,
     scheduler: crate::scheduler::TargetScheduler,
     reader_task: Option<tokio::task::JoinHandle<()>>,
     released: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedBatchAction {
+    pub method: String,
+    pub params: Value,
+    pub stop_on_not_ok: bool,
 }
 
 impl SharedExtensionSession {
@@ -817,6 +826,32 @@ impl SharedExtensionSession {
         let method = method.to_owned();
         self.scheduler
             .run_target(&target_id, self.command_wire(&target_id, &method, params))
+            .await
+    }
+
+    pub async fn command_batch(
+        &self,
+        registry: &SessionRegistry,
+        session: &SessionHandle,
+        target_id: &str,
+        actions: Vec<SharedBatchAction>,
+    ) -> Result<Value, ProviderError> {
+        if actions.is_empty() || actions.len() > 64 {
+            return Err(ProviderError::Extension(
+                "batch requires 1..64 actions".into(),
+            ));
+        }
+        if !self.batch_execution {
+            return Err(ProviderError::Extension(
+                "paired extension does not advertise bounded batch execution; reload the current extension".into(),
+            ));
+        }
+        for action in &actions {
+            self.authorize_command(registry, session, target_id, &action.method)?;
+        }
+        let target_id = target_id.to_owned();
+        self.scheduler
+            .run_target(&target_id, self.batch_wire(&target_id, actions))
             .await
     }
 
@@ -918,6 +953,63 @@ impl SharedExtensionSession {
             return Err(ProviderError::Extension(error.to_string()));
         }
         Ok(result.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn batch_wire(
+        &self,
+        target_id: &str,
+        actions: Vec<SharedBatchAction>,
+    ) -> Result<Value, ProviderError> {
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        let wire_actions = actions
+            .into_iter()
+            .map(|action| json!({"method":action.method,"params":action.params,"stop_on_not_ok":action.stop_on_not_ok}))
+            .collect::<Vec<_>>();
+        let request = json!({"type":"batch","id":id,"target_id":target_id,"actions":wire_actions});
+        let serialized = request.to_string();
+        if serialized.len() > SHARED_MESSAGE_LIMIT {
+            return Err(ProviderError::Extension(
+                "batch request exceeds the shared-message limit".into(),
+            ));
+        }
+        let (sender, mut receiver) = oneshot::channel();
+        self.pending.lock().await.insert(id, sender);
+        let pending_guard = PendingEntryGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+            armed: true,
+        };
+        if let Err(error) = self
+            .sink
+            .lock()
+            .await
+            .send(Message::Text(serialized.into()))
+            .await
+        {
+            return Err(ProviderError::Extension(error.to_string()));
+        }
+        let response = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
+            Ok(Ok(Ok(value))) => value,
+            Ok(Ok(Err(error))) => return Err(ProviderError::Extension(error)),
+            Ok(Err(_)) => {
+                return Err(ProviderError::Extension(
+                    "extension response channel closed".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(ProviderError::Extension(
+                    "extension batch timed out; delivery is unknown".into(),
+                ));
+            }
+        };
+        pending_guard.disarm();
+        let mut result = response.get("result").cloned().unwrap_or(Value::Null);
+        if let Some(error) = response.get("error").and_then(Value::as_str)
+            && let Some(object) = result.as_object_mut()
+        {
+            object.insert("batch_error".into(), Value::String(error.to_owned()));
+        }
+        Ok(result)
     }
 }
 
@@ -3008,7 +3100,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17", "18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true, "targets":["17", "18"]})
                         .to_string()
                         .into(),
                 ))
@@ -3033,6 +3125,13 @@ list.addEventListener('scroll',render);render();
                         .to_string().into(),
                 )).await.unwrap();
             }
+            let batch: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(batch["type"], "batch");
+            assert_eq!(batch["actions"].as_array().unwrap().len(), 2);
+            assert_eq!(batch["actions"][0]["stop_on_not_ok"], true);
+            socket.send(Message::Text(json!({"type":"batch_result","id":batch["id"],"result":{"completed":2,"host_round_trips":1}}).to_string().into())).await.unwrap();
         });
         let (first, second) = tokio::join!(
             attached.command(
@@ -3052,6 +3151,27 @@ list.addEventListener('scroll',render);render();
         );
         assert_eq!(first.unwrap(), json!({"target":"17"}));
         assert_eq!(second.unwrap(), json!({"target":"18"}));
+        let batch = attached
+            .command_batch(
+                &registry,
+                &session,
+                "17",
+                vec![
+                    SharedBatchAction {
+                        method: "Runtime.evaluate".into(),
+                        params: json!({"expression":"1+1"}),
+                        stop_on_not_ok: true,
+                    },
+                    SharedBatchAction {
+                        method: "Runtime.evaluate".into(),
+                        params: json!({"expression":"2+2"}),
+                        stop_on_not_ok: false,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch, json!({"completed":2,"host_round_trips":1}));
         command_socket.await.unwrap();
         registry.revoke_provider(ProviderKind::SharedExtension);
         assert!(

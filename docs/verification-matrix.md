@@ -1,5 +1,17 @@
 # Verification matrix
 
+## V3 PR #2 local verification — 2026-10-09
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Rust formatting, warning-denied Clippy, workspace tests | pass | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace --locked`. Three existing installed-Chrome tests remain ignored by default. |
+| Real-Chrome headless stress | pass, macOS | `cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture`; eight isolated headless profiles opened, observed, and identity-bound-cleaned. This does not qualify headed-background or app persistence. |
+| Extension batch and background harnesses | pass | `node extensions/chrome-controlla/test-background.cjs`; `node extensions/chrome-controlla/test-v3-batch.cjs`; JS syntax check. Batch tests cover stale guard early-stop and no later dispatch. |
+| Node/client/app/benchmark/release checks | pass | Node 24.19.0 / npm 11.17.0 after `npm ci`; `check:docs`, `check:provenance`, `check:clients`, `check:apps`, `check:bench`, `check:release`, and `check:v3`. Generated benchmark rows remain ineligible as real evidence. |
+| Dependency and package checks | pass, macOS arm64 | `scripts/check-dependencies.sh`, `scripts/package-build.sh`, and `scripts/package-check.sh`; packaged plugin discovery confirms the six v3 tools. No published install is claimed. |
+| Hosted Linux/macOS/Windows CI | pending | Run against the pushed PR head. |
+| Real competitor/client qualification | not run / unverified | External competitor runtimes/credentials and live client workflows were not available in this local verification. The claim gate remains blocked. |
+
 ## Source-audit repair follow-up — 2026-10-08
 
 | Check | Result | Evidence / limit |

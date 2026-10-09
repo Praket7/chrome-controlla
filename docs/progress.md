@@ -1,5 +1,11 @@
 # Build progress
 
+## V3 PR #2 continuation — 2026-10-09
+
+Continued from exact PR #2 head `b71e8b2146d4be7006f107679fe45a0458602a4d` in an isolated worktree. Fixed the current hosted extension/background assertion and Windows Codex config-path expectation. Added bounded extension batch dispatch and a Rust FastKeys caller, replaced the v3 IME placeholder with composition/commit/readback, added an eight-profile real-Chrome headless stress test and Ubuntu CI lane, fixed same-client reentrant target leases, and added a fail-closed bounded WebMCP input-schema validator. Review also found and fixed partial FastKeys delivery classification, workflow continuation after uncertain steps, leases expiring before an action could finish, and lease-key bypass through session aliases. The packaged ChatGPT plugin check now verifies the actual six-tool v3 surface.
+
+Local verification now passes: formatting, warning-denied Clippy, workspace tests, Node 24.19 install and docs/provenance/client/app/benchmark/release/v3 checks, dependency checks, package build/consumer lifecycle, extension harnesses, and the eight-profile real-Chrome headless stress run. Hosted CI for the pushed head remains pending. The v3 plan remains partial: WebMCP browser invocation is not integrated, client live smokes are unverified, full browser-mode and event-semantics qualification remains open, and no controlled competitor results exist. Keep the claim gate fail-closed and PR #2 in draft.
+
 ## Fresh paired-bridge recheck — 2026-10-08
 
 - In a fresh native-extension session, `discover_shared_tabs`, exact-tab pairing, `accept_shared`, and `release_shared` succeeded on the authorized testing Slides tab (`1649771881`) and testing Classroom tab (`1649771875`). The first read-only debugger command timed out on both; no page content was changed. Earlier successful paired reads on the test Classroom remain historical evidence, but this later failure means the route is not currently reliable.

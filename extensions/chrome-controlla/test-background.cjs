@@ -121,6 +121,7 @@ const chrome = {
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration === "guard") return { result: { value: { ok: false } } };
       if (method === "Runtime.evaluate" && params?.awaitResult) {
         return new Promise(resolve => pendingCommands.push(resolve));
       }
@@ -159,7 +160,18 @@ function message(payload) {
   assert.deepEqual(attached, [41, 43], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true }));
+  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true, batch_execution: true }));
+  const callsBeforeBatch = debuggerCalls.length;
+  native.hostMessage({ type: "batch", id: "guarded-batch", target_id: "41", actions: [
+    { method: "Runtime.callFunctionOn", params: { functionDeclaration: "guard" }, stop_on_not_ok: true },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
+  ] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const guardedBatch = native.sent.at(-1);
+  assert.equal(guardedBatch.type, "batch_result");
+  assert.equal(guardedBatch.result.stopped_before, 1);
+  assert.equal(debuggerCalls.length, callsBeforeBatch + 1, "a rejected read guard stops before its mutation");
+  commandDiagnostics.splice(0);
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/" } });
   await new Promise(resolve => setTimeout(resolve, 0));
   const opened = native.sent.at(-1);

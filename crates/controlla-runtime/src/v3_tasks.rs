@@ -244,6 +244,68 @@ pub fn validate_page_tool_result(value: &Value, max_bytes: usize) -> bool {
         && serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max_bytes)
 }
 
+/// Validates the bounded JSON Schema subset accepted for native page tools.
+/// Unsupported keywords or malformed schemas fail closed to semantic UI routing.
+pub fn validate_page_tool_input(schema: &Value, input: &Value) -> bool {
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+    if schema.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "type" | "properties" | "required" | "additionalProperties"
+        )
+    }) || schema.get("type") != Some(&Value::String("object".into()))
+    {
+        return false;
+    }
+    let (Some(properties), Some(input)) = (
+        schema.get("properties").and_then(Value::as_object),
+        input.as_object(),
+    ) else {
+        return false;
+    };
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return false;
+    };
+    if required.iter().any(|name| {
+        name.as_str()
+            .is_none_or(|name| !input.contains_key(name) || !properties.contains_key(name))
+    }) || schema.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        return false;
+    }
+    input.iter().all(|(name, value)| {
+        let Some(property_schema) = properties.get(name).and_then(Value::as_object) else {
+            return false;
+        };
+        if property_schema
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "minLength" | "maxLength"))
+            || property_schema.get("type") != Some(&Value::String("string".into()))
+        {
+            return false;
+        }
+        let parse_length = |key: &str, default| match property_schema.get(key) {
+            None => Some(default),
+            Some(value) => value
+                .as_u64()
+                .and_then(|length| usize::try_from(length).ok())
+                .filter(|length| *length <= 16_384),
+        };
+        let (Some(min), Some(max)) = (
+            parse_length("minLength", 0),
+            parse_length("maxLength", 16_384),
+        ) else {
+            return false;
+        };
+        let Some(value) = value.as_str() else {
+            return false;
+        };
+        min <= max && value.chars().count() >= min && value.chars().count() <= max
+    })
+}
+
 fn valid_descriptor(tool: &PageToolDescriptor) -> bool {
     !tool.name.is_empty() && tool.name.len() <= 128 && tool.input_schema.is_object()
 }

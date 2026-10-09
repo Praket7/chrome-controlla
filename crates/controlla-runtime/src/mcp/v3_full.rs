@@ -82,6 +82,33 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+fn fast_key_batch_failure(
+    error: &str,
+    completed_actions: u64,
+    prior_key_events: u64,
+) -> (&'static str, bool) {
+    let definitely_not_dispatched = error.contains("read guard rejected")
+        && completed_actions == 1
+        && prior_key_events == 0;
+    if definitely_not_dispatched {
+        ("not_dispatched", false)
+    } else {
+        ("unknown", prior_key_events > 0 || completed_actions > 1)
+    }
+}
+
+fn workflow_should_stop(value: &Value) -> bool {
+    matches!(value.get("status").and_then(Value::as_str), Some("unknown" | "not_dispatched"))
+}
+
+fn lease_target_key(_session_id: &str, tab_id: &str) -> crate::v3::TargetKey {
+    crate::v3::TargetKey {
+        // A tab may be paired through more than one MCP session; session IDs do not identify Chrome.
+        browser_id: "shared-extension".into(),
+        tab_id: tab_id.to_owned(),
+    }
+}
+
 fn parse_mode(mode: Option<&str>) -> Result<crate::v3::BrowserMode, rmcp::ErrorData> {
     Ok(match mode.unwrap_or("foreground") {
         "foreground" => crate::v3::BrowserMode::Foreground,
@@ -103,8 +130,8 @@ fn parse_typing_mode(mode: Option<&str>) -> Result<crate::v3::TypingMode, rmcp::
 
 async fn acquire_lease(app: &AppV3, args: &V3ActArgs) -> Result<crate::v3::TargetKey, rmcp::ErrorData> {
     let owner = args.client_id.as_deref().unwrap_or("local-mcp");
-    let key = crate::v3::TargetKey { browser_id: args.session_id.clone(), tab_id: args.chrome_tab_id.clone() };
-    app.leases.lock().await.acquire(key.clone(), owner, now_ms(), 30_000)
+    let key = lease_target_key(&args.session_id, &args.chrome_tab_id);
+    app.leases.lock().await.acquire(key.clone(), owner, now_ms(), 120_000)
         .map_err(|lease| invalid(format!("target is leased by {}; retry after observing fresh state", lease.owner)))?;
     Ok(key)
 }
@@ -140,10 +167,77 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
 }
 
 async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
-    let mut result = block_type(app, args).await?;
-    result["typing_mode"] = json!("ime");
-    result["composition_safe_fallback"] = json!(true);
-    Ok(result)
+    let reference = args.reference.as_deref().ok_or_else(|| invalid("type requires reference"))?;
+    let expected = args.expected_value.as_deref().unwrap_or_default();
+    let text = args.value.as_deref().unwrap_or_default();
+    if text.is_empty() || expected.len().saturating_add(text.len()) > 16_384 {
+        return Err(invalid("IME text must be nonempty and final value <= 16384 bytes"));
+    }
+    let legacy_reference = resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
+    let live = app.core.legacy.shared_sessions.lock().await.get(&args.session_id).cloned()
+        .ok_or_else(|| invalid("unknown shared session_id"))?;
+    let mut shared = live.lock().await;
+    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+        return Err(invalid("session is not owned by this server principal"));
+    }
+    let snapshot = shared.snapshots.get(&args.chrome_tab_id).cloned()
+        .ok_or_else(|| invalid("take browser_snapshot first"))?;
+    let (token, index) = legacy_reference.rsplit_once(':').ok_or_else(|| invalid("invalid retained reference"))?;
+    let index = index.parse::<usize>().map_err(|_| invalid("invalid retained reference index"))?;
+    if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+        return Err(invalid("stale or consumed reference; take one fresh browser_snapshot"));
+    }
+    let identity = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, &args.chrome_tab_id)
+            .await.map_err(invalid)?
+    };
+    if identity != snapshot.identity {
+        return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
+    }
+    let guard = r#"function(index,expected){const e=this.nodes[index];return !!e&&e.isConnected&&(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))&&!e.disabled&&!e.readOnly&&document.activeElement===e&&e.value===expected&&e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;}"#;
+    let initial = {
+        let connection = shared.connection.as_ref().unwrap();
+        connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+            "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":expected}],"returnByValue":true
+        })).await.map_err(|error| invalid(error.to_string()))?
+    };
+    if super::super::shared_value(&initial).map_err(invalid)? != json!(true) {
+        return Ok(json!({"status":"not_dispatched","action":"type","typing_mode":"ime","reason":"field, focus, or caret changed before composition"}));
+    }
+    shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed = true;
+    let connection = shared.connection.as_ref().unwrap();
+    let final_value = format!("{expected}{text}");
+    let composition_len = text.encode_utf16().count();
+    if let Err(error) = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.imeSetComposition", json!({
+        "text":text,"selectionStart":composition_len,"selectionEnd":composition_len
+    })).await {
+        return Ok(json!({"status":"unknown","action":"type","typing_mode":"ime","reason":format!("IME composition delivery is unknown; inspect state and do not retry: {error}")}));
+    }
+    let composed = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+        "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true
+    })).await;
+    if !matches!(composed, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value == true)) {
+        let _ = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.imeSetComposition", json!({"text":"","selectionStart":0,"selectionEnd":0})).await;
+        return Ok(json!({"status":"unknown","action":"type","typing_mode":"ime","dispatch_acknowledged":true,
+            "reason":"IME composition changed target or document state; composition cancellation was attempted; inspect before retrying"}));
+    }
+    if let Err(error) = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.insertText", json!({"text":text})).await {
+        return Ok(json!({"status":"unknown","action":"type","typing_mode":"ime","dispatch_acknowledged":true,
+            "reason":format!("IME commit delivery is unknown; inspect state and do not retry: {error}")}));
+    }
+    let readback = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+        "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true
+    })).await;
+    let after = super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, &args.chrome_tab_id).await;
+    let verified = matches!(readback, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value == json!(true)))
+        && matches!(after, Ok(ref current) if current == &identity);
+    drop(shared);
+    if !verified {
+        return Ok(json!({"status":"unknown","action":"type","typing_mode":"ime","dispatch_acknowledged":true,
+            "reason":"IME commit did not pass retained-node and document readback; inspect before retrying"}));
+    }
+    Ok(json!({"status":"verified","action":"type","typing_mode":"ime","dispatch_acknowledged":true,"readback":final_value}))
 }
 
 async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy) -> Result<Value, rmcp::ErrorData> {
@@ -192,7 +286,60 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
     }
     shared.snapshots.get_mut(&args.chrome_tab_id).ok_or_else(|| invalid("snapshot disappeared before dispatch"))?.consumed = true;
     let mut dispatch_count = 0_u64;
-    for character in text.chars() {
+    if policy.mode == crate::v3::TypingMode::FastKeys {
+        let characters = text.chars().collect::<Vec<_>>();
+        for chunk in characters.chunks(16) {
+            let mut actions = Vec::with_capacity(chunk.len() * 4);
+            for character in chunk {
+                actions.push(controlla_browser::providers::SharedBatchAction {
+                    method: "Runtime.callFunctionOn".into(),
+                    params: json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
+                        "arguments":[{"value":index},{"value":progress}],"returnByValue":true}),
+                    stop_on_not_ok: true,
+                });
+                let key = character.to_string();
+                for params in [
+                    json!({"type":"keyDown","key":key}),
+                    json!({"type":"char","key":key,"text":key,"unmodifiedText":key}),
+                    json!({"type":"keyUp","key":key}),
+                ] {
+                    actions.push(controlla_browser::providers::SharedBatchAction {
+                        method: "Input.dispatchKeyEvent".into(),
+                        params,
+                        stop_on_not_ok: false,
+                    });
+                }
+                progress.push(*character);
+            }
+            let connection = shared.connection.as_ref().unwrap();
+            let result = connection
+                .command_batch(
+                    shared.registry()?,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    actions,
+                )
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,
+                    "reason":format!("fast-key batch delivery is unknown; inspect state and do not automatically retry: {error}")})),
+            };
+            if let Some(error) = result["batch_error"].as_str() {
+                let completed = result["completed"].as_u64().unwrap_or(0);
+                let (status, acknowledged) =
+                    fast_key_batch_failure(error, completed, dispatch_count);
+                return Ok(json!({"status":status,"action":"type","dispatch_acknowledged":acknowledged,
+                    "batch_receipt":result,"reason":format!("fast-key batch stopped; inspect current state and do not automatically retry: {error}")}));
+            }
+            if result["completed"].as_u64() != Some((chunk.len() * 4) as u64) {
+                return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,
+                    "batch_receipt":result,"reason":"fast-key batch returned an incomplete receipt; inspect state and do not automatically retry"}));
+            }
+            dispatch_count = dispatch_count.saturating_add((chunk.len() * 3) as u64);
+        }
+    } else {
+      for character in text.chars() {
         let guard = {
             let connection = shared.connection.as_ref().unwrap();
             let response = tokio::time::timeout_at(deadline, connection.command(
@@ -224,10 +371,18 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
             dispatch_count = dispatch_count.saturating_add(1);
         }
         progress.push(character);
-        if policy.delay_ms > 0 {
-            tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(policy.delay_ms)))
-                .await.map_err(|_| invalid("typing deadline expired after partial dispatch; inspect before retrying"))?;
+        if policy.delay_ms > 0
+            && tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(Duration::from_millis(policy.delay_ms)),
+            )
+            .await
+            .is_err()
+        {
+            return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":true,
+                "reason":"typing deadline expired after partial dispatch; inspect before retrying"}));
         }
+      }
     }
     let readback = {
         let connection = shared.connection.as_ref().unwrap();
@@ -278,10 +433,12 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
         return Ok(json!({"status":"not_dispatched","action":"press","reason":"referenced element is not connected and focused"}));
     }
     shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed = true;
-    for event in [json!({"type":"keyDown","key":key}), json!({"type":"keyUp","key":key})] {
+    for (index, event) in [json!({"type":"keyDown","key":key}), json!({"type":"keyUp","key":key})].into_iter().enumerate() {
         let connection = shared.connection.as_ref().unwrap();
-        connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.dispatchKeyEvent", event)
-            .await.map_err(|error| invalid(format!("press delivery uncertain after dispatch: {error}; inspect before retrying")))?;
+        if let Err(error) = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.dispatchKeyEvent", event).await {
+            return Ok(json!({"status":"unknown","action":"press","dispatch_acknowledged":index > 0,
+                "reason":format!("press delivery is uncertain; inspect before retrying: {error}")}));
+        }
     }
     Ok(json!({"status":"dispatched","action":"press","dispatch_acknowledged":true,"requires_verify":true}))
 }
@@ -311,7 +468,8 @@ impl AppV3 {
     #[tool(description = "Perform a guarded mutation. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.")]
     async fn act(&self, Parameters(mut args): Parameters<V3ActArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         let lease = acquire_lease(self, &args).await?;
-        let result = match args.action.as_str() {
+        let result = match tokio::time::timeout(Duration::from_secs(60), async {
+        match args.action.as_str() {
             "click" => self.core.browser_act(Parameters(BrowserActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "click".into(), reference: args.reference.clone(), expected_value: None, value: None, outcome: args.outcome.take(), timeout_ms: args.timeout_ms })).await.map(|Json(v)| v),
             "fill" | "select" => {
                 let reference = args.reference.as_deref().ok_or_else(|| invalid(format!("{} requires reference", args.action)))?;
@@ -328,8 +486,15 @@ impl AppV3 {
             }
             "press" => press(self, &args).await,
             _ => Err(invalid("action must be click, fill, type, press, or select")),
+        }
+        }).await {
+            Ok(result) => result,
+            Err(_) => Ok(json!({"status":"unknown","action":args.action,"dispatch_acknowledged":false,
+                "reason":"action exceeded its 60-second bound; inspect state before retrying"})),
         };
-        release_lease(self, &args, &lease).await;
+        if !matches!(&result, Ok(value) if value["status"] == "unknown") {
+            release_lease(self, &args, &lease).await;
+        }
         result.map(Json)
     }
 
@@ -369,7 +534,12 @@ impl AppV3 {
                 V3WorkflowStep::Extract { selector } => self.core.browser_extract(Parameters(BrowserExtractArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector, fields: std::collections::BTreeMap::new(), max_items: Some(100), max_text_chars: Some(6000), max_bytes: Some(100_000) })).await?.0,
                 V3WorkflowStep::Verify { predicate } => verify_impl(&self.core, &BrowserVerifyArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate }).await?,
             };
+            let stop_status = workflow_should_stop(&value)
+                .then(|| value["status"].as_str().unwrap_or("unknown").to_owned());
             receipts.push(value);
+            if let Some(status) = stop_status {
+                return Ok(Json(json!({"status":status,"steps":receipts.len(),"receipts":receipts})));
+            }
         }
         Ok(Json(json!({"status":"completed","steps":receipts.len(),"receipts":receipts})))
     }
@@ -412,4 +582,30 @@ pub(super) async fn run() -> Result<(), String> {
     let service = app.serve(rmcp::transport::io::stdio()).await.map_err(|error| error.to_string())?;
     service.waiting().await.map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod v3_batch_delivery_tests {
+    use super::{fast_key_batch_failure, lease_target_key, workflow_should_stop};
+    use serde_json::json;
+
+    #[test]
+    fn a_late_guard_failure_is_unknown_after_keys_were_sent() {
+        assert_eq!(fast_key_batch_failure("Batch read guard rejected", 1, 0), ("not_dispatched", false));
+        assert_eq!(fast_key_batch_failure("Batch read guard rejected", 5, 0), ("unknown", true));
+        assert_eq!(fast_key_batch_failure("Batch read guard rejected", 1, 48), ("unknown", true));
+    }
+
+    #[test]
+    fn workflow_stops_after_uncertain_or_undispatched_actions() {
+        assert!(workflow_should_stop(&json!({"status":"unknown"})));
+        assert!(workflow_should_stop(&json!({"status":"not_dispatched"})));
+        assert!(!workflow_should_stop(&json!({"status":"verified"})));
+    }
+
+    #[test]
+    fn session_aliases_share_the_same_selected_chrome_tab_lease() {
+        assert_eq!(lease_target_key("session-a", "17"), lease_target_key("session-b", "17"));
+        assert_ne!(lease_target_key("session-a", "17"), lease_target_key("session-a", "18"));
+    }
 }
