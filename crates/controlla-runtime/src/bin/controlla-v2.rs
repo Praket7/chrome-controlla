@@ -1,6 +1,6 @@
 pub use controlla_runtime::{
-    apps, artifacts, cache, canva, capability, capcut_recipe, doctor, http_auth, http_server,
-    jobs, native_host, native_setup, slides_deck, verifier, workflow,
+    apps, artifacts, cache, canva, capability, capcut_recipe, doctor, http_auth, http_server, jobs,
+    native_host, native_setup, slides_deck, verifier, workflow,
 };
 
 mod legacy_mcp {
