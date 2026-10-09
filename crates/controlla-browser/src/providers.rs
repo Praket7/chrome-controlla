@@ -2558,6 +2558,112 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    #[ignore = "requires installed Google Chrome; verifies real ordered key events"]
+    async fn real_chrome_fast_key_events_are_ordered_without_a_sixty_ms_floor() {
+        use crate::sessions::ProviderGrants;
+
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let provider = DedicatedChromeProvider::new(executable);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "real-chrome-fast-keys",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(&mut registry, &handle, "data:text/html,<input id=field>")
+            .await
+            .unwrap();
+        session.process.preserve_on_drop = false;
+        let connection = session.connection().clone();
+        let target = connection
+            .targets
+            .read()
+            .await
+            .targets
+            .get(session.target_id())
+            .cloned()
+            .unwrap();
+        let evaluate = |expression: String| {
+            connection.target_command(
+                &target.id,
+                target.generation,
+                &target.revision,
+                "Runtime.evaluate",
+                json!({"expression":expression,"returnByValue":true}),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if evaluate("!!document.querySelector('#field')".into())
+                    .await
+                    .is_ok_and(|value| value["result"]["value"] == true)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        evaluate("window.keyEvents=[];const e=document.querySelector('#field');for(const type of ['keydown','beforeinput','input','keyup'])e.addEventListener(type,event=>{if(window.keyEvents.length<8)window.keyEvents.push({type:event.type,key:event.key||'',data:event.data||'',trusted:event.isTrusted})});e.focus();true".into())
+            .await
+            .unwrap();
+
+        let text = "a".repeat(1_000);
+        let started = tokio::time::Instant::now();
+        for character in text.chars() {
+            let key = character.to_string();
+            for params in [
+                json!({"type":"keyDown","key":key}),
+                json!({"type":"char","key":key,"text":key,"unmodifiedText":key}),
+                json!({"type":"keyUp","key":key}),
+            ] {
+                connection
+                    .target_command(
+                        &target.id,
+                        target.generation,
+                        &target.revision,
+                        "Input.dispatchKeyEvent",
+                        params,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!("real Chrome FastKeys: 1000 characters, {elapsed:?}");
+        let result = evaluate(
+            "({value:document.querySelector('#field').value,events:window.keyEvents})".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["result"]["value"]["value"], text);
+        let events = result["result"]["value"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 8);
+        for cycle in events.chunks_exact(4) {
+            assert_eq!(cycle[0]["type"], "keydown");
+            assert_eq!(cycle[1]["type"], "beforeinput");
+            assert_eq!(cycle[2]["type"], "input");
+            assert_eq!(cycle[3]["type"], "keyup");
+            assert!(cycle.iter().all(|event| event["trusted"] == true));
+        }
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "1,000 fast key events took {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
     async fn real_chrome_cdp_promise_settles_and_navigation_cancels_pending_evaluation() {
         use crate::sessions::{IndependentTargetObserver, ProviderGrants};

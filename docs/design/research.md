@@ -2,6 +2,18 @@
 
 Research date: 2026-10-06. Status: research and design, not an implemented product or measured performance result.
 
+## 10. Implementation follow-up research — 2026-10-09
+
+These sources were refreshed during v3 implementation with Exa and checked against their current first-party pages. They inform implementation choices; they are not comparative performance evidence.
+
+- [Stagehand v4 reference](https://docs.stagehand.dev/v4/reference/stagehand) documents an experimental service-worker batch callback that avoids an SDK-to-browser round trip per operation. Its timeout prevents later work from starting, but an in-flight operation may still finish. Controlla should keep its bounded executor near the extension, reauthorize each mutation, stop before subsequent dispatch on deadline, and report uncertain in-flight effects as `unknown`; a batch is not atomic.
+- [Browser Use MCP guide](https://github.com/webllm/browser-use/blob/main/docs/MCP_SERVER.md) documents a minimal coding-agent profile with two tools, an in-process command runner, serialized access to persistent state, and bounded output. This supports keeping Controlla's default schema compact while preserving one explicit command surface and strict authorization. It does not imply that serialization alone resolves human or external-client interference.
+- [Vercel agent-browser](https://github.com/vercel-labs/agent-browser) is a strong CLI-first baseline. Its current repository describes a native Rust CLI and recommends installing a pinned Chrome for Testing runtime. Controlla's comparisons should include CLI-plus-skill usage rather than comparing MCP tool counts alone.
+- [Chrome's WebMCP overview](https://developer.chrome.com/docs/ai/webmcp) (updated 2026-10-07) describes WebMCP as a proposed standard and a progressive enhancement for page-declared tools. The [imperative API](https://developer.chrome.com/docs/ai/webmcp/imperative-api) documents JSON-schema input and optional annotations such as read-only and untrusted-content hints. Page declarations remain page-controlled input: rediscover/revalidate schemas, keep page-tool authority explicit, and retain UI fallback. The current docs do not qualify Controlla's real-browser execution or cancellation behavior.
+- [Emergence WebVoyager](https://arxiv.org/html/2603.29020v1) reports that clearer task instantiation, failure handling, annotation, and reporting materially changed a previously reported Operator success rate in its audit. For Controlla's competitor harness, preserve raw failed attempts, use fixed task instantiations and independent verification, publish environment/version manifests, and count failures in latency/cost summaries; do not infer leadership from selected successful runs.
+
+The refreshed material strengthens the implementation and evaluation requirements above. No competitor run, real-client smoke, or universal superiority result was produced by this research refresh.
+
 Read with [improvements.md](improvements.md), [build.md](build.md), and [MASTER_GUIDE.md](../MASTER_GUIDE.md). The guide is a proposed runtime contract, not documentation of tools already installed.
 
 ## 1. Recommendation
