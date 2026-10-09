@@ -32,3 +32,8 @@ tower = { version = "=0.5.3", features = ["util"] }
 [[bin]]
 name = "controlla"
 path = "src/main.rs"
+
+[[bin]]
+name = "controlla-v2"
+path = "src/bin/controlla-v2.rs"
+test = false
