@@ -27,12 +27,19 @@ const SCRIPT_WORKER_ARG: &str = "--__controlla-script-worker";
 
 pub fn script_worker_executable() -> Result<std::path::PathBuf, String> {
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
-    #[cfg(test)]
+    let worker_name = format!("controlla{}", std::env::consts::EXE_SUFFIX);
+    if current
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&worker_name))
+    {
+        return Ok(current);
+    }
     if let Some(binary) = current
         .parent()
-        .and_then(std::path::Path::parent)
-        .map(|directory| directory.join(format!("controlla{}", std::env::consts::EXE_SUFFIX)))
-        .filter(|path| path.is_file())
+        .into_iter()
+        .chain(current.parent().and_then(std::path::Path::parent))
+        .map(|directory| directory.join(&worker_name))
+        .find(|path| path.is_file())
     {
         return Ok(binary);
     }

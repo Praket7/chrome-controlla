@@ -22,10 +22,10 @@ This ledger supersedes the initial unchecked template only where it cites curren
 | Compact tool surface | Contract verified | `tools/list` contract requires six tools; packaged MCP discovery is checked by `scripts/package-check.sh`. |
 | Client adapters | Config contract verified | `npm run check:v3` covers six config contracts. The matrix now labels live client smokes `unverified`; no broad live qualification is claimed. |
 | Work/research primitives | Partial | Deterministic task expansions and bounded evidence receipts have tests. Full authenticated multi-tab research, persistent app forms, and upload/download acceptance are not qualified. |
-| WebMCP | Partial | Descriptor routing and a fail-closed bounded input-schema validator have unit coverage. Discovery and invocation are not connected to the live selected-tab MCP route. |
+| WebMCP | Partial | The selected-tab `act` and deterministic `workflow` surfaces can explicitly discover and invoke `document.modelContext` tools. Calls require a fresh unconsumed snapshot, bounded supported schema/input/output, a stable schema across discovery and dispatch, and runtime delivery classification; unavailable tools stop with a semantic-UI fallback receipt. An in-process WebMCP fixture covers discovery, execution, and schema drift. Real-browser qualification, cancellation behavior, and page-tool effect classification remain open. |
 | Headless/background recovery | Partial | An ignored real-Chrome stress test opens and closes eight isolated headless profiles; Ubuntu CI now has a headless/background stress lane. Crash/reconnect injection and headed-background user-interference parity remain open. |
 | Competitor evidence and release gate | Blocked on external measurements | Harness contracts and fail-closed claim tests pass. No controlled real competitor results exist; broad superiority claims remain disabled. |
-| Repository-controlled verification | Pass on pushed head | Local checks and hosted Linux/macOS/Windows matrix plus headless/background stress passed at `f724637cf5c9121c6ebaa3bde420c1c133a9e417`; see `docs/verification-matrix.md`. The overall v3 plan remains partial and is not release-qualified. |
+| Repository-controlled verification | Pass on pushed head | Local checks and hosted Linux/macOS/Windows matrix plus headless/background stress passed at `9f96f63eb226977a129d05eca9c65b12e89d27c4`; see `docs/verification-matrix.md`. The overall v3 plan remains partial and is not release-qualified. |
 
 ## Global Constraints
 

@@ -18,6 +18,18 @@ pub const MAX_BATCH_ACTIONS: usize = 64;
 pub const MAX_PAGE_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_RESULT_BYTES: usize = 512 * 1024;
 
+pub struct PageToolProgram;
+
+impl PageToolProgram {
+    pub fn discovery() -> &'static str {
+        r#"async function(){const context=document.modelContext;if(!context||typeof context.getTools!=="function")return {available:false,tools:[]};const tools=await document.modelContext.getTools();return {available:true,tools:Array.isArray(tools)?tools.slice(0,64).map(t=>({name:String(t.name||"").slice(0,128),description:String(t.description||"").slice(0,512),input_schema:t.inputSchema??{}})):[]};}"#
+    }
+
+    pub fn invocation() -> &'static str {
+        r#"async function(name,input,expectedSchema){const context=document.modelContext;if(!context||typeof context.getTools!=="function"||typeof context.executeTool!=="function")return {available:false};const tools=await document.modelContext.getTools();const tool=Array.isArray(tools)?tools.find(t=>t.name===name):undefined;if(!tool)return {available:true,not_found:true};const stable=v=>v&&typeof v==="object"?(Array.isArray(v)?v.map(stable):Object.keys(v).sort().reduce((o,k)=>(o[k]=stable(v[k]),o),{})):v;if(JSON.stringify(stable(tool.inputSchema??{}))!==JSON.stringify(stable(expectedSchema)))return {available:true,schema_changed:true};return {available:true,result:await document.modelContext.executeTool(tool,input)};}"#
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BrowserLaunchPlan {
     pub mode: BrowserMode,

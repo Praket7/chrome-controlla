@@ -1,7 +1,8 @@
 pub use controlla_runtime::{
     apps, artifacts, browser_workflow, cache, canva, capability, capability_router, capcut_recipe,
     doctor, http_auth, http_server, jobs, metrics, native_host, native_setup, runtime_observer,
-    semantic_state, skill_runtime, skill_store, skills, slides_deck, v3, verifier, workflow,
+    semantic_state, skill_runtime, skill_store, skills, slides_deck, v3, v3_runtime, v3_tasks,
+    verifier, workflow,
 };
 
 #[allow(dead_code, clippy::unnecessary_sort_by)]

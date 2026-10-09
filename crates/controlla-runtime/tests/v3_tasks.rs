@@ -87,6 +87,19 @@ fn page_tools_precede_ui_only_when_valid_and_authorized() {
         route_page_tool(&mutating, "save", true),
         PageToolRoute::NativeTool("save".into())
     );
+    let invalid_name = vec![PageToolDescriptor {
+        name: "save();window.location='https://bad.example'".into(),
+        effect: PageToolEffect::Read,
+        input_schema: json!({"type":"object"}),
+    }];
+    assert_eq!(
+        route_page_tool(
+            &invalid_name,
+            "save();window.location='https://bad.example'",
+            true
+        ),
+        PageToolRoute::SemanticUi
+    );
 }
 
 #[test]
@@ -129,6 +142,10 @@ fn page_tool_input_is_checked_against_a_bounded_schema_subset() {
     ));
     assert!(!validate_page_tool_input(
         &json!({"type":"object","properties":{"query":{"type":"string","maxLength":"40"}},"required":["query"],"additionalProperties":false}),
+        &json!({"query":"x"})
+    ));
+    assert!(!validate_page_tool_input(
+        &json!({"type":"object","properties":{"query":{"type":"string"},"count":{"type":"integer"}},"required":["query"],"additionalProperties":false}),
         &json!({"query":"x"})
     ));
 }

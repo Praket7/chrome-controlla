@@ -275,17 +275,13 @@ pub fn validate_page_tool_input(schema: &Value, input: &Value) -> bool {
     {
         return false;
     }
+    if !properties.values().all(valid_string_property_schema) {
+        return false;
+    }
     input.iter().all(|(name, value)| {
         let Some(property_schema) = properties.get(name).and_then(Value::as_object) else {
             return false;
         };
-        if property_schema
-            .keys()
-            .any(|key| !matches!(key.as_str(), "type" | "minLength" | "maxLength"))
-            || property_schema.get("type") != Some(&Value::String("string".into()))
-        {
-            return false;
-        }
         let parse_length = |key: &str, default| match property_schema.get(key) {
             None => Some(default),
             Some(value) => value
@@ -306,6 +302,33 @@ pub fn validate_page_tool_input(schema: &Value, input: &Value) -> bool {
     })
 }
 
+fn valid_string_property_schema(value: &Value) -> bool {
+    let Some(schema) = value.as_object() else {
+        return false;
+    };
+    if schema
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "minLength" | "maxLength"))
+        || schema.get("type") != Some(&Value::String("string".into()))
+    {
+        return false;
+    }
+    let length = |key: &str, default| match schema.get(key) {
+        None => Some(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| *length <= 16_384),
+    };
+    matches!((length("minLength", 0), length("maxLength", 16_384)), (Some(min), Some(max)) if min <= max)
+}
+
 fn valid_descriptor(tool: &PageToolDescriptor) -> bool {
-    !tool.name.is_empty() && tool.name.len() <= 128 && tool.input_schema.is_object()
+    !tool.name.is_empty()
+        && tool.name.len() <= 128
+        && tool
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && tool.input_schema.is_object()
 }

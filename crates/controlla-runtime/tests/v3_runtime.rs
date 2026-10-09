@@ -1,8 +1,9 @@
 use controlla_runtime::v3::{BrowserMode, InteractionEpoch, RecoveryClass, TypingMode};
 use controlla_runtime::v3_runtime::{
     BatchAction, BatchActionKind, BrowserLaunchPlan, ClientKind, ClientQualification,
-    DEFAULT_AGENT_TOOLS, PageToolAuthority, PageToolCall, ReconnectController, ReconnectDecision,
-    TypingPlan, compact_tool_surface_valid, execute_guarded_batch, result_within_budget,
+    DEFAULT_AGENT_TOOLS, PageToolAuthority, PageToolCall, PageToolProgram, ReconnectController,
+    ReconnectDecision, TypingPlan, compact_tool_surface_valid, execute_guarded_batch,
+    result_within_budget,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -105,6 +106,48 @@ fn page_tools_are_allowlisted_bounded_and_typed() {
     let mut oversized = call.clone();
     oversized.max_output_bytes = 300_000;
     assert!(oversized.validate(&allowed).is_err());
+}
+
+#[test]
+fn page_tool_program_uses_the_document_model_context_api_without_interpolation() {
+    let discovery = PageToolProgram::discovery();
+    let invocation = PageToolProgram::invocation();
+    assert!(discovery.contains("document.modelContext.getTools()"));
+    assert!(invocation.contains("document.modelContext.executeTool(tool,input)"));
+    assert!(invocation.contains("async function(name,input,expectedSchema)"));
+    assert!(invocation.contains("expectedSchema"));
+    assert!(!invocation.contains("JSON.stringify(name)"));
+}
+
+#[tokio::test]
+async fn page_tool_programs_use_webmcp_fixture_and_reject_schema_drift() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let (discovery, invoked, drifted, tool_invoked) = context
+        .async_with(async |ctx| {
+            ctx.eval::<(), _>(r#"globalThis.document={modelContext:{getTools:async()=>[{name:"search",description:"Search",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"],additionalProperties:false}}],executeTool:async(tool,input)=>({tool:tool.name,query:input.query})}};"#).unwrap();
+            let discover = format!("(async()=>JSON.stringify(await ({})()))()", PageToolProgram::discovery());
+            let discovery = ctx.eval::<rquickjs::Promise, _>(discover).unwrap().into_future::<String>().await.unwrap();
+            let schema = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false});
+            let name = serde_json::to_string("search").unwrap();
+            let input = serde_json::to_string(&json!({"query":"cats"})).unwrap();
+            let schema_literal = serde_json::to_string(&schema).unwrap();
+            let invoked = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})({name},{input},{schema_literal})))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
+            ctx.eval::<(), _>("document.modelContext.getTools=async()=>[{name:'search',inputSchema:{type:'object',properties:{query:{type:'string'},limit:{type:'string'}},required:['query'],additionalProperties:false}}];globalThis.toolInvoked=false;document.modelContext.executeTool=async()=>{toolInvoked=true;return 'unexpected'};").unwrap();
+            let drifted = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})({name},{input},{schema_literal})))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
+            Ok::<_, rquickjs::Error>((discovery, invoked, drifted, ctx.eval::<bool, _>("toolInvoked").unwrap()))
+        })
+        .await
+        .unwrap();
+    let discovery: serde_json::Value = serde_json::from_str(&discovery).unwrap();
+    let invoked: serde_json::Value = serde_json::from_str(&invoked).unwrap();
+    let drifted: serde_json::Value = serde_json::from_str(&drifted).unwrap();
+    assert_eq!(discovery["available"], true);
+    assert_eq!(discovery["tools"][0]["name"], "search");
+    assert_eq!(invoked["result"]["tool"], "search");
+    assert_eq!(invoked["result"]["query"], "cats");
+    assert_eq!(drifted["schema_changed"], true);
+    assert!(!tool_invoked);
 }
 
 #[test]

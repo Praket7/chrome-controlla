@@ -50,6 +50,8 @@ struct V3ActArgs {
     typing_mode: Option<String>,
     delay_ms: Option<u64>,
     client_id: Option<String>,
+    page_tool_name: Option<String>,
+    page_tool_input: Option<Value>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -71,6 +73,7 @@ enum V3WorkflowStep {
     Type { reference: String, expected_value: String, value: String, typing_mode: Option<String>, delay_ms: Option<u64> },
     Press { reference: String, key: String },
     Extract { selector: String },
+    PageTool { name: String, input: Value },
     Verify { predicate: BrowserPredicate },
 }
 
@@ -443,6 +446,155 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
     Ok(json!({"status":"dispatched","action":"press","dispatch_acknowledged":true,"requires_verify":true}))
 }
 
+fn page_tool_completion(response: Result<Value, String>) -> Result<Value, Value> {
+    response.map_err(|error| json!({
+        "status":"unknown","action":"page_tool","dispatch_acknowledged":true,
+        "reason":format!("page-tool completion is uncertain; inspect before retrying: {error}")
+    }))
+}
+
+fn page_tool_snapshot_fresh(consumed: bool, identity_matches: bool) -> bool {
+    !consumed && identity_matches
+}
+
+fn page_tool_unavailable(reason: &str) -> Value {
+    json!({"status":"not_dispatched","action":"page_tool","fallback":"semantic_ui","reason":reason})
+}
+
+async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
+    let name = args.page_tool_name.as_deref().filter(|name| !name.is_empty() && name.len() <= 128);
+    if args.action == "page_tool" && name.is_none() {
+        return Err(invalid("page_tool requires a bounded page_tool_name"));
+    }
+    let input = args.page_tool_input.clone().unwrap_or_else(|| json!({}));
+    let timeout_ms = args.timeout_ms.unwrap_or(10_000).clamp(1, 30_000);
+    if !input.is_object() || serde_json::to_vec(&input).map_or(true, |value| value.len() > 16_384) {
+        return Err(invalid("page_tool_input must be an object within 16384 bytes"));
+    }
+    let live = app.core.legacy.shared_sessions.lock().await.get(&args.session_id).cloned()
+        .ok_or_else(|| invalid("unknown shared session_id"))?;
+    let mut shared = live.lock().await;
+    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+        return Err(invalid("session is not owned by this server principal"));
+    }
+    let snapshot = shared.snapshots.get(&args.chrome_tab_id).cloned()
+        .ok_or_else(|| invalid("take browser_snapshot before discovering page tools"))?;
+    let (before, discovery) = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let before = super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, &args.chrome_tab_id)
+            .await.map_err(invalid)?;
+        if !page_tool_snapshot_fresh(snapshot.consumed, before == snapshot.identity) {
+            return Err(invalid(if snapshot.consumed {
+                "snapshot was already consumed; take a fresh browser_snapshot"
+            } else {
+                "document changed since snapshot; take a fresh browser_snapshot"
+            }));
+        }
+        let discovery = tokio::time::timeout(Duration::from_millis(timeout_ms), connection.command(
+            shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
+            json!({"expression":format!("({})()", crate::v3_runtime::PageToolProgram::discovery()),"awaitPromise":true,"returnByValue":true}),
+        )).await.map_err(|_| invalid("page-tool discovery timed out"))?
+            .map_err(|error| invalid(error.to_string()))?;
+        (before, discovery)
+    };
+    let discovered = super::super::shared_value(&discovery).map_err(invalid)?;
+    if discovered["available"] != true {
+        return Ok(page_tool_unavailable("page does not expose WebMCP tools"));
+    }
+    if !crate::v3_tasks::validate_page_tool_result(
+        &discovered,
+        crate::v3_runtime::MAX_PAGE_TOOL_OUTPUT_BYTES,
+    ) {
+        return Ok(page_tool_unavailable("page-tool discovery exceeded its output budget"));
+    }
+    let tools = discovered["tools"].as_array().ok_or_else(|| invalid("page-tool discovery returned invalid tools"))?;
+    if args.action == "page_tools" {
+        let listed: Vec<_> = tools.iter().take(64).filter_map(|tool| {
+            Some(json!({
+                "name":tool.get("name")?.as_str()?.chars().take(128).collect::<String>(),
+                "description":tool.get("description")?.as_str()?.chars().take(512).collect::<String>(),
+                "input_schema":tool.get("input_schema")?.clone()
+            }))
+        }).collect();
+        return Ok(json!({"status":"discovered","available":!listed.is_empty(),"tools":listed,"page_content_is_untrusted":true,
+            "fallback":if listed.is_empty() { Some("semantic_ui") } else { None }}));
+    }
+    let name = name.expect("page_tool name validated before discovery");
+    let descriptor = tools.iter().filter_map(|tool| {
+        Some(crate::v3_tasks::PageToolDescriptor {
+            name: tool.get("name")?.as_str()?.to_owned(),
+            effect: crate::v3_tasks::PageToolEffect::Consequential,
+            input_schema: tool.get("input_schema")?.clone(),
+        })
+    }).find(|tool| tool.name == name);
+    let Some(descriptor) = descriptor else {
+        return Ok(page_tool_unavailable("requested page tool is not available"));
+    };
+    if !matches!(
+        crate::v3_tasks::route_page_tool(std::slice::from_ref(&descriptor), name, true),
+        crate::v3_tasks::PageToolRoute::NativeTool(_)
+    ) {
+        return Ok(page_tool_unavailable("page tool is not authorized for this action"));
+    }
+    if !crate::v3_tasks::validate_page_tool_input(&descriptor.input_schema, &input) {
+        return Ok(page_tool_unavailable("page-tool input does not match the supported schema"));
+    }
+    let call = crate::v3_runtime::PageToolCall {
+        name: name.to_owned(), authority: crate::v3_runtime::PageToolAuthority::Consequential,
+        input: input.clone(), timeout_ms, max_output_bytes: crate::v3_runtime::MAX_PAGE_TOOL_OUTPUT_BYTES,
+    };
+    call.validate(&std::collections::BTreeSet::from([descriptor.name.clone()])).map_err(invalid)?;
+    let object_id = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let global = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id,
+            "Runtime.evaluate", json!({"expression":"globalThis","returnByValue":false})).await
+            .map_err(|error| invalid(error.to_string()))?;
+        global.pointer("/result/objectId").and_then(Value::as_str).map(str::to_owned)
+            .ok_or_else(|| invalid("page context did not expose a callable global object"))?
+    };
+    let dispatch_identity = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, &args.chrome_tab_id)
+            .await.map_err(invalid)?
+    };
+    if !page_tool_snapshot_fresh(snapshot.consumed, dispatch_identity == before) {
+        return Ok(page_tool_unavailable("document changed after tool discovery; take a fresh snapshot"));
+    }
+    shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed = true;
+    let execution = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        tokio::time::timeout(Duration::from_millis(timeout_ms), connection.command(
+            shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+                "objectId":object_id,"functionDeclaration":crate::v3_runtime::PageToolProgram::invocation(),
+                "arguments":[{"value":name},{"value":input},{"value":descriptor.input_schema}],"awaitPromise":true,"returnByValue":true
+            }),
+        )).await
+    };
+    let result = match execution {
+        Err(_) => page_tool_completion(Err("page tool exceeded its bound".into())),
+        Ok(Err(error)) => page_tool_completion(Err(error.to_string())),
+        Ok(Ok(result)) => page_tool_completion(super::super::shared_value(&result)),
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(unknown) => return Ok(unknown),
+    };
+    if result["available"] != true || result["not_found"] == true || result["schema_changed"] == true {
+        return Ok(json!({"status":"not_dispatched","action":"page_tool","reason":"page tool disappeared or its schema changed after discovery; use semantic UI"}));
+    }
+    if !crate::v3_tasks::validate_page_tool_result(&result["result"], call.max_output_bytes) {
+        return Ok(json!({"status":"unknown","action":"page_tool","dispatch_acknowledged":true,"reason":"page tool returned an oversized result; inspect page state"}));
+    }
+    let after = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, &args.chrome_tab_id).await
+    };
+    if !matches!(after, Ok(ref identity) if identity == &before) {
+        return Ok(json!({"status":"unknown","action":"page_tool","dispatch_acknowledged":true,"reason":"document identity changed during page-tool execution; inspect before retrying"}));
+    }
+    Ok(json!({"status":"dispatched","action":"page_tool","tool":name,"result":result["result"],"requires_verify":true}))
+}
+
 #[tool_router]
 impl AppV3 {
     #[tool(description = "Manage one browser/session surface. Supports foreground, background, and headless modes; background never requires window activation. action=describe returns the v3 contract.")]
@@ -465,7 +617,7 @@ impl AppV3 {
         snapshot_impl(&self.core, &args).await.map(Json)
     }
 
-    #[tool(description = "Perform a guarded mutation. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.")]
+    #[tool(description = "Perform a guarded mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.")]
     async fn act(&self, Parameters(mut args): Parameters<V3ActArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         let lease = acquire_lease(self, &args).await?;
         let result = match tokio::time::timeout(Duration::from_secs(60), async {
@@ -485,7 +637,8 @@ impl AppV3 {
                 }
             }
             "press" => press(self, &args).await,
-            _ => Err(invalid("action must be click, fill, type, press, or select")),
+            "page_tools" | "page_tool" => call_page_tool(self, &args).await,
+            _ => Err(invalid("action must be click, fill, type, press, select, page_tools, or page_tool")),
         }
         }).await {
             Ok(result) => result,
@@ -498,7 +651,7 @@ impl AppV3 {
         result.map(Json)
     }
 
-    #[tool(description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/extract/verify and rejects unresolved refs or >40 steps.")]
+    #[tool(description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/page_tool/extract/verify and rejects unresolved refs or >40 steps.")]
     async fn workflow(&self, Parameters(args): Parameters<V3WorkflowArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.steps.is_empty() || args.steps.len() > 40 { return Err(invalid("workflow requires 1..40 steps")); }
         let mut vars = std::collections::BTreeMap::<String,String>::new();
@@ -517,21 +670,27 @@ impl AppV3 {
                 }
                 V3WorkflowStep::Click { reference, outcome } => {
                     let reference = resolve(reference, &vars)?;
-                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"click".into(), reference:Some(reference), expected_value:None, value:None, key:None, outcome, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone() })).await?.0
+                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"click".into(), reference:Some(reference), expected_value:None, value:None, key:None, outcome, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone(), page_tool_name:None, page_tool_input:None })).await?.0
                 }
                 V3WorkflowStep::Fill { reference, expected_value, value } => {
                     let reference = resolve(reference, &vars)?;
-                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"fill".into(), reference:Some(reference), expected_value:Some(expected_value), value:Some(value), key:None, outcome:None, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone() })).await?.0
+                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"fill".into(), reference:Some(reference), expected_value:Some(expected_value), value:Some(value), key:None, outcome:None, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone(), page_tool_name:None, page_tool_input:None })).await?.0
                 }
                 V3WorkflowStep::Type { reference, expected_value, value, typing_mode, delay_ms } => {
                     let reference = resolve(reference, &vars)?;
-                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"type".into(), reference:Some(reference), expected_value:Some(expected_value), value:Some(value), key:None, outcome:None, timeout_ms:None, typing_mode, delay_ms, client_id:args.client_id.clone() })).await?.0
+                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"type".into(), reference:Some(reference), expected_value:Some(expected_value), value:Some(value), key:None, outcome:None, timeout_ms:None, typing_mode, delay_ms, client_id:args.client_id.clone(), page_tool_name:None, page_tool_input:None })).await?.0
                 }
                 V3WorkflowStep::Press { reference, key } => {
                     let reference = resolve(reference, &vars)?;
-                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"press".into(), reference:Some(reference), expected_value:None, value:None, key:Some(key), outcome:None, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone() })).await?.0
+                    self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"press".into(), reference:Some(reference), expected_value:None, value:None, key:Some(key), outcome:None, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone(), page_tool_name:None, page_tool_input:None })).await?.0
                 }
                 V3WorkflowStep::Extract { selector } => self.core.browser_extract(Parameters(BrowserExtractArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector, fields: std::collections::BTreeMap::new(), max_items: Some(100), max_text_chars: Some(6000), max_bytes: Some(100_000) })).await?.0,
+                V3WorkflowStep::PageTool { name, input } => self.act(Parameters(V3ActArgs {
+                    session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "page_tool".into(),
+                    reference: None, expected_value: None, value: None, key: None, outcome: None, timeout_ms: None,
+                    typing_mode: None, delay_ms: None, client_id: args.client_id.clone(),
+                    page_tool_name: Some(name), page_tool_input: Some(input),
+                })).await?.0,
                 V3WorkflowStep::Verify { predicate } => verify_impl(&self.core, &BrowserVerifyArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate }).await?,
             };
             let stop_status = workflow_should_stop(&value)
@@ -586,7 +745,7 @@ pub(super) async fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod v3_batch_delivery_tests {
-    use super::{fast_key_batch_failure, lease_target_key, workflow_should_stop};
+    use super::{fast_key_batch_failure, lease_target_key, page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, workflow_should_stop};
     use serde_json::json;
 
     #[test]
@@ -601,6 +760,29 @@ mod v3_batch_delivery_tests {
         assert!(workflow_should_stop(&json!({"status":"unknown"})));
         assert!(workflow_should_stop(&json!({"status":"not_dispatched"})));
         assert!(!workflow_should_stop(&json!({"status":"verified"})));
+    }
+
+    #[test]
+    fn page_tool_runtime_exceptions_are_unknown_mutation_delivery() {
+        let failure = page_tool_completion(Err("page evaluation failed".into())).unwrap_err();
+        assert_eq!(failure["status"], "unknown");
+        assert_eq!(failure["dispatch_acknowledged"], true);
+        assert!(workflow_should_stop(&failure));
+    }
+
+    #[test]
+    fn page_tool_requires_an_unconsumed_matching_snapshot() {
+        assert!(page_tool_snapshot_fresh(false, true));
+        assert!(!page_tool_snapshot_fresh(true, true));
+        assert!(!page_tool_snapshot_fresh(false, false));
+    }
+
+    #[test]
+    fn unavailable_page_tool_stops_workflow_for_ui_fallback() {
+        let unavailable = page_tool_unavailable("page tools are not exposed");
+        assert_eq!(unavailable["status"], "not_dispatched");
+        assert_eq!(unavailable["fallback"], "semantic_ui");
+        assert!(workflow_should_stop(&unavailable));
     }
 
     #[test]
