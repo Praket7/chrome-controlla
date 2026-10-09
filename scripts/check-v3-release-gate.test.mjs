@@ -13,6 +13,13 @@ const complete = {
   default_schema_bytes: 40_000,
   client_contracts_qualified: true,
   live_client_smokes_complete: true,
+  live_client_smokes: ['freebuff', 'opencode', 'claude-code', 'codex', 'chatgpt-desktop', 'generic-mcp'].map(client => ({
+    client,
+    status: 'verified',
+    evidence_hash: `client-smoke-${client}-evidence`,
+    client_version: 'client-1.0',
+    controlla_version: 'controlla-test',
+  })),
   headless_recovery_bounded: true,
   page_tools_fail_closed: true,
   severe_safety_failures: 0,
@@ -56,4 +63,13 @@ test('unqualified live clients block v3 release', () => {
   const result = evaluateV3Gate({ ...complete, live_client_smokes_complete: false });
   assert.equal(result.pass, false);
   assert.ok(result.failures.includes('real client smoke evidence incomplete'));
+});
+
+test('every supported client needs its own verified live smoke evidence', () => {
+  const incomplete = evaluateV3Gate({
+    ...complete,
+    live_client_smokes: complete.live_client_smokes.filter(entry => entry.client !== 'opencode'),
+  });
+  assert.equal(incomplete.pass, false);
+  assert.ok(incomplete.failures.includes('real client smoke evidence must cover all six supported clients'));
 });

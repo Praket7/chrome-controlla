@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 
+const clientMatrix = JSON.parse(await readFile(new URL('../apps/client-qualification-matrix.json', import.meta.url), 'utf8'));
+
 export function evaluateV3Gate(evidence) {
   const failures = [];
   const require = (condition, message) => { if (!condition) failures.push(message); };
@@ -23,6 +25,21 @@ export function evaluateV3Gate(evidence) {
   }
   require(evidence.client_contracts_qualified === true, 'supported client contracts are not qualified');
   require(evidence.live_client_smokes_complete === true, 'real client smoke evidence incomplete');
+  const clients = evidence.live_client_smokes;
+  const supportedClients = Object.keys(clientMatrix.clients);
+  const clientSmokesValid = Array.isArray(clients)
+    && clients.length === supportedClients.length
+    && new Set(clients.map(entry => entry?.client)).size === supportedClients.length
+    && supportedClients.every(client => clients.some(entry =>
+      entry?.client === client
+      && entry.status === 'verified'
+      && typeof entry.evidence_hash === 'string'
+      && entry.evidence_hash.length >= 8
+      && typeof entry.client_version === 'string'
+      && entry.client_version.length > 0
+      && typeof entry.controlla_version === 'string'
+      && entry.controlla_version.length > 0));
+  require(clientSmokesValid, 'real client smoke evidence must cover all six supported clients');
   require(evidence.headless_recovery_bounded === true, 'headless reconnect is not bounded');
   require(evidence.page_tools_fail_closed === true, 'page tool route is not fail-closed');
   require(evidence.severe_safety_failures === 0, 'severe safety failure present');
