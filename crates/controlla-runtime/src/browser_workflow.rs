@@ -132,12 +132,12 @@ pub fn compile_browser_workflow(
     let mut variables = BTreeSet::<String>::new();
     for step in &definition.steps {
         validate_step(step, &variables)?;
-        if let BrowserWorkflowStep::Find { save_as, .. } = step {
-            if !variables.insert(save_as.clone()) {
-                return Err(format!(
-                    "workflow variable ${save_as} is defined more than once"
-                ));
-            }
+        if let BrowserWorkflowStep::Find { save_as, .. } = step
+            && !variables.insert(save_as.clone())
+        {
+            return Err(format!(
+                "workflow variable ${save_as} is defined more than once"
+            ));
         }
     }
 

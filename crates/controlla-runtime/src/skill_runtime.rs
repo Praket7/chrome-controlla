@@ -254,10 +254,10 @@ mod tests {
 
     #[test]
     fn expiry_and_severe_safety_fail_closed() {
-        let runtime = runtime();
-        qualify(&runtime);
+        let expiring_runtime = runtime();
+        qualify(&expiring_runtime);
         assert!(matches!(
-            runtime.replay(
+            expiring_runtime.replay(
                 "registration",
                 "https://example.test",
                 "registration:v1",
@@ -266,16 +266,17 @@ mod tests {
             Err(SkillRuntimeError::NotQualified)
         ));
         assert_eq!(
-            runtime.status("registration", 1000).unwrap().status,
+            expiring_runtime.status("registration", 1000).unwrap().status,
             SkillStatus::Expired
         );
+        let _ = std::fs::remove_dir_all(expiring_runtime.store().path().parent().unwrap());
 
-        let runtime = runtime();
-        qualify(&runtime);
-        let record = runtime
+        let safety_runtime = runtime();
+        qualify(&safety_runtime);
+        let record = safety_runtime
             .record_runtime_verification("registration", Verification::Passed, true, false)
             .unwrap();
         assert_eq!(record.status, SkillStatus::Quarantined);
-        let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());
+        let _ = std::fs::remove_dir_all(safety_runtime.store().path().parent().unwrap());
     }
 }
