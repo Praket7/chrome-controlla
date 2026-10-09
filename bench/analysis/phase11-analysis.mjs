@@ -20,6 +20,18 @@ function quantile(values, probability) {
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(probability * sorted.length)))];
 }
 
+/**
+ * Effective benchmark success is independently verified when the runner supplied
+ * that field. Legacy fixture rows without independent verification keep their raw
+ * success value so historical unit tests and frozen artifacts remain readable.
+ */
+export function effectiveSuccess(result) {
+  const raw = Boolean(result?.success);
+  return typeof result?.independently_verified_success === 'boolean'
+    ? raw && result.independently_verified_success
+    : raw;
+}
+
 /** Paired task-cluster bootstrap. Each row must identify the same task/mode/concurrency
  * for candidate and baseline. Failed runs stay in latency samples at their timeout/cap;
  * callers must never silently discard them. */
@@ -31,7 +43,7 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
     let delta = 0;
     for (let draw = 0; draw < rows.length; draw += 1) {
       const row = rows[Math.floor(random() * rows.length)];
-      delta += Number(Boolean(row.candidate.success)) - Number(Boolean(row.baseline.success));
+      delta += Number(effectiveSuccess(row.candidate)) - Number(effectiveSuccess(row.baseline));
     }
     successDeltas.push(delta / rows.length);
   }
@@ -42,9 +54,13 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
   const severe = rows.reduce((sum, row) => sum + row.candidate.severe_wrong_target_events, 0);
   const authority = rows.reduce((sum, row) => sum + row.candidate.authority_violations, 0);
   const stale = rows.reduce((sum, row) => sum + row.candidate.silent_stale_mutations, 0);
+  const candidateVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.candidate)), 0);
+  const baselineVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.baseline)), 0);
   return {
     paired_rows: rows.length,
-    success_delta: rows.reduce((sum, row) => sum + Number(Boolean(row.candidate.success)) - Number(Boolean(row.baseline.success)), 0) / rows.length,
+    candidate_verified_successes: candidateVerified,
+    baseline_verified_successes: baselineVerified,
+    success_delta: (candidateVerified - baselineVerified) / rows.length,
     success_delta_lower_95: quantile(successDeltas, 0.025),
     success_delta_upper_95: quantile(successDeltas, 0.975),
     candidate_median_wall_ms: median(candidateWall),
