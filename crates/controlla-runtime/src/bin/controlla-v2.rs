@@ -20,13 +20,14 @@ mod legacy_mcp {
         }
     }
 
-    pub(crate) fn run_compact() -> Result<(), Box<dyn std::error::Error>> {
-        v2::v3::run()
+    pub(crate) async fn run_compact() -> Result<(), String> {
+        v2::v3::run().await
     }
 }
 
-fn main() {
-    if let Err(error) = legacy_mcp::run_compact() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = legacy_mcp::run_compact().await {
         eprintln!("Controlla v3 MCP server failed: {error}");
         std::process::exit(1);
     }
