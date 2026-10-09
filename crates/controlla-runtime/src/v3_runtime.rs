@@ -12,12 +12,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub const DEFAULT_AGENT_TOOLS: [&str; 6] = [
-    "browser",
-    "snapshot",
-    "act",
-    "workflow",
-    "extract",
-    "verify",
+    "browser", "snapshot", "act", "workflow", "extract", "verify",
 ];
 pub const MAX_BATCH_ACTIONS: usize = 64;
 pub const MAX_PAGE_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
@@ -351,7 +346,12 @@ impl ClientQualification {
 pub fn compact_tool_surface_valid(serialized_schema_bytes: usize) -> bool {
     serialized_schema_bytes <= 48 * 1024
         && DEFAULT_AGENT_TOOLS.len() == 6
-        && DEFAULT_AGENT_TOOLS.iter().copied().collect::<BTreeSet<_>>().len() == 6
+        && DEFAULT_AGENT_TOOLS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            == 6
 }
 
 pub fn result_within_budget(value: &Value) -> bool {

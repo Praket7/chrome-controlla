@@ -38,9 +38,18 @@ fn browser_modes_produce_explicit_launch_plans() {
 fn guarded_batch_is_one_host_round_trip_and_stops_before_stale_mutation() {
     let grounded = epoch();
     let actions = vec![
-        BatchAction { id: "read".into(), kind: BatchActionKind::Read },
-        BatchAction { id: "fill".into(), kind: BatchActionKind::TextMutation },
-        BatchAction { id: "click".into(), kind: BatchActionKind::PointerMutation },
+        BatchAction {
+            id: "read".into(),
+            kind: BatchActionKind::Read,
+        },
+        BatchAction {
+            id: "fill".into(),
+            kind: BatchActionKind::TextMutation,
+        },
+        BatchAction {
+            id: "click".into(),
+            kind: BatchActionKind::PointerMutation,
+        },
     ];
     let mut stale = grounded.clone();
     stale.selection_fingerprint = Some("10:1:1".into());
@@ -120,7 +129,9 @@ fn reconnect_never_blindly_replays_mutations_and_is_bounded() {
 fn default_agent_surface_is_exactly_six_compact_tools() {
     assert_eq!(
         DEFAULT_AGENT_TOOLS,
-        ["browser", "snapshot", "act", "workflow", "extract", "verify"]
+        [
+            "browser", "snapshot", "act", "workflow", "extract", "verify"
+        ]
     );
     assert!(compact_tool_surface_valid(47 * 1024));
     assert!(!compact_tool_surface_valid(49 * 1024));
