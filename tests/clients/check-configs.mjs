@@ -21,7 +21,7 @@ assert.deepEqual(entries[0], {
   command: binary,
   args: ['mcp'],
   env: {
-    CONTROLLA_STATE_DIR: `${state}/freebuff`,
+    CONTROLLA_STATE_DIR: path.join(state, 'freebuff'),
   },
 });
 assert.deepEqual(entries[1], {
@@ -29,21 +29,21 @@ assert.deepEqual(entries[1], {
   command: [binary, 'mcp'],
   enabled: true,
   environment: {
-    CONTROLLA_STATE_DIR: `${state}/opencode-v1`,
+    CONTROLLA_STATE_DIR: path.join(state, 'opencode-v1'),
   },
 });
 assert.deepEqual(entries[2], {
   type: 'local',
   command: [binary, 'mcp'],
   environment: {
-    CONTROLLA_STATE_DIR: `${state}/opencode-v2`,
+    CONTROLLA_STATE_DIR: path.join(state, 'opencode-v2'),
   },
 });
 assert.equal(new Set(entries.map((entry) => entry.env?.CONTROLLA_STATE_DIR ?? entry.environment.CONTROLLA_STATE_DIR)).size, 3);
 assert.match(generate('claude', binary, state), /^claude mcp add .*--transport stdio --scope user chrome-controlla -- '\/opt\/chrome-controlla\/controlla' mcp/m);
 const quotedClaude = generate('claude', "/tmp/agent's $(touch nope)/controlla", "/tmp/state with spaces");
 assert.ok(quotedClaude.includes("'/tmp/agent'\"'\"'s $(touch nope)/controlla'"));
-assert.ok(quotedClaude.includes("'CONTROLLA_STATE_DIR=/tmp/state with spaces/claude'"));
+assert.ok(quotedClaude.includes(`'CONTROLLA_STATE_DIR=${path.join('/tmp/state with spaces', 'claude')}'`));
 assert.throws(() => generate('chatgpt', binary, state), /Unsupported local-stdio/);
 assert.throws(() => generate('freebuff', 'controlla', state), /absolute paths/);
 const tempDir = await mkdtemp(path.join(os.tmpdir(), 'controlla-config-install-'));
