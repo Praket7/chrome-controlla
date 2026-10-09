@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +13,26 @@ fn write_native(writer: &mut impl Write, message: Value) {
         .unwrap();
     writer.write_all(&bytes).unwrap();
     writer.flush().unwrap();
+}
+
+fn publish_pairing(path: &Path, bytes: &[u8]) {
+    let temporary = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+    #[cfg(not(unix))]
+    fs::write(&temporary, bytes).unwrap();
+    fs::rename(&temporary, path).unwrap();
 }
 
 #[test]
@@ -76,12 +97,7 @@ fn native_host_lists_tabs_before_pairing_and_recovers_from_bad_request() {
     assert_eq!(inventory["tabs"][0]["id"], 42);
     let host_id = inventory["host_id"].as_str().unwrap();
     let pairing = state.join(format!("native-pairing-{host_id}.json"));
-    fs::write(&pairing, b"bad json").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&pairing, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    publish_pairing(&pairing, b"bad json");
     std::thread::sleep(Duration::from_millis(350));
     assert!(
         child.try_wait().unwrap().is_none(),
@@ -92,18 +108,10 @@ fn native_host_lists_tabs_before_pairing_and_recovers_from_bad_request() {
         .unwrap()
         .as_secs()
         + 60;
-    fs::write(
-        &pairing,
-        json!({"endpoint":"ws://127.0.0.1:12345/","token":"fixture-token",
+    let request = json!({"endpoint":"ws://127.0.0.1:12345/","token":"fixture-token",
         "tab_ids":[42],"request_id":"r1","expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"expires_at_unix":expires})
-        .to_string(),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&pairing, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+        .to_string();
+    publish_pairing(&pairing, request.as_bytes());
     let pair = loop {
         let message = next();
         if message["type"] == "pair" {
