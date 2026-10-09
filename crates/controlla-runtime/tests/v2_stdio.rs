@@ -17,7 +17,7 @@ impl ClientHandler for Client {
     fn get_info(&self) -> ClientConfig {
         ClientConfig::new(
             rmcp::model::ClientCapabilities::default(),
-            Implementation::new("controlla-v2-contract-test", "0.1.0"),
+            Implementation::new("controlla-v3-contract-test", "0.1.0"),
         )
         .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
     }
@@ -26,23 +26,23 @@ impl ClientHandler for Client {
 fn state_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
-        "controlla-v2-contract-{}-{}",
+        "controlla-v3-contract-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
 #[tokio::test]
-async fn compact_v2_advertises_full_guarded_execution_surface() {
+async fn compact_v3_advertises_exactly_six_guarded_tools() {
     let state_dir = state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_controlla-v2"));
     command.env("CONTROLLA_STATE_DIR", &state_dir);
-    let transport = TokioChildProcess::new(command).expect("spawn compact v2 MCP server");
+    let transport = TokioChildProcess::new(command).expect("spawn compact v3 MCP server");
     let client = Client
         .serve(transport)
         .await
-        .expect("initialize compact v2");
+        .expect("initialize compact v3");
     let tools = client.list_tools(None).await.unwrap();
     let names = tools
         .tools
@@ -51,67 +51,37 @@ async fn compact_v2_advertises_full_guarded_execution_surface() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         names,
-        BTreeSet::from([
-            "browser_act",
-            "browser_extract",
-            "browser_find",
-            "browser_probe",
-            "browser_session",
-            "browser_skill",
-            "browser_snapshot",
-            "browser_verify",
-            "browser_workflow",
-        ])
+        BTreeSet::from(["act", "browser", "extract", "snapshot", "verify", "workflow"])
     );
+    assert_eq!(tools.tools.len(), 6);
 
     let schema = |name: &str| {
         let tool = tools.tools.iter().find(|tool| tool.name == name).unwrap();
         serde_json::to_value(&tool.input_schema).unwrap()
     };
-    let act = schema("browser_act");
-    assert!(act["properties"].get("key").is_some());
-    let probe = schema("browser_probe");
-    for property in ["reference", "selector", "region"] {
-        assert!(
-            probe["properties"].get(property).is_some(),
-            "probe {property}"
-        );
+    let browser = schema("browser");
+    for property in ["action", "mode", "provider", "session_id", "target_ids"] {
+        assert!(browser["properties"].get(property).is_some(), "browser {property}");
     }
-    let skill = schema("browser_skill");
+    let act = schema("act");
     for property in [
-        "definition",
-        "run_id",
-        "predicate",
-        "expires_at_ms",
-        "severe_safety_failure",
+        "action",
+        "reference",
+        "expected_value",
+        "value",
+        "key",
+        "typing_mode",
+        "delay_ms",
+        "client_id",
     ] {
-        assert!(
-            skill["properties"].get(property).is_some(),
-            "skill {property}"
-        );
+        assert!(act["properties"].get(property).is_some(), "act {property}");
     }
-    let workflow_text = serde_json::to_string(&schema("browser_workflow")).unwrap();
-    for step in [
-        "navigate",
-        "find",
-        "click",
-        "fill",
-        "type",
-        "press",
-        "select",
-        "wait_for",
-        "observe",
-        "extract",
-        "assert",
-        "verify",
-        "checkpoint",
-        "script",
-    ] {
-        assert!(
-            workflow_text.contains(step),
-            "workflow schema contains {step}"
-        );
+    let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
+    for step in ["snapshot", "find", "click", "fill", "type", "press", "extract", "verify"] {
+        assert!(workflow_text.contains(step), "workflow schema contains {step}");
     }
+    let schema_bytes = serde_json::to_vec(&tools.tools).unwrap().len();
+    assert!(schema_bytes <= 48 * 1024, "default tool schema budget is {schema_bytes} bytes");
 
     client.cancel().await.unwrap();
     std::fs::remove_dir_all(state_dir).unwrap();
