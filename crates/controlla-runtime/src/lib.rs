@@ -20,6 +20,7 @@ pub mod skill_runtime;
 pub mod skill_store;
 pub mod skills;
 pub mod slides_deck;
+pub mod v3;
 pub mod verifier;
 pub mod workflow;
 
