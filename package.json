@@ -11,8 +11,9 @@
     "check:provenance": "node scripts/check-provenance.mjs",
     "check:clients": "node tests/clients/check-configs.mjs",
     "check:apps": "node apps/check-phase8-briefs.mjs && node apps/check-phase13-qualification.mjs",
-    "check:bench": "node --test bench/phase10-pilot.test.mjs bench/analysis/phase10-analysis.test.mjs bench/analysis/offline-task-harness.test.mjs bench/analysis/phase11-analysis.test.mjs bench/runners/phase11-runner.test.mjs bench/runners/phase11-suite.test.mjs && node scripts/check-phase10-heldout.mjs && node scripts/check-phase11-realistic.mjs && node scripts/check-phase15-faults.mjs && python3 bench/phase6_compare.py",
-    "check:release": "node --test scripts/check-best-chrome-release-gate.test.mjs && node scripts/check-best-chrome-release-gate.mjs",
+    "check:bench": "node --test bench/phase10-pilot.test.mjs bench/analysis/phase10-analysis.test.mjs bench/analysis/offline-task-harness.test.mjs bench/analysis/phase11-analysis.test.mjs bench/analysis/phase12-analysis.test.mjs bench/runners/phase11-runner.test.mjs bench/runners/phase11-suite.test.mjs && node scripts/check-phase10-heldout.mjs && node scripts/check-phase11-realistic.mjs && node scripts/check-phase15-faults.mjs && python3 bench/phase6_compare.py",
+    "check:release": "node --test scripts/check-best-chrome-release-gate.test.mjs scripts/check-v3-release-gate.test.mjs && node scripts/check-best-chrome-release-gate.mjs",
+    "check:v3": "node apps/check-client-qualification.mjs && node --test bench/analysis/phase12-analysis.test.mjs scripts/check-v3-release-gate.test.mjs",
     "prepare:release-candidate": "node scripts/prepare-release-candidate.mjs"
   },
   "devDependencies": {
