@@ -19,9 +19,10 @@ export function evaluateV3Gate(evidence) {
   require(evidence.unknown_mutation_auto_retries === 0, 'unknown mutation delivery was retried automatically');
   require(evidence.default_tool_count === 6, 'default agent tool surface is not six tools');
   if (requireNonnegative(evidence.default_schema_bytes, 'default schema bytes')) {
-    require(evidence.default_schema_bytes <= 48 * 1024, 'default agent schema exceeds 48KiB');
+  require(evidence.default_schema_bytes <= 48 * 1024, 'default agent schema exceeds 48KiB');
   }
   require(evidence.client_contracts_qualified === true, 'supported client contracts are not qualified');
+  require(evidence.live_client_smokes_complete === true, 'real client smoke evidence incomplete');
   require(evidence.headless_recovery_bounded === true, 'headless reconnect is not bounded');
   require(evidence.page_tools_fail_closed === true, 'page tool route is not fail-closed');
   require(evidence.severe_safety_failures === 0, 'severe safety failure present');

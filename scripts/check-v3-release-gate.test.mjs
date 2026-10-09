@@ -12,6 +12,7 @@ const complete = {
   default_tool_count: 6,
   default_schema_bytes: 40_000,
   client_contracts_qualified: true,
+  live_client_smokes_complete: true,
   headless_recovery_bounded: true,
   page_tools_fail_closed: true,
   severe_safety_failures: 0,
@@ -49,4 +50,10 @@ test('negative numeric evidence cannot satisfy v3 release thresholds', () => {
   assert.equal(result.pass, false);
   assert.ok(result.failures.includes('block typing protocol calls must be a finite nonnegative number'));
   assert.ok(result.failures.includes('default schema bytes must be a finite nonnegative number'));
+});
+
+test('unqualified live clients block v3 release', () => {
+  const result = evaluateV3Gate({ ...complete, live_client_smokes_complete: false });
+  assert.equal(result.pass, false);
+  assert.ok(result.failures.includes('real client smoke evidence incomplete'));
 });
