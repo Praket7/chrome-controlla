@@ -2649,7 +2649,9 @@ mod tests {
         assert_eq!(result["result"]["value"]["value"], text);
         let events = result["result"]["value"]["events"].as_array().unwrap();
         assert_eq!(events.len(), 8);
-        for cycle in events.chunks_exact(4) {
+        let (cycles, remainder) = events.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        for cycle in cycles {
             assert_eq!(cycle[0]["type"], "keydown");
             assert_eq!(cycle[1]["type"], "beforeinput");
             assert_eq!(cycle[2]["type"], "input");
