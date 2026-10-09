@@ -39,3 +39,14 @@ test('any wrong-target mutation blocks release', () => {
   const result = evaluateV3Gate({ ...complete, interference_wrong_target_mutations: 1 });
   assert.equal(result.pass, false);
 });
+
+test('negative numeric evidence cannot satisfy v3 release thresholds', () => {
+  const result = evaluateV3Gate({
+    ...complete,
+    block_typing_protocol_calls_per_1000_chars: -1,
+    default_schema_bytes: -1,
+  });
+  assert.equal(result.pass, false);
+  assert.ok(result.failures.includes('block typing protocol calls must be a finite nonnegative number'));
+  assert.ok(result.failures.includes('default schema bytes must be a finite nonnegative number'));
+});
