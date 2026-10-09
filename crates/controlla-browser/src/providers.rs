@@ -740,6 +740,7 @@ impl SharedExtensionProvider {
                 browser_instance_id: self.browser_instance_id,
                 selected_targets: targets,
                 batch_execution: hello["batch_execution"] == true,
+                batch_deadline: hello["batch_deadline"] == true,
                 next_command_id: AtomicU64::new(1),
                 scheduler: crate::scheduler::TargetScheduler::default(),
                 reader_task: Some(reader_task),
@@ -758,6 +759,7 @@ pub struct SharedExtensionSession {
     browser_instance_id: u128,
     selected_targets: BTreeSet<String>,
     batch_execution: bool,
+    batch_deadline: bool,
     next_command_id: AtomicU64,
     scheduler: crate::scheduler::TargetScheduler,
     reader_task: Option<tokio::task::JoinHandle<()>>,
@@ -835,6 +837,7 @@ impl SharedExtensionSession {
         session: &SessionHandle,
         target_id: &str,
         actions: Vec<SharedBatchAction>,
+        deadline: Duration,
     ) -> Result<Value, ProviderError> {
         if actions.is_empty() || actions.len() > 64 {
             return Err(ProviderError::Extension(
@@ -846,12 +849,21 @@ impl SharedExtensionSession {
                 "paired extension does not advertise bounded batch execution; reload the current extension".into(),
             ));
         }
+        if !self.batch_deadline {
+            return Err(ProviderError::Extension(
+                "paired extension does not advertise bounded batch deadlines; reload the current extension".into(),
+            ));
+        }
+        let deadline_ms = deadline.as_millis().clamp(1, 60_000) as u64;
         for action in &actions {
             self.authorize_command(registry, session, target_id, &action.method)?;
         }
         let target_id = target_id.to_owned();
         self.scheduler
-            .run_target(&target_id, self.batch_wire(&target_id, actions))
+            .run_target(
+                &target_id,
+                self.batch_wire(&target_id, actions, deadline_ms),
+            )
             .await
     }
 
@@ -959,13 +971,14 @@ impl SharedExtensionSession {
         &self,
         target_id: &str,
         actions: Vec<SharedBatchAction>,
+        deadline_ms: u64,
     ) -> Result<Value, ProviderError> {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let wire_actions = actions
             .into_iter()
             .map(|action| json!({"method":action.method,"params":action.params,"stop_on_not_ok":action.stop_on_not_ok}))
             .collect::<Vec<_>>();
-        let request = json!({"type":"batch","id":id,"target_id":target_id,"actions":wire_actions});
+        let request = json!({"type":"batch","id":id,"target_id":target_id,"deadline_ms":deadline_ms,"actions":wire_actions});
         let serialized = request.to_string();
         if serialized.len() > SHARED_MESSAGE_LIMIT {
             return Err(ProviderError::Extension(
@@ -3100,7 +3113,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true, "targets":["17", "18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true, "targets":["17", "18"]})
                         .to_string()
                         .into(),
                 ))
@@ -3131,6 +3144,7 @@ list.addEventListener('scroll',render);render();
             assert_eq!(batch["type"], "batch");
             assert_eq!(batch["actions"].as_array().unwrap().len(), 2);
             assert_eq!(batch["actions"][0]["stop_on_not_ok"], true);
+            assert_eq!(batch["deadline_ms"], 5_000);
             socket.send(Message::Text(json!({"type":"batch_result","id":batch["id"],"result":{"completed":2,"host_round_trips":1}}).to_string().into())).await.unwrap();
         });
         let (first, second) = tokio::join!(
@@ -3168,6 +3182,7 @@ list.addEventListener('scroll',render);render();
                         stop_on_not_ok: false,
                     },
                 ],
+                Duration::from_secs(5),
             )
             .await
             .unwrap();

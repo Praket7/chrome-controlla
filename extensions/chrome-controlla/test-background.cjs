@@ -34,6 +34,8 @@ let navigationCommitted;
 let navigationError;
 let debuggerDetached;
 let nextCreatedTab = 500;
+let mockNow = 1_000;
+let advanceClockOnNextDebuggerCall = 0;
 const expectedUrls = ids => Object.fromEntries(ids.map(id => [id, `https://example.test/${id}`]));
 const expectedDocuments = ids => Object.fromEntries(ids.map(id => [id, `document-${id}`]));
 class FakeWebSocket {
@@ -120,6 +122,8 @@ const chrome = {
     },
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
+      mockNow += advanceClockOnNextDebuggerCall;
+      advanceClockOnNextDebuggerCall = 0;
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration === "guard") return { result: { value: { ok: false } } };
       if (method === "Runtime.evaluate" && params?.awaitResult) {
@@ -132,6 +136,8 @@ const chrome = {
 };
 vm.runInNewContext(fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8"), {
   chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
+  Date: { now() { return mockNow; } },
+  performance: { now() { return mockNow; } },
   console: { debug(...args) { commandDiagnostics.push(args); } },
   setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
   clearTimeout,
@@ -160,9 +166,9 @@ function message(payload) {
   assert.deepEqual(attached, [41, 43], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true, batch_execution: true }));
+  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true, batch_execution: true, batch_deadline: true }));
   const callsBeforeBatch = debuggerCalls.length;
-  native.hostMessage({ type: "batch", id: "guarded-batch", target_id: "41", actions: [
+  native.hostMessage({ type: "batch", id: "guarded-batch", target_id: "41", deadline_ms: 1000, actions: [
     { method: "Runtime.callFunctionOn", params: { functionDeclaration: "guard" }, stop_on_not_ok: true },
     { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
   ] });
@@ -171,6 +177,19 @@ function message(payload) {
   assert.equal(guardedBatch.type, "batch_result");
   assert.equal(guardedBatch.result.stopped_before, 1);
   assert.equal(debuggerCalls.length, callsBeforeBatch + 1, "a rejected read guard stops before its mutation");
+  advanceClockOnNextDebuggerCall = 2;
+  const callsBeforeDeadlineBatch = debuggerCalls.length;
+  native.hostMessage({ type: "batch", id: "deadline-batch", target_id: "41", deadline_ms: 1, actions: [
+    { method: "DOM.getDocument", params: {} },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
+  ] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const expiredBatch = native.sent.at(-1);
+  assert.equal(expiredBatch.type, "batch_result");
+  assert.match(expiredBatch.error, /deadline/);
+  assert.equal(expiredBatch.result.completed, 1);
+  assert.equal(debuggerCalls.length, callsBeforeDeadlineBatch + 1,
+    "an expired batch must stop before sending the next mutation");
   commandDiagnostics.splice(0);
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/" } });
   await new Promise(resolve => setTimeout(resolve, 0));

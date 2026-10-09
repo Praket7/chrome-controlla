@@ -123,7 +123,7 @@ async function pairNative(port, portGeneration, message) {
       const attached = await chrome.tabs.get(tabId).catch(() => null); const attachedFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
       if (navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || !attached || attached.status !== "complete" || attached.url !== beforeAttach.url || attachedFrame?.documentId !== beforeFrame.documentId) throw new Error("Tab " + tabId + " navigated during pairing; rediscover tabs and pair again.");
     }
-    sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, targets: [...nativeAttachedTabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, document_identity: true, batch_execution: true });
+    sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, targets: [...nativeAttachedTabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, document_identity: true, batch_execution: true, batch_deadline: true });
   } catch (error) {
     if (attemptGeneration !== undefined) await detachNative(attemptGeneration);
     if (reservation) for (const tabId of requested || []) { if (manualAttachedTabs.has(tabId)) continue; pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); }
@@ -131,24 +131,27 @@ async function pairNative(port, portGeneration, message) {
   } finally { if (reservation) releasePairingTabs(requested, reservation); }
 }
 async function dispatchBatch(request, isAuthorized, respond) {
-  const tabId = Number(request.target_id); const actions = request.actions; const startedAt = Date.now();
+  const tabId = Number(request.target_id); const actions = request.actions; const startedAt = performance.now();
   if (!Number.isSafeInteger(tabId) || !isAuthorized(tabId)) { respond({ type: "batch_result", id: request.id, error: "Target is not attached." }); return; }
   if (!Array.isArray(actions) || actions.length === 0 || actions.length > MAX_BATCH_ACTIONS) { respond({ type: "batch_result", id: request.id, error: "Batch requires 1..64 actions." }); return; }
+  if (!Number.isSafeInteger(request.deadline_ms) || request.deadline_ms < 1 || request.deadline_ms > 60000) { respond({ type: "batch_result", id: request.id, error: "Batch deadline must be within 1..60000ms." }); return; }
   const receipts = [];
   for (let index = 0; index < actions.length; index++) {
+    if (performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
     const action = actions[index];
     if (!action || typeof action.method !== "string" || action.method.length > 128 || (action.target_id !== undefined && Number(action.target_id) !== tabId) || (action.stop_on_not_ok !== undefined && typeof action.stop_on_not_ok !== "boolean")) {
-      respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: "Invalid batch action or target mismatch." }); return;
+      respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Invalid batch action or target mismatch." }); return;
     }
     let settled;
     await dispatchCommand({ type: "command", id: `${String(request.id).slice(0, 96)}:${index}`, target_id: String(tabId), method: action.method, params: action.params || {} }, isAuthorized, response => { settled = response; });
     const receipt = { index, method: action.method };
     if (settled?.error) receipt.error = settled.error; else receipt.result = settled?.result;
     receipts.push(receipt);
-    if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: settled.error }); return; }
-    if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
+    if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: settled.error }); return; }
+    if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
+    if (index + 1 < actions.length && performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
   }
-  respond({ type: "batch_result", id: request.id, result: { receipts, completed: actions.length, stopped_before: null, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: Date.now() - startedAt } });
+  respond({ type: "batch_result", id: request.id, result: { receipts, completed: actions.length, stopped_before: null, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt } });
 }
 async function dispatchCommand(request, isAuthorized, respond) {
   const tabId = Number(request.target_id); const startedAt = Date.now();
@@ -225,7 +228,7 @@ async function pairManual(endpointUrl, token, tabs) {
   const next = new WebSocket(endpointUrl.href); socket = next;
   try {
     await new Promise((resolve, reject) => { next.onopen = resolve; next.onerror = () => reject(new Error("Cannot connect to the loopback provider.")); next.onclose = () => reject(new Error("Loopback pairing was closed.")); }); if (generation !== manualGeneration) throw new Error("Pairing was replaced.");
-    const extensionVersion = chrome.runtime.getManifest().version; next.send(JSON.stringify({ type: "hello", token, extension_version: extensionVersion, document_identity: true, batch_execution: true, targets: [...manualAttachedTabs].map(String).sort() }));
+    const extensionVersion = chrome.runtime.getManifest().version; next.send(JSON.stringify({ type: "hello", token, extension_version: extensionVersion, document_identity: true, batch_execution: true, batch_deadline: true, targets: [...manualAttachedTabs].map(String).sort() }));
     await new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Provider did not confirm pairing.")), 5000); next.onmessage = event => { const reply = JSON.parse(event.data); if (reply.type === "ready" && reply.server_version === extensionVersion) { clearTimeout(timer); resolve(); } else { clearTimeout(timer); reject(new Error(reply.error || "Pairing rejected.")); } }; });
   } catch (error) { next.close(); if (socket === next) socket = undefined; await detachManual(generation); throw error; }
   if (generation !== manualGeneration) { next.close(); return; }

@@ -323,6 +323,7 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
                     &shared.handle,
                     &args.chrome_tab_id,
                     actions,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
                 ),
             )
             .await
