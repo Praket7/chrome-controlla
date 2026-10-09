@@ -44,6 +44,7 @@ pub enum SchedulerError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerPressure {
     Healthy,
+    Neutral,
     Slow,
     Timeout,
     TransportFailure,
@@ -116,6 +117,7 @@ impl AdaptiveGate {
                     }
                 }
             }
+            SchedulerPressure::Neutral => {}
             SchedulerPressure::Slow
             | SchedulerPressure::Timeout
             | SchedulerPressure::TransportFailure => {
@@ -231,8 +233,7 @@ impl TargetScheduler {
         } else if queue_wait <= Duration::from_millis(100) && execution <= Duration::from_secs(2) {
             SchedulerPressure::Healthy
         } else {
-            // Neutral samples neither grow nor shrink concurrency.
-            return SchedulerPressure::Healthy;
+            SchedulerPressure::Neutral
         }
     }
 
@@ -311,6 +312,15 @@ mod tests {
             scheduler.record_pressure(SchedulerPressure::Healthy);
         }
         assert_eq!(scheduler.current_active_limit(), 2);
+    }
+
+    #[test]
+    fn neutral_pressure_does_not_grow_concurrency() {
+        let scheduler = TargetScheduler::default();
+        for _ in 0..64 {
+            scheduler.record_pressure(SchedulerPressure::Neutral);
+        }
+        assert_eq!(scheduler.current_active_limit(), 4);
     }
 
     #[tokio::test]
