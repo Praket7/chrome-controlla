@@ -28,7 +28,9 @@ pub enum BrowserWorkflowPredicate {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserWorkflowStep {
-    Navigate { url: String },
+    Navigate {
+        url: String,
+    },
     Find {
         query: String,
         role: Option<String>,
@@ -48,7 +50,10 @@ pub enum BrowserWorkflowStep {
         expected_value: String,
         value: String,
     },
-    Press { reference: String, key: String },
+    Press {
+        reference: String,
+        key: String,
+    },
     Select {
         reference: String,
         expected_value: String,
@@ -67,10 +72,16 @@ pub enum BrowserWorkflowStep {
         max_items: usize,
         max_bytes: usize,
     },
-    Assert { predicate: BrowserWorkflowPredicate },
-    Verify { predicate: BrowserWorkflowPredicate },
+    Assert {
+        predicate: BrowserWorkflowPredicate,
+    },
+    Verify {
+        predicate: BrowserWorkflowPredicate,
+    },
     Checkpoint,
-    Script { source: String },
+    Script {
+        source: String,
+    },
 }
 
 impl BrowserWorkflowStep {
@@ -83,9 +94,7 @@ impl BrowserWorkflowStep {
             | Self::Assert { .. }
             | Self::Verify { .. }
             | Self::Checkpoint => EffectClass::ReadOnly,
-            Self::Fill { .. } | Self::Type { .. } | Self::Select { .. } => {
-                EffectClass::Reversible
-            }
+            Self::Fill { .. } | Self::Type { .. } | Self::Select { .. } => EffectClass::Reversible,
             Self::Click { .. } | Self::Press { .. } => EffectClass::External,
             Self::Navigate { .. } => EffectClass::AuthorityBoundary,
             Self::Script { .. } => EffectClass::Unknown,
@@ -125,12 +134,18 @@ pub fn compile_browser_workflow(
         validate_step(step, &variables)?;
         if let BrowserWorkflowStep::Find { save_as, .. } = step {
             if !variables.insert(save_as.clone()) {
-                return Err(format!("workflow variable ${save_as} is defined more than once"));
+                return Err(format!(
+                    "workflow variable ${save_as} is defined more than once"
+                ));
             }
         }
     }
 
-    let effects = definition.steps.iter().map(BrowserWorkflowStep::effect).collect();
+    let effects = definition
+        .steps
+        .iter()
+        .map(BrowserWorkflowStep::effect)
+        .collect();
     Ok(CompiledBrowserWorkflow {
         steps: definition.steps,
         effects,
@@ -256,7 +271,10 @@ fn validate_variable_name(name: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
-        Err("workflow variable names must be 1..=64 ASCII alphanumeric/underscore characters".into())
+        Err(
+            "workflow variable names must be 1..=64 ASCII alphanumeric/underscore characters"
+                .into(),
+        )
     } else {
         Ok(())
     }
@@ -350,24 +368,28 @@ mod tests {
 
     #[test]
     fn unresolved_and_duplicate_variables_fail_closed() {
-        assert!(compile(vec![BrowserWorkflowStep::Click {
-            reference: "$missing".into(),
-            expected_outcome: "dialog visible".into(),
-        }])
-        .is_err());
-        assert!(compile(vec![
-            BrowserWorkflowStep::Find {
-                query: "one".into(),
-                role: None,
-                save_as: "same".into(),
-            },
-            BrowserWorkflowStep::Find {
-                query: "two".into(),
-                role: None,
-                save_as: "same".into(),
-            },
-        ])
-        .is_err());
+        assert!(
+            compile(vec![BrowserWorkflowStep::Click {
+                reference: "$missing".into(),
+                expected_outcome: "dialog visible".into(),
+            }])
+            .is_err()
+        );
+        assert!(
+            compile(vec![
+                BrowserWorkflowStep::Find {
+                    query: "one".into(),
+                    role: None,
+                    save_as: "same".into(),
+                },
+                BrowserWorkflowStep::Find {
+                    query: "two".into(),
+                    role: None,
+                    save_as: "same".into(),
+                },
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -383,21 +405,29 @@ mod tests {
 
     #[test]
     fn script_isolated_and_bounds_are_enforced() {
-        assert!(compile(vec![
-            BrowserWorkflowStep::Script { source: "return 1".into() },
-            BrowserWorkflowStep::Checkpoint,
-        ])
-        .is_err());
-        assert!(compile(vec![BrowserWorkflowStep::WaitFor {
-            selector: "body".into(),
-            timeout_ms: MAX_TIMEOUT_MS + 1,
-        }])
-        .is_err());
-        assert!(compile(vec![BrowserWorkflowStep::Extract {
-            selector: "body".into(),
-            max_items: 501,
-            max_bytes: 4096,
-        }])
-        .is_err());
+        assert!(
+            compile(vec![
+                BrowserWorkflowStep::Script {
+                    source: "return 1".into()
+                },
+                BrowserWorkflowStep::Checkpoint,
+            ])
+            .is_err()
+        );
+        assert!(
+            compile(vec![BrowserWorkflowStep::WaitFor {
+                selector: "body".into(),
+                timeout_ms: MAX_TIMEOUT_MS + 1,
+            }])
+            .is_err()
+        );
+        assert!(
+            compile(vec![BrowserWorkflowStep::Extract {
+                selector: "body".into(),
+                max_items: 501,
+                max_bytes: 4096,
+            }])
+            .is_err()
+        );
     }
 }

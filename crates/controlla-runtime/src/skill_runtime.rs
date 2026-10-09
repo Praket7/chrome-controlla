@@ -45,7 +45,10 @@ impl SkillRuntime {
         &self.store
     }
 
-    pub fn register_candidate(&self, definition: SkillDefinition) -> Result<SkillRecord, SkillRuntimeError> {
+    pub fn register_candidate(
+        &self,
+        definition: SkillDefinition,
+    ) -> Result<SkillRecord, SkillRuntimeError> {
         let record = SkillRecord::candidate(definition)?;
         self.store.upsert(record.clone())?;
         Ok(record)
@@ -87,7 +90,10 @@ impl SkillRuntime {
     }
 
     pub fn status(&self, skill_id: &str, now_ms: u64) -> Result<SkillRecord, SkillRuntimeError> {
-        let mut record = self.store.get(skill_id)?.ok_or(SkillRuntimeError::NotFound)?;
+        let mut record = self
+            .store
+            .get(skill_id)?
+            .ok_or(SkillRuntimeError::NotFound)?;
         if record.status == SkillStatus::Qualified && !record.replay_allowed(now_ms) {
             self.store.upsert(record.clone())?;
         }
@@ -104,7 +110,10 @@ impl SkillRuntime {
         structural_signature: &str,
         now_ms: u64,
     ) -> Result<SkillReplay, SkillRuntimeError> {
-        let mut record = self.store.get(skill_id)?.ok_or(SkillRuntimeError::NotFound)?;
+        let mut record = self
+            .store
+            .get(skill_id)?
+            .ok_or(SkillRuntimeError::NotFound)?;
         if !record.replay_allowed(now_ms) {
             self.store.upsert(record)?;
             return Err(SkillRuntimeError::NotQualified);
@@ -150,7 +159,10 @@ impl SkillRuntime {
         skill_id: &str,
         update: impl FnOnce(&mut SkillRecord) -> Result<(), SkillRuntimeError>,
     ) -> Result<SkillRecord, SkillRuntimeError> {
-        let mut record = self.store.get(skill_id)?.ok_or(SkillRuntimeError::NotFound)?;
+        let mut record = self
+            .store
+            .get(skill_id)?
+            .ok_or(SkillRuntimeError::NotFound)?;
         update(&mut record)?;
         self.store.upsert(record.clone())?;
         Ok(record)
@@ -192,8 +204,12 @@ mod tests {
 
     fn qualify(runtime: &SkillRuntime) {
         runtime.register_candidate(definition()).unwrap();
-        runtime.record_training_success("registration", "train-1").unwrap();
-        runtime.record_validation_success("registration", "validate-1").unwrap();
+        runtime
+            .record_training_success("registration", "train-1")
+            .unwrap();
+        runtime
+            .record_validation_success("registration", "validate-1")
+            .unwrap();
         runtime
             .qualify("registration", Verification::Passed, 100, 1000)
             .unwrap();
@@ -257,12 +273,7 @@ mod tests {
         let runtime = runtime();
         qualify(&runtime);
         let record = runtime
-            .record_runtime_verification(
-                "registration",
-                Verification::Passed,
-                true,
-                false,
-            )
+            .record_runtime_verification("registration", Verification::Passed, true, false)
             .unwrap();
         assert_eq!(record.status, SkillStatus::Quarantined);
         let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());

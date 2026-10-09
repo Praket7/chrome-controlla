@@ -1,7 +1,9 @@
 use controlla_runtime::{
-    runtime_observer::{validate_observation, RuntimeObservation, VerificationPolicy, VerificationStrength},
+    runtime_observer::{
+        RuntimeObservation, VerificationPolicy, VerificationStrength, validate_observation,
+    },
     skill_runtime::{SkillRuntime, SkillRuntimeError},
-    skills::{SkillDefinition, SkillStatus, SKILL_SCHEMA_VERSION},
+    skills::{SKILL_SCHEMA_VERSION, SkillDefinition, SkillStatus},
     verifier::Verification,
 };
 use serde_json::json;
@@ -35,8 +37,12 @@ fn definition() -> SkillDefinition {
 
 fn qualified(runtime: &SkillRuntime) {
     runtime.register_candidate(definition()).unwrap();
-    runtime.record_training_success("fault-skill", "train").unwrap();
-    runtime.record_validation_success("fault-skill", "validate").unwrap();
+    runtime
+        .record_training_success("fault-skill", "train")
+        .unwrap();
+    runtime
+        .record_validation_success("fault-skill", "validate")
+        .unwrap();
     runtime
         .qualify("fault-skill", Verification::Passed, 10, 10_000)
         .unwrap();
@@ -65,9 +71,11 @@ fn severe_safety_failure_quarantines_immediately() {
         .record_runtime_verification("fault-skill", Verification::Passed, true, false)
         .unwrap();
     assert_eq!(record.status, SkillStatus::Quarantined);
-    assert!(runtime
-        .replay("fault-skill", "https://example.test", "sig-v1", 20)
-        .is_err());
+    assert!(
+        runtime
+            .replay("fault-skill", "https://example.test", "sig-v1", 20)
+            .is_err()
+    );
     let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());
 }
 
