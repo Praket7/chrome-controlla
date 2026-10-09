@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "chrome-controlla": {
+      "command": "/absolute/path/to/controlla",
+      "args": ["mcp"],
+      "env": {
+        "CONTROLLA_STATE_DIR": "/absolute/path/to/controlla-state",
+        "CONTROLLA_AGENT_SURFACE": "v3-compact"
+      }
+    }
+  }
+}
