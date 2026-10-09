@@ -795,6 +795,15 @@ impl SharedExtensionSession {
         &self.selected_targets
     }
 
+    pub fn add_selected_target(&mut self, target_id: String) -> Result<(), ProviderError> {
+        if target_id.parse::<u32>().is_err() || !self.selected_targets.insert(target_id) {
+            return Err(ProviderError::Extension(
+                "new Chrome tab ID is invalid or already attached".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn command(
         &self,
         registry: &SessionRegistry,
@@ -3239,11 +3248,15 @@ list.addEventListener('scroll',render);render();
                 assert!(reply.to_text().unwrap().contains("\"type\":\"ready\""));
             }
         );
-        let session = accepted
+        let mut session = accepted
             .expect("legitimate extension still pairs after a bad peer")
             .unwrap();
         assert_eq!(session.selected_targets().len(), 1);
         assert!(session.selected_targets().contains("17"));
+        session.add_selected_target("18".into()).unwrap();
+        assert!(session.selected_targets().contains("18"));
+        assert!(session.add_selected_target("18".into()).is_err());
+        assert!(session.add_selected_target("not-a-tab".into()).is_err());
     }
 
     #[tokio::test]

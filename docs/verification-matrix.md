@@ -394,6 +394,7 @@ Focused verification below ran 2026-10-06 20:37 EDT on implementation commit `20
 | `node tests/guide/check-master-example.mjs` | pass | Node.js local | Parsed the master-guide JSON sample and checked its documented workflow/request fields; this does not call MCP or qualify B35. |
 | Master guide B35 usability | pass (20/20) | Four fresh-agent groups / rebuilt packaged local stdio MCP schema; 2026-10-06 | Separate 5-task groups assessed target/route boundaries, professional app limits, long jobs/unknown outcomes, extraction/resume and file selection. Each group queried the rebuilt server's tool catalog and its per-scenario record is checked in under `docs/review/phase9-b35-*.md`. No browser, app, or external client was connected. |
 | Shared `shared_input` route | pass | macOS 26 / Rust 1.99.0 | Duplex extension-protocol fixture covers event-handler-changed fill readback, stale/ambiguous refusal, click-coordinate refresh, inherited-disabled/offscreen/overlay script guards, plus sequential ASCII key events tied to one retained CDP DOM object. It verifies selector replacement refusal, empty-input no-dispatch, non-ASCII rejection, and injected key-down/character/key-up failures with one bounded key-up retry; a transient release error remains unverified even when retry is acknowledged. This is fixture evidence, not live Chrome extension/app acceptance. |
+| Same-tab navigation continuity (`node extensions/chrome-controlla/test-background.cjs`; `cargo test -p controlla-runtime shared_click_reports_verified_navigation_in_the_same_tab`) | pass | Local extension and MCP fixtures | A committed HTTP(S) navigation refreshes the document binding while retaining the explicitly selected tab; an extension-reported debugger detach during navigation is restored only for that same tab, and failed or unreported navigation still fails closed. The MCP click fixture confirms a new loader and URL are returned as a verified navigation. Fixture evidence only; live Chrome retry is separate. |
 | Fixed-paced shared typing (`cargo test -p controlla-runtime --lib mcp_shared_input_fills_with_readback_and_refuses_stale_or_ambiguous_targets`) | pass | macOS 26 / Rust 1.99.0 | Runtime fixture observed two actual keyDown dispatches at least 60 ms apart; the pace is fixed (non-random), and a 100-character request at the 6 second minimum timeout was rejected before any browser command. Minimum duration is `(character count - 1) × 60 ms`; the action budget reserves 5 seconds of the requested overall timeout for framing/cleanup. CDP events are not OS keyboard input/native IME and are not for bypassing app security or bot checks. This is local fixture evidence only. |
 | `cargo test -p controlla-runtime --lib` | pass, 63/63 | macOS 26 / Rust 1.99.0 | Full runtime library suite passed after the pacing change. |
 | Parse fenced JSON in `docs/clients.md` and `git diff --check` | pass | Python 3 / working tree | Three client JSON config examples parse; whitespace check clean. |
@@ -633,3 +634,24 @@ The enabled local `[mcp_servers.chrome-controlla]` entry was served through the 
 | Session and tab cleanup | pass | `release_shared` confirmed debugger attachments were released. Closed only the agent-created fixture tab. |
 
 This verifies live shared-route fill, typing, guarded clicks, stale-document rejection, re-pairing, and bounded observation on the local fixture. It does not verify file upload, real Google/Canva/CapCut workflows, app save/persistence, nor execution of any remote action. The earlier pending status for this server binary is superseded by this fixture-only live run; it must not be read as an app qualification.
+
+## Shared-tab open and navigation — 2026-10-09
+
+| Check | Result | Evidence and limit |
+|---|---|---|
+| Extension open/navigation protocol | pass, fixture | New active tab was created, attached to the current pairing, and returned its tab ID/URL/document ID; navigating that exact tab reattached and returned its updated URL/document ID. `javascript:` was rejected. |
+| MCP tool registration | pass, local | `shared_tab` is present in `tools/list` with action and URL arguments. Runtime and browser-provider compile/tests pass. |
+| Live extension/session behavior | not run | The changed unpacked extension has not been reloaded into Chrome; no live open/navigation effect is claimed. |
+
+## Efficiency repair evidence (2026-10-09)
+
+| Repair | Evidence | Boundary |
+|---|---|---|
+| Schema cache and maintained task client | 7 Node tests: queued startup, type/required validation, stderr separation, timeout without replay, tool error preservation, schema invalidation, child/startup failure | Not a full general JSON Schema engine; server validation remains authoritative |
+| Result count independent from scan depth | Real Chrome exact target beyond 200 DOM nodes with max_items=1 | 65,536-node scan ceiling remains explicit |
+| Snapshot references and shared click | Real Chrome masked-text, accessible-name, delayed menu, stale node, timeout counter and fragment-navigation regression | Light DOM only; UI outcome is not persistence or causality evidence |
+| Distribution and instructions | Workspace tests, clippy, docs/provenance/client checks, extension fixture suite, package install/upgrade/rollback checks; independent static review | Current app/account task and installed-extension end-to-end test still pending |
+
+## Live extension check after reload — 2026-10-09
+
+Passed through the installed native extension and Hotload: accepted a selected-tab session, opened ESPN in a new foreground tab, read a shared_snapshot, clicked the accessible-label league menu and verified expanded=true, then navigated through an observed Gamecast link. A score-card click first opened a menu rather than navigating; shared_click reported unknown for its unsatisfied navigation outcome, returned the new Gamecast control, and did not replay the action. Clicking that new control verified the destination URL. A subsequent snapshot on the same session reported ready_state=complete, the expected game title and 34 controls. Session release succeeded; the foreground tab was preserved. No re-pair or reconnect was needed after navigation. This qualifies that ESPN flow on this Mac; Classroom account switching and the to-do task remain unverified.

@@ -25,7 +25,7 @@ const manifest = JSON.parse(await readFile(path.join(root, 'packages/chrome-cont
 manifest.os = [os];
 manifest.cpu = [cpu];
 await writeFile(path.join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-for (const file of ['controlla.cjs', 'controlla', 'controlla.cmd']) {
+for (const file of ['controlla.cjs', 'controlla-client.cjs', 'controlla', 'controlla.cmd']) {
   await cp(path.join(root, 'packages/chrome-controlla/bin', file), path.join(target, 'bin', file));
 }
 await cp(core, path.join(target, 'bin', path.basename(core)));

@@ -353,7 +353,8 @@ pub fn observation_command(spec: &ObserveSpec) -> Result<Value, BrowserError> {
         validate_field_name(name)?;
         validate_selector(selector)?;
     }
-    let max_scan_nodes = spec.max_items.saturating_mul(64).clamp(64, 65_536);
+    // A one-item result may live late in the DOM. Bound search independently of output size.
+    let max_scan_nodes = 65_536;
     let expression = json!({"selector":spec.selector,"fields":spec.fields,"limit":spec.max_items,"maxScanNodes":max_scan_nodes,"chars":spec.max_text_chars,"bytes":spec.max_bytes}).to_string();
     let script = observation_page_script(&expression);
     Ok(json!({"expression":script,"returnByValue":true,"awaitPromise":false}))

@@ -3,7 +3,8 @@ use controlla_browser::{
     ObserveSpec, ScreenshotCrop, SessionProvider, connect_permissioned_auto_connect,
     identity_marker_command, list_sessions, observation_command, parse_observation,
     sessions::{
-        IdentityRevisions, ProviderGrants, SessionMode, SessionRegistry, SessionSpec, TargetRef,
+        IdentityRevisions, Ownership, ProviderGrants, SessionMode, SessionRegistry, SessionSpec,
+        TargetRef,
     },
 };
 use rmcp::{
@@ -113,6 +114,14 @@ struct SharedInputArgs {
     postcondition_selector: Option<String>,
     postcondition: Option<String>,
     timeout_ms: Option<u64>,
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SharedTabArgs {
+    session_id: String,
+    action: String,
+    chrome_tab_id: Option<String>,
+    url: String,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -336,6 +345,7 @@ struct LiveSession {
 }
 
 struct SharedLiveSession {
+    snapshots: BTreeMap<String, SharedPageSnapshot>,
     pairing: Option<
         tokio::task::JoinHandle<
             Result<
@@ -366,6 +376,202 @@ impl Drop for SharedLiveSession {
             task.abort();
         }
     }
+}
+
+#[derive(Clone)]
+struct SharedPageSnapshot {
+    token: String,
+    object_id: String,
+    identity: (String, String, String),
+    count: usize,
+    consumed: bool,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SharedSnapshotArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    #[serde(default = "snapshot_scope")]
+    selector: String,
+    #[serde(default = "snapshot_items")]
+    max_items: usize,
+    #[serde(default = "snapshot_chars")]
+    max_text_chars: usize,
+    #[serde(default = "snapshot_bytes")]
+    max_bytes: usize,
+}
+fn snapshot_scope() -> String {
+    "body".into()
+}
+fn snapshot_items() -> usize {
+    60
+}
+fn snapshot_chars() -> usize {
+    2000
+}
+fn snapshot_bytes() -> usize {
+    24000
+}
+
+#[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SharedClickOutcome {
+    Navigation { url: Option<String> },
+    Visible { selector: String },
+    Text { selector: String, text: String },
+    Expanded { selector: Option<String> },
+    Selected { selector: Option<String> },
+}
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SharedClickArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    reference: String,
+    outcome: SharedClickOutcome,
+    timeout_ms: Option<u64>,
+}
+
+fn shared_value(response: &Value) -> Result<Value, String> {
+    if response.get("exceptionDetails").is_some() {
+        return Err("page evaluation failed; take a fresh snapshot".into());
+    }
+    response
+        .pointer("/result/value")
+        .cloned()
+        .ok_or_else(|| "page evaluation omitted value".into())
+}
+
+async fn capture_shared_snapshot(
+    shared: &mut SharedLiveSession,
+    args: &SharedSnapshotArgs,
+) -> Result<Value, String> {
+    if args.selector.is_empty()
+        || args.selector.len() > 512
+        || args.selector.chars().any(char::is_control)
+        || !(1..=200).contains(&args.max_items)
+        || args.max_text_chars > 6000
+        || !(4096..=100000).contains(&args.max_bytes)
+        || args.max_bytes < args.max_text_chars * 6 + 4096
+    {
+        return Err("snapshot limits: 1..200 items, 0..6000 text chars, 4096..100000 bytes; bytes must cover 6*text chars + 4096".into());
+    }
+    let connection = shared
+        .connection
+        .as_ref()
+        .ok_or("shared session is not accepted")?;
+    let registry = shared.registry().map_err(|e| e.to_string())?;
+    let before =
+        shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await?;
+    if let Some(old) = shared.snapshots.get(&args.chrome_tab_id) {
+        let _ = connection
+            .command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.releaseObject",
+                json!({"objectId":old.object_id}),
+            )
+            .await;
+    }
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|e| e.to_string())?;
+    let token = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token});
+    let expression = format!("({})({})", include_str!("shared_page/snapshot.js"), config);
+    let response = connection
+        .command(
+            registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+            "Runtime.evaluate",
+            json!({"expression":expression,"returnByValue":false}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let object_id = response
+        .pointer("/result/objectId")
+        .and_then(Value::as_str)
+        .ok_or("snapshot failed to retain target identities")?
+        .to_owned();
+    let read=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true})).await.map_err(|e|e.to_string());
+    let result = async {
+        let mut value = shared_value(&read?)?;
+        let after =
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                .await?;
+        if before != after {
+            return Err("document changed during snapshot; discard and read once again".into());
+        }
+        value["snapshot_id"] = json!(token);
+        value["chrome_tab_id"] = json!(args.chrome_tab_id);
+        value["document"] = json!({"frame_id":before.0,"loader_id":before.1,"url":before.2});
+        if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > args.max_bytes {
+            return Err("snapshot exceeded byte budget; reduce text/items".into());
+        }
+        Ok(value)
+    }
+    .await;
+    match result {
+        Ok(value) => {
+            let count = value["items"]
+                .as_array()
+                .ok_or("snapshot omitted items")?
+                .len();
+            shared.snapshots.insert(
+                args.chrome_tab_id.clone(),
+                SharedPageSnapshot {
+                    token,
+                    object_id,
+                    identity: before,
+                    count,
+                    consumed: false,
+                },
+            );
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.releaseObject",
+                    json!({"objectId":object_id}),
+                )
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn evaluate_shared_outcome(
+    shared: &SharedLiveSession,
+    tab: &str,
+    snapshot: &SharedPageSnapshot,
+    index: usize,
+    outcome: &SharedClickOutcome,
+    identity: &(String, String, String),
+) -> Result<bool, String> {
+    if let SharedClickOutcome::Navigation { url } = outcome {
+        return Ok(
+            identity != &snapshot.identity && url.as_ref().is_none_or(|url| url == &identity.2)
+        );
+    }
+    let connection = shared.connection.as_ref().ok_or("session not accepted")?;
+    let registry = shared.registry().map_err(|e| e.to_string())?;
+    let function = include_str!("shared_page/outcome.js");
+    let response=if identity==&snapshot.identity {
+        connection.command(registry,&shared.handle,tab,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":function,"arguments":[{"value":outcome},{"value":index}],"returnByValue":true})).await
+    } else {
+        let expression=format!("({function})({},0)",serde_json::to_string(outcome).map_err(|e|e.to_string())?);
+        connection.command(registry,&shared.handle,tab,"Runtime.evaluate",json!({"expression":expression,"returnByValue":true})).await
+    }.map_err(|e|e.to_string())?;
+    Ok(shared_value(&response)? == true)
 }
 
 #[derive(Clone)]
@@ -1086,6 +1292,7 @@ struct SharedTypeGuard<'a> {
 }
 
 const SHARED_TYPE_INTER_CHARACTER_DELAY: Duration = Duration::from_millis(60);
+const SHARED_CLICK_NAVIGATION_GRACE: Duration = Duration::from_secs(3);
 
 fn shared_typing_minimum_duration(character_count: usize) -> Duration {
     SHARED_TYPE_INTER_CHARACTER_DELAY.saturating_mul(
@@ -1202,7 +1409,45 @@ async fn shared_frame_identity(
     let url = frame["url"]
         .as_str()
         .ok_or_else(|| "Page.getFrameTree omitted root frame URL".to_owned())?;
-    Ok((id.to_owned(), loader.to_owned(), url.to_owned()))
+    let fragment = frame["urlFragment"].as_str().unwrap_or("");
+    Ok((id.to_owned(), loader.to_owned(), format!("{url}{fragment}")))
+}
+
+async fn wait_for_shared_frame_change(
+    connection: &controlla_browser::providers::SharedExtensionSession,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    before: &(String, String, String),
+    deadline: tokio::time::Instant,
+) -> Result<(String, String, String), String> {
+    let deadline = std::cmp::min(
+        deadline,
+        tokio::time::Instant::now() + SHARED_CLICK_NAVIGATION_GRACE,
+    );
+    let mut last_error = None;
+    loop {
+        match tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, handle, tab_id),
+        )
+        .await
+        {
+            Ok(Ok(identity)) if &identity != before => return Ok(identity),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                return Err(last_error.unwrap_or_else(|| "tab navigation was not observed".into()));
+            }
+        }
+        let next = tokio::time::Instant::now() + Duration::from_millis(50);
+        if tokio::time::timeout_at(deadline, tokio::time::sleep_until(next))
+            .await
+            .is_err()
+        {
+            return Err(last_error.unwrap_or_else(|| "tab navigation was not observed".into()));
+        }
+    }
 }
 
 #[tool_router]
@@ -1658,6 +1903,7 @@ impl App {
                 shared_sessions.insert(
                     session_id.clone(),
                     Arc::new(Mutex::new(SharedLiveSession {
+                        snapshots: BTreeMap::new(),
                         pairing: Some(tokio::spawn(async move {
                             let connection = provider
                                 .accept_with_timeout(&mut registry, Duration::from_secs(300))
@@ -2020,6 +2266,261 @@ impl App {
     }
 
     #[tool(
+        name = "shared_snapshot",
+        description = "Read a compact visible-page snapshot with actionable references, names, raw values, observed link URLs, readiness and coverage. Default scope is body. References retain DOM identity and expire on the next snapshot, document change or click. Use shared_click with a returned reference; never invent selectors or URLs. Text is an excerpt, not proof that all tasks were listed."
+    )]
+    async fn shared_snapshot(
+        &self,
+        Parameters(args): Parameters<SharedSnapshotArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            capture_shared_snapshot(&mut shared, &args),
+        )
+        .await
+        .map_err(|_| invalid("snapshot timed out; no action dispatched"))?
+        .map_err(invalid)?;
+        Ok(rmcp::handler::server::wrapper::Json(result))
+    }
+
+    #[tool(
+        name = "shared_click",
+        description = "Click exactly one reference from shared_snapshot. No selectors or raw text needed for the target. Declare a bounded outcome: navigation (optional observed destination URL), visible/text selector (may be absent before click), or expanded/selected (defaults to the target). Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+    )]
+    async fn shared_click(
+        &self,
+        Parameters(args): Parameters<SharedClickArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let outcome = json!(args.outcome);
+        if outcome
+            .get("selector")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.is_empty() || s.len() > 512 || s.chars().any(char::is_control))
+            || outcome
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() > 16384)
+            || outcome
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() > 2048)
+        {
+            return Err(invalid("outcome selector/text/URL exceeds bounds"));
+        }
+        let timeout = args.timeout_ms.unwrap_or(10000);
+        if !(1000..=30000).contains(&timeout) {
+            return Err(invalid("timeout_ms must be 1000..30000"));
+        }
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let snapshot = shared
+            .snapshots
+            .get(&args.chrome_tab_id)
+            .cloned()
+            .ok_or_else(|| invalid("take shared_snapshot first"))?;
+        let (token, index) = args
+            .reference
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("invalid reference; use the returned reference unchanged"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid reference index"))?;
+        if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+            return Err(invalid(
+                "stale or consumed reference; take one fresh snapshot before acting",
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
+        let prepare = async {
+            let connection = shared.connection.as_ref().ok_or("session not accepted")?;
+            let registry = shared.registry().map_err(|e| e.to_string())?;
+            let identity =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await?;
+            if identity != snapshot.identity {
+                return Err("stale document; take a fresh snapshot".to_owned());
+            }
+            let guard = include_str!("shared_page/guard.js")
+                .replace("__UNSAFE__", SHARED_CLICK_UNSAFE_PREDICATE);
+            let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
+            let value = shared_value(&response)?;
+            if value["ok"] != true {
+                return Err(format!("target refused: {}", value["reason"]));
+            }
+            if evaluate_shared_outcome(
+                &shared,
+                &args.chrome_tab_id,
+                &snapshot,
+                index,
+                &args.outcome,
+                &identity,
+            )
+            .await?
+            {
+                return Err("outcome already satisfied; no click needed".to_owned());
+            }
+            Ok(guard)
+        };
+        let guard = match tokio::time::timeout_at(deadline, prepare).await {
+            Ok(Ok(guard)) => guard,
+            result => {
+                let reason = match result {
+                    Ok(Err(e)) => e,
+                    _ => "preflight timed out".into(),
+                };
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","reason":reason,"dispatch_acknowledged":false}),
+                ));
+            }
+        };
+        // Consume before dispatch: even a lost reply must not permit a duplicate click with this reference.
+        shared
+            .snapshots
+            .get_mut(&args.chrome_tab_id)
+            .unwrap()
+            .consumed = true;
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("session not accepted"))?;
+        let registry = shared.registry()?;
+        let recheck=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index}],"returnByValue":true}))).await;
+        let checked = match recheck {
+            Ok(Ok(v)) => shared_value(&v).unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        if checked["ok"] != true {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","reason":"target changed during revalidation; take one fresh snapshot","dispatch_acknowledged":false}),
+            ));
+        }
+        let fresh = tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+        )
+        .await;
+        if !matches!(fresh, Ok(Ok(ref identity)) if identity == &snapshot.identity) {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","reason":"document changed before dispatch; take one fresh snapshot","dispatch_acknowledged":false}),
+            ));
+        }
+        let (x, y) = (
+            checked["x"].as_f64().ok_or_else(|| invalid("missing x"))?,
+            checked["y"].as_f64().ok_or_else(|| invalid("missing y"))?,
+        );
+        let press = tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Input.dispatchMouseEvent",
+                json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
+            ),
+        )
+        .await;
+        // Release once even when the press reply was lost; never repeat the press.
+        let release = tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Input.dispatchMouseEvent",
+                json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
+            ),
+        )
+        .await;
+        let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
+        let mut result = json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"});
+        if acknowledged {
+            while tokio::time::Instant::now() < deadline {
+                let check = async {
+                    let identity = shared_frame_identity(
+                        connection,
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                    )
+                    .await?;
+                    let observed = evaluate_shared_outcome(
+                        &shared,
+                        &args.chrome_tab_id,
+                        &snapshot,
+                        index,
+                        &args.outcome,
+                        &identity,
+                    )
+                    .await?;
+                    let after = shared_frame_identity(
+                        connection,
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                    )
+                    .await?;
+                    let verified = observed && identity == after;
+                    Ok::<_, String>((identity, verified))
+                };
+                if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
+                    result = json!({"status":"verified","dispatch_acknowledged":true,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity});
+                    break;
+                }
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::sleep(Duration::from_millis(100)),
+                )
+                .await;
+            }
+        } else {
+            result["reason"] = json!(
+                "mouse dispatch/release uncertain; inspect state before deciding any further action"
+            );
+        }
+        let snapshot_args = SharedSnapshotArgs {
+            session_id: args.session_id,
+            chrome_tab_id: args.chrome_tab_id,
+            selector: snapshot_scope(),
+            max_items: snapshot_items(),
+            max_text_chars: snapshot_chars(),
+            max_bytes: snapshot_bytes(),
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            capture_shared_snapshot(&mut shared, &snapshot_args),
+        )
+        .await
+        {
+            Ok(Ok(next)) => result["snapshot"] = next,
+            Ok(Err(error)) => result["snapshot_error"] = json!(error),
+            Err(_) => {
+                result["snapshot_error"] = json!("snapshot timed out; outcome remains as reported")
+            }
+        }
+        Ok(rmcp::handler::server::wrapper::Json(result))
+    }
+
+    #[tool(
         name = "shared_observe",
         description = "Read a bounded observation from one explicitly paired Chrome tab. Freshness is checked by matching root frame, loader, and URL before and after the read; this route does not create a Direct CDP TargetRef."
     )]
@@ -2227,7 +2728,7 @@ impl App {
 
     #[tool(
         name = "shared_input",
-        description = "Perform guarded fill, nonempty sequential ASCII typing, or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value; typing retains the matched DOM object, requires a focused ordinary text field with a collapsed caret at its end, rechecks object identity and value around each key dispatch and at readback, and waits a fixed 60 ms between characters. Typing is refused before dispatch if its minimum paced duration cannot fit the action budget. This sends CDP key events, not OS hardware input or IME, and must not be used to bypass app security or bot checks. A key release gets at most one bounded retry, but any uncertain dispatch/release is an error. Enforces a 6–60 second overall deadline and checks same root frame, loader, and URL before and after. Readback proves only DOM state, not app save or persistence."
+        description = "Perform guarded fill, nonempty sequential ASCII typing, or click on an explicitly paired Chrome tab. Requires a unique CSS match and exact current value; typing retains the matched DOM object, requires a focused ordinary text field with a collapsed caret at its end, rechecks object identity and value around each key dispatch and at readback, and waits a fixed 60 ms between characters. Typing is refused before dispatch if its minimum paced duration cannot fit the action budget. This sends CDP key events, not OS hardware input or IME, and must not be used to bypass app security or bot checks. A key release gets at most one bounded retry, but any uncertain dispatch/release is an error. Enforces a 6–60 second overall deadline; fill and typing require the same root frame, loader, and URL before and after, while click may return a verified new-document identity for navigation in the same selected tab. Readback proves only DOM state, not app save or persistence."
     )]
     async fn shared_input(
         &self,
@@ -2370,6 +2871,7 @@ impl App {
                 Some("shared input deadline exceeded; effect may have occurred".into()),
             ),
         };
+        let mut click_postcondition_error = None;
         if args.action != "type" && action_error.is_none() && preflight["ok"] != true {
             let detail = preflight["detail"]
                 .as_object()
@@ -2811,16 +3313,16 @@ impl App {
                     json!({"expression":readback_expression,"returnByValue":true,"awaitPromise":false}),
                 )).await {
                     Ok(Ok(readback)) if readback.pointer("/result/value/ok") == Some(&Value::Bool(true)) => {}
-                    Ok(Ok(_)) => action_error = Some("click postcondition did not match; effect may have occurred".into()),
-                    Ok(Err(error)) => action_error = Some(format!("click postcondition readback failed; effect may have occurred: {error}")),
-                    Err(_) => action_error = Some("click postcondition deadline exceeded; effect may have occurred".into()),
+                    Ok(Ok(_)) => click_postcondition_error = Some("click postcondition did not match; effect may have occurred".into()),
+                    Ok(Err(error)) => click_postcondition_error = Some(format!("click postcondition readback failed; effect may have occurred: {error}")),
+                    Err(_) => click_postcondition_error = Some("click postcondition deadline exceeded; effect may have occurred".into()),
                 }
             }
             observed_value = postcondition.to_owned();
         } else {
             observed_value = String::new();
         }
-        let after = tokio::time::timeout_at(
+        let first_after = tokio::time::timeout_at(
             deadline,
             shared_frame_identity(
                 connection,
@@ -2829,19 +3331,89 @@ impl App {
                 &args.chrome_tab_id,
             ),
         )
-        .await
-        .map_err(|_| {
-            invalid("post-action identity readback deadline exceeded; effect may have occurred")
-        })?
-        .map_err(|e| {
-            invalid(format!(
-                "post-action identity readback failed; effect may have occurred: {e}"
-            ))
-        })?;
+        .await;
+        let after = match first_after {
+            Ok(Ok(after)) => after,
+            Ok(Err(error)) if args.action == "click" && action_error.is_none() => {
+                wait_for_shared_frame_change(
+                    connection,
+                    shared.registry()?,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    &before,
+                    deadline,
+                )
+                .await
+                .map_err(|navigation_error| {
+                    invalid(format!(
+                        "post-click identity could not be confirmed ({navigation_error}); effect may have occurred: {error}"
+                    ))
+                })?
+            }
+            Err(_) if args.action == "click" && action_error.is_none() => {
+                wait_for_shared_frame_change(
+                    connection,
+                    shared.registry()?,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    &before,
+                    deadline,
+                )
+                .await
+                .map_err(|navigation_error| {
+                    invalid(format!(
+                        "post-click identity could not be confirmed ({navigation_error}); effect may have occurred"
+                    ))
+                })?
+            }
+            Ok(Err(error)) => {
+                return Err(invalid(format!(
+                    "post-action identity readback failed; effect may have occurred: {error}"
+                )))
+            }
+            Err(_) => {
+                return Err(invalid(
+                    "post-action identity readback deadline exceeded; effect may have occurred",
+                ))
+            }
+        };
+        let should_wait_for_click_navigation =
+            click_postcondition_error.as_deref().is_some_and(|error| {
+                error.contains("readback failed") || error.contains("deadline exceeded")
+            });
+        let after = if args.action == "click"
+            && action_error.is_none()
+            && should_wait_for_click_navigation
+            && before == after
+        {
+            wait_for_shared_frame_change(
+                connection,
+                shared.registry()?,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &before,
+                deadline,
+            )
+            .await
+            .unwrap_or(after)
+        } else {
+            after
+        };
         if before != after {
+            if args.action == "click" && action_error.is_none() {
+                return Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "action":"click","dispatch_acknowledged":true,"navigation_observed":true,
+                    "postcondition":"unavailable_due_to_navigation",
+                    "identity":"same explicitly paired tab; new document observed",
+                    "navigation":{"frame_id":after.0,"loader_id":after.1,"url":after.2}
+                })));
+            }
             return Err(invalid(
                 "shared target changed frame, loader, or URL during input; effect may have occurred",
             ));
+        }
+        if let Some(error) = click_postcondition_error {
+            return Err(invalid(error));
         }
         if let Some(error) = action_error {
             return Err(invalid(error));
@@ -2850,6 +3422,117 @@ impl App {
             "action":args.action,"observed_value":observed_value,"verified":true,
             "identity":"same root frame, loader, and URL before and after"
         })))
+    }
+    #[tool(
+        name = "shared_tab",
+        description = "Open an active Chrome tab or navigate an explicitly paired tab through the native Controlla extension session. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
+    )]
+    async fn shared_tab(
+        &self,
+        Parameters(args): Parameters<SharedTabArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let (scheme, rest) = args
+            .url
+            .split_once("://")
+            .ok_or_else(|| invalid("URL must be HTTP(S) and cannot contain credentials"))?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if !matches!(scheme, "http" | "https")
+            || authority.is_empty()
+            || authority.contains('@')
+            || args.url.len() > 2048
+            || args.url.chars().any(char::is_whitespace)
+        {
+            return Err(invalid(
+                "URL must be HTTP(S), bounded, and cannot contain credentials",
+            ));
+        }
+        if args.action != "open" && args.action != "navigate" {
+            return Err(invalid("shared_tab action must be open or navigate"));
+        }
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let method = if args.action == "open" {
+            "Controlla.openTab"
+        } else {
+            "Controlla.navigate"
+        };
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let source = if args.action == "open" {
+            let candidates = connection.selected_targets().clone();
+            let registry = shared.registry()?;
+            let probe = async {
+                for target in candidates {
+                    if connection
+                        .command(
+                            registry,
+                            &shared.handle,
+                            &target,
+                            "Page.getFrameTree",
+                            Value::Null,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        return Some(target);
+                    }
+                }
+                None
+            };
+            tokio::time::timeout(Duration::from_secs(5), probe)
+                .await
+                .map_err(|_| invalid("timed out finding an attached source tab"))?
+                .ok_or_else(|| invalid("shared session has no currently attached source tab"))?
+        } else {
+            args.chrome_tab_id
+                .clone()
+                .ok_or_else(|| invalid("chrome_tab_id is required for navigation"))?
+        };
+        let result = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?
+            .command(
+                shared.registry()?,
+                &shared.handle,
+                &source,
+                method,
+                json!({"url":args.url}),
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let tab_id = result["tab_id"]
+            .as_str()
+            .filter(|id| id.parse::<u32>().is_ok())
+            .ok_or_else(|| invalid("extension returned an invalid tab ID"))?
+            .to_owned();
+        if args.action == "open" {
+            let session_id = shared.handle.id.clone();
+            shared
+                .registry
+                .as_mut()
+                .ok_or_else(|| invalid("shared registry is unavailable"))?
+                .register_tab(&session_id, tab_id.clone(), Ownership::Borrowed)
+                .map_err(|e| invalid(format!("cannot register opened tab: {e:?}")))?;
+            shared
+                .connection
+                .as_mut()
+                .ok_or_else(|| invalid("shared connection is unavailable"))?
+                .add_selected_target(tab_id)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        Ok(rmcp::handler::server::wrapper::Json(result))
     }
     #[tool(
         name = "extract",
@@ -3359,7 +4042,7 @@ fn bootstrap_instructions() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Use tools/list for current argument schemas. Start with session discovery; connect only to explicitly selected target IDs, then use returned target references. Read the versioned guide resource for full instructions. Registered tools: {registered}."
+        "Cache tools/list schemas. Pair selected tabs once; snapshot then click returned references. Never replay unknown effects. Read guide as needed. Tools: {registered}."
     )
 }
 
@@ -3739,6 +4422,14 @@ mod tests {
         let server_task = tokio::spawn(async move { server.waiting().await });
         let client = ().serve(client_io).await.unwrap();
         let listed = client.list_tools(None).await.unwrap();
+        let shared_tab = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "shared_tab")
+            .expect("shared tab open/navigation tool is registered");
+        let shared_tab_schema = serde_json::to_value(&shared_tab.input_schema).unwrap();
+        assert!(shared_tab_schema["properties"]["action"].is_object());
+        assert!(shared_tab_schema["properties"]["url"].is_object());
         for name in ["observe", "shared_observe"] {
             let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
@@ -3839,6 +4530,7 @@ mod tests {
         assert!(names.contains(&"artifact_verify"));
         assert!(names.contains(&"file_select"));
         assert!(names.contains(&"shared_observe"));
+        assert!(names.contains(&"shared_tab"));
         assert!(names.contains(&"guide"));
         assert!(names.contains(&"app_capabilities"));
         assert!(names.contains(&"slides_plan_text_edit"));
@@ -5618,4 +6310,105 @@ mod tests {
         client.cancel().await.unwrap();
         let _ = server_task.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn shared_click_reports_observed_navigation_without_claiming_causality() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let server = serve_directly::<RoleServer, _, _, _, _>(App::default(), server_io, None);
+        let server_task = tokio::spawn(async move { server.waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let args = |value: Value| value.as_object().unwrap().clone();
+        let paired = client
+            .call_tool(
+                CallToolRequestParams::new("session").with_arguments(args(json!({
+                    "action":"pair_shared","target_ids":["123"]
+                }))),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let endpoint = paired["endpoint"].as_str().unwrap().to_owned();
+        let token = paired["one_session_token"].as_str().unwrap().to_owned();
+        let session_id = paired["session_id"].as_str().unwrap().to_owned();
+        let accept = client.call_tool(CallToolRequestParams::new("session").with_arguments(args(
+            json!({
+                "action":"accept_shared","session_id":session_id
+            }),
+        )));
+        let extension = async move {
+            let (mut socket, _) = connect_async(endpoint).await.unwrap();
+            socket.send(Message::Text(json!({"type":"hello","token":token,
+                "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"targets":["123"]
+            }).to_string().into())).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+        };
+        let (accepted, mut extension) = tokio::join!(accept, extension);
+        assert_eq!(
+            accepted.unwrap().structured_content.unwrap()["accepted"],
+            true
+        );
+        let extension_task = tokio::spawn(async move {
+            let mut frame_reads = 0;
+            let mut eval_reads = 0;
+            while let Some(Ok(message)) = extension.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "Page.getFrameTree" => {
+                        frame_reads += 1;
+                        let (loader, url) = if frame_reads == 1 {
+                            ("doc-before", "https://fixture.test/team")
+                        } else {
+                            ("doc-after", "https://fixture.test/story")
+                        };
+                        json!({"type":"result","id":request["id"],"result":{"frameTree":{"frame":{"id":"root","loaderId":loader,"url":url}}}})
+                    }
+                    "Runtime.evaluate" => {
+                        eval_reads += 1;
+                        if eval_reads <= 2 {
+                            json!({"type":"result","id":request["id"],"result":{"result":{"type":"object","value":{"ok":true,"x":10.0,"y":20.0,"postcondition_before_is_desired":false}}}})
+                        } else {
+                            json!({"type":"result","id":request["id"],"error":"Execution context was destroyed by navigation."})
+                        }
+                    }
+                    "Input.dispatchMouseEvent" => {
+                        json!({"type":"result","id":request["id"],"result":{}})
+                    }
+                    _ => panic!("unexpected shared command: {method}"),
+                };
+                extension
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let clicked = client
+            .call_tool(
+                CallToolRequestParams::new("shared_input").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","selector":"a.story",
+                    "action":"click","expected_value":"Story","value":"",
+                    "postcondition_selector":"main h1","postcondition":"Story"
+                }))),
+            )
+            .await
+            .unwrap();
+        let result = clicked.structured_content.unwrap();
+        assert_eq!(result["navigation_observed"], true);
+        assert_eq!(result["dispatch_acknowledged"], true);
+        assert!(result.get("verified").is_none());
+        assert_eq!(result["navigation"]["url"], "https://fixture.test/story");
+        assert_eq!(result["navigation"]["loader_id"], "doc-after");
+        extension_task.abort();
+        client.cancel().await.unwrap();
+        let _ = server_task.await.unwrap();
+    }
 }
+
+#[cfg(test)]
+#[path = "shared_page_tests.rs"]
+mod shared_page_tests;

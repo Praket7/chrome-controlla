@@ -50,6 +50,7 @@ expect_archive_entry() {
     fi
 }
 expect_archive_entry 'package/bin/controlla.cjs'
+expect_archive_entry 'package/bin/controlla-client.cjs'
 expect_archive_entry 'package/LICENSE'
 expect_archive_entry 'package/NOTICE'
 if [ "$(node -p 'process.platform')" = win32 ]; then

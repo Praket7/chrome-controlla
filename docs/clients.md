@@ -33,6 +33,8 @@ The popup's endpoint/token form is used when `host_id` is omitted, including whe
 
 Pairing trusts the MCP client that supplies the tab IDs: use it only through a client you trust. Chrome displays its debugger indicator for attached tabs; separate browser-side per-tab approval beyond that indicator has not been established.
 
+After `accept_shared`, use `shared_tab` for direct navigation: `action:"open"` plus `url` creates an active tab and adds it to the same session; `action:"navigate"` also requires the exact `chrome_tab_id`. URLs are bounded HTTP(S) without credentials. The result includes the tab ID, final URL, and fresh document ID. If navigation fails, rediscover and pair the tab again before using it.
+
 Live qualification is narrow: on 2026-10-09, the enabled local MCP entry and loaded extension paired one agent-created local fixture tab over the native route. Guarded fill, typing, fixture slide clicks, mock in-memory post, navigation invalidation/re-pair, bounded readback, release, and tab cleanup succeeded. The file-input attempt was blocked and no file was selected. These checks do not establish remote app changes or persistence. Classroom writes, app acceptance/persistence, and broad client compatibility remain unqualified; see `verification-matrix.md` for details.
 
 Generate the dated config shape for a client with `node integrations/generate-config.mjs <client> /absolute/path/to/controlla /absolute/path/to/state-root`. Supported IDs are `freebuff`, `opencode-v1`, `opencode-v2`, and `claude`; OpenCode versions have different nesting. Each output gives that client its own state subdirectory. These versioned templates are configuration examples, not proof that an installed client accepts them. ChatGPT is intentionally omitted because this preview has neither local-stdio support there nor an authenticated remote endpoint.
@@ -127,3 +129,23 @@ ChatGPT does not connect directly to a local stdio process. This branch has no a
 4. If setup fails, run `controlla doctor` locally and preserve its report. Do not infer browser reachability from tool listing.
 
 The CLI config schemas were checked against [Freebuff MCP config loading](https://github.com/CodebuffAI/freebuff/blob/main/sdk/src/agents/load-mcp-config.ts), [OpenCode v1 MCP docs](https://thdxr.dev.opencode.ai/docs/mcp-servers/), [OpenCode v2 MCP docs](https://opencode.ai/v2/docs/mcp-servers/), and [Claude Code MCP docs](https://code.claude.com/docs/en/mcp) on 2026-10-06. [ChatGPT's MCP setup documentation](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt) says ChatGPT connects to remote MCP servers, not local stdio servers. Run `npm run check:clients` to verify generated config shapes and per-client state isolation; this local check is not client acceptance.
+
+## Maintained standalone task client
+
+Use registered Controlla tools first, including a scoped Hotload search when available. This fallback is for hosts that do not expose those tools. It is a task helper, not a replacement MCP server entry.
+
+After staging/installing the local package, run `controlla-client`. From a checkout:
+
+```sh
+node packages/chrome-controlla/bin/controlla-client.cjs --server "$PWD/target/release/controlla" --server-arg mcp
+```
+
+Keep stdin open for the task (use a persistent terminal/PTY when the shell tool otherwise closes stdin). Send one JSON object per line. Startup performs MCP initialization and lists schemas once. Query a selected full schema before calling that tool:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"name":"shared_snapshot"}}
+```
+
+Tool calls use `method:"tools/call"`, with `params.name` and `params.arguments` exactly as that schema declares. IDs remain strings where declared. Local validation rejects misspelled fields and wrong types before dispatch. Compact replies prefer structured content; stderr is separate. Schema changes require restarting the helper. Timeouts are never retried automatically; a tool-call timeout is an unknown outcome.
+
+Close stdin after cleanup to end the child process. Interrupts and failed startup also close it, with bounded termination escalation. Use `--state-dir /absolute/path` only for an intentionally separate client. If ownership is busy, use or stop the existing owner; do not evade the conflict with random state directories. Restarting this helper loses in-memory sessions, so reconnect deliberately.

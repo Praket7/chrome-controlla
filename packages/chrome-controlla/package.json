@@ -4,7 +4,8 @@
   "description": "Package-relative Chrome Controlla CLI launcher and platform binary",
   "license": "Apache-2.0",
   "bin": {
-    "controlla": "bin/controlla.cjs"
+    "controlla": "bin/controlla.cjs",
+    "controlla-client": "bin/controlla-client.cjs"
   },
   "files": [
     "bin/",

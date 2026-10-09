@@ -26,10 +26,14 @@ const tabUrlOverrides = new Map();
 const tabDocumentOverrides = new Map();
 const reloadDuringAttach = new Set();
 const replaceDuringAttach = new Set();
+const failAttach = new Set();
 let tabsUpdated;
 let tabsReplaced;
 let navigationBefore;
 let navigationCommitted;
+let navigationError;
+let debuggerDetached;
+let nextCreatedTab = 500;
 const expectedUrls = ids => Object.fromEntries(ids.map(id => [id, `https://example.test/${id}`]));
 const expectedDocuments = ids => Object.fromEntries(ids.map(id => [id, `document-${id}`]));
 class FakeWebSocket {
@@ -67,12 +71,14 @@ const chrome = {
   },
   tabs: {
     async query() { return tabList; },
+    async create({ url }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete" }; tabList.push(tab); return tab; },
+    async update(tabId, { url }) { const tab = tabList.find(tab => tab.id === tabId); if (!tab) throw new Error("missing tab"); tab.url = url; tab.status = "complete"; tabUrlOverrides.set(tabId, url); tabDocumentOverrides.set(tabId, `${tabDocumentOverrides.get(tabId) || `document-${tabId}`}-next`); return tab; },
     async get(tabId) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("No tab with id: " + tabId);
       return { ...tab, url: tabUrlOverrides.has(tabId) ? tabUrlOverrides.get(tabId) : tab.url };
     },
-    onUpdated: { addListener(callback) { tabsUpdated = callback; } },
+    onUpdated: { addListener(callback) { tabsUpdated = callback; }, removeListener() {} },
     onReplaced: { addListener(callback) { tabsReplaced = callback; } },
   },
   webNavigation: {
@@ -90,6 +96,7 @@ const chrome = {
     },
     onBeforeNavigate: { addListener(callback) { navigationBefore = callback; } },
     onCommitted: { addListener(callback) { navigationCommitted = callback; } },
+    onErrorOccurred: { addListener(callback) { navigationError = callback; } },
   },
   runtime: {
     getManifest() { return { version: "0.1.0" }; },
@@ -99,6 +106,7 @@ const chrome = {
   },
   debugger: {
     async attach({ tabId }) {
+      if (failAttach.delete(tabId)) throw new Error("fixture attach failure");
       attached.push(tabId);
       if (reloadDuringAttach.delete(tabId)) {
         tabsUpdated(tabId, { status: "loading" });
@@ -118,7 +126,7 @@ const chrome = {
       }
       return { accepted: true };
     },
-    onDetach: { addListener() {} },
+    onDetach: { addListener(callback) { debuggerDetached = callback; } },
   },
 };
 vm.runInNewContext(fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8"), {
@@ -152,6 +160,29 @@ function message(payload) {
   assert.deepEqual([...new Set(attached)], [41, 43], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
   assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true }));
+  native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const opened = native.sent.at(-1);
+  assert.equal(opened.id, "open-tab");
+  assert.equal(opened.result.tab_id, "500");
+  assert.equal(opened.result.url, "https://www.espn.com/");
+  assert.equal(opened.result.document_id, "document-500-next");
+  assert.ok(attached.includes(500), "the opened tab joins the existing native session");
+  native.hostMessage({ type: "command", id: "navigate-tab", target_id: "500", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const navigated = native.sent.at(-1);
+  assert.equal(navigated.result.tab_id, "500");
+  assert.equal(navigated.result.url, "https://www.espn.com/nfl/");
+  assert.equal(navigated.result.document_id, "document-500-next-next");
+  native.hostMessage({ type: "command", id: "unsafe-url", target_id: "41", method: "Controlla.openTab", params: { url: "javascript:alert(1)" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.at(-1).error, /HTTP\(S\)/);
+  failAttach.add(501);
+  native.hostMessage({ type: "command", id: "failed-open", target_id: "41", method: "Controlla.openTab", params: { url: "https://example.test/failed" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.at(-1).error, /Tab 501 remains open/);
+  assert.match(native.sent.at(-1).error, /fixture attach failure/);
+  assert.ok(tabList.some(tab => tab.id === 501), "a failed open preserves the page so user edits cannot be lost");
   native.hostMessage({ type: "command", id: "dom", target_id: "41", method: "DOM.getDocument", params: {} });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(debuggerCalls.at(-1).method, "DOM.getDocument");
@@ -383,7 +414,7 @@ function message(payload) {
   assert.ok(!attached.includes(60) || detached.includes(60), "refused pairing leaves no debugger attachment");
   tabUrlOverrides.delete(60);
 
-  // Mid-session navigation detaches the paired tab.
+  // Navigation keeps the selected tab session and refreshes its document binding.
   liveNative.hostMessage({ type: "pair", request_id: "pair-nav", tab_ids: [62], expected_urls: { 62: "https://example.test/62" }, expected_document_ids: expectedDocuments([62]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).type, "paired");
@@ -393,7 +424,7 @@ function message(payload) {
   assert.ok(!detached.includes(62), "same-URL navigation keeps the pairing");
   tabsUpdated(62, { url: "https://example.test/replaced" });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.ok(detached.includes(62), "navigation to a different document detaches the paired tab");
+  assert.ok(detached.includes(62), "a URL change without navigation lifecycle events fails closed");
 
   // A same-URL reload during debugger attachment must fail closed for the
   // native path, even though the tab URL is unchanged before and after.
@@ -415,10 +446,20 @@ function message(payload) {
     expected_urls: expectedUrls([67]), expected_document_ids: expectedDocuments([67]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).type, "paired");
+  const priorNavigationAttachCount = attached.filter(tabId => tabId === 67).length;
   tabDocumentOverrides.set(67, "replacement-document-67");
-  navigationCommitted({ tabId: 67, frameId: 0, documentId: "replacement-document-67" });
+  tabUrlOverrides.set(67, "https://example.test/67/story");
+  navigationBefore({ tabId: 67, frameId: 0, url: "https://example.test/67/story" });
+  debuggerDetached({ tabId: 67 }, "target_closed");
+  navigationCommitted({ tabId: 67, frameId: 0, documentId: "replacement-document-67", url: "https://example.test/67/story" });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.ok(detached.includes(67), "a committed same-URL document replacement detaches the paired tab");
+  assert.ok(!detached.includes(67), "a committed navigation keeps the selected tab attached");
+  assert.equal(attached.filter(tabId => tabId === 67).length, priorNavigationAttachCount + 1,
+    "a debugger detach during navigation is restored only for the same selected tab");
+  liveNative.hostMessage({ type: "command", id: "command-after-navigation", target_id: "67", method: "DOM.getDocument", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).id, "command-after-navigation");
+  assert.equal(liveNative.sent.at(-1).error, undefined, "commands use the refreshed document identity");
 
   liveNative.hostMessage({ type: "pair", request_id: "document-command-guard", tab_ids: [68],
     expected_urls: expectedUrls([68]), expected_document_ids: expectedDocuments([68]) });
@@ -430,6 +471,35 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(debuggerCalls.length, callsBeforeDocumentGuard, "commands fail closed when the current document ID changed");
   assert.match(liveNative.sent.at(-1).error, /document identity changed/);
+
+  liveNative.hostMessage({ type: "pair", request_id: "late-navigation-detach", tab_ids: [72],
+    expected_urls: expectedUrls([72]), expected_document_ids: expectedDocuments([72]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).type, "paired");
+  const lateDetachAttachCount = attached.filter(tabId => tabId === 72).length;
+  tabDocumentOverrides.set(72, "replacement-document-72");
+  tabUrlOverrides.set(72, "https://example.test/72/story");
+  navigationBefore({ tabId: 72, frameId: 0, url: "https://example.test/72/story" });
+  navigationCommitted({ tabId: 72, frameId: 0, documentId: "replacement-document-72", url: "https://example.test/72/story" });
+  debuggerDetached({ tabId: 72 }, "target_closed");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(!detached.includes(72), "a debugger detach delivered after commit preserves the selected pairing");
+  assert.equal(attached.filter(tabId => tabId === 72).length, lateDetachAttachCount + 1,
+    "a late detach restores the committed document attachment");
+
+  liveNative.hostMessage({ type: "pair", request_id: "user-detach-during-grace", tab_ids: [73],
+    expected_urls: expectedUrls([73]), expected_document_ids: expectedDocuments([73]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  navigationBefore({ tabId: 73, frameId: 0, url: "https://example.test/73/story" });
+  navigationCommitted({ tabId: 73, frameId: 0, documentId: "replacement-document-73", url: "https://example.test/73/story" });
+  const userDetachAttachCount = attached.filter(tabId => tabId === 73).length;
+  debuggerDetached({ tabId: 73 }, "canceled_by_user");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  liveNative.hostMessage({ type: "command", id: "user-detach-cleared", target_id: "73", method: "DOM.getDocument", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(liveNative.sent.at(-1).error, /not attached/);
+  assert.equal(attached.filter(tabId => tabId === 73).length, userDetachAttachCount,
+    "user cancellation never triggers automatic reattachment");
 
   liveNative.hostMessage({ type: "pair", request_id: "document-auth-race", tab_ids: [70],
     expected_urls: expectedUrls([70]), expected_document_ids: expectedDocuments([70]) });
@@ -445,7 +515,8 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(debuggerCalls.length, callsBeforeAuthRace, "navigation during document lookup revokes authorization before dispatch");
   assert.equal(liveNative.sent.at(-1).id, "navigation-auth-race");
-  assert.match(liveNative.sent.at(-1).error, /no longer attached/);
+  assert.match(liveNative.sent.at(-1).error, /navigating/);
+  assert.ok(!detached.includes(70), "a navigation race pauses commands without dropping the tab session");
 
   liveNative.hostMessage({ type: "pair", request_id: "detach-repair", tab_ids: [71],
     expected_urls: expectedUrls([71]), expected_document_ids: expectedDocuments([71]) });
@@ -453,18 +524,19 @@ function message(payload) {
   assert.equal(liveNative.sent.at(-1).type, "paired");
   blockedDetach = { tabId: 71 };
   navigationBefore({ tabId: 71, frameId: 0 });
+  navigationError({ tabId: 71, frameId: 0, error: "net::ERR_ABORTED" });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(typeof blockedDetach.resolve, "function", "navigation began its guarded debugger detach");
+  assert.equal(typeof blockedDetach.resolve, "function", "failed navigation drops the tab session");
   const priorAttachments = attached.filter(tabId => tabId === 71).length;
   liveNative.hostMessage({ type: "pair", request_id: "repair-after-detach", tab_ids: [71],
     expected_urls: expectedUrls([71]), expected_document_ids: expectedDocuments([71]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(attached.filter(tabId => tabId === 71).length, priorAttachments,
-    "re-pair waits for an in-flight navigation detach");
+    "re-pair waits for an in-flight navigation failure detach");
   blockedDetach.resolve();
   blockedDetach = undefined;
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(liveNative.sent.at(-1).type, "paired", "re-pair proceeds after the prior detach settles");
+  assert.equal(liveNative.sent.at(-1).type, "paired", "re-pair proceeds after the failed-navigation detach settles");
 
   liveNative.hostMessage({ type: "release" });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -476,13 +548,12 @@ function message(payload) {
   await nativePairFrame;
   assert.ok(attached.includes(72), "native pair attaches its first tab before stalling on the next");
   blockedDetach = { tabId: 72 };
-  tabList.find(tab => tab.id === 72).status = "loading";
-  tabsUpdated(72, { status: "loading" });
-  tabList.find(tab => tab.id === 72).status = "complete";
+  navigationBefore({ tabId: 72, frameId: 0 });
+  navigationError({ tabId: 72, frameId: 0, error: "net::ERR_ABORTED" });
   const attachmentsBeforePopupRepair = attached.filter(tabId => tabId === 72).length;
   const popupRepairDuringPair = await message({ type: "pair", endpoint: "ws://127.0.0.1:1234/", token: "queued-detach", tabIds: [72] });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(typeof blockedDetach.resolve, "function", "navigation detach is pending while the native queue is busy");
+  assert.equal(typeof blockedDetach.resolve, "function", "failed-navigation detach is pending while the native queue is busy");
   assert.equal(popupRepairDuringPair.ok, false, "popup repair refuses a tab with a native pairing reservation");
   assert.equal(attached.filter(tabId => tabId === 72).length, attachmentsBeforePopupRepair,
     "popup loser does not attach concurrently with native pairing");
@@ -492,7 +563,7 @@ function message(payload) {
   const popupRepair = message({ type: "pair", endpoint: "ws://127.0.0.1:1234/", token: "queued-detach-retry", tabIds: [72] });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(attached.filter(tabId => tabId === 72).length, attachmentsBeforePopupRepair,
-    "popup retry waits for the pending native navigation detach");
+    "popup retry waits for the pending native failure detach");
   blockedDetach.resolve();
   blockedDetach = undefined;
   assert.equal((await popupRepair).ok, true, "popup retry proceeds after navigation detach settles");

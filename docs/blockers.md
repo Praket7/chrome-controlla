@@ -99,3 +99,11 @@ External-client live qualification and platform-specific interference observatio
 ## Phase 10 preregistration boundary
 
 - The 30-task pilot and disjoint 100-task held-out manifest, task-clustered analysis, and rejection rules are checked locally. The current held-out split digest is `b14d325e932a540ca8f66e58efb43bb8732d75c7676329269e3987ba039e08e8`; it is bound to offline-planner candidate commit `b0a7c7c1634a993523c69577289d20ac2f97ff93`. The validator rejects mismatched freezes and incomplete/unverified result rows. Baseline package pins and source revisions are recorded, but supported execution configurations and model identity/version remain unresolved. No benchmark task, pilot, held-out comparison, or AGWC ablation has run.
+
+## Current efficiency repair boundary (2026-10-09)
+
+The new shared_snapshot/shared_click path and maintained client are implemented and locally checked. The real Chrome regression uses a fixture extension transport. The actual refreshed Chrome extension, Classroom account switch and today/tomorrow to-do task have not been rerun with this build. Reload the extension before that live check; older notes saying no reload is needed do not apply to this repair. Snapshot coverage excludes iframe/shadow roots and is bounded; empty excerpts never establish an empty task list.
+
+## Live extension check after reload — 2026-10-09
+
+Passed through the installed native extension and Hotload: accepted a selected-tab session, opened ESPN in a new foreground tab, read a shared_snapshot, clicked the accessible-label league menu and verified expanded=true, then navigated through an observed Gamecast link. A score-card click first opened a menu rather than navigating; shared_click reported unknown for its unsatisfied navigation outcome, returned the new Gamecast control, and did not replay the action. Clicking that new control verified the destination URL. A subsequent snapshot on the same session reported ready_state=complete, the expected game title and 34 controls. Session release succeeded; the foreground tab was preserved. No re-pair or reconnect was needed after navigation. This qualifies that ESPN flow on this Mac; Classroom account switching and the to-do task remain unverified.
