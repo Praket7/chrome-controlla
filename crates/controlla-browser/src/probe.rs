@@ -45,12 +45,7 @@ pub struct VisualTargetRef {
 }
 
 impl VisualTargetRef {
-    pub fn valid_for(
-        &self,
-        binding: VisualBinding<'_>,
-        now_ms: u64,
-        max_age_ms: u64,
-    ) -> bool {
+    pub fn valid_for(&self, binding: VisualBinding<'_>, now_ms: u64, max_age_ms: u64) -> bool {
         !self.content_hash.is_empty()
             && self.region.valid()
             && self.target_id == binding.target_id
