@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "input": {
+    "task_id": "string",
+    "mode": "cold_unknown|warm_known|warm_skill",
+    "concurrency": "1|2|4|8",
+    "fixture_url": "string",
+    "deadline_ms": "integer"
+  },
+  "output_required": [
+    "adapter","task_id","mode","concurrency","success","independently_verified_success",
+    "wall_ms","model_round_trips","model_tokens","mcp_calls","browser_ops","observation_bytes",
+    "screenshot_bytes","retries","recovery_events","cache_status","verification_ms","cpu_ms",
+    "peak_rss_bytes","focus_disruptions","clipboard_disruptions","human_interventions",
+    "severe_wrong_target_events","authority_violations","silent_stale_mutations"
+  ],
+  "rules": [
+    "same Chrome version viewport reset model prompt budget and task deadline across structured adapters",
+    "failed runs retain elapsed or capped wall time and are not removed from latency analysis",
+    "computer-use is reported as a separate vision track",
+    "adapters may report unsupported but may not silently replace a requested task with an easier one",
+    "all mutating tasks use an independent verifier outside the acting adapter"
+  ]
+}

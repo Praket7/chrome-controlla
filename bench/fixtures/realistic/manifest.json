@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {"id":"registration-form","covers":["forms","human_interference","repeated_workflow"]},
+    {"id":"records-table","covers":["extraction"]},
+    {"id":"paired-tabs","covers":["multitab","concurrent_tabs"]},
+    {"id":"spa-router","covers":["spa","stale_navigation","renderer_replacement"]},
+    {"id":"canvas-widget","covers":["visual_canvas","canvas"]},
+    {"id":"virtual-list","covers":["virtual_list","infinite_scroll"]},
+    {"id":"file-input","covers":["upload","file_download"]},
+    {"id":"workflow-suite","covers":["long_workflow","dialogs_overlays","contenteditable","shadow_dom","iframes"]}
+  ],
+  "reset_contract": [
+    "fresh fixture state per measured run",
+    "same viewport and Chrome build across compared structured adapters",
+    "no retained cookies storage or tabs unless the benchmark mode explicitly requests warm state",
+    "independent verifier state is outside the acting adapter"
+  ]
+}

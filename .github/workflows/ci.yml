@@ -34,6 +34,7 @@ jobs:
       - run: npm run check:clients
       - run: npm run check:apps
       - run: npm run check:bench
+      - run: npm run check:release
       - run: node extensions/chrome-controlla/test-background.cjs
       - run: node --check extensions/chrome-controlla/background.js
       - run: ./scripts/check-dependencies.sh

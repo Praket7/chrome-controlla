@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "generated_for": "best-chrome-use-v2",
+  "qualification_rule": "fixture evidence may validate engine behavior but never substitutes for remote app persistence evidence",
+  "classes": [
+    {"id":"traditional_forms","fixture_status":"covered","live_status":"not_required","evidence":"semantic refs plus guarded fill/select/readback"},
+    {"id":"react","fixture_status":"covered","live_status":"pending","evidence":"replacement/stale-node policy"},
+    {"id":"vue","fixture_status":"covered","live_status":"pending","evidence":"replacement/stale-node policy"},
+    {"id":"angular","fixture_status":"covered","live_status":"pending","evidence":"replacement/stale-node policy"},
+    {"id":"contenteditable","fixture_status":"covered","live_status":"pending","evidence":"fast input fails closed to adapter/strict route"},
+    {"id":"shadow_dom","fixture_status":"covered","live_status":"pending","evidence":"semantic/probe harness contract"},
+    {"id":"iframes","fixture_status":"covered","live_status":"pending","evidence":"frame/document revision binding"},
+    {"id":"virtual_lists","fixture_status":"covered","live_status":"pending","evidence":"bounded observation and cursor contract"},
+    {"id":"infinite_scroll","fixture_status":"covered","live_status":"pending","evidence":"bounded extraction contract"},
+    {"id":"dialogs_overlays","fixture_status":"covered","live_status":"pending","evidence":"guarded click and visible outcome"},
+    {"id":"drag_drop","fixture_status":"contract_only","live_status":"pending","evidence":"requires explicit adapter qualification"},
+    {"id":"file_download","fixture_status":"covered","live_status":"pending","evidence":"artifact broker and guarded file selection"},
+    {"id":"canvas","fixture_status":"contract_only","live_status":"pending","evidence":"targeted probe/native adapter route"},
+    {"id":"spa_navigation","fixture_status":"covered","live_status":"pending","evidence":"document invalidation and fresh refs"},
+    {"id":"human_interference","fixture_status":"covered","live_status":"pending","evidence":"expected-value guards and stale revision rejection"},
+    {"id":"renderer_replacement","fixture_status":"covered","live_status":"pending","evidence":"unknown delivery and re-observe-before-retry policy"}
+  ],
+  "named_apps": {
+    "google_slides":{"status":"pending","required_evidence":["remote mutation","reload persistence","independent verification"]},
+    "canva":{"status":"pending","required_evidence":["remote mutation","reload persistence","independent verification"]},
+    "capcut_web":{"status":"pending","required_evidence":["remote mutation","reload persistence","independent verification"]}
+  },
+  "narrow_local_evidence": {
+    "date":"2026-10-09",
+    "status":"passed",
+    "scope":["native pairing","fixture fill","strict typing","fixture slide click","mock post","navigation invalidation","bounded readback","release and cleanup"],
+    "excluded_claims":["remote application mutation","remote persistence","broad app compatibility"]
+  }
+}

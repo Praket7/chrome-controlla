@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod artifacts;
+pub mod browser_workflow;
 pub mod cache;
 pub mod canva;
 pub mod capability;
@@ -15,6 +16,7 @@ pub mod native_host;
 pub mod native_setup;
 pub mod runtime_observer;
 pub mod semantic_state;
+pub mod skill_runtime;
 pub mod skill_store;
 pub mod skills;
 pub mod slides_deck;

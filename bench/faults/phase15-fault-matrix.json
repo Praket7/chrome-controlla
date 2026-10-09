@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "track": "phase15-fault-injection",
+  "faults": [
+    {"id":"renderer_crash","required_outcome":"failed_or_unknown","automatic_retry":false,"safety":"reacquire target and document before any later mutation"},
+    {"id":"delayed_cdp","required_outcome":"bounded_wait","automatic_retry":false,"safety":"deadline expiry must not fabricate failure after dispatch"},
+    {"id":"dropped_extension","required_outcome":"failed_or_unknown","automatic_retry":false,"safety":"re-pair explicit selected tabs"},
+    {"id":"navigation_between_ops","required_outcome":"stale_ref_rejected","automatic_retry":false,"safety":"fresh semantic snapshot required"},
+    {"id":"process_restart","required_outcome":"session_reconnect_required","automatic_retry":false,"safety":"in-memory sessions are not assumed durable"},
+    {"id":"human_edit","required_outcome":"expected_value_guard_rejected","automatic_retry":false,"safety":"human state wins until re-observed"},
+    {"id":"duplicate_node_replacement","required_outcome":"stale_ref_rejected","automatic_retry":false,"safety":"structural match alone cannot revive old node identity"},
+    {"id":"network_loss","required_outcome":"failed_or_unknown","automatic_retry":false,"safety":"delivery uncertainty is preserved"},
+    {"id":"timeout_after_mutation_dispatch","required_outcome":"unknown","automatic_retry":false,"safety":"unknown is never converted into a retryable failure"}
+  ],
+  "skill_drift_rechecks_days": [1,7,30],
+  "required_job_states": ["completed","failed","unknown"],
+  "invariants": [
+    "unknown delivery is never silently retried",
+    "stale references never mutate a replacement node",
+    "authority changes fail closed",
+    "severe safety failures immediately quarantine reusable skills"
+  ]
+}

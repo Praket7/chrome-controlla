@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "track": "phase11-realistic",
+  "frozen_phase10_unchanged": true,
+  "modes": ["cold_unknown","warm_known","warm_skill"],
+  "concurrency": [1,2,4,8],
+  "task_classes": [
+    "forms","extraction","multitab","spa","visual_canvas","virtual_list","upload",
+    "repeated_workflow","interference","stale_navigation","long_workflow","concurrent_tabs"
+  ],
+  "tasks": [
+    {"id":"form-guarded-fill","class":"forms","fixture":"registration-form","requires_independent_verification":true},
+    {"id":"structured-extraction","class":"extraction","fixture":"records-table","requires_independent_verification":true},
+    {"id":"two-tab-compare","class":"multitab","fixture":"paired-tabs","requires_independent_verification":true},
+    {"id":"spa-document-change","class":"spa","fixture":"spa-router","requires_independent_verification":true},
+    {"id":"canvas-targeted-probe","class":"visual_canvas","fixture":"canvas-widget","requires_independent_verification":true},
+    {"id":"virtual-list-find","class":"virtual_list","fixture":"virtual-list","requires_independent_verification":true},
+    {"id":"guarded-upload","class":"upload","fixture":"file-input","requires_independent_verification":true},
+    {"id":"repeat-qualified-flow","class":"repeated_workflow","fixture":"registration-form","requires_independent_verification":true},
+    {"id":"human-edit-race","class":"interference","fixture":"registration-form","requires_independent_verification":true},
+    {"id":"stale-after-navigation","class":"stale_navigation","fixture":"spa-router","requires_independent_verification":true},
+    {"id":"bounded-long-flow","class":"long_workflow","fixture":"workflow-suite","requires_independent_verification":true},
+    {"id":"eight-tab-pressure","class":"concurrent_tabs","fixture":"paired-tabs","requires_independent_verification":true}
+  ],
+  "adapters": [
+    {"id":"controlla","track":"structured"},
+    {"id":"playwright-mcp","track":"structured"},
+    {"id":"chrome-devtools-mcp","track":"structured"},
+    {"id":"agent-browser","track":"structured"},
+    {"id":"stagehand","track":"structured"},
+    {"id":"browser-use","track":"structured"},
+    {"id":"computer-use","track":"separate-vision"}
+  ],
+  "required_metrics": [
+    "success","independently_verified_success","severe_wrong_target_events","authority_violations",
+    "silent_stale_mutations","wall_ms","model_round_trips","model_tokens","mcp_calls","browser_ops",
+    "observation_bytes","screenshot_bytes","retries","recovery_events","cache_status","verification_ms",
+    "cpu_ms","peak_rss_bytes","focus_disruptions","clipboard_disruptions","human_interventions"
+  ],
+  "claim_gates": {
+    "success_noninferiority_lower_bound": -0.02,
+    "minimum_model_round_trip_reduction": 0.30,
+    "minimum_median_wall_time_reduction": 0.25,
+    "maximum_severe_wrong_target_events": 0,
+    "maximum_authority_violations": 0,
+    "maximum_silent_stale_mutations": 0
+  }
+}
