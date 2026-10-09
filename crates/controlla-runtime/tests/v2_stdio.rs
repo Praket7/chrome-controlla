@@ -3,7 +3,11 @@ use rmcp::{
     model::{ClientConfig, Implementation, ProtocolVersion},
     transport::child_process::TokioChildProcess,
 };
-use std::{collections::BTreeSet, path::PathBuf, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use tokio::process::Command;
 
 #[derive(Clone)]
@@ -35,7 +39,10 @@ async fn compact_v2_advertises_full_guarded_execution_surface() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_controlla-v2"));
     command.env("CONTROLLA_STATE_DIR", &state_dir);
     let transport = TokioChildProcess::new(command).expect("spawn compact v2 MCP server");
-    let client = Client.serve(transport).await.expect("initialize compact v2");
+    let client = Client
+        .serve(transport)
+        .await
+        .expect("initialize compact v2");
     let tools = client.list_tools(None).await.unwrap();
     let names = tools
         .tools
@@ -65,7 +72,10 @@ async fn compact_v2_advertises_full_guarded_execution_surface() {
     assert!(act["properties"].get("key").is_some());
     let probe = schema("browser_probe");
     for property in ["reference", "selector", "region"] {
-        assert!(probe["properties"].get(property).is_some(), "probe {property}");
+        assert!(
+            probe["properties"].get(property).is_some(),
+            "probe {property}"
+        );
     }
     let skill = schema("browser_skill");
     for property in [
@@ -75,7 +85,10 @@ async fn compact_v2_advertises_full_guarded_execution_surface() {
         "expires_at_ms",
         "severe_safety_failure",
     ] {
-        assert!(skill["properties"].get(property).is_some(), "skill {property}");
+        assert!(
+            skill["properties"].get(property).is_some(),
+            "skill {property}"
+        );
     }
     let workflow_text = serde_json::to_string(&schema("browser_workflow")).unwrap();
     for step in [
@@ -94,7 +107,10 @@ async fn compact_v2_advertises_full_guarded_execution_surface() {
         "checkpoint",
         "script",
     ] {
-        assert!(workflow_text.contains(step), "workflow schema contains {step}");
+        assert!(
+            workflow_text.contains(step),
+            "workflow schema contains {step}"
+        );
     }
 
     client.cancel().await.unwrap();
