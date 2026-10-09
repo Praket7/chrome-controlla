@@ -10,7 +10,7 @@ The extension batch path now requires the negotiated capability, reauthorizes ea
 
 The v3 client matrix verifies generated configuration and adapter contracts for Freebuff, OpenCode, Claude Code, Codex, ChatGPT Desktop, and generic MCP. It explicitly records real-client smoke status as unverified. The WebMCP descriptor route and bounded schema validator are unit-tested, but browser discovery and invocation are not wired into the selected-tab MCP route. Headless stress covers eight isolated real Chrome profiles locally and in the new Ubuntu lane; it does not establish full headed-background parity or crash/reconnect recovery.
 
-The v3 plan remains open for real user-interference and multi-client browser races, complete mode/typing event semantics, app-level authenticated persistence and file acceptance, live client qualification, integrated WebMCP execution, and controlled competitor runs. The broad superiority gate remains blocked without complete real competitor evidence.
+Repository-controlled verification passed locally and on the pushed head `f724637cf5c9121c6ebaa3bde420c1c133a9e417`. Hosted runs [37994625965](https://github.com/Praket7/chrome-controlla/actions/runs/37994625965) and [37994621542](https://github.com/Praket7/chrome-controlla/actions/runs/37994621542) passed the Linux, macOS, Windows, and headless/background stress jobs. The v3 plan remains open for real user-interference and multi-client browser races, complete mode/typing event semantics, app-level authenticated persistence and file acceptance, live client qualification, integrated WebMCP execution, and controlled competitor runs. The broad superiority gate remains blocked without complete real competitor evidence.
 
 ## Implemented engine foundations
 

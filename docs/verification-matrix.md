@@ -9,7 +9,7 @@
 | Extension batch and background harnesses | pass | `node extensions/chrome-controlla/test-background.cjs`; `node extensions/chrome-controlla/test-v3-batch.cjs`; JS syntax check. Batch tests cover stale guard early-stop and no later dispatch. |
 | Node/client/app/benchmark/release checks | pass | Node 24.19.0 / npm 11.17.0 after `npm ci`; `check:docs`, `check:provenance`, `check:clients`, `check:apps`, `check:bench`, `check:release`, and `check:v3`. Generated benchmark rows remain ineligible as real evidence. |
 | Dependency and package checks | pass, macOS arm64 | `scripts/check-dependencies.sh`, `scripts/package-build.sh`, and `scripts/package-check.sh`; packaged plugin discovery confirms the six v3 tools. No published install is claimed. |
-| Hosted Linux/macOS/Windows CI | pending | Run against the pushed PR head. |
+| Hosted Linux/macOS/Windows CI and headless/background stress | pass | GitHub runs [37994625965](https://github.com/Praket7/chrome-controlla/actions/runs/37994625965) and [37994621542](https://github.com/Praket7/chrome-controlla/actions/runs/37994621542), exact head `f724637cf5c9121c6ebaa3bde420c1c133a9e417`; both passed all Ubuntu, macOS, Windows, and stress jobs. |
 | Real competitor/client qualification | not run / unverified | External competitor runtimes/credentials and live client workflows were not available in this local verification. The claim gate remains blocked. |
 
 ## Source-audit repair follow-up — 2026-10-08

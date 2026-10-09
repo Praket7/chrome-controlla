@@ -25,7 +25,7 @@ This ledger supersedes the initial unchecked template only where it cites curren
 | WebMCP | Partial | Descriptor routing and a fail-closed bounded input-schema validator have unit coverage. Discovery and invocation are not connected to the live selected-tab MCP route. |
 | Headless/background recovery | Partial | An ignored real-Chrome stress test opens and closes eight isolated headless profiles; Ubuntu CI now has a headless/background stress lane. Crash/reconnect injection and headed-background user-interference parity remain open. |
 | Competitor evidence and release gate | Blocked on external measurements | Harness contracts and fail-closed claim tests pass. No controlled real competitor results exist; broad superiority claims remain disabled. |
-| Full verification | In progress | See `docs/verification/best-chrome-use-status.md` and `docs/verification-matrix.md`; hosted CI must pass on the pushed head. |
+| Repository-controlled verification | Pass on pushed head | Local checks and hosted Linux/macOS/Windows matrix plus headless/background stress passed at `f724637cf5c9121c6ebaa3bde420c1c133a9e417`; see `docs/verification-matrix.md`. The overall v3 plan remains partial and is not release-qualified. |
 
 ## Global Constraints
 
