@@ -2,8 +2,8 @@ use controlla_runtime::v3::{BrowserMode, InteractionEpoch, RecoveryClass, Typing
 use controlla_runtime::v3_runtime::{
     BatchAction, BatchActionKind, BrowserLaunchPlan, ClientKind, ClientQualification,
     DEFAULT_AGENT_TOOLS, PageToolAuthority, PageToolCall, PageToolProgram, ReconnectController,
-    ReconnectDecision, TypingPlan, compact_tool_surface_valid, execute_guarded_batch,
-    result_within_budget,
+    ReconnectDecision, TypingPlan, await_key_batch, compact_tool_surface_valid,
+    execute_guarded_batch, result_within_budget,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -33,6 +33,20 @@ fn browser_modes_produce_explicit_launch_plans() {
     assert!(background.chrome_args.contains(&"--start-minimized"));
     assert!(headless.chrome_args.contains(&"--headless=new"));
     assert_eq!(headless.provider, "dedicated_headless");
+}
+
+#[tokio::test]
+async fn key_batch_waiting_stops_at_the_callers_deadline() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+    let result = await_key_batch(
+        deadline,
+        tokio::time::sleep(std::time::Duration::from_millis(20)),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an expired batch deadline must stop waiting for delivery"
+    );
 }
 
 #[test]

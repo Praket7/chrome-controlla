@@ -278,10 +278,11 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
     let mut progress = expected.to_owned();
     let preflight = {
         let connection = shared.connection.as_ref().unwrap();
-        let response = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+        let response = crate::v3_runtime::await_key_batch(deadline, connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
             "objectId":snapshot.object_id,"functionDeclaration":guard_function,
             "arguments":[{"value":index},{"value":progress}],"returnByValue":true
-        })).await.map_err(|error| invalid(error.to_string()))?;
+        }))).await.map_err(|_| invalid("type preflight timed out; no key dispatched"))?
+            .map_err(|error| invalid(error.to_string()))?;
         super::super::shared_value(&response).map_err(invalid)?
     };
     if preflight["ok"] != true {
@@ -315,14 +316,21 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
                 progress.push(*character);
             }
             let connection = shared.connection.as_ref().unwrap();
-            let result = connection
-                .command_batch(
+            let result = match crate::v3_runtime::await_key_batch(
+                deadline,
+                connection.command_batch(
                     shared.registry()?,
                     &shared.handle,
                     &args.chrome_tab_id,
                     actions,
-                )
-                .await;
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,
+                    "reason":"fast-key batch exceeded its deadline; inspect state and do not automatically retry"})),
+            };
             let result = match result {
                 Ok(result) => result,
                 Err(error) => return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,

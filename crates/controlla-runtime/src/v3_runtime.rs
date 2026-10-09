@@ -10,6 +10,7 @@ use crate::v3::{BrowserMode, EpochUse, InteractionEpoch, RecoveryClass, TypingMo
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::future::Future;
 
 pub const DEFAULT_AGENT_TOOLS: [&str; 6] = [
     "browser", "snapshot", "act", "workflow", "extract", "verify",
@@ -17,6 +18,13 @@ pub const DEFAULT_AGENT_TOOLS: [&str; 6] = [
 pub const MAX_BATCH_ACTIONS: usize = 64;
 pub const MAX_PAGE_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_RESULT_BYTES: usize = 512 * 1024;
+
+pub async fn await_key_batch<F: Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout_at(deadline, future).await
+}
 
 pub struct PageToolProgram;
 
