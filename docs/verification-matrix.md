@@ -10,7 +10,7 @@
 | Page-tool route contracts | pass, fixture/unit scope | Rust tests cover bounded `document.modelContext` discovery/invocation against an in-process fixture, timeout-triggered `AbortSignal`, schema-drift rejection before execution, input schemas, unsupported tool names/schemas, consumed-snapshot rejection, fallback stop receipts, and exception-to-unknown delivery. No live WebMCP page or app-cooperative cancellation test has run. |
 | Node/client/app/benchmark/release checks | pass | Node 24.19.0 / npm 11.17.0 after `npm ci`; `check:docs`, `check:provenance`, `check:clients`, `check:apps`, `check:bench`, `check:release`, and `check:v3`. Generated benchmark rows remain ineligible as real evidence. |
 | Dependency and package checks | pass, macOS arm64 | `scripts/check-dependencies.sh`, `scripts/package-build.sh`, and `scripts/package-check.sh`; packaged plugin discovery confirms the six v3 tools. No published install is claimed. |
-| Hosted Linux/macOS/Windows CI and headless/background stress | pass | GitHub run [37998710107](https://github.com/Praket7/chrome-controlla/actions/runs/37998710107), exact head `5ea60c1d21fad882478af78e1136f5125f524356`; Ubuntu, macOS, Windows, and stress jobs passed. |
+| Hosted Linux/macOS/Windows CI and headless/background stress | pass | GitHub run [38000377763](https://github.com/Praket7/chrome-controlla/actions/runs/38000377763), exact head `29b557caaab31068fb60b30d0c2fd2eb1a5e8c40`; Ubuntu, macOS, Windows, and stress jobs passed. |
 | Real competitor/client qualification | not run / unverified | External competitor runtimes/credentials and live client workflows were not available in this local verification. The claim gate remains blocked. |
 
 ## Source-audit repair follow-up — 2026-10-08
