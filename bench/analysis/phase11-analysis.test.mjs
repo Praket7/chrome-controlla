@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzePaired, evaluateClaimGate } from './phase11-analysis.mjs';
+import { analyzePaired, effectiveSuccess, evaluateClaimGate } from './phase11-analysis.mjs';
 
 const winningRows = Array.from({ length: 24 }, (_, index) => ({
   task_id: `task-${index}`,
@@ -45,4 +45,22 @@ test('latency accounting retains failed runs rather than conditioning on success
   const report = analyzePaired(rows, { iterations: 500, seed: 5 });
   assert.equal(report.paired_rows, 4);
   assert.ok(report.candidate_median_wall_ms >= 700);
+});
+
+test('independent verification overrides a self-reported acting success', () => {
+  assert.equal(effectiveSuccess({ success: true, independently_verified_success: false }), false);
+  assert.equal(effectiveSuccess({ success: true, independently_verified_success: true }), true);
+  assert.equal(effectiveSuccess({ success: false, independently_verified_success: true }), false);
+  assert.equal(effectiveSuccess({ success: true }), true);
+
+  const rows = structuredClone(winningRows.slice(0, 4));
+  for (const row of rows) {
+    row.candidate.independently_verified_success = true;
+    row.baseline.independently_verified_success = true;
+  }
+  rows[0].candidate.independently_verified_success = false;
+  const report = analyzePaired(rows, { iterations: 500, seed: 9 });
+  assert.equal(report.candidate_verified_successes, 3);
+  assert.equal(report.baseline_verified_successes, 4);
+  assert.equal(report.success_delta, -0.25);
 });
