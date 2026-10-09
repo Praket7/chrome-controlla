@@ -146,7 +146,11 @@ impl SkillRecord {
         self.recent_outcomes
             .push_back(verification == Verification::Passed);
         if self.recent_outcomes.len() == OUTCOME_WINDOW {
-            let passed = self.recent_outcomes.iter().filter(|passed| **passed).count();
+            let passed = self
+                .recent_outcomes
+                .iter()
+                .filter(|passed| **passed)
+                .count();
             if passed * 100 < MINIMUM_PASS_PERCENT * OUTCOME_WINDOW {
                 self.quarantine("rolling verification pass rate below 60 percent");
             }

@@ -140,14 +140,12 @@ impl SemanticMemory {
             } else {
                 let reference = format!("@c{}", self.next_ref);
                 self.next_ref = self.next_ref.saturating_add(1);
-                self.stable_to_short
-                    .insert(stable_key, reference.clone());
+                self.stable_to_short.insert(stable_key, reference.clone());
                 reference
             };
             item["reference"] = json!(short);
             item["index"] = json!(index);
-            self.short_to_legacy
-                .insert(short.clone(), legacy_reference);
+            self.short_to_legacy.insert(short.clone(), legacy_reference);
             self.items.insert(short, item.clone());
             public_items.push(item);
         }
@@ -231,7 +229,9 @@ mod tests {
             .ingest(
                 document("https://example.test/form"),
                 "s1",
-                vec![json!({"reference":"legacy:0","role":"textbox","name":"Email","raw_value":""})],
+                vec![
+                    json!({"reference":"legacy:0","role":"textbox","name":"Email","raw_value":""}),
+                ],
             )
             .unwrap();
         assert_eq!(first.items[0]["reference"], "@c1");

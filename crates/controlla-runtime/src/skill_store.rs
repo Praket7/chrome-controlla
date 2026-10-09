@@ -1,5 +1,8 @@
 use crate::skills::SkillRecord;
-use std::{collections::BTreeMap, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 const MAX_SKILLS: usize = 1024;
 const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024;
@@ -68,7 +71,9 @@ impl SkillStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temp = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let temp = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
         std::fs::write(&temp, bytes)?;
         if let Err(first_error) = std::fs::rename(&temp, &self.path) {
             if self.path.exists() {

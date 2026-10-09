@@ -125,6 +125,9 @@ mod tests {
             max_age_ms: 5,
             minimum_strength: VerificationStrength::FreshPageState,
         };
-        assert_eq!(validate_observation(policy, "r7", 20, &observation), Verification::Inconclusive);
+        assert_eq!(
+            validate_observation(policy, "r7", 20, &observation),
+            Verification::Inconclusive
+        );
     }
 }
