@@ -115,10 +115,10 @@ fn workflow_find_reference(found: &Value) -> Result<String, rmcp::ErrorData> {
 
 fn validate_workflow_steps(steps: &[V3WorkflowStep]) -> Result<(), rmcp::ErrorData> {
     if steps.iter().enumerate().any(|(index, step)| {
-        matches!(step, V3WorkflowStep::PageTool { .. })
+        matches!(step, V3WorkflowStep::PageTool { .. } | V3WorkflowStep::Press { .. })
             && !matches!(steps.get(index + 1), Some(V3WorkflowStep::Verify { .. }))
     }) {
-        return Err(invalid("page_tool must be followed immediately by runtime verification"));
+        return Err(invalid("press and page_tool steps must be followed immediately by runtime verification"));
     }
     Ok(())
 }
@@ -801,13 +801,19 @@ mod v3_batch_delivery_tests {
     }
 
     #[test]
-    fn workflow_requires_runtime_verification_after_page_tools() {
+    fn workflow_requires_runtime_verification_after_unverified_effects() {
         let page_tool = V3WorkflowStep::PageTool { name: "submit".into(), input: json!({}) };
         let fill = V3WorkflowStep::Fill { reference: "@c1".into(), expected_value: "".into(), value: "x".into() };
         assert!(validate_workflow_steps(&[page_tool, fill]).is_err());
         let page_tool = V3WorkflowStep::PageTool { name: "submit".into(), input: json!({}) };
         let verify = V3WorkflowStep::Verify { predicate: BrowserPredicate::Url { equals: "https://example.test/ok".into() } };
         assert!(validate_workflow_steps(&[page_tool, verify]).is_ok());
+        let press = V3WorkflowStep::Press { reference: "@c1".into(), key: "Enter".into() };
+        let fill = V3WorkflowStep::Fill { reference: "@c1".into(), expected_value: "".into(), value: "x".into() };
+        assert!(validate_workflow_steps(&[press, fill]).is_err());
+        let press = V3WorkflowStep::Press { reference: "@c1".into(), key: "Enter".into() };
+        let verify = V3WorkflowStep::Verify { predicate: BrowserPredicate::Url { equals: "https://example.test/ok".into() } };
+        assert!(validate_workflow_steps(&[press, verify]).is_ok());
     }
 
     #[test]
