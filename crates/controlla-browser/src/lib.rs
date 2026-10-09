@@ -1,14 +1,26 @@
 #![deny(unsafe_code)]
 
 mod blocking;
+mod input;
 mod manager;
+pub mod native;
+mod observe;
 pub mod providers;
 pub mod scheduler;
 mod session;
 pub mod sessions;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
+pub use input::{
+    FileSelectionEvidence, GuardDecision, GuardSnapshot, GuardedFileSelection, GuardedInput,
+    InputAction, InputOutcome, InvalidationSet, SemanticLocator, on_external_change, validate_step,
+};
 pub use manager::BrowserManager;
+pub use observe::{
+    AccessibilityObservation, Completeness, ExpansionControl, ExtractionResult, ExtractionSpec,
+    Observation, ObserveSpec, ScreenshotCrop, ScreenshotObservation, identity_marker_command,
+    observation_command, parse_observation,
+};
 pub use session::{
     BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,
     connect_permissioned_auto_connect, list_sessions, select_provider,
@@ -269,9 +281,13 @@ pub struct BrowserConnection {
     events: broadcast::Sender<BrowserEvent>,
     event_replay: Arc<Mutex<VecDeque<BrowserEvent>>>,
     event_sequence: Arc<AtomicU64>,
+    pub(crate) extraction_cursors: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl BrowserConnection {
+    pub fn instance_id(&self) -> u128 {
+        self.instance_id
+    }
     pub async fn connect(url: &str) -> Result<Self, BrowserError> {
         use futures_util::{SinkExt, StreamExt};
         let instance_id = new_browser_instance_id()?;
@@ -403,6 +419,7 @@ impl BrowserConnection {
             events,
             event_replay,
             event_sequence,
+            extraction_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1876,6 +1893,423 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_text_actions_use_revision_bound_cdp_and_race_yields() {
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (race_event_seen_tx, race_event_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"input-tab","type":"page","url":"https://fixture.test/"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"input-session","targetInfo":{"targetId":"input-tab","type":"page"}}}),
+                serde_json::json!({"sessionId":"input-session","method":"Page.frameNavigated","params":{"frame":{"id":"input-frame","loaderId":"input-load","url":"https://fixture.test/"}}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let mut methods = Vec::new();
+            let mut guard_started = None;
+            let mut measured_window_micros = 0;
+            let mut race_event_seen_rx = Some(race_event_seen_rx);
+            let dom_value = |value: &str| serde_json::json!({"ok":true,"count":1,"tag":"INPUT","type":"text","editable":false,"disabled":false,"visible":true,"rect":{"x":0,"y":0,"width":100,"height":20},"hit":true,"token":"fixture-node","value":value,"selectionStart":value.encode_utf16().count(),"selectionEnd":value.encode_utf16().count()});
+            while methods.len() < 32 {
+                let msg = socket.next().await.unwrap().unwrap();
+                let req: Value = serde_json::from_str(&msg.to_string()).unwrap();
+                if methods.is_empty() {
+                    guard_started = Some(std::time::Instant::now());
+                }
+                methods.push(req["method"].as_str().unwrap().to_owned());
+                let n = methods.len();
+                if n == 3 {
+                    measured_window_micros = guard_started.unwrap().elapsed().as_micros();
+                    assert!(
+                        req["params"]["expression"]
+                            .as_str()
+                            .unwrap()
+                            .contains("e.value!==\"\"")
+                    );
+                }
+                let method = req["method"].as_str().unwrap();
+                let response = if method != "Runtime.evaluate" {
+                    serde_json::json!({"id":req["id"],"sessionId":"input-session","result":{}})
+                } else {
+                    let value = match n {
+                        1 => dom_value(""),
+                        2 | 6 | 7 | 11 | 12 | 14 | 16 => Value::Bool(true),
+                        3 => serde_json::json!({"stale":false,"applied":true}),
+                        4 | 5 | 8 => dom_value("héllo 👋"),
+                        9 | 10 => dom_value("héllo 👋!"),
+                        13 | 15 | 17 => Value::Bool(true),
+                        18 | 19 | 24 | 31 | 32 => dom_value("héllo 👋!a"),
+                        20 | 23 | 25 | 26 | 30 | 33 => Value::Bool(true),
+                        21 | 22 | 27 | 28 | 29 => Value::Bool(true),
+                        _ => panic!("unexpected evaluate request {n}"),
+                    };
+                    serde_json::json!({"id":req["id"],"sessionId":"input-session","result":{"result":{"type":if value.is_object(){"object"}else{"boolean"},"value":value}}})
+                };
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+                if n == 32 {
+                    socket.send(Message::Text(serde_json::json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"input-tab","type":"page","url":"https://fixture.test/raced"}}}).to_string().into())).await.unwrap();
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        race_event_seen_rx.take().unwrap(),
+                    )
+                    .await
+                    .expect("client did not observe the injected target change")
+                    .expect("race event observer was dropped");
+                }
+            }
+            assert!(
+                timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "mutation callback must be withheld after target revision changes"
+            );
+            (methods, measured_window_micros)
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut registry = crate::sessions::SessionRegistry::new(crate::sessions::ProviderGrants {
+            dedicated_headed: true,
+            ..Default::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: crate::sessions::SessionMode::Headed,
+                    selected_target_ids: vec![],
+                },
+                "fixture-principal",
+            )
+            .unwrap();
+        registry
+            .bind_session_to_browser(&session, connection.instance_id)
+            .unwrap();
+        let reference = timeout(Duration::from_secs(1), async {
+            loop {
+                if connection
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .contains_key("input-tab")
+                    && connection
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .contains_key("input-frame")
+                {
+                    registry
+                        .register_tab(
+                            &session.id,
+                            "input-tab",
+                            crate::sessions::Ownership::Borrowed,
+                        )
+                        .unwrap();
+                    break connection
+                        .capture_target_ref(&registry, &session, "input-tab", "input-frame", 1, 1)
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snap = crate::input::GuardSnapshot {
+            navigation: 1,
+            account: 1,
+            document: 1,
+            dependencies: ["field:a".into()].into_iter().collect(),
+            strict_background: true,
+            requires_native: false,
+        };
+        let mut stale = snap.clone();
+        stale.account += 1;
+        let locator = crate::input::SemanticLocator::Css("input[name='x']".into());
+        let unsafe_action = crate::input::InputAction::Fill("unsafe".into());
+        assert!(matches!(
+            connection
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "fixture-principal",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snap,
+                        current: &stale,
+                        locator: &locator,
+                        action: &unsafe_action,
+                        expected_value: "",
+                    }
+                )
+                .await,
+            Err(BrowserError::StaleReference(_))
+        ));
+        let fill = crate::input::InputAction::Fill("héllo 👋".into());
+        let outcome = connection
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snap,
+                    current: &snap,
+                    locator: &locator,
+                    action: &fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome,crate::input::InputOutcome::Applied{observed_value:Some(v),..} if v=="héllo 👋")
+        );
+        let insert = crate::input::InputAction::Insert("!".into());
+        let inserted = connection
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snap,
+                    current: &snap,
+                    locator: &locator,
+                    action: &insert,
+                    expected_value: "héllo 👋",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(inserted,crate::input::InputOutcome::Applied{observed_value:Some(v),..} if v=="héllo 👋!")
+        );
+        let keys = crate::input::InputAction::SequentialKeys("a".into());
+        let typed = connection
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snap,
+                    current: &snap,
+                    locator: &locator,
+                    action: &keys,
+                    expected_value: "héllo 👋!",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(typed,crate::input::InputOutcome::Applied{observed_value:Some(v),..} if v=="héllo 👋!a")
+        );
+        let click = crate::input::InputAction::Click {
+            x: 25.0,
+            y: 10.0,
+            postcondition: crate::input::ClickPostcondition::Value("héllo 👋!a".into()),
+        };
+        assert_eq!(
+            connection
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "fixture-principal",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snap,
+                        current: &snap,
+                        locator: &locator,
+                        action: &click,
+                        expected_value: "héllo 👋!a",
+                    }
+                )
+                .await
+                .unwrap(),
+            crate::input::InputOutcome::NeedsForeground
+        );
+        let foreground = snap.clone();
+        let mut foreground = foreground;
+        foreground.strict_background = false;
+        let clicked = connection
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground,
+                    current: &foreground,
+                    locator: &locator,
+                    action: &click,
+                    expected_value: "héllo 👋!a",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            clicked,
+            crate::input::InputOutcome::Applied {
+                postcondition_verified: true,
+                ..
+            }
+        ));
+        let drag = crate::input::InputAction::Drag {
+            from: (25.0, 10.0),
+            to: (30.0, 10.0),
+            postcondition: crate::input::DragPostcondition {
+                left: 20.0,
+                top: 5.0,
+                tolerance: 1.0,
+            },
+        };
+        let dragged = connection
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground,
+                    current: &foreground,
+                    locator: &locator,
+                    action: &drag,
+                    expected_value: "héllo 👋!a",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            dragged,
+            crate::input::InputOutcome::Applied {
+                postcondition_verified: true,
+                ..
+            }
+        ));
+        let raced_ref = connection
+            .capture_target_ref(&registry, &session, "input-tab", "input-frame", 1, 1)
+            .await
+            .unwrap();
+        let race_observer = connection.clone();
+        let race_event_seen = tokio::spawn(async move {
+            loop {
+                let event = race_observer
+                    .next_event(Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                if event["method"] == "Target.targetInfoChanged"
+                    && event["params"]["targetInfo"]["url"] == "https://fixture.test/raced"
+                {
+                    break;
+                }
+            }
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if race_observer.targets.read().await.targets["input-tab"]
+                        .url
+                        .as_deref()
+                        == Some("https://fixture.test/raced")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("target graph did not apply the injected change");
+            let _ = race_event_seen_tx.send(());
+        });
+        let overwrite = crate::input::InputAction::Fill("overwrite".into());
+        let race = connection
+            .perform_guarded_input(
+                &registry,
+                &raced_ref,
+                "fixture-principal",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snap,
+                    current: &snap,
+                    locator: &locator,
+                    action: &overwrite,
+                    expected_value: "héllo 👋!a",
+                },
+            )
+            .await;
+        assert!(matches!(race, Err(BrowserError::StaleReference(_))));
+        race_event_seen.await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.targets.read().await.targets["input-tab"]
+                    .url
+                    .as_deref()
+                    == Some("https://fixture.test/raced")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (methods, measured_window_micros) = server.await.unwrap();
+        assert!(measured_window_micros > 0 && measured_window_micros < 5_000_000);
+        println!("CDP fixture probe-to-fill dispatch interval: {measured_window_micros} us");
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "Input.insertText")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "Input.dispatchKeyEvent")
+                .count(),
+            3
+        );
+        assert!(
+            methods.len() < 33,
+            "the raced fill request must be withheld"
+        );
+    }
+
+    #[tokio::test]
     async fn blocked_browser_target_does_not_block_healthy_target_dispatch() {
         use tokio_tungstenite::tungstenite::Message;
 
@@ -1994,6 +2428,7 @@ mod tests {
             events: broadcast::channel(8).0,
             event_replay: Arc::new(Mutex::new(VecDeque::new())),
             event_sequence: Arc::new(AtomicU64::new(0)),
+            extraction_cursors: Arc::new(Mutex::new(HashMap::new())),
         };
         connection.targets.write().await.apply_created(target());
         let result = connection
@@ -2050,6 +2485,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = registry
             .create_session(
@@ -2234,6 +2670,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = registry
             .create_session(
@@ -2404,6 +2841,7 @@ mod tests {
             dedicated_headed: true,
             dedicated_headless: false,
             shared_extension: false,
+            direct_cdp: false,
         });
         let session = sessions
             .create_session(

@@ -163,10 +163,10 @@ fn now_ms() -> u128 {
 }
 
 /// Discover local browser surfaces without connecting to anything.
-/// Check if the companion extension native host is registered on this platform.
-fn native_bridge_available() -> bool {
+/// Registration alone does not prove a live extension round trip.
+fn native_bridge_registered() -> bool {
     #[allow(unused_variables)]
-    let host_id = "comptrol_browser_bridge";
+    let host_id = "chrome_controlla_bridge";
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -189,7 +189,7 @@ fn native_bridge_available() -> bool {
         std::process::Command::new("reg")
             .args([
                 "query",
-                "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\comptrol_browser_bridge",
+                "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\chrome_controlla_bridge",
                 "/ve",
             ])
             .output()
@@ -208,7 +208,7 @@ pub fn list_sessions() -> Vec<BrowserSession> {
     let chrome_endpoint_detected = chrome_user_data_dirs()
         .iter()
         .any(|user_data_dir| find_devtools_active_port(user_data_dir).is_some());
-    let companion_available = native_bridge_available();
+    let companion_registered = native_bridge_registered();
     vec![
         BrowserSession {
             provider: SessionProvider::PermissionedAutoConnect,
@@ -227,12 +227,13 @@ pub fn list_sessions() -> Vec<BrowserSession> {
         },
         BrowserSession {
             provider: SessionProvider::CompanionExtension,
-            available: companion_available,
-            reason: if companion_available {
-                "companion extension native host is registered; CDP commands route through the daemon"
+            // Registration alone cannot prove the extension is connected.
+            available: false,
+            reason: if companion_registered {
+                "Chrome Controlla native host is registered; use discover_shared_tabs for a fresh extension round trip before selecting tab IDs"
                     .to_owned()
             } else {
-                "companion extension native host is not registered; install the Browser Bridge extension"
+                "Chrome Controlla native host is not registered; run controlla install-bridge with the exact extension ID"
                     .to_owned()
             },
             signed_in_capable: true,
@@ -278,10 +279,7 @@ pub fn select_provider(needs_signed_in: bool) -> Result<SessionProvider, String>
     if needs_signed_in {
         let extension = get(SessionProvider::CompanionExtension);
         let permissioned = get(SessionProvider::PermissionedAutoConnect);
-        // Prefer the persistent extension bridge when installed. The direct
-        // CDP route may trigger Chrome's native consent prompt for each new
-        // connection, while the extension's install permission is reviewed
-        // once by the user and then reused across tasks.
+        // Registration alone is not a live extension round trip or a tab grant.
         if let Some(provider) =
             preferred_signed_in_provider(extension.available, permissioned.available)
         {
@@ -508,6 +506,16 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn registration_alone_is_not_a_live_extension_round_trip() {
+        let companion = list_sessions()
+            .into_iter()
+            .find(|session| session.provider == SessionProvider::CompanionExtension)
+            .expect("companion provider is listed");
+        assert!(!companion.available);
+        assert!(companion.reason.contains("native host"));
     }
 
     #[test]

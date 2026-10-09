@@ -1,6 +1,19 @@
+pub mod apps;
+pub mod artifacts;
+pub mod cache;
+pub mod canva;
 pub mod capability;
+pub mod capcut_recipe;
 pub mod doctor;
+pub mod http_auth;
+pub mod http_server;
 pub mod jobs;
+pub mod mcp;
+pub mod native_host;
+pub mod native_setup;
+pub mod slides_deck;
+pub mod verifier;
+pub mod workflow;
 
 #[cfg(test)]
 mod tests {

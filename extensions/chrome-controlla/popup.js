@@ -1,12 +1,39 @@
 const tabsEl = document.querySelector("#tabs");
 const statusEl = document.querySelector("#status");
+const nativeStatusEl = document.querySelector("#native-status");
+const nativeTabsEl = document.querySelector("#native-tabs");
+
+async function refreshNativeStatus() {
+  try {
+    const status = await chrome.runtime.sendMessage({ type: "native-status" });
+    if (status?.error) {
+      nativeStatusEl.textContent = `Native bridge unavailable: ${status.error}`;
+    } else {
+      nativeStatusEl.textContent = status?.connected
+        ? "Native bridge connected"
+        : "Native bridge unavailable. Expand Manual fallback to pair with a local WebSocket.";
+    }
+    const attached = Array.isArray(status?.attached) ? status.attached : [];
+    nativeTabsEl.textContent = attached.length
+      ? `Attached tab IDs: ${attached.join(", ")}`
+      : "No tabs attached through the native bridge.";
+  } catch (error) {
+    nativeStatusEl.textContent = `Native bridge unavailable: ${error?.message || error}`;
+    nativeTabsEl.textContent = "";
+  }
+}
+
+refreshNativeStatus();
+const statusPoll = setInterval(refreshNativeStatus, 1000);
+window.addEventListener("unload", () => clearInterval(statusPoll), { once: true });
+
 chrome.tabs.query({}).then(tabs => {
   for (const tab of tabs.filter(item => Number.isInteger(item.id) && item.url?.startsWith("http"))) {
     const label = document.createElement("label");
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.value = String(tab.id);
-    label.append(checkbox, ` ${tab.title || tab.url}`);
+    label.append(checkbox, ` [${tab.id}] ${tab.title || tab.url}`);
     tabsEl.append(label);
   }
 });

@@ -1,9 +1,12 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Pair selected tabs</title><style>
-body{font:13px system-ui,sans-serif;width:340px;margin:14px;color:#202124}label{display:block;margin:8px 0}input[type=text],input[type=password]{box-sizing:border-box;width:100%;padding:7px}button{padding:7px 10px;margin-top:8px}#tabs{max-height:220px;overflow:auto}.status{color:#555;white-space:pre-wrap}
+body{font:13px system-ui,sans-serif;width:340px;margin:14px;color:#202124}label{display:block;margin:8px 0}input[type=text],input[type=password]{box-sizing:border-box;width:100%;padding:7px}button{padding:7px 10px;margin-top:8px}#tabs{max-height:220px;overflow:auto}.status{color:#555;white-space:pre-wrap}details{margin-top:14px}summary{cursor:pointer}
 </style></head><body>
-<strong>Choose tabs to share</strong><p>Only checked tabs receive a debugger attachment. Closing the provider detaches them; you can also release them here.</p><div id="tabs"></div>
+<strong>Chrome Controlla</strong><p id="native-status" class="status">Checking native bridge…</p><p id="native-tabs" class="status"></p>
+<p>Use MCP <code>discover_shared_tabs</code> to list available tabs, then <code>pair_shared</code> with the IDs to attach them. The native bridge pairs them automatically; no token is needed.</p>
+<details><summary>Manual fallback</summary>
+<p>Choose tabs to share. Only checked tabs receive a debugger attachment. Closing the provider detaches them.</p><div id="tabs"></div>
 <label>Local provider WebSocket<input id="endpoint" type="text" placeholder="ws://127.0.0.1:PORT/"></label>
 <label>One-session pairing token<input id="token" type="password" autocomplete="off"></label>
-<button id="pair">Attach selected tabs</button> <button id="release">Release attached tabs</button><p class="status" id="status"></p>
+<button id="pair">Attach selected tabs</button> <button id="release">Release attached tabs</button><p class="status" id="status"></p></details>
 <script src="popup.js"></script></body></html>

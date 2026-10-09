@@ -110,14 +110,14 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 
 **Consumes:** upstream Git URL and researched SHA. **Produces:** clean Chrome-only repo, pinned toolchain and source inventory.
 
-- [ ] Inspect workspace instructions, Git identity/auth and existing repositories before cloning. Do not overwrite a user checkout or discard uncommitted changes.
-- [ ] Clone upstream into a separate source directory. Record fetched HEAD, remote URL and dirty state. Compare browser/core/bridge/package changes to the researched SHA; determine whether reported regressions correspond to an older binary or another route.
-- [ ] Inspect licenses and dependencies. Create a new local repository named `chrome-controlla`, preserving notices and provenance, with no credentials or browser profiles.
-- [ ] If executing this prompt includes authorized GitHub repository creation, use the authenticated user’s intended owner and create **a separate repository**, never rename/delete Comptrol. Default private when visibility is unspecified; record that choice. If the name exists, inspect ownership/content and stop before overwriting. Do not guess an alternate name or push into an unrelated repo.
-- [ ] Select and pin Rust, Node/reference runner, MCP SDK/protocol and Chrome for Testing versions supported by the environment. Document rationale and supported OS targets.
-- [ ] Extract minimal browser engine and tests, not the monolithic app registry. Create provenance mapping and a dependency check that fails if native desktop platform crates/adapters re-enter the distribution.
-- [ ] Add a CI baseline: formatting, static checks, focused Rust tests, fixtures, package/docs checks. Confirm a clean checkout can build without upstream globally installed.
-- [ ] Commit `chore: establish Chrome-only source extraction and provenance`.
+- [x] Inspect workspace instructions, Git identity/auth and existing repositories before cloning. Do not overwrite a user checkout or discard uncommitted changes.
+- [x] Clone upstream into a separate source directory. Record fetched HEAD, remote URL and dirty state. Compare browser/core/bridge/package changes to the researched SHA; determine whether reported regressions correspond to an older binary or another route.
+- [x] Inspect licenses and dependencies. Create a new local repository named `chrome-controlla`, preserving notices and provenance, with no credentials or browser profiles.
+- [x] If executing this prompt includes authorized GitHub repository creation, use the authenticated user's intended owner and create **a separate repository**, never rename/delete Comptrol. Default private when visibility is unspecified; record that choice. If the name exists, inspect ownership/content and stop before overwriting. Do not guess an alternate name or push into an unrelated repo.
+- [x] Select and pin Rust, Node/reference runner, MCP SDK/protocol and Chrome for Testing versions supported by the environment. Document rationale and supported OS targets.
+- [x] Extract minimal browser engine and tests, not the monolithic app registry. Create provenance mapping and a dependency check that fails if native desktop platform crates/adapters re-enter the distribution.
+- [x] Add a CI baseline: formatting, static checks, focused Rust tests, fixtures, package/docs checks. Confirm a clean checkout can build without upstream globally installed.
+- [x] Commit `chore: establish Chrome-only source extraction and provenance`.
 
 **Gate:** actual source reconciliation and clean build, not merely a GitHub repo URL. Owner/visibility/publication decisions are recorded. No implementation superiority claim.
 
@@ -127,13 +127,13 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 
 **Interfaces:** `evaluate_capability(ctx: &CapabilityContext, action: &str) -> CapabilityDecision`; `doctor(config: &Config) -> DiagnosticReport`; dispatch consumes the same decision function.
 
-- [ ] Write failing tests for CC-01–04 and B01–04: direct-only, bridge-only, unconfigured, denied, revoked, minimal PATH, and help with open stdin.
-- [ ] Implement early argument parsing. Help/version/list-schema never initialize browser runtime or mutate state. Invalid flags fail clearly.
-- [ ] Implement one evaluator with structured reasons; catalog is a snapshot, dispatch reevaluates. Add principal and policy revision to diagnostic correlation without secrets.
-- [ ] Report heartbeat and authenticated round-trip separately. Preserve storage/path/permission errors instead of mapping all to false. Test different process environments and daemon state paths without claiming one is the tester’s proven cause.
-- [ ] Resolve the launcher relative to the installed package or explicit path. Make cold install failures distinguish download, architecture, permission and missing executable.
-- [ ] Run focused tests and clean-install smoke; inspect packaged contents.
-- [ ] Commit `feat: unify capability decisions and standalone CLI packaging`.
+- [x] Write tests for CC-01–04 and B01–04: direct-only, bridge-only, unconfigured, denied, revoked, minimal PATH, and help with open stdin.
+- [x] Implement early argument parsing. Help/version/list-schema never initialize browser runtime or mutate state. Invalid flags fail clearly.
+- [x] Implement one evaluator with structured reasons; catalog is a snapshot, dispatch reevaluates. Add principal and policy revision to diagnostic correlation without secrets.
+- [x] Report heartbeat and authenticated round-trip separately. Preserve storage/path/permission errors instead of mapping all to false. Test different process environments and daemon state paths without claiming one is the tester's proven cause.
+- [x] Resolve the launcher relative to the installed package or explicit path. Make cold install failures distinguish download, architecture, permission and missing executable.
+- [x] Run focused tests and clean-install smoke; inspect packaged contents.
+- [x] Commit `feat: unify capability decisions and standalone CLI packaging`.
 
 **Gate:** catalog/dispatch matrix agrees under the same context; every help path exits without side effects; install works without Comptrol.
 
@@ -149,7 +149,7 @@ Make workflow/script/workflow_ref mutually exclusive in schema. Validate unknown
 - [x] Add owned/borrowed/adopted tab ledger and cleanup receipts. Preserve user tabs and changed ownership, including after crashes.
 - [x] Use per-target actors plus declared shared-resource locks. Run 1/4/8-tab fixture tests; prove a hung page does not stall all tabs.
 - [ ] Qualify platform focus/cursor/clipboard behavior with an independent observer. Unsupported platform/mode cells remain unqualified.
-- [ ] Commit `feat: isolate Chrome sessions and track tab ownership`.
+- [x] Commit `feat: isolate Chrome sessions and track tab ownership` (`f0fd586`, reviewed and pushed; hosted CI passed).
 
 **Gate:** correct target identity and cleanup, with honest platform boundaries. Headless Chrome availability is not headless Canva/CapCut qualification.
 
@@ -161,15 +161,18 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `admit(principal, session, request, key) -> Admission`; `record_dispatch(principal, session, op, correlation) -> DispatchClaim { acquired, operation }`; `reconcile(principal, session, op_id) -> Operation`; `wait(principal, session, op_id, after_revision, max_wait_ms) -> Operation`.
 
-- [x] Implement local journal contracts for B05–07/B18–19; controlled fixture counting covers duplicate prevention after an accepted effect. No live endpoint or dispatch route exists yet.
+- [x] Implement local journal contracts for B05–07/B18–19; controlled fixture counting covers duplicate prevention after an accepted effect. Workflow dispatch is exercised through local MCP fixtures; no live browser or external HTTP-client effect is claimed.
 - [x] Bind canonical JSON request identity to principal/session/key. Same key/body replays the original operation; changed body conflicts.
-- [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations. Process-kill injection at every journal boundary remains open.
-- [x] Separate bounded caller wait from durable operation state, persist a bounded 60-second default job deadline, and expose monotonic revisions. Broader execution limits remain unapplied because no worker route consumes them.
-- [ ] Test real resolve/reject/never-resolve promises and navigation during evaluation over both CDP and bridge routes. No jobs execution route exists yet; local async lifecycle fixtures cover only persisted states.
+- [x] Use SQLite immediate transactions and unique constraints. Separate-connection simultaneous admission and dispatch-claim tests permit one sender; operations are scoped by principal/session on reads and mutations.
+- [x] Separate bounded caller wait from durable operation state, persist a bounded 60-second default job deadline, and expose monotonic revisions. The workflow worker consumes declared step, time, observation, and output bounds.
+- [x] Exercise fulfilled, rejected, delayed, and never-settling JavaScript promises through the pinned QuickJS async broker, including rejection propagation to scripts. This is local worker evidence only.
+- [x] Verify a broker-backed QuickJS Promise resolving after exactly 12 seconds through the local worker wrapper. This does not qualify browser routes.
+- [x] Kill/reopen subprocesses at seven durable journal fixture cut points (admitted, running/not-sent, claim-before-effect, effect-before-ack, acknowledged, checkpointed, completed); confirm recovered state and replay refusal. This is journal-fixture evidence, not live Chrome dispatch or every runtime boundary.
+- [ ] Qualify exact 12-second resolve/reject and navigation during evaluation through live CDP and extension-bridge browser routes; inject kills at remaining runtime/browser dispatch boundaries.
 - [x] Cancellation blocks queued dispatch; expiry before dispatch becomes `failed` with `deadline_error=deadline_exceeded` and `delivery=not_sent`. Expiry/recovery after dispatch becomes `unknown` while preserving delivery as `sent` only when transport acknowledgement was recorded, otherwise `unknown`.
 - [x] Commit reviewed local journal gate as `feat: persist browser jobs and reconcile uncertain effects`.
 
-**Gate:** local journal fixtures refuse duplicate dispatch on replay; remote exactly-once is not claimed. The exact 12-second Promise/CDP/bridge case remains untested because execution routes do not exist.
+**Gate:** local journal fixtures refuse duplicate dispatch on replay, including seven tested durable cut points, and the QuickJS worker exercises async Promise outcomes. Remote exactly-once, live browser Promise parity, navigation invalidation during evaluation, and untested runtime/browser process-kill boundaries remain unqualified.
 
 ## Phase 4 — reliable input, guards and interference
 
@@ -177,13 +180,15 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `validate_step(target, dependencies) -> GuardDecision`; `perform_input(target, InputAction) -> DispatchEvidence`; `on_external_change(event) -> InvalidationSet`.
 
-- [ ] Write B09–13/B22–25/B36 fixtures: account change, field edit, unrelated churn, overlay, frame change, Unicode, masked controls, drag, focus/clipboard and foreground requirement.
-- [ ] Implement semantic locators and unambiguous matching. Add typed fill/insert/sequential keys/click/drag operations with postconditions.
-- [ ] Implement navigation/account/document guards, semantic dependency invalidation, geometry/hit checks, and conservative fallback when relevance cannot be proved.
-- [ ] Keep event handlers/remote effects in mind: DOM observations cannot guarantee atomic input. Inject a change between final validation and dispatch; measure the residual race and document stronger server revision paths where available.
-- [ ] Implement internal clipboard and artifact insertion. No system clipboard mutation in strict background mode. No disabling human input to preserve a lease.
-- [ ] Run real-OS disruption tests where available and mark the rest unverified.
-- [ ] Commit `feat: guard input against stale targets and user interference`.
+- [x] Add B09–13/B22–25/B36 local fixtures for account/dependency changes, navigation, Unicode, explicitly marked masked/event-dependent controls, contenteditable, overlay interception, DOM drag, strict-background text, and foreground-required mouse/native routes. Installed Chrome covers the supported DOM controls; a separate read-only macOS observer records frontmost app, cursor, and clipboard change count.
+- [x] Implement fail-closed semantic locators, typed fill/insert/sequential keys/click/drag routes, value/caret postconditions, geometry/hit checks, and caller-supplied navigation/account/document/dependency revisions. Application identity and edit observers remain adapter work.
+- [x] Inject navigation between final validation and dispatch; verify the write is withheld. Record mock protocol timing and the remaining non-atomic CDP/page/server race; mock timing is not a real Chrome bound.
+- [x] Implement a bounded per-session in-memory text clipboard and guarded insertion through CDP; strict-background mode never reads/writes the OS clipboard. Never disable human input to preserve a lease.
+- [x] Add bounded artifact-byte registration and opaque session/principal-scoped handles; select a verified `input[type=file]` through guarded CDP using private temporary files. Return `Selected` evidence only. Caller host paths are never accepted, and app acceptance/persistence is not claimed.
+- [x] Run isolated installed-Chrome fixtures for ordinary inputs, fail-closed masked/event-dependent markers, contenteditable/password, overlay interception, DOM drag bounds, stale-value interference, and guarded IME composition. A native snapshot around strict-background text confirms unchanged foreground app, cursor, and clipboard change count on this macOS host.
+- [x] Repeat the installed-Chrome focus-handler interference fixture three times; each guarded write yields and preserves the externally changed value. This remains controlled fixture evidence.
+- [ ] Measure the real Chrome check-to-dispatch window and qualify repeated live-user interference; the websocket fixture measures only its mock protocol window.
+- [x] Commit Phase 4 implementation and fixture work (`e1a8f10`, `197b8a6`, `8784f1b`, `d211c50`, `e69674b`, `a50d088`).
 
 **Gate:** relevant detectable interference yields before subsequent mutation; input fixtures verify actual values/positions. No “interference-proof” claim.
 
@@ -193,12 +198,12 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `observe(target, selector, fields, budget) -> Observation`; `extract(target, ExtractionSpec) -> ExtractionResult`.
 
-- [ ] Create fixtures for 42 virtualized records, 21-item separate bucket, blocked expansion, recycled nodes, duplicate labels, stale count, infinite feed and wrong-account 404.
-- [ ] Implement bounded DOM/AX reads, semantic deltas and targeted screenshot crops with freshness, omissions and truncation fields.
-- [ ] Implement schema-guided extraction, stable-ID deduplication, pagination/section traversal, and explicit terminal evidence. Keep parsing near the page; output large results as artifacts.
-- [ ] Test `complete`, `partial`, and `unknown` classification against ground truth. Matching a count and repeated no-change scrolls alone must not certify completion.
-- [ ] Measure payload and latency against full DOM/snapshot baselines without dropping necessary facts.
-- [ ] Commit `feat: extract structured data with coverage evidence`.
+- [x] Create policy fixtures for 42 virtualized records, 21-item separate bucket, blocked expansion, recycled nodes, duplicate labels, stale count, infinite feed and wrong-account 404; add a real Chrome virtualized 42-record run.
+- [x] Implement bounded CSS/DOM observations and schema-guided extraction with stable-ID deduplication, caller-declared multi-section traversal, explicit terminal evidence, freshness, omissions, and truncation fields. Add selected-node partial AX, byte-preflighted PNG crops, bounded single-use resumable cursors, and declared hidden-section expansion checks.
+- [x] Test `complete`, `partial`, and `unknown` against fixture evidence; count and repeated no-change alone do not certify completion.
+- [x] Record a single synthetic payload/latency comparison as a diagnostic only; repeated and representative performance qualification remains open.
+- [x] Verify Phase 5 features with mocked MCP/CDP tests and an isolated Chrome synthetic page covering AX, crop, resume/stale cursor, and expanded/blocked sections. This is fixture evidence, not broad app qualification.
+- [x] Commit Phase 5 implementation and fixture work (`c656c1c`, `44041af`, `1fd49f9`).
 
 **Gate:** all records or explicit missing coverage; never the tester’s visible-row-only false completeness.
 
@@ -208,30 +213,37 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** `compile(request, capabilities) -> WorkflowGraph`; `run(graph, budget) -> OperationReceipt`; broker API `call(session_handle, operation, args) -> TypedResult`.
 
-- [ ] Spike candidate script runtimes for wall/CPU/memory interruption, async host calls and isolation. Record the result and select one; do not stall the deterministic graph path on scripting research.
-- [ ] Create failing tests for B27/B31/B32, cross-session handles, module import, network/file/process escape and output limits. Protect broker authority independently from JS parsing.
-- [ ] Implement typed IR nodes and conservative effect/read/write metadata. SDK scripts may use bounded dynamic control flow; unsupported static analysis gets conservative scheduling rather than a fake proof.
-- [ ] Implement batching boundaries, local condition waits, checkpointing, compact return values and script-generated artifact output. Count all underlying calls.
-- [ ] Add dependency-scoped invalidation and effect-aware splitting. Start with rules, not RL.
-- [ ] Compare fixed batch, code mode, and guarded compiler on fixtures; profile local overhead before optimizing Rust internals.
-- [ ] Commit `feat: execute bounded browser programs with guarded checkpoints`.
+- [x] Spike candidate runtimes for interruption, memory bounds and asynchronous host calls. Wasmtime remains a WebAssembly engine, not a JavaScript runtime. A runnable pinned `rquickjs 0.14.0` probe and official crate API confirm interrupt handlers, memory/stack limits and futures-based async host calls. See [rquickjs 0.14.0 API](https://docs.rs/rquickjs/0.14.0/rquickjs/), [Wasmtime interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html), and [Wasmtime ResourceLimiter](https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html). `node:vm` is not treated as a security boundary.
+- [x] Add red-first compiler and worker tests for cross-session handles, unavailable imports and ambient file/network/process access, loop interruption, heap/output limits, and workflow step/wait/output bounds.
+- [x] Enforce the script deadline around pending async JavaScript as well as active bytecode; a never-settling Promise regression returns an error and releases the worker future.
+- [x] Implement typed bounded graph/script IR and a fresh-context QuickJS worker. Its only host function is an asynchronous, per-call reauthorized read broker; scripts are local-trust-only and disabled unless `CHROME_CONTROLLA_ENABLE_TRUSTED_SCRIPTS=1`. QuickJS runs in a bounded child process with a cleared environment, but no kernel sandbox or OS RSS/CPU quota is enforced; untrusted and production scripts remain gated pending those controls and platform qualification.
+- [x] Add bounded asynchronous MCP admission, a 60-second durable job deadline, resumable `workflow_status`, persistent checkpoints/partial receipts, pre-dispatch operation claims/counting, unknown delivery after timeout, and receipts bound to operation, target, and revisions. Startup takes an exclusive state-directory lifetime lock before recovery: accepted and running/not-sent work fails as not sent; running work after a dispatch claim becomes unknown while preserving delivery/checkpoints; browser effects are never retried. Script broker calls reserve their declared output budget against the workflow-wide cap before dispatch. Client disconnect does not cancel an accepted job; there is no workflow-cancel tool.
+- [x] Accept one explicit {kind:"artifact",filename,media_type,bytes:[...]} return from the gated sole-script workflow step. Validate exact fields, filename, allowlisted media types, and 1–12 KiB byte bounds; store bytes, SHA-256, and operation/principal/session binding inline in the existing journal receipt for `workflow_status` retrieval and idempotent replay. No artifact file is written.
+- [x] Add dependency-scoped invalidation and effect-aware splitting as deterministic planning rules. The fixture covers direct/transitive dependents and isolates non-read effects; declared effects remain hints, not proof that page code has no side effects.
+- [x] Add a deterministic fixture comparison for fixed batching, bounded code, and compiler boundaries. It reports operation/recovery counts only; browser overhead and wall-clock profiling remain open.
+- [x] Force-kill a subprocess after two journaled fixture dispatch claims, reopen the journal, and verify the checkpoint and unknown delivery survive while replay is rejected. This is journal/claim-layer recovery evidence only; it does not kill the MCP service during a real Chrome dispatch.
+- [x] Commit the Phase 6 implementation and review fixes (`3271bb6`, bounded deterministic workflows; `5ce2100`, async receipts; `dc16a0d`, aggregate output and restart recovery; `1831f9a`, journal ownership lock).
 
-**Gate:** useful multi-action scripts without ambient host authority; cancellation and partial receipts survive script failure.
+**Gate:** a useful deterministic read graph, dependency-scoped invalidation/effect-aware planning rules, count-only fixture comparison, gated trusted-local JavaScript path, and bounded inline script artifacts are implemented through the stdio MCP server. The QuickJS child process is not qualified as an OS security boundary, so untrusted/production script execution remains blocked. Arbitrary writes, mutation batching, file-backed/download artifacts, measured browser overhead, and OS-level resource isolation are not claimed.
 
 ## Phase 7 — outcome verification and workflow cache
 
 **Files:** `verifier.rs`, `cache.rs`, `artifacts.rs`, B28–30 tests, rubric schemas.
 
-**Interfaces:** `verify(target, predicate, evidence_scope) -> VerificationResult`; `qualify(workflow, suite) -> Qualification`; `lookup(signature) -> QualifiedWorkflow | Miss`; `quarantine(id, reason)`.
+**Interfaces:** `verify(operation_binding, predicate, evidence) -> VerificationResult`; `qualify(definition, observed_suite) -> opaque QualificationToken`; `insert(token)`; `lookup(workflow_id, current_definition, now) -> QualifiedWorkflow | Miss | Quarantined`; `quarantine(id, reason)`.
 
-- [ ] Test persuasive fake success, old screenshot, wrong revision, stale save, truncated download and changed control semantics with independent ground truth.
-- [ ] Implement deterministic field/object/state verifiers and artifact validators. Use visual review for visual criteria; record inconclusive when necessary.
-- [ ] Bind receipts to target, app/account, revision, observer/time and predicate. Keep process correctness and outcome correctness separate.
-- [ ] Implement versioned workflow cache with training/validation provenance, environment and authority preconditions, expiration/requalification and quarantine.
-- [ ] Validate cold/warm behavior and include preparation/recovery costs. A historical success never authorizes a present mutation.
-- [ ] Commit `feat: verify outcomes and retire stale workflows`.
+- [x] Add offline independent-state fixtures that reject a persuasive fake save against stale ground truth, old revision/stale observation, truncated known artifact, and changed control semantics. The visual predicate stays inconclusive; this is synthetic fixture evidence, not a production observer.
+- [ ] Test old screenshot claims and representative app save/download outcomes through a production independent observer; no safe observer or release suite exists yet.
+- [ ] Implement a production outcome observer for independent field/object/state evidence. The local verifier now evaluates predicates only after a sealed runtime-observer receipt; its issuer exists only in tests, so caller-supplied evidence remains `inconclusive` and production observations cannot pass. Visual predicates remain inconclusive.
+- [x] Bind evidence claims to operation/provenance ID, principal/session/target/app/account/revision, observer label, time and predicate hash. These fields do not establish observer trust.
+- [x] Add `artifact_verify` for an opaque registered artifact: runtime re-reads its private session file and compares byte length/SHA-256 with the registration-time receipt. This verifies local staging integrity only; it is not an app-state or download observer.
+- [x] Implement the canonical cache contract and in-memory quarantine/expiry mechanics. Insert/unquarantine requires an opaque successful training/validation token; no production observer or suite runner can mint one yet, so production cache admission is unavailable.
+- [ ] Validate cold/warm performance and include preparation/recovery costs. Current fixture tests establish lookup behavior only; a historical success never authorizes a present mutation.
+- [x] Commit `feat: verify outcomes and retire stale workflows` (local fixture implementation; release gate remains open).
 
 **Gate:** no release-suite false completion; visual/aesthetic uncertainty is preserved, not coerced into pass.
+
+**Pre-live app planning slice (2026-10-06):** read-only MCP tools compile a 10-slide revision-bound Slides request, a five-page identity/session/version-bound Canva design plan, and a CapCut timeline recipe validated against caller-supplied licensed-asset metadata. The fixed proposals are unit- and stdio-tested, but none connects to vendor APIs or mutates a browser. They do not provide authoritative identity/session observation, OAuth, edit dispatch, app readback, persistence, export, or quality review. Acceptance briefs and separate correctness/visual rubrics are present under `apps/`; all live evidence remains pending. See `docs/review/phase8-offline-planners.md`.
 
 ## Phase 8 — qualify professional web-app workflows
 
@@ -256,12 +268,20 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Interfaces:** identical operation/result semantics across supported transports; `guide(topic, server_version) -> GuideSection`; versioned client config generators.
 
-- [ ] Implement supported MCP protocol negotiation and transport behavior against pinned SDK conformance tests. Do not mix “latest” protocol semantics with legacy initialization assumptions.
-- [ ] Add authenticated remote endpoint, principal/audience-bound authorization and optional paired outbound local bridge. No public unauthenticated browser control; validate tenant and target binding.
-- [ ] Generate Freebuff, OpenCode v1/v2 as supported, Claude Code and ChatGPT setup instructions for actual versions. Do not assume every platform has the same config nesting or local process support.
+**Current local slice (2026-10-07):** `docs/clients.md` records local stdio examples for Freebuff/Codebuff, OpenCode v1/v2, and Claude Code, plus ChatGPT's local-stdio limitation. A read-only `guide` tool and canonical `controlla://guide/{topic}/{server_version}` resources serve `clients` and `master` Markdown for exact server version `0.1.0`; pinned rmcp child-process tests exercise every initialize revision advertised by the pinned SDK and its current discovery lifecycle, resource listing/reading, tool schemas, and invalid requests over stdio. A four-group, 20-task fresh-agent B35 run passed against the packaged local MCP schemas after guide corrections. An opt-in authenticated Streamable HTTP endpoint is implemented for loopback only. A 2026-10-07 bounded live process smoke completed HTTP initialize, tool discovery, a versioned guide call, and missing-bearer rejection; OpenCode 1.18.5 separately connected over stdio and discovered tools, without a tool action. No supported external-client tool action or HTTP-client acceptance is claimed.
+
+The B35 task descriptions, individual outcomes, schema evidence and limitations are recorded in [route evaluation](../review/phase9-b35-routes.md), [professional-app cases](../review/phase9-b35-apps.md), [long-task cases](../review/phase9-b35-long-tasks.md), and [extraction/file-selection cases](../review/phase9-b35-extract-file.md). They are task/evaluation records, not live browser or client acceptance.
+
+- [x] Cover every initialize revision advertised by pinned rmcp and its latest discovery lifecycle over packaged local stdio, including tool discovery checks; other transports and external-client behavior remain open. Do not mix latest discovery semantics with legacy initialize assumptions.
+- [x] Add an opt-in authenticated loopback Streamable HTTP endpoint with endpoint-bound audience, server-owned principal, Host/Origin checks, bounded bodies, and MCP protocol validation. It binds only to `127.0.0.1` and is started only by the explicit `serve-http` CLI command.
+- [x] Run a bounded authenticated loopback service process and verify initialize, tool discovery, a versioned guide call, and missing-bearer rejection. This is a protocol harness, not client acceptance.
+- [ ] Run supported external-client tool actions and HTTP-client acceptance; implement/qualify an optional paired outbound bridge. Do not expose public unauthenticated browser control.
+- [x] Record dated local stdio setup examples for Freebuff/Codebuff, OpenCode v1/v2, Claude Code, and ChatGPT's local-process limitation in `docs/clients.md`; examples are schema-checked but installed client versions and client acceptance remain open.
+- [x] Generate dated client-specific configuration examples with per-client state isolation and validate their shapes against the checked-in schemas. Installed versions and client acceptance remain open; do not assume every platform has the same config nesting or local process support.
+- [x] Add an installer for JSON-based Freebuff/OpenCode configuration files; it preserves unrelated entries and refuses ambiguous or conflicting entries. It atomically replaces the file and best-effort detects edits before replacement, but does not serialize with arbitrary external writers. Claude's CLI command remains a human-reviewed output, and no live client config was changed.
 - [ ] In each available real client, run session setup, observation, guarded edit, long job, reconnect/reconcile, structured result/artifact and cleanup. Record client version and server SHA. A raw JSON-RPC smoke alone does not qualify a client.
-- [ ] Turn the companion master-guide draft into exact runnable documentation. Generate shared facts from registry/schema. Implement `guide` and the canonical resource; include short bootstrap instructions in session/tool responses.
-- [ ] Run B35 and the 20-task fresh-agent usability suite. Fix tool ambiguity, missing recovery instructions and invented flags rather than adding a larger wall of prose.
+- [x] Turn the companion master guide into runnable setup, observation, extraction/resume, workflow-polling, and artifact/file-selection examples. Checks parse examples and verify supported names. The initialize bootstrap lists runtime-derived tool names and directs clients to `tools/list` for schemas. Descriptive facts remain partly human-maintained. Version-bound `guide` tool and `controlla://guide/{topic}/{server_version}` resources serve `clients` and `master`.
+- [x] Run the 20-task fresh-agent B35 usability suite in four five-task groups; 20/20 passed after guide corrections. Evaluators queried packaged MCP schemas over isolated stdio and did not connect a browser or app. Real-client acceptance remains open.
 - [ ] Commit `feat: qualify MCP clients and ship executable master guide`.
 
 **Gate:** each advertised client has live evidence or is explicitly marked unavailable/unqualified; guide and schemas agree.
@@ -270,9 +290,11 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Files:** `bench/tasks`, `bench/baselines`, `bench/analysis`, immutable run manifests, `bench/reports/`.
 
-- [ ] Pin Playwright MCP, Chrome DevTools MCP, Stagehand, Browser Use, Vercel agent-browser and relevant other baseline revisions. Use their supported configurations; do not handicap batching/caching or assign mismatched models.
+- [x] Pin exact Playwright MCP, Chrome DevTools MCP, Stagehand, Browser Use and Vercel agent-browser package artifacts/source revisions in `bench/baselines/versions.lock.json`. The pins are not installations or benchmark runs.
+- [ ] Freeze the supported model/browser configuration and install supported baselines before the pilot; model identity/version is unresolved. Keep batching/caching available and avoid mismatched model configurations.
 - [ ] Where actual Computer plugin/Claude Chrome/Cowork access is available, define a documented end-to-end track. If they cannot be run, mark missing instead of inventing results.
 - [ ] Run the 30-template pilot, estimate variance, preregister primary metrics/thresholds and held-out split. Include generic tasks, extraction, interference, multi-tab and design tasks; disclose design-review sample sizes separately.
+- [x] Bind offline clone-reset and independent readback-predicate fixtures to each of the 30 preregistered pilot templates. These validate harness contracts only; they do not run the candidate, Chrome, a model, or visual review.
 - [ ] Run at least 100 held-out task templates with five reset runs each for controlled comparison, plus 20 critical workflows × 10 independent runs. If sample size/power is inadequate, expand before claiming a win.
 - [ ] Produce task-clustered intervals, success noninferiority analysis, p50/p95 latency, tokens, model/MCP/browser calls, failed runs, interventions, focus/clipboard disruption, cleanup and cold/warm cache costs.
 - [ ] Run the AGWC ablations from research.md. Regressions require fixes or removal of the optimization, not selective reporting.
@@ -299,10 +321,19 @@ The local/code review gate passed on 2026-10-06. Live extension attachment, inde
 
 **Files:** release workflow, package manifests, checksums/SBOM, support matrix, release notes, benchmark report, guide, rollback instructions.
 
-- [ ] Run necessary full integration/security/package/docs checks on the release commit. Use actual platform runners for cross-platform claims.
-- [ ] Test fresh installation, version upgrade, rollback, stale daemon/extension mismatch, uninstall, and user-data preservation. No credential/browser-profile deletion on uninstall without explicit request.
-- [ ] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims.
-- [ ] Prepare a release candidate with reproducible artifacts. Create/push to the authorized new repository; never push Chrome Controlla changes into Comptrol by accident.
+- [x] Run the configured Rust, dependency, client, app-brief, benchmark, docs, provenance, extension, and package checks on the candidate source commit. Hosted run [37618717861](https://github.com/Praket7/chrome-controlla/actions/runs/37618717861) passed Windows, macOS, and Linux build/package jobs for `13c64e3`.
+- [x] Test clean-prefix installation, package-version upgrade/rollback, uninstall, and unrelated user-data preservation on the current host. The lifecycle harness supports distinct binaries and verifies the installed executable digest at each version; see the dated evidence record for exact revisions and digests.
+- [x] Prepare the local release-candidate bundle path: host package and extension archives, runtime dependency SBOM, artifact checksums, support matrix, release notes, and rollback instructions. The bundle remains unpublished and must be generated from a clean release commit.
+- [x] Generate the unpublished macOS arm64 release-candidate bundle from clean source commit `2f4fb06`; verify the recorded SBOM and archive checksums. This does not qualify other hosts or consumer installation.
+- [x] Reject stale or missing shared-extension versions during pairing and verify the extension releases its debugger attachment on mismatch. This local fixture does not qualify release-binary upgrade compatibility.
+- [x] Test a local distinct-binary package upgrade/rollback on the current host, checking installed executable digests and user-data preservation. The macOS arm64 lifecycle passed; see [distinct-binary lifecycle evidence](../review/phase12-binary-lifecycle.md). This does not establish live MCP client/server compatibility.
+- [x] Generate an unpublished local macOS arm64 candidate from clean commit `13c64e3`; verify npm package, extension, and SBOM checksums. The package remains unpublished and live acceptance is not run.
+- [x] Verify fresh clean-prefix consumer installs on Windows, macOS, and Linux through `package-check.sh`, which installs each host-matched archive and runs the installed command shim. Hosted run [37628108314](https://github.com/Praket7/chrome-controlla/actions/runs/37628108314) passed all three jobs; this is not a published GitHub install.
+- [ ] Verify stale/current MCP client/server behavior beyond the extension handshake, signed release artifacts/SBOM, and consumer installation from GitHub. No credential/browser-profile deletion on uninstall without explicit request.
+- [x] Review packaged files for desktop baggage, secrets, stale docs, test-only capabilities and unqualified marketing claims; archive listings contain only expected CLI, license/notice, core binary, and Chrome extension files.
+- [x] Prepare and checksum a local macOS arm64 release candidate from clean commit `2f4fb06`; push the feature branch to the authorized Chrome Controlla repository. The candidate is unpublished; no GitHub release was created.
+- [x] Pass hosted build/package CI on the candidate source commit; run `37564319202` passed Windows, macOS, and Linux.
+- [ ] Verify published Windows/Linux consumer installs; CI-built artifacts are not a public consumer installation.
 - [ ] Publish/deploy only within actual authorization. If final approval is required, present exact version, diff, test report, visibility, costs and artifact destinations so approval is the last step.
 - [ ] After any authorized publication, verify registry/release availability and a clean consumer installation. A successful upload command is not release verification.
 - [ ] Deliver repo URL/commit, install instructions, master guide, capability matrix, benchmark results, known blockers, and exact verification boundaries. Record all 24 CC requirements and 36 B cases as passed/failed/blocked/unimplemented with evidence.

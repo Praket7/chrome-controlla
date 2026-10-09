@@ -113,6 +113,358 @@ fn admission_is_scoped_durable_and_conflicts_on_changed_request() {
 }
 
 #[test]
+fn acknowledged_correlation_cannot_be_reclaimed_but_new_steps_may() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("p", "s", "ack-guard", &json!({"steps":true}))
+        .unwrap();
+    assert!(journal.start("p", "s", &admitted.operation.id).unwrap());
+    let first = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .unwrap()
+    );
+    // The acknowledged correlation is confirmed-delivered: re-claiming it must
+    // never admit a second send of the same browser effect.
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .is_err()
+    );
+    // A distinct correlation is the next workflow step and stays allowed.
+    let second = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+        .unwrap();
+    assert!(second.acquired);
+    assert_eq!(second.operation.dispatch_count, 2);
+    assert_eq!(second.operation.delivery, Delivery::Unknown);
+    let repeat = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+        .unwrap();
+    assert!(!repeat.acquired);
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-1")
+            .unwrap()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-2")
+            .unwrap()
+            .acquired
+    );
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-2")
+            .unwrap()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .is_err()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+            .is_err()
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn completion_allows_no_dispatch_but_rejects_unacknowledged_dispatch() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+
+    let local = journal.admit("p", "s", "local", &json!({})).unwrap();
+    assert!(journal.start("p", "s", &local.operation.id).unwrap());
+    let completed = journal
+        .complete("p", "s", &local.operation.id, json!({"value":1}))
+        .unwrap();
+    assert_eq!(completed.status, JobStatus::Completed);
+    assert_eq!(completed.delivery, Delivery::NotSent);
+
+    let uncertain = journal.admit("p", "s", "uncertain", &json!({})).unwrap();
+    let claim = journal
+        .record_dispatch("p", "s", &uncertain.operation.id, "send")
+        .unwrap();
+    assert!(claim.acquired);
+    assert!(
+        journal
+            .complete("p", "s", &uncertain.operation.id, json!({"value":1}))
+            .is_err()
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn workflow_checkpoint_survives_reopen_and_each_browser_dispatch_is_claimed() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("local-stdio", "s", "workflow-1", &json!({"steps":[]}))
+        .unwrap();
+    assert!(
+        journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    assert!(
+        !journal
+            .start("local-stdio", "s", &admitted.operation.id)
+            .unwrap()
+    );
+    let first = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    assert_eq!(first.operation.dispatch_count, 1);
+    journal
+        .acknowledge_dispatch("local-stdio", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    journal.checkpoint("local-stdio", "s", &admitted.operation.id, json!({"completed_steps":1,"browser_operations":1,"steps":[{"kind":"observe","value":"saved"}]})).unwrap();
+    let second = journal
+        .record_dispatch("local-stdio", "s", &admitted.operation.id, "step-2")
+        .unwrap();
+    assert!(second.acquired);
+    assert_eq!(second.operation.dispatch_count, 2);
+    let pending = journal
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.delivery, Delivery::Unknown);
+    drop(journal);
+    let reopened = Journal::open(&path).unwrap();
+    let restored = reopened
+        .get("local-stdio", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.result.as_ref().unwrap()["browser_operations"], 1);
+    assert_eq!(restored.delivery, Delivery::Unknown);
+    assert_eq!(restored.dispatch_count, 2);
+    let unknown = reopened
+        .mark_unknown(
+            "local-stdio",
+            "s",
+            &admitted.operation.id,
+            restored.result.clone().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(unknown.status, JobStatus::Unknown);
+    assert_eq!(unknown.delivery, Delivery::Unknown);
+    cleanup(&path);
+}
+
+#[test]
+fn inline_artifact_receipt_survives_reopen_and_idempotent_replay() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let request = json!({"steps":[{"kind":"script","source":"artifact fixture"}]});
+    let admitted = journal
+        .admit("local-stdio", "session-a", "artifact-key", &request)
+        .unwrap();
+    journal
+        .start("local-stdio", "session-a", &admitted.operation.id)
+        .unwrap();
+    journal
+        .record_dispatch(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            "script-observe",
+        )
+        .unwrap();
+    journal
+        .acknowledge_dispatch(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            "script-observe",
+        )
+        .unwrap();
+    let receipt = json!({"artifacts":[{
+        "operation_id":admitted.operation.id,
+        "principal":"local-stdio",
+        "session_id":"session-a",
+        "filename":"summary.json",
+        "media_type":"application/json",
+        "bytes":[123,125]
+    }]});
+    journal
+        .complete(
+            "local-stdio",
+            "session-a",
+            &admitted.operation.id,
+            receipt.clone(),
+        )
+        .unwrap();
+    drop(journal);
+    let reopened = Journal::open(&path).unwrap();
+    let status = reopened
+        .get("local-stdio", "session-a", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.result.as_ref().unwrap(), &receipt);
+    let replay = reopened
+        .admit("local-stdio", "session-a", "artifact-key", &request)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.operation.result.unwrap(), receipt);
+    assert!(
+        reopened
+            .get("other-principal", "session-a", &admitted.operation.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .get("local-stdio", "other-session", &admitted.operation.id)
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn startup_recovery_marks_running_unknown_and_preserves_checkpoint_without_replay() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("p", "s", "running-key", &json!({"step":1}))
+        .unwrap();
+    assert!(journal.start("p", "s", &admitted.operation.id).unwrap());
+    let claim = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "sent-1")
+        .unwrap();
+    assert!(claim.acquired);
+    let checkpoint = json!({"operation_id":admitted.operation.id,"status":"running","completed_steps":1,"target_revision":12});
+    journal
+        .checkpoint("p", "s", &admitted.operation.id, checkpoint.clone())
+        .unwrap();
+    let queued = journal
+        .admit("p", "s", "queued-key", &json!({"step":2}))
+        .unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.recover_after_restart().unwrap(), 2);
+    let recovered = journal
+        .get("p", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, JobStatus::Unknown);
+    assert_eq!(recovered.delivery, Delivery::Unknown);
+    assert_eq!(recovered.dispatch_count, 1);
+    assert_eq!(recovered.result, Some(checkpoint));
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "retry")
+            .is_err()
+    );
+    let recovered_queued = journal
+        .get("p", "s", &queued.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_queued.status, JobStatus::Failed);
+    assert_eq!(recovered_queued.delivery, Delivery::NotSent);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn startup_recovery_keeps_running_job_not_sent_when_dispatch_was_never_claimed() {
+    let path = temp_db();
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("p", "s", "started-not-sent", &json!({"effect":"read"}))
+        .unwrap();
+    assert!(journal.start("p", "s", &admitted.operation.id).unwrap());
+    drop(journal);
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.recover_after_restart().unwrap(), 1);
+    let recovered = journal
+        .get("p", "s", &admitted.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, JobStatus::Failed);
+    assert_eq!(recovered.delivery, Delivery::NotSent);
+    assert_eq!(
+        recovered.deadline_error.as_deref(),
+        Some("process_restarted")
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &recovered.id, "after-restart")
+            .is_err()
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn restart_preserves_acknowledged_delivery_and_leaves_completed_jobs_untouched() {
+    let path = temp_db();
+    let journal = Journal::open(&path).unwrap();
+    let sent = journal
+        .admit("p", "s", "restart-sent", &json!({"effect":"save"}))
+        .unwrap();
+    assert!(journal.start("p", "s", &sent.operation.id).unwrap());
+    assert!(
+        journal
+            .record_dispatch("p", "s", &sent.operation.id, "ack")
+            .unwrap()
+            .acquired
+    );
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &sent.operation.id, "ack")
+            .unwrap()
+    );
+    let complete = journal
+        .admit("p", "s", "restart-complete", &json!({"effect":"save"}))
+        .unwrap();
+    assert!(journal.start("p", "s", &complete.operation.id).unwrap());
+    assert!(
+        journal
+            .record_dispatch("p", "s", &complete.operation.id, "complete")
+            .unwrap()
+            .acquired
+    );
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &complete.operation.id, "complete")
+            .unwrap()
+    );
+    journal
+        .complete("p", "s", &complete.operation.id, json!({"saved":true}))
+        .unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.recover_after_restart().unwrap(), 1);
+    let recovered = journal.get("p", "s", &sent.operation.id).unwrap().unwrap();
+    assert_eq!(recovered.status, JobStatus::Unknown);
+    assert_eq!(recovered.delivery, Delivery::Sent);
+    let recovered_complete = journal
+        .get("p", "s", &complete.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_complete.status, JobStatus::Completed);
+    assert_eq!(recovered_complete.delivery, Delivery::Sent);
+    cleanup(&path);
+}
+
+#[test]
 fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
     let path = temp_db();
     let _ = std::fs::remove_file(&path);
@@ -131,9 +483,16 @@ fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
             .acknowledge_dispatch("p", "s", &admission.operation.id, "request-1")
             .unwrap()
     );
+    let queued = journal
+        .admit("p", "s", "queued-recovery", &json!({"effect":"read"}))
+        .unwrap();
+    let started = journal
+        .admit("p", "s", "started-recovery", &json!({"effect":"read"}))
+        .unwrap();
+    assert!(journal.start("p", "s", &started.operation.id).unwrap());
     drop(journal);
     let journal = Journal::open(&path).unwrap();
-    assert_eq!(journal.recover_uncertain("p", "s").unwrap(), 1);
+    assert_eq!(journal.recover_uncertain("p", "s").unwrap(), 3);
     let recovered = journal
         .get("p", "s", &admission.operation.id)
         .unwrap()
@@ -146,6 +505,15 @@ fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
     );
     assert_eq!(recovered.status, JobStatus::Unknown);
     assert_eq!(recovered.delivery, Delivery::Sent);
+    for operation in [queued.operation, started.operation] {
+        let recovered = journal.get("p", "s", &operation.id).unwrap().unwrap();
+        assert_eq!(recovered.status, JobStatus::Failed);
+        assert_eq!(recovered.delivery, Delivery::NotSent);
+        assert_eq!(
+            recovered.deadline_error.as_deref(),
+            Some("process_restarted")
+        );
+    }
     assert!(
         journal
             .admit("p", "s", "lost", &json!({"effect":"save"}))
@@ -168,6 +536,243 @@ fn dispatch_crash_is_unknown_and_cannot_be_blindly_replayed() {
     );
     assert_eq!(endpoint.effects.load(Ordering::SeqCst), 1);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn subprocess_kill_recovers_each_supported_journal_boundary_without_replay() {
+    use std::{
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn stop_at_durable_boundary(
+        child: &mut Child,
+        ready: &std::path::Path,
+        root: &std::path::Path,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                let _ = std::fs::remove_dir_all(root);
+                panic!("crash worker exited before its durable boundary: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(root);
+            panic!("crash worker did not reach its durable boundary before timeout");
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    let checkpoint = json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]});
+    for (
+        boundary,
+        expected_status,
+        expected_delivery,
+        expected_dispatches,
+        expected_result,
+        effects,
+    ) in [
+        ("admitted", JobStatus::Failed, Delivery::NotSent, 0, None, 0),
+        (
+            "running_not_sent",
+            JobStatus::Failed,
+            Delivery::NotSent,
+            0,
+            None,
+            0,
+        ),
+        (
+            "dispatch_claimed",
+            JobStatus::Unknown,
+            Delivery::Unknown,
+            1,
+            None,
+            0,
+        ),
+        (
+            "effect_before_ack",
+            JobStatus::Unknown,
+            Delivery::Unknown,
+            1,
+            None,
+            1,
+        ),
+        (
+            "acknowledged",
+            JobStatus::Unknown,
+            Delivery::Sent,
+            1,
+            None,
+            1,
+        ),
+        (
+            "checkpointed",
+            JobStatus::Unknown,
+            Delivery::Sent,
+            1,
+            Some(checkpoint.clone()),
+            1,
+        ),
+        (
+            "completed",
+            JobStatus::Completed,
+            Delivery::Sent,
+            1,
+            Some(checkpoint.clone()),
+            1,
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "controlla-crash-{boundary}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let ready = root.join("ready");
+        let effects_path = root.join("effects");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_worker", "--nocapture"])
+            .env("CONTROLLA_CRASH_STATE", &state)
+            .env("CONTROLLA_CRASH_READY", &ready)
+            .env("CONTROLLA_CRASH_EFFECTS", &effects_path)
+            .env("CONTROLLA_CRASH_BOUNDARY", boundary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        stop_at_durable_boundary(&mut child, &ready, &root);
+
+        let journal = Journal::open(state.join("operations.sqlite")).unwrap();
+        assert_eq!(
+            journal.recover_after_restart().unwrap(),
+            usize::from(boundary != "completed"),
+            "{boundary}"
+        );
+        let operation_id = std::fs::read_to_string(&ready).unwrap();
+        let operation = journal
+            .get("p", "s", &operation_id)
+            .unwrap()
+            .expect("operation survives forced process termination");
+        assert_eq!(operation.status, expected_status, "{boundary}");
+        assert_eq!(operation.delivery, expected_delivery, "{boundary}");
+        assert_eq!(operation.dispatch_count, expected_dispatches, "{boundary}");
+        assert_eq!(operation.result, expected_result, "{boundary}");
+        assert!(
+            journal
+                .record_dispatch("p", "s", &operation.id, "retry-after-restart")
+                .is_err(),
+            "replay must stay blocked after {boundary}"
+        );
+        let effect_count =
+            std::fs::read_to_string(&effects_path).map_or(0, |contents| contents.lines().count());
+        assert_eq!(
+            effect_count, effects,
+            "{boundary}: recovery cannot replay effects"
+        );
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn crash_worker() {
+    use std::io::Write;
+
+    fn publish_ready(path: &std::path::Path, operation_id: &str) {
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary).unwrap();
+        file.write_all(operation_id.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(temporary, path).unwrap();
+    }
+
+    fn pause_for_parent() -> ! {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    let (Ok(state), Ok(ready), Ok(effects), Ok(boundary)) = (
+        std::env::var("CONTROLLA_CRASH_STATE"),
+        std::env::var("CONTROLLA_CRASH_READY"),
+        std::env::var("CONTROLLA_CRASH_EFFECTS"),
+        std::env::var("CONTROLLA_CRASH_BOUNDARY"),
+    ) else {
+        return;
+    };
+    let journal = Journal::open(std::path::Path::new(&state).join("operations.sqlite")).unwrap();
+    let admission = journal
+        .admit(
+            "p",
+            "s",
+            "crash-key",
+            &json!({"steps":["observe","observe"]}),
+        )
+        .unwrap();
+    if boundary != "admitted" {
+        assert!(journal.start("p", "s", &admission.operation.id).unwrap());
+    }
+    if matches!(
+        boundary.as_str(),
+        "dispatch_claimed" | "effect_before_ack" | "acknowledged" | "checkpointed" | "completed"
+    ) {
+        let claim = journal
+            .record_dispatch("p", "s", &admission.operation.id, "step-0")
+            .unwrap();
+        assert!(claim.acquired);
+        if boundary == "dispatch_claimed" {
+            publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+            pause_for_parent();
+        }
+        let mut effect = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&effects)
+            .unwrap();
+        effect.write_all(b"effect\n").unwrap();
+        effect.sync_all().unwrap();
+        if boundary == "effect_before_ack" {
+            publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+            pause_for_parent();
+        }
+        assert!(
+            journal
+                .acknowledge_dispatch("p", "s", &admission.operation.id, "step-0")
+                .unwrap()
+        );
+        if matches!(boundary.as_str(), "checkpointed" | "completed") {
+            journal
+                .checkpoint(
+                    "p",
+                    "s",
+                    &admission.operation.id,
+                    json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
+                )
+                .unwrap();
+        }
+        if boundary == "completed" {
+            journal
+                .complete(
+                    "p",
+                    "s",
+                    &admission.operation.id,
+                    json!({"completed_steps":1,"steps":[{"kind":"observe","value":"fixture"}]}),
+                )
+                .unwrap();
+        }
+    }
+    publish_ready(std::path::Path::new(&ready), &admission.operation.id);
+    pause_for_parent();
 }
 
 #[test]
@@ -426,6 +1031,18 @@ async fn persisted_job_deadline_marks_unsent_and_dispatched_effects_differently(
             .record_dispatch("p", "s", &queued.id, "too-late")
             .is_err()
     );
+
+    let started = journal
+        .admit_with_deadline("p", "s", "started-deadline", &json!({"effect":"read"}), 100)
+        .unwrap();
+    assert!(journal.start("p", "s", &started.operation.id).unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let expired_started = journal
+        .get("p", "s", &started.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired_started.status, JobStatus::Failed);
+    assert_eq!(expired_started.delivery, Delivery::NotSent);
 
     let sent = journal
         .admit_with_deadline("p", "s", "sent-deadline", &json!({"effect":"save"}), 100)

@@ -1,0 +1,9 @@
+[
+  {"case":"virtualized_42_recycled_8_nodes","observed":42,"expected":42,"account":true,"terminal":true,"missing":false,"truncated":false,"completeness":"complete"},
+  {"case":"separate_bucket_21","observed":21,"expected":21,"account":true,"terminal":true,"missing":false,"truncated":false,"completeness":"complete"},
+  {"case":"blocked_expansion","observed":8,"expected":42,"account":true,"terminal":false,"missing":true,"truncated":false,"completeness":"partial"},
+  {"case":"duplicate_labels_distinct_ids","observed":2,"expected":2,"account":true,"terminal":true,"missing":false,"truncated":false,"completeness":"complete"},
+  {"case":"stale_count","observed":42,"expected":40,"account":true,"terminal":true,"missing":true,"truncated":false,"completeness":"partial"},
+  {"case":"infinite_feed_no_terminal_marker","observed":42,"expected":null,"account":true,"terminal":false,"missing":true,"truncated":false,"completeness":"partial"},
+  {"case":"wrong_account_404","observed":0,"expected":42,"account":false,"terminal":false,"missing":true,"truncated":false,"completeness":"unknown"}
+]

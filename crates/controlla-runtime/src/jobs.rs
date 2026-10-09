@@ -74,6 +74,7 @@ pub struct Operation {
     pub dispatch_correlation: Option<String>,
     pub deadline_at_ms: u64,
     pub delivery: Delivery,
+    pub dispatch_count: u64,
     pub deadline_error: Option<String>,
 }
 
@@ -125,6 +126,27 @@ impl Journal {
                 UNIQUE(principal, session, idem_key)
             );",
         )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS acknowledged_dispatches (
+                operation_id TEXT NOT NULL, correlation TEXT NOT NULL,
+                PRIMARY KEY(operation_id, correlation)
+            );
+            INSERT OR IGNORE INTO acknowledged_dispatches (operation_id, correlation)
+            SELECT id, dispatch_correlation FROM operations
+            WHERE delivery='sent' AND dispatch_correlation IS NOT NULL;",
+        )?;
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(operations)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !columns.iter().any(|column| column == "dispatch_count") {
+            connection.execute(
+                "ALTER TABLE operations ADD COLUMN dispatch_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -192,28 +214,55 @@ impl Journal {
         id: &str,
         correlation: &str,
     ) -> Result<DispatchClaim, JournalError> {
-        let connection = self.0.lock().expect("journal mutex poisoned");
-        expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='accepted' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let mut connection = self.0.lock().expect("journal mutex poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_one(&tx, principal, session, id)?;
+        // Keep acknowledged step correlations after later steps replace the
+        // operation's current correlation.
+        let acknowledged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM acknowledged_dispatches WHERE operation_id=?1 AND correlation=?2)",
+            params![id, correlation],
+            |row| row.get(0),
+        )?;
+        if acknowledged {
+            tx.commit()?;
+            return Err(JournalError::InvalidTransition("dispatch"));
+        }
+        let changed = tx.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', dispatch_count=dispatch_count+1, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND (status='accepted' OR (status='running' AND delivery IN ('not_sent','sent'))) AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
         if changed == 0 {
-            expire_one(&connection, principal, session, id)?;
-            let current = get_conn(&connection, principal, session, id)?;
+            expire_one(&tx, principal, session, id)?;
+            let current = get_conn(&tx, principal, session, id)?;
             if let Some(op) = current
                 && op.status == JobStatus::Running
                 && op.dispatch_correlation.as_deref() == Some(correlation)
             {
+                tx.commit()?;
                 return Ok(DispatchClaim {
                     operation: op,
                     acquired: false,
                 });
             }
+            tx.commit()?;
             return Err(JournalError::InvalidTransition("dispatch"));
         }
+        let operation = get_conn(&tx, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("dispatch"))?;
+        tx.commit()?;
         Ok(DispatchClaim {
-            operation: get_conn(&connection, principal, session, id)?
-                .ok_or(JournalError::InvalidTransition("dispatch"))?,
+            operation,
             acquired: true,
         })
+    }
+
+    /// Atomically appoint one runner for an admitted job without claiming external delivery.
+    pub fn start(&self, principal: &str, session: &str, id: &str) -> Result<bool, JournalError> {
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        expire_one(&connection, principal, session, id)?;
+        let changed = connection.execute(
+            "UPDATE operations SET status='running', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='accepted' AND deadline_at_ms>?4",
+            params![id, principal, session, now_ms() as i64],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn complete(
@@ -224,6 +273,50 @@ impl Journal {
         result: Value,
     ) -> Result<Operation, JournalError> {
         self.finish(principal, session, id, JobStatus::Completed, Some(result))
+    }
+
+    /// Persist a resumable receipt after a completed step while leaving the operation running.
+    pub fn checkpoint(
+        &self,
+        principal: &str,
+        session: &str,
+        id: &str,
+        result: Value,
+    ) -> Result<Operation, JournalError> {
+        let encoded = serde_json::to_string(&result)?;
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        expire_one(&connection, principal, session, id)?;
+        let changed = connection.execute(
+            "UPDATE operations SET result=?4, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?5",
+            params![id, principal, session, encoded, now_ms() as i64],
+        )?;
+        if changed == 0 {
+            expire_one(&connection, principal, session, id)?;
+            return Err(JournalError::InvalidTransition("checkpoint"));
+        }
+        get_conn(&connection, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("checkpoint"))
+    }
+
+    /// Preserve an operation receipt when dispatch outcome cannot be established.
+    pub fn mark_unknown(
+        &self,
+        principal: &str,
+        session: &str,
+        id: &str,
+        result: Value,
+    ) -> Result<Operation, JournalError> {
+        let encoded = serde_json::to_string(&result)?;
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE operations SET status='unknown', result=?4, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running'",
+            params![id, principal, session, encoded],
+        )?;
+        if changed == 0 {
+            return Err(JournalError::InvalidTransition("unknown outcome"));
+        }
+        get_conn(&connection, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("unknown outcome"))
     }
 
     pub fn fail(
@@ -247,7 +340,7 @@ impl Journal {
         let encoded = result.map(|v| serde_json::to_string(&v)).transpose()?;
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status=?4, result=?5, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?6 AND (?4!='completed' OR delivery='sent')", params![id, principal, session, status.as_str(), encoded, now_ms() as i64])?;
+        let changed = connection.execute("UPDATE operations SET status=?4, result=?5, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND deadline_at_ms>?6 AND (?4!='completed' OR delivery IN ('not_sent','sent'))", params![id, principal, session, status.as_str(), encoded, now_ms() as i64])?;
         if changed == 0 {
             expire_one(&connection, principal, session, id)?;
             return Err(JournalError::InvalidTransition("completion"));
@@ -266,7 +359,15 @@ impl Journal {
     ) -> Result<bool, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND dispatch_correlation=?4 AND delivery='unknown' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let tx = connection.unchecked_transaction()?;
+        let changed = tx.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND dispatch_correlation=?4 AND delivery='unknown' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        if changed == 1 {
+            tx.execute(
+                "INSERT OR IGNORE INTO acknowledged_dispatches (operation_id, correlation) VALUES (?1, ?2)",
+                params![id, correlation],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed == 1)
     }
 
@@ -306,12 +407,21 @@ impl Journal {
     /// Call only after this process has recovered a database from a prior runtime; dispatched effects stay uncertain.
     pub fn recover_uncertain(&self, principal: &str, session: &str) -> Result<usize, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
-        let mut count = connection.execute(
-            "UPDATE operations SET status='unknown', deadline_error=CASE WHEN deadline_at_ms<=?3 THEN 'deadline_exceeded' ELSE deadline_error END, revision=revision+1 WHERE principal=?1 AND session=?2 AND status='running'",
+        Ok(connection.execute(
+            "UPDATE operations SET status=CASE WHEN status='running' AND delivery!='not_sent' THEN 'unknown' ELSE 'failed' END, deadline_error=CASE WHEN deadline_at_ms<=?3 THEN 'deadline_exceeded' ELSE 'process_restarted' END, revision=revision+1 WHERE principal=?1 AND session=?2 AND status IN ('accepted','running')",
             params![principal, session, now_ms() as i64],
-        )?;
-        count += connection.execute("UPDATE operations SET status='failed', deadline_error='deadline_exceeded', revision=revision+1 WHERE principal=?1 AND session=?2 AND status='accepted' AND deadline_at_ms<=?3", params![principal, session, now_ms() as i64])?;
-        Ok(count)
+        )?)
+    }
+
+    /// Reconcile durable records immediately after opening a journal from a prior process.
+    /// Jobs before dispatch fail as not sent; claimed jobs become unknown and keep their
+    /// latest checkpoint because a browser effect may have begun.
+    pub fn recover_after_restart(&self) -> Result<usize, JournalError> {
+        let connection = self.0.lock().expect("journal mutex poisoned");
+        Ok(connection.execute(
+            "UPDATE operations SET status=CASE WHEN status='running' AND delivery!='not_sent' THEN 'unknown' ELSE 'failed' END, deadline_error='process_restarted', revision=revision+1 WHERE status IN ('accepted','running')",
+            [],
+        )?)
     }
 
     pub fn reconcile(
@@ -377,7 +487,7 @@ fn get_conn(
 ) -> Result<Option<Operation>, JournalError> {
     Ok(connection
         .query_row(
-            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
+            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery,dispatch_count FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
             params![id, principal, session],
             row_operation,
         )
@@ -391,7 +501,7 @@ fn get_tx(
 ) -> Result<Option<Operation>, JournalError> {
     Ok(tx
         .query_row(
-            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
+            "SELECT id,status,revision,result,dispatch_correlation,deadline_at_ms,deadline_error,delivery,dispatch_count FROM operations WHERE id=?1 AND principal=?2 AND session=?3",
             params![id, principal, session],
             row_operation,
         )
@@ -412,6 +522,7 @@ fn row_operation(row: &rusqlite::Row<'_>) -> Result<Operation, rusqlite::Error> 
         dispatch_correlation: row.get(4)?,
         deadline_at_ms: row.get::<_, i64>(5)? as u64,
         delivery: Delivery::parse(&row.get::<_, String>(7)?)?,
+        dispatch_count: row.get::<_, i64>(8)? as u64,
         deadline_error: row.get(6)?,
     })
 }
@@ -432,6 +543,6 @@ fn expire_one(
     session: &str,
     id: &str,
 ) -> Result<(), JournalError> {
-    connection.execute("UPDATE operations SET status=CASE status WHEN 'accepted' THEN 'failed' ELSE 'unknown' END, deadline_error='deadline_exceeded', delivery=CASE status WHEN 'accepted' THEN 'not_sent' ELSE delivery END, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('accepted','running') AND deadline_at_ms<=?4", params![id, principal, session, now_ms() as i64])?;
+    connection.execute("UPDATE operations SET status=CASE WHEN status='accepted' OR delivery='not_sent' THEN 'failed' ELSE 'unknown' END, deadline_error='deadline_exceeded', delivery=CASE WHEN status='accepted' THEN 'not_sent' ELSE delivery END, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('accepted','running') AND deadline_at_ms<=?4", params![id, principal, session, now_ms() as i64])?;
     Ok(())
 }

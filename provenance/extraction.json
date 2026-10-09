@@ -14,24 +14,24 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "47a07e53f6a03818b317b9a7b99d19352d91110461dfc85e7e95cc021abaf3a3",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.",
+      "destination_sha256": "8978dc22dcdf0f151814b277abe438ec1a7bd49a04b2ee56c4d96cc55522bb41",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1\u2013A8 follow-up updates guarded-input regression fixture with the required stable DOM node token",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
       "source_path": "../Comptrol/crates/comptrol-browser/src/manager.rs",
       "destination_path": "crates/controlla-browser/src/manager.rs",
       "source_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
-      "destination_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
-      "edits": "none; byte-for-byte copy",
+      "destination_sha256": "262c56a5b23e2a9a444592fc16acc1222b550405459a3aa106f5556eb9b61828",
+      "edits": "none; byte-for-byte copy before Phase 5; Phase 5 seeds the target graph from getTargets snapshots before immediate flattened attachment",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
       "source_path": "../Comptrol/crates/comptrol-browser/src/session.rs",
       "destination_path": "crates/controlla-browser/src/session.rs",
       "source_sha256": "8143ef5fe92c8a140c90e41d77fb30d55c4df0d1a4a9ba5979eed89782f4959f",
-      "destination_sha256": "955fc3140681a38360a7a93911c4a94c445b5cce56885a9f1f90e5dce6d42a24",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests.",
+      "destination_sha256": "e5e62c2a0a61923a2402baf91e818cb126037ce16be20ad1fa18e2168840f3ad",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 updated the cache test to assert the generated current target revision and retained all originally imported tests; native host discovery now identifies Chrome Controlla registration and defers live availability to MCP inventory evidence.",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
@@ -94,24 +94,24 @@
       "source_path": "../../outputs/improvements.md",
       "destination_path": "docs/design/improvements.md",
       "source_sha256": "f333236504419021b4c36810acc17a795d6dc7898a14e79ba490058e873b5592",
-      "destination_sha256": "1a8112e19fe7158312e81caca4d220b44627a264f1b6c671cd916ac0aa813e21",
-      "edits": "updated relative link to relocated master guide",
+      "destination_sha256": "8b0a13156b62ae5c580f56b8a21231e5d84236f81ca431f3f2a1d484b9978446",
+      "edits": "updated relative link to relocated master guide; Phase 7 review records canonical cache preconditions and unqualified observer/cache admission gates",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
       "source_path": "../../outputs/build.md",
       "destination_path": "docs/design/build.md",
       "source_sha256": "c1fcd9437701b685dd528ca3f7ca415462bdc43f2e1928fb280ad4f79c5d0a02",
-      "destination_sha256": "aaaecea731b8c34397b1b73d9fddf42c9e9f16133c4e5758dc3bf6831c825ad3",
-      "edits": "updated relative link and document placement; recorded Phase 2 implementation/review evidence and Phase 3 local journal coverage while retaining open live qualification and dispatch gates",
+      "destination_sha256": "6295fdb5eaaa348d692b475f0e25f39d623c72793e2550d63ee6d4f4fe22de6e",
+      "edits": "updated relative link and document placement; reconciled implementation, review, CI and fixture evidence through Phase 12; records Phase 3 local 12-second QuickJS Promise coverage, Phase 6 bounded child-process workflows and async Promise worker tests, Phase 7 offline independent-state fixtures and live-observer/performance boundaries, Phase 8 unqualified app routes, Phase 9 all SDK initialize revisions, 20/20 pre-live B35 results, authenticated loopback HTTP process smoke, OpenCode stdio discovery-only evidence, Phase 10 pinned artifacts and unrun browser/model comparison, and Phase 12 latest candidate, three-platform clean-prefix installs and CI boundaries; updated Phase 6 sandbox caveat to match the bounded child-process implementation",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "d3459d8bca0e1f5ef2425edc3ebbe41f2b7a9887f4088dd1669022b2e9a2783c",
-      "edits": "Phase 1 status updated to distinguish implemented CLI/evaluator from proposed live browser workflows",
+      "destination_sha256": "34fc39ba590858a4f7a03fe144177be0761c5ebc8ef062122638471ccefee08d",
+      "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3; immediately listening shared-tab pairing and nonblocking acceptance status; current shared accessibility and changed-state click semantics with fixture/live evidence boundaries; native host one-time registration and tab discovery; bounded child-process script worker with remaining OS-isolation caveat.; Phase 4/5 native bridge setup is authoritative with one-time install, reload, exact tab discovery/pairing/acceptance, live discovery evidence, and explicit fixture-only reconnect/status boundary; native shared-tab setup passes discover_shared_tabs.snapshot.host_id with exact IDs to pair_shared, documents 100-tab truncation, 15-second freshness, and fixture/local-only host binding, pair-error, serialized cleanup evidence; 2026-10-08: default client config uses native messaging without legacy auto-connect, and live selected-tab attachment/AX/fixture input evidence supersedes earlier unverified statement; 2026-10-09: setup now names Chrome 106+, webNavigation approval, absolute built executable for native-host registration, and current disposable-fixture evidence",
       "license": "user-provided design document; no third-party license asserted"
     }
   ],

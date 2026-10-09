@@ -18,11 +18,49 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
-use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+#[cfg(all(test, unix))]
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::{
+    WebSocketStream, accept_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 static NEXT_PROFILE_SUFFIX: AtomicU64 = AtomicU64::new(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-peer WS handshake + hello bound: one silent local connection must not
+/// consume the whole pairing window and starve the legitimate extension.
+const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SHARED_MESSAGE_LIMIT: usize = 1_048_576;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// Removes one pending-command entry when dropped unless disarmed. Guarantees
+/// cancellation-safe cleanup of the pending-reply map even when the awaiting
+/// command future is dropped between send and reply.
+struct PendingEntryGuard {
+    pending: PendingReplies,
+    id: u64,
+    armed: bool,
+}
+
+impl PendingEntryGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingEntryGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let pending = Arc::clone(&self.pending);
+            let id = self.id;
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -105,6 +143,38 @@ impl DedicatedChromeProvider {
                 return Err(error.into());
             }
         };
+        let attached_session = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, targets) = connection.target_snapshot().await;
+                if let Some(target) = targets.iter().find(|target| target.id == target_id)
+                    && target.attached
+                    && let Some(session_id) = target.session_id.clone()
+                {
+                    break session_id;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let attached_session = match attached_session {
+            Ok(session_id) => session_id,
+            Err(_) => {
+                let _ = connection
+                    .command(None, "Target.closeTarget", json!({"targetId": target_id}))
+                    .await;
+                let _ = registry.release_session(&session.id, |_| Ok(()));
+                process.stop();
+                return Err(ProviderError::Browser(BrowserError::Timeout));
+            }
+        };
+        if let Err(error) = connection.bootstrap_target(attached_session).await {
+            let _ = connection
+                .command(None, "Target.closeTarget", json!({"targetId": target_id}))
+                .await;
+            let _ = registry.release_session(&session.id, |_| Ok(()));
+            process.stop();
+            return Err(error.into());
+        }
         Ok(DedicatedBrowserSession {
             process: process.preserve_after_launch(),
             connection,
@@ -501,7 +571,16 @@ impl SharedExtensionProvider {
         &mut self,
         registry: &mut SessionRegistry,
     ) -> Result<SharedExtensionSession, ProviderError> {
-        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        self.accept_with_timeout(registry, STARTUP_TIMEOUT).await
+    }
+
+    /// Accept within a bounded user-pairing window, independently of MCP calls.
+    pub async fn accept_with_timeout(
+        &mut self,
+        registry: &mut SessionRegistry,
+        timeout: Duration,
+    ) -> Result<SharedExtensionSession, ProviderError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let (stream, peer) = tokio::time::timeout(remaining, self.listener.accept())
@@ -512,17 +591,31 @@ impl SharedExtensionProvider {
                     "non-loopback client rejected".into(),
                 ));
             }
-            let mut socket = accept_async(stream)
-                .await
-                .map_err(|error| ProviderError::Extension(error.to_string()))?;
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let message = tokio::time::timeout(remaining, socket.next())
-                .await
-                .map_err(|_| ProviderError::Extension("extension hello timed out".into()))?
-                .ok_or_else(|| {
-                    ProviderError::Extension("extension disconnected before hello".into())
-                })?
-                .map_err(|error| ProviderError::Extension(error.to_string()))?;
+            let mut socket_config = WebSocketConfig::default();
+            socket_config.max_message_size = Some(SHARED_MESSAGE_LIMIT);
+            socket_config.max_frame_size = Some(SHARED_MESSAGE_LIMIT);
+            // Bound one peer's WS handshake + hello to a short slice of the
+            // total pairing window so a single silent connection cannot consume
+            // the entire pairing deadline and block the real extension. A timed
+            // out peer is closed and the accept loop continues.
+            let peer_deadline = tokio::time::Instant::now() + PER_PEER_HANDSHAKE_TIMEOUT;
+            let mut socket = match tokio::time::timeout_at(
+                peer_deadline,
+                accept_async_with_config(stream, Some(socket_config)),
+            )
+            .await
+            {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(_)) => continue,
+                Err(_) => continue,
+            };
+            let message = match tokio::time::timeout_at(peer_deadline, socket.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    continue;
+                }
+            };
             let hello = message
                 .to_text()
                 .ok()
@@ -531,6 +624,20 @@ impl SharedExtensionProvider {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             };
+            if hello["type"] == "pair_error"
+                && hello["token"]
+                    .as_str()
+                    .is_some_and(|token| constant_time_eq(token, &self.pairing.token))
+            {
+                return Err(ProviderError::Extension(
+                    hello["error"]
+                        .as_str()
+                        .unwrap_or("extension could not attach selected tabs")
+                        .chars()
+                        .take(256)
+                        .collect(),
+                ));
+            }
             let Some(target_values) = hello["targets"].as_array() else {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
@@ -546,7 +653,11 @@ impl SharedExtensionProvider {
             let valid_token = hello["token"]
                 .as_str()
                 .is_some_and(|token| constant_time_eq(token, &self.pairing.token));
-            if hello["type"] != "hello" || !valid_token || targets != self.expected_targets {
+            if hello["type"] != "hello"
+                || hello["document_identity"] != true
+                || !valid_token
+                || targets != self.expected_targets
+            {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             }
@@ -554,8 +665,28 @@ impl SharedExtensionProvider {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             }
+            let extension_version = hello["extension_version"].as_str();
+            if extension_version != Some(env!("CARGO_PKG_VERSION")) {
+                let observed = extension_version.unwrap_or("unknown");
+                let _ = socket
+                    .send(Message::Text(
+                        json!({"type":"error","error":"extension/server version mismatch; reload the matching unpacked extension"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                let _ = socket.send(Message::Close(None)).await;
+                return Err(ProviderError::Extension(format!(
+                    "extension version {observed} does not match server version {}",
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
             if let Err(error) = socket
-                .send(Message::Text(json!({"type":"ready"}).to_string().into()))
+                .send(Message::Text(
+                    json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
+                        .to_string()
+                        .into(),
+                ))
                 .await
             {
                 return Err(ProviderError::Extension(error.to_string()));
@@ -742,13 +873,21 @@ impl SharedExtensionSession {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
+        // The pending entry must be removed no matter how this future ends:
+        // normal reply, timeout, transport error, or the future being dropped
+        // (cancelled) between send and reply. A drop guard guarantees cleanup
+        // even though await points below can be cancelled without running code.
+        let pending_guard = PendingEntryGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+            armed: true,
+        };
         let message = Message::Text(
             json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params})
                 .to_string()
                 .into(),
         );
         if let Err(error) = self.sink.lock().await.send(message).await {
-            self.pending.lock().await.remove(&id);
             return Err(ProviderError::Extension(error.to_string()));
         }
         let result = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
@@ -760,12 +899,12 @@ impl SharedExtensionSession {
                 ));
             }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
                 return Err(ProviderError::Extension(
                     "extension command timed out".into(),
                 ));
             }
         };
+        pending_guard.disarm();
         if let Some(error) = result.get("error") {
             return Err(ProviderError::Extension(error.to_string()));
         }
@@ -810,6 +949,24 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_entry_drop_cleans_up_after_mutex_contention() {
+        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::from([(
+            7,
+            tokio::sync::oneshot::channel().0,
+        )])));
+        let guard = PendingEntryGuard {
+            pending: Arc::clone(&pending),
+            id: 7,
+            armed: true,
+        };
+        let held = pending.lock().await;
+        drop(guard);
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(pending.lock().await.is_empty());
+    }
 
     #[test]
     fn devtools_active_port_requires_loopback_browser_websocket_path() {
@@ -1501,10 +1658,11 @@ mod tests {
                 "real-chrome-fixture",
             )
             .unwrap();
-        let session = provider
-            .launch(&mut registry, &handle, "about:blank")
-            .await
-            .unwrap();
+        let page =
+            "data:text/html,%3Cinput%20id%3D%22field%22%20type%3D%22text%22%20value%3D%22%22%3E";
+        let mut session = provider.launch(&mut registry, &handle, page).await.unwrap();
+        // A failed assertion must not leave this test's isolated Chrome alive.
+        session.process.preserve_on_drop = false;
         assert!(session.profile_directory().is_dir());
         let (_, targets) = session.connection().target_snapshot().await;
         assert_eq!(
@@ -1530,6 +1688,736 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["result"]["value"], "visible");
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let target_now = session
+                    .connection()
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .get(&target.id)
+                    .cloned();
+                if let Some(target_now) = target_now
+                    && let Ok(ready) = session
+                        .connection()
+                        .target_command(
+                            &target.id,
+                            target_now.generation,
+                            &target_now.revision,
+                            "Runtime.evaluate",
+                            json!({"expression":"!!document.querySelector('#field')","returnByValue":true}),
+                        )
+                        .await
+                    && ready["result"]["value"] == true
+                    && let Some(frame) = session
+                        .connection()
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .values()
+                        .find(|frame| frame.target_id == target.id)
+                {
+                    break frame.id.clone();
+                }
+                let frames = session.connection().frames.read().await;
+                drop(frames);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let frames = session
+                .connection()
+                .frames
+                .try_read()
+                .map(|frames| format!("{:?}", frames.frames.values().collect::<Vec<_>>()))
+                .unwrap_or_else(|error| error.to_string());
+            panic!("input fixture navigation did not create a frame: {error:?}; target={target:?}; frames={frames}");
+        });
+        let reference = session
+            .connection()
+            .capture_target_ref(&registry, &handle, &target.id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                json!({"expression":"(()=>{document.body.innerHTML='<input id=field type=text><input id=fileInput type=file style=display:none><input id=replacedFile type=file style=display:none><input id=interference type=text value=before><input id=masked type=tel data-masked value=><div id=editable contenteditable=true></div><input id=dependent type=text data-requires-trusted><input id=password type=password value=secret><canvas id=canvas width=200 height=100></canvas><button id=covered style=\"position:absolute;left:250px;top:20px;width:80px;height:40px\">covered</button><div id=overlay style=\"position:absolute;z-index:2;left:250px;top:20px;width:80px;height:40px\"></div><div id=drag style=\"position:absolute;left:20px;top:100px;width:40px;height:40px;background:red\"></div>';document.querySelector('#replacedFile').addEventListener('change',e=>{e.target.replaceWith(e.target.cloneNode())});document.querySelector('#interference').addEventListener('focus',e=>e.target.value='external');const d=document.querySelector('#drag');let active=false,ox=0,oy=0;d.addEventListener('mousedown',e=>{active=true;ox=e.clientX-d.getBoundingClientRect().left;oy=e.clientY-d.getBoundingClientRect().top});document.addEventListener('mousemove',e=>{if(active){d.style.left=(e.clientX-ox)+'px';d.style.top=(e.clientY-oy)+'px'}});document.addEventListener('mouseup',()=>active=false);document.querySelector('#covered').addEventListener('click',e=>e.target.dataset.clicked='yes');const dep=document.querySelector('#dependent');dep.addEventListener('input',e=>{if(e.isTrusted)dep.dataset.model=dep.value});return true})()","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        let snapshot = crate::input::GuardSnapshot {
+            navigation: 1,
+            account: 1,
+            document: 1,
+            dependencies: ["#field".into()].into_iter().collect(),
+            strict_background: true,
+            requires_native: false,
+        };
+        let locator = crate::input::SemanticLocator::Css("#field".into());
+        let artifact = registry
+            .put_artifact_bytes(&handle, "sample.txt", b"file fixture bytes")
+            .unwrap();
+        let file_locator = crate::input::SemanticLocator::Css("#fileInput".into());
+        let revisions = crate::sessions::IdentityRevisions {
+            account: 1,
+            document: 1,
+        };
+        let wrong_target = session
+            .connection()
+            .select_file_input_artifact(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                revisions,
+                crate::input::GuardedFileSelection {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    handle: &artifact.handle,
+                },
+            )
+            .await;
+        assert!(
+            wrong_target.is_err(),
+            "non-file target unexpectedly accepted: {wrong_target:?}"
+        );
+        let selected = session
+            .connection()
+            .select_file_input_artifact(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                revisions,
+                crate::input::GuardedFileSelection {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &file_locator,
+                    handle: &artifact.handle,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.filename, "sample.txt");
+        assert_eq!(selected.size, b"file fixture bytes".len());
+        assert_eq!(selected.transaction.stage, crate::UploadStage::Selected);
+        assert_eq!(
+            selected.transaction.operation_id,
+            artifact.handle.opaque_id()
+        );
+        let file_readback = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture", revisions, "Runtime.evaluate",
+            json!({"expression":"(()=>{const f=document.querySelector('#fileInput').files;return f.length===1&&f[0].name==='sample.txt'&&f[0].size===18})()","returnByValue":true}),
+        ).await.unwrap();
+        assert_eq!(file_readback["result"]["value"], true);
+        let replacement_locator = crate::input::SemanticLocator::Css("#replacedFile".into());
+        let replaced = session
+            .connection()
+            .select_file_input_artifact(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                revisions,
+                crate::input::GuardedFileSelection {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &replacement_locator,
+                    handle: &artifact.handle,
+                },
+            )
+            .await;
+        assert!(
+            replaced.is_err(),
+            "detached input was incorrectly reported selected: {replaced:?}"
+        );
+        let native_before = crate::native::NativeSnapshot::capture().unwrap();
+        let fill = crate::input::InputAction::Fill("héllo 👋".into());
+        let filled = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(filled,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋")
+        );
+        let native_after = crate::native::NativeSnapshot::capture().unwrap();
+        assert_eq!(
+            native_before.frontmost_bundle_id,
+            native_after.frontmost_bundle_id
+        );
+        assert_eq!(
+            native_before.pasteboard_change_count,
+            native_after.pasteboard_change_count
+        );
+        assert_eq!(native_before.cursor_x, native_after.cursor_x);
+        assert_eq!(native_before.cursor_y, native_after.cursor_y);
+        session.connection().target_ref_command(&registry,&reference,"real-chrome-fixture",crate::sessions::IdentityRevisions{account:1,document:1},"Runtime.evaluate",json!({"expression":"(()=>{const e=document.querySelector('#field');e.setSelectionRange(e.value.length,e.value.length);return e.selectionStart})()","returnByValue":true})).await.unwrap();
+        let insert = crate::input::InputAction::Insert("λ".into());
+        let inserted = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &insert,
+                    expected_value: "héllo 👋",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(inserted,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋λ")
+        );
+        let keys = crate::input::InputAction::SequentialKeys("a".into());
+        let typed = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &keys,
+                    expected_value: "héllo 👋λ",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(typed,crate::input::InputOutcome::Applied{observed_value:Some(value),postcondition_verified:true,..} if value=="héllo 👋λa")
+        );
+        let position=session.connection().target_ref_command(&registry,&reference,"real-chrome-fixture",crate::sessions::IdentityRevisions{account:1,document:1},"Runtime.evaluate",json!({"expression":"({value:document.querySelector('#field').value,selectionStart:document.querySelector('#field').selectionStart})","returnByValue":true})).await.unwrap();
+        assert_eq!(position["result"]["value"]["value"], "héllo 👋λa");
+        assert_eq!(
+            position["result"]["value"]["selectionStart"],
+            "héllo 👋λa".encode_utf16().count()
+        );
+        let stale_fill = crate::input::InputAction::Fill("must-not-write".into());
+        let stale = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &stale_fill,
+                    expected_value: "old-value",
+                },
+            )
+            .await;
+        assert!(matches!(stale, Err(crate::BrowserError::StaleReference(_))));
+
+        // Real Chrome event ordering: focusing the field changes it after the
+        // initial probe, so the final guarded fill must yield without overwrite.
+        let interference_locator = crate::input::SemanticLocator::Css("#interference".into());
+        let interference_fill = crate::input::InputAction::Fill("requested".into());
+        for attempt in 1..=3 {
+            // Reset and blur so each attempt traverses the same real Chrome
+            // focus-handler race, rather than merely observing a prior change.
+            session
+                .connection()
+                .target_ref_command(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    "Runtime.evaluate",
+                    json!({"expression":"(()=>{const e=document.querySelector('#interference');e.value='before';e.blur();return e.value})()","returnByValue":true}),
+                )
+                .await
+                .unwrap();
+            let interference = session
+                .connection()
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snapshot,
+                        current: &snapshot,
+                        locator: &interference_locator,
+                        action: &interference_fill,
+                        expected_value: "before",
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(interference, crate::input::InputOutcome::Stale(_)),
+                "interference attempt {attempt} unexpectedly wrote: {interference:?}"
+            );
+            let interference_value = session
+                .connection()
+                .target_ref_command(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    "Runtime.evaluate",
+                    json!({"expression":"document.querySelector('#interference').value","returnByValue":true}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                interference_value["result"]["value"], "external",
+                "interference attempt {attempt} did not preserve the external value"
+            );
+        }
+
+        // The browser's IME protocol emits a real composition event sequence;
+        // this probes Chrome protocol support, not a product-level input action.
+        session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents=[];const e=document.querySelector('#field');for(const name of ['compositionstart','compositionupdate','compositionend'])e.addEventListener(name,event=>window.compositionEvents.push({type:event.type,data:event.data}));e.addEventListener('input',event=>window.compositionEvents.push({type:'input',isComposing:event.isComposing}));e.focus();true","returnByValue":true}),
+        ).await.unwrap();
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Input.imeSetComposition",
+                json!({"text":"あ","selectionStart":1,"selectionEnd":1}),
+            )
+            .await
+            .unwrap();
+        let composing = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"({events:window.compositionEvents.map(event=>event.type),composingInput:window.compositionEvents.some(event=>event.type==='input'&&event.isComposing),value:document.querySelector('#field').value})","returnByValue":true}),
+        ).await.unwrap();
+        assert!(
+            composing["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionstart"))
+        );
+        assert!(
+            composing["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionupdate"))
+        );
+        assert_eq!(composing["result"]["value"]["composingInput"], true);
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Input.insertText",
+                json!({"text":"あ"}),
+            )
+            .await
+            .unwrap();
+        let ended = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"({events:window.compositionEvents.map(event=>event.type),value:document.querySelector('#field').value})","returnByValue":true}),
+        ).await.unwrap();
+        assert!(
+            ended["result"]["value"]["events"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("compositionend"))
+        );
+        assert_eq!(ended["result"]["value"]["value"], "héllo 👋λaあ");
+
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                json!({"expression":"window.compositionEvents=[];true","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        let ime = crate::input::InputAction::ImeText("に".into());
+        let ime_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &ime,
+                    expected_value: "héllo 👋λaあ",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ime_result,
+            crate::input::InputOutcome::Applied {
+                observed_value: Some(value),
+                postcondition_verified: true,
+                ..
+            } if value == "héllo 👋λaあに"
+        ));
+        let ime_events = session.connection().target_ref_command(
+            &registry, &reference, "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents.map(event=>event.type)","returnByValue":true}),
+        ).await.unwrap();
+        let event_types = ime_events["result"]["value"].as_array().unwrap();
+        assert!(event_types.contains(&json!("compositionstart")));
+        assert!(event_types.contains(&json!("compositionupdate")));
+        assert!(event_types.contains(&json!("compositionend")));
+        let composing_input = session.connection().target_ref_command(
+            &registry,
+            &reference,
+            "real-chrome-fixture",
+            crate::sessions::IdentityRevisions { account: 1, document: 1 },
+            "Runtime.evaluate",
+            json!({"expression":"window.compositionEvents.some(event=>event.type==='input'&&event.isComposing)","returnByValue":true}),
+        ).await.unwrap();
+        assert_eq!(composing_input["result"]["value"], true);
+
+        let masked_locator = crate::input::SemanticLocator::Css("#masked".into());
+        let masked_fill = crate::input::InputAction::Fill("2125550100".into());
+        let masked_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &masked_locator,
+                    action: &masked_fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            masked_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        let masked_value = session.connection().target_ref_command(&registry, &reference, "real-chrome-fixture", crate::sessions::IdentityRevisions { account: 1, document: 1 }, "Runtime.evaluate", json!({"expression":"document.querySelector('#masked').value","returnByValue":true})).await.unwrap();
+        assert_eq!(masked_value["result"]["value"], "");
+
+        for (selector, value) in [
+            ("#editable", "plain contenteditable"),
+            ("#dependent", "event dependent"),
+        ] {
+            let locator = crate::input::SemanticLocator::Css(selector.into());
+            let fill = crate::input::InputAction::Fill(value.into());
+            let result = session
+                .connection()
+                .perform_guarded_input(
+                    &registry,
+                    &reference,
+                    "real-chrome-fixture",
+                    crate::sessions::IdentityRevisions {
+                        account: 1,
+                        document: 1,
+                    },
+                    crate::input::GuardedInput {
+                        expected: &snapshot,
+                        current: &snapshot,
+                        locator: &locator,
+                        action: &fill,
+                        expected_value: "",
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, crate::input::InputOutcome::Unsupported(_)),
+                "{selector}: {result:?}"
+            );
+        }
+        let password_locator = crate::input::SemanticLocator::Css("#password".into());
+        let password_fill = crate::input::InputAction::Fill("replacement".into());
+        let password_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &password_locator,
+                    action: &password_fill,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            password_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        assert!(format!("{password_result:?}").find("secret").is_none());
+
+        let covered_locator = crate::input::SemanticLocator::Css("#covered".into());
+        let covered_click = crate::input::InputAction::Click {
+            x: 280.0,
+            y: 40.0,
+            postcondition: crate::input::ClickPostcondition::ActiveElement,
+        };
+        let mut foreground_snapshot = snapshot.clone();
+        foreground_snapshot.strict_background = false;
+        let covered_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &covered_locator,
+                    action: &covered_click,
+                    expected_value: "",
+                },
+            )
+            .await;
+        assert!(matches!(
+            covered_result,
+            Err(crate::BrowserError::StaleReference(_))
+        ));
+        let covered_state = session.connection().target_ref_command(&registry, &reference, "real-chrome-fixture", crate::sessions::IdentityRevisions { account: 1, document: 1 }, "Runtime.evaluate", json!({"expression":"document.querySelector('#covered').dataset.clicked||''","returnByValue":true})).await.unwrap();
+        assert_eq!(covered_state["result"]["value"], "");
+
+        let drag_locator = crate::input::SemanticLocator::Css("#drag".into());
+        let drag = crate::input::InputAction::Drag {
+            from: (40.0, 120.0),
+            to: (160.0, 180.0),
+            postcondition: crate::input::DragPostcondition {
+                left: 140.0,
+                top: 160.0,
+                tolerance: 1.0,
+            },
+        };
+        let dragged = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &drag_locator,
+                    action: &drag,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            dragged,
+            crate::input::InputOutcome::Applied {
+                postcondition_verified: true,
+                ..
+            }
+        ));
+        let canvas_drag = crate::input::InputAction::Drag {
+            from: (10.0, 10.0),
+            to: (80.0, 60.0),
+            postcondition: crate::input::DragPostcondition {
+                left: 0.0,
+                top: 0.0,
+                tolerance: 0.0,
+            },
+        };
+        let canvas_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &foreground_snapshot,
+                    current: &foreground_snapshot,
+                    locator: &crate::input::SemanticLocator::Css("#canvas".into()),
+                    action: &canvas_drag,
+                    expected_value: "",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            canvas_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        let empty_paste = crate::input::InputAction::PasteInternalClipboard;
+        let empty_paste_result = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &empty_paste,
+                    expected_value: "héllo 👋λaあに",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            empty_paste_result,
+            crate::input::InputOutcome::Unsupported(_)
+        ));
+        registry
+            .set_internal_clipboard_text(&handle, " clipboard text")
+            .unwrap();
+        let native_before_internal_paste = crate::native::NativeSnapshot::capture().unwrap();
+        let paste = crate::input::InputAction::PasteInternalClipboard;
+        let pasted = session
+            .connection()
+            .perform_guarded_input(
+                &registry,
+                &reference,
+                "real-chrome-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                crate::input::GuardedInput {
+                    expected: &snapshot,
+                    current: &snapshot,
+                    locator: &locator,
+                    action: &paste,
+                    expected_value: "héllo 👋λaあに",
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            pasted,
+            crate::input::InputOutcome::Applied {
+                observed_value: Some(value),
+                postcondition_verified: true,
+                ..
+            } if value == "héllo 👋λaあに clipboard text"
+        ));
+        assert_eq!(
+            registry.internal_clipboard_text(&handle).unwrap(),
+            Some(" clipboard text")
+        );
+        let native_after_internal_paste = crate::native::NativeSnapshot::capture().unwrap();
+        assert_eq!(
+            native_before_internal_paste.frontmost_bundle_id,
+            native_after_internal_paste.frontmost_bundle_id
+        );
+        assert_eq!(
+            native_before_internal_paste.pasteboard_change_count,
+            native_after_internal_paste.pasteboard_change_count
+        );
         struct TestOwnedTargetObserver;
         impl IndependentTargetObserver for TestOwnedTargetObserver {
             fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {
@@ -1554,6 +2442,473 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
+    async fn real_chrome_cdp_promise_settles_and_navigation_cancels_pending_evaluation() {
+        use crate::sessions::{IndependentTargetObserver, ProviderGrants};
+        struct FixtureObserver;
+        impl IndependentTargetObserver for FixtureObserver {
+            fn verify_unchanged(
+                &self,
+                _: &crate::sessions::CleanupObservation,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let provider = DedicatedChromeProvider::new(executable);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "real-chrome-promise-fixture",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(
+                &mut registry,
+                &handle,
+                "data:text/html,<title>promise</title>",
+            )
+            .await
+            .unwrap();
+        session.process.preserve_on_drop = false;
+        let connection = session.connection().clone();
+        let target_id = session.target_id().to_owned();
+        let target = connection
+            .targets
+            .read()
+            .await
+            .targets
+            .get(&target_id)
+            .cloned()
+            .unwrap();
+        let eval = |expression: &str| json!({"expression":expression,"awaitPromise":true,"returnByValue":true});
+        let started = tokio::time::Instant::now();
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(15),
+            connection.target_command(
+                &target_id,
+                target.generation,
+                &target.revision,
+                "Runtime.evaluate",
+                eval("new Promise(r=>setTimeout(()=>r('resolved'),12000))"),
+            ),
+        )
+        .await
+        .expect("12-second resolve exceeded safe timeout")
+        .unwrap();
+        assert!(
+            (Duration::from_millis(11_800)..=Duration::from_secs(15)).contains(&started.elapsed()),
+            "resolve duration was {:?}",
+            started.elapsed()
+        );
+        assert_eq!(resolved["result"]["value"], "resolved");
+
+        let started = tokio::time::Instant::now();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(15),
+            connection.target_command(
+                &target_id,
+                target.generation,
+                &target.revision,
+                "Runtime.evaluate",
+                eval("new Promise((_,r)=>setTimeout(()=>r(new Error('rejected')),12000))"),
+            ),
+        )
+        .await
+        .expect("12-second rejection exceeded safe timeout")
+        .unwrap();
+        assert!(
+            (Duration::from_millis(11_800)..=Duration::from_secs(15)).contains(&started.elapsed()),
+            "reject duration was {:?}",
+            started.elapsed()
+        );
+        assert!(
+            rejected["exceptionDetails"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rejected"),
+            "unexpected rejection response: {rejected}"
+        );
+
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = connection
+                    .frames
+                    .read()
+                    .await
+                    .frames
+                    .values()
+                    .find(|frame| frame.target_id == target_id)
+                {
+                    break frame.id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial frame was not observed");
+        let original_ref = connection
+            .capture_target_ref(&registry, &handle, &target_id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+
+        // This second CDP connection models an external Chrome/user navigation;
+        // it deliberately avoids the browser crate's per-target actor.
+        let external = BrowserConnection::connect(&session.endpoint).await.unwrap();
+        let attached = external
+            .command(
+                None,
+                "Target.attachToTarget",
+                json!({"targetId":target_id,"flatten":true}),
+            )
+            .await
+            .unwrap();
+        let external_session = attached["sessionId"].as_str().unwrap().to_owned();
+
+        let pending_connection = connection.clone();
+        let pending_target = target.clone();
+        let pending_target_id = target_id.clone();
+        let pending = tokio::spawn(async move {
+            pending_connection
+                .target_command(
+                    &pending_target_id,
+                    pending_target.generation,
+                    &pending_target.revision,
+                    "Runtime.evaluate",
+                    eval("(()=>{window.__phase3PendingStarted='started';return new Promise(r=>setTimeout(()=>r('too-late'),12000))})()"),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let marker = external.command(
+                    Some(external_session.clone()), "Runtime.evaluate",
+                    json!({"expression":"window.__phase3PendingStarted||null","returnByValue":true}),
+                ).await;
+                if marker.is_ok_and(|value| value["result"]["value"] == "started") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("pending evaluation was not observed in Chrome before navigation");
+        let navigated = tokio::time::timeout(
+            Duration::from_secs(3),
+            external.command(
+                Some(external_session.clone()),
+                "Page.navigate",
+                json!({"url":"data:text/html,%3Ctitle%3Enavigated%3C/title%3E"}),
+            ),
+        )
+        .await
+        .expect("external navigation exceeded safe timeout");
+        assert!(
+            navigated.is_ok(),
+            "navigation was blocked behind pending evaluation: {navigated:?}"
+        );
+        let pending_result = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .expect("pending evaluation did not settle after navigation")
+            .unwrap();
+        assert!(
+            pending_result.is_err() || pending_result.unwrap()["result"]["value"] != "too-late"
+        );
+        let state = tokio::time::timeout(Duration::from_secs(3), external.command(
+            Some(external_session), "Runtime.evaluate",
+            json!({"expression":"({url:location.href,title:document.title})","returnByValue":true}),
+        )).await.expect("post-navigation observation exceeded safe timeout").unwrap();
+        assert_eq!(state["result"]["value"]["title"], "navigated");
+        assert!(
+            state["result"]["value"]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:text/html,")
+        );
+        let stale = connection
+            .target_ref_command(
+                &registry,
+                &original_ref,
+                "real-chrome-promise-fixture",
+                crate::sessions::IdentityRevisions {
+                    account: 1,
+                    document: 1,
+                },
+                "Runtime.evaluate",
+                eval("document.title"),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(crate::BrowserError::StaleReference(_))),
+            "pre-navigation reference remained usable: {stale:?}"
+        );
+        let outcome = session
+            .shutdown(&mut registry, Some(&FixtureObserver))
+            .await;
+        assert!(
+            outcome.cleanup_error.is_none(),
+            "Chrome fixture cleanup failed: {:?}",
+            outcome.cleanup_error
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
+    async fn real_chrome_extracts_virtualized_phase5_fixture_and_guards_wrong_account() {
+        use crate::{
+            observe::{Completeness, ExtractionSpec},
+            sessions::{CleanupObservation, IndependentTargetObserver, ProviderGrants},
+        };
+        use std::collections::BTreeMap;
+
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let html = r#"<!doctype html><meta charset="utf-8">
+<div id="account">fixture-account</div>
+<div id="list"><div id="spacer"></div><div id="rows"></div></div>
+<script>
+const list=document.querySelector('#list'),rows=document.querySelector('#rows');
+list.style.cssText='height:240px;overflow:auto;position:relative';
+document.querySelector('#spacer').style.height='1680px';
+const render=()=>{const first=Math.min(34,Math.floor(list.scrollTop/40));rows.replaceChildren();
+for(let i=first;i<Math.min(42,first+8);i++){const r=document.createElement('div');r.className='record';
+r.style.cssText='position:absolute;top:'+(i*40)+'px;height:40px';
+r.innerHTML='<span class="id">item-'+String(i+1).padStart(2,'0')+'</span><span class="label">record '+(i+1)+'</span>';rows.append(r)}
+list.querySelector('.terminal')?.remove();
+if(list.scrollTop+list.clientHeight>=list.scrollHeight-2){const end=document.createElement('span');end.className='terminal';end.style.cssText='position:absolute;bottom:0';end.textContent='end';list.append(end)}};
+list.addEventListener('scroll',render);render();
+</script>"#;
+        let encoded = html
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect::<String>();
+        let provider = DedicatedChromeProvider::new(executable);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "real-chrome-phase5-fixture",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(&mut registry, &handle, &format!("data:text/html,{encoded}"))
+            .await
+            .unwrap();
+        // Drop always kills the isolated child and removes its profile after a failed assertion.
+        session.process.preserve_on_drop = false;
+        let (_, targets) = session.connection().target_snapshot().await;
+        let target = targets
+            .iter()
+            .find(|target| target.id == session.target_id())
+            .unwrap();
+        let frame_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let target_now = session
+                    .connection()
+                    .targets
+                    .read()
+                    .await
+                    .targets
+                    .get(&target.id)
+                    .cloned();
+                if let Some(target_now) = target_now
+                    && let Ok(ready) = session
+                        .connection()
+                        .target_command(
+                            &target.id,
+                            target_now.generation,
+                            &target_now.revision,
+                            "Runtime.evaluate",
+                            json!({"expression":"!!document.querySelector('#list .record')","returnByValue":true}),
+                        )
+                        .await
+                    && ready["result"]["value"] == true
+                    && let Some(frame) = session
+                        .connection()
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .values()
+                        .find(|frame| frame.target_id == target.id)
+                {
+                    break frame.id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("virtualized fixture did not load");
+        let reference = session
+            .connection()
+            .capture_target_ref(&registry, &handle, &target.id, &frame_id, 1, 1)
+            .await
+            .unwrap();
+        let revisions = crate::sessions::IdentityRevisions {
+            account: 1,
+            document: 1,
+        };
+        let spec = ExtractionSpec {
+            container: "#list".into(),
+            record: ".record".into(),
+            fields: BTreeMap::from([
+                ("id".into(), ".id".into()),
+                ("label".into(), ".label".into()),
+            ]),
+            id_field: "id".into(),
+            max_steps: 40,
+            max_records: 100,
+            max_text_chars: 100,
+            max_bytes: 64 * 1024,
+            expected_count: Some(42),
+            account_marker: Some(("#account".into(), "fixture-account".into())),
+            terminal_selector: Some(".terminal".into()),
+            expand: vec![],
+            cursor: None,
+        };
+        let extraction_started = std::time::Instant::now();
+        let result = session
+            .connection()
+            .extract(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                &spec,
+            )
+            .await;
+        let extraction_elapsed = extraction_started.elapsed();
+        let result = result.unwrap();
+        assert_eq!(result.unique_count, 42, "{result:?}");
+        assert_eq!(result.records.len(), 42);
+        assert_eq!(result.completeness, Completeness::Complete, "{result:?}");
+        assert_eq!(result.expected_count, Some(42));
+        assert!(!result.terminal_evidence.is_empty());
+        let ids = result
+            .records
+            .iter()
+            .map(|record| record["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 42);
+
+        let baseline_started = std::time::Instant::now();
+        let baseline = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"({html:document.documentElement.outerHTML,text:document.body.innerText})","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        let baseline_elapsed = baseline_started.elapsed();
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+        let extraction_bytes = serde_json::to_vec(&result).unwrap().len();
+        println!(
+            "synthetic Chrome extraction diagnostic: extraction_elapsed_ms={} extraction_result_bytes={} full_dom_snapshot_elapsed_ms={} full_dom_snapshot_response_bytes={baseline_bytes}",
+            extraction_elapsed.as_secs_f64() * 1000.0,
+            extraction_bytes,
+            baseline_elapsed.as_secs_f64() * 1000.0
+        );
+
+        session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"(()=>{const l=document.querySelector('#list');l.scrollTop=80;document.querySelector('#account').textContent='wrong-account';return new Promise(r=>requestAnimationFrame(()=>r(l.scrollTop)))})()","returnByValue":true,"awaitPromise":true}),
+            )
+            .await
+            .unwrap();
+        let before = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"document.querySelector('#list').scrollTop","returnByValue":true}),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .as_f64()
+            .unwrap();
+        let wrong_account = session
+            .connection()
+            .extract(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                &spec,
+            )
+            .await
+            .unwrap();
+        let after = session
+            .connection()
+            .target_ref_command(
+                &registry,
+                &reference,
+                "real-chrome-phase5-fixture",
+                revisions,
+                "Runtime.evaluate",
+                json!({"expression":"document.querySelector('#list').scrollTop","returnByValue":true}),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(wrong_account.completeness, Completeness::Unknown);
+        assert_eq!(wrong_account.unique_count, 0);
+        assert_eq!(before, after, "wrong-account extraction scrolled the list");
+
+        struct OwnedTargetObserver;
+        impl IndependentTargetObserver for OwnedTargetObserver {
+            fn verify_unchanged(&self, _: &CleanupObservation) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let profile = session.profile_directory().to_owned();
+        let outcome = session
+            .shutdown(&mut registry, Some(&OwnedTargetObserver))
+            .await;
+        assert!(
+            outcome.cleanup_error.is_none(),
+            "{:?}",
+            outcome.cleanup_error
+        );
+        assert!(outcome.recovery.is_none());
+        assert!(!profile.exists(), "isolated profile remained: {profile:?}");
+    }
+
     #[tokio::test]
     async fn dedicated_provider_rejects_shared_extension_session_before_launch() {
         let mut registry = SessionRegistry::new(crate::sessions::ProviderGrants {
@@ -1576,6 +2931,45 @@ mod tests {
                 .await,
             Err(ProviderError::Session(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_extension_reports_authenticated_native_pair_error() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (result, ()) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"pair_error","token":pairing.token,"error":"debugger attach failed"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        assert!(
+            matches!(result, Err(ProviderError::Extension(error)) if error == "debugger attach failed")
+        );
     }
 
     #[tokio::test]
@@ -1605,7 +2999,7 @@ mod tests {
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17", "18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17", "18"]})
                         .to_string()
                         .into(),
                 ))
@@ -1660,6 +3054,261 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_commands_do_not_leak_pending_entries_or_replay_late_replies() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (attached, mut socket) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+        });
+        let attached = attached.unwrap();
+        // A connected extension that never replies: each command times out.
+        for _ in 0..3 {
+            let result = tokio::time::timeout(
+                Duration::from_millis(1200),
+                attached.command(
+                    &registry,
+                    &session,
+                    "17",
+                    "Runtime.evaluate",
+                    json!({"expression":"1+1"}),
+                ),
+            )
+            .await;
+            // Timeout can come from either the caller (early cancel) or the
+            // STARTUP_TIMEOUT path; either way no entry may remain.
+            assert!(result.is_err());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !attached.pending.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled command pending entry is removed even after contention");
+        }
+        // After the timeouts, a normal command still works, and the late
+        // replies to the timed-out ids are not replayed onto the new reply.
+        let (result, late_drain) = tokio::join!(
+            attached.command(
+                &registry,
+                &session,
+                "17",
+                "Runtime.evaluate",
+                json!({"expression":"2+2"}),
+            ),
+            async {
+                let mut seen_ids = Vec::new();
+                // Skip the ready confirmation before counting command messages.
+                while let Ok(Some(Ok(message))) =
+                    tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+                {
+                    let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if value["type"] != "ready" {
+                        seen_ids.push(value["id"].as_u64().unwrap());
+                        break;
+                    }
+                }
+                for _ in 0..3 {
+                    if let Ok(Some(Ok(message))) =
+                        tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+                    {
+                        let value: Value =
+                            serde_json::from_str(message.to_text().unwrap()).unwrap();
+                        seen_ids.push(value["id"].as_u64().unwrap());
+                        socket
+                            .send(Message::Text(
+                                json!({"type":"result", "id":value["id"], "result":{"late":true}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                seen_ids
+            }
+        );
+        result.unwrap();
+        let ids = late_drain;
+        assert_eq!(
+            ids.len(),
+            4,
+            "exactly one wire command per issued command id"
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len(),
+            "command ids are never reused after cancellation"
+        );
+        assert_eq!(attached.pending.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_extension_closes_a_bad_peer_and_still_accepts_the_extension() {
+        use crate::sessions::ProviderGrants;
+        use tokio::io::AsyncWriteExt;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let endpoint = provider.pairing().endpoint.clone();
+        let token = provider.pairing().token.clone();
+        let listener_addr = provider.listener.local_addr().unwrap();
+        let (accepted, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), provider.accept(&mut registry)),
+            async {
+                // A malformed upgrade and an oversized hello must not consume
+                // the pairing window: the provider keeps accepting peers.
+                let mut malformed = tokio::net::TcpStream::connect(listener_addr).await.unwrap();
+                malformed
+                    .write_all(b"not a websocket upgrade\r\n\r\n")
+                    .await
+                    .unwrap();
+                drop(malformed);
+                let (mut legacy, _) = connect_async(&endpoint).await.unwrap();
+                legacy
+                    .send(Message::Text(
+                        serde_json::json!({"type":"hello","token":token,"targets":["17"],"extension_version":env!("CARGO_PKG_VERSION")})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let rejected = tokio::time::timeout(Duration::from_secs(2), legacy.next())
+                    .await
+                    .unwrap();
+                assert!(matches!(rejected, Some(Ok(Message::Close(_))) | None));
+                let (mut bad, _) = connect_async(&endpoint).await.unwrap();
+                let oversized = "x".repeat(SHARED_MESSAGE_LIMIT + 1);
+                let _ = bad.send(Message::Text(oversized.into())).await;
+                // The legitimate extension pairs right after the bad peer.
+                let (mut good, _) = connect_async(&endpoint).await.unwrap();
+                good.send(Message::Text(
+                    serde_json::json!({"type":"hello","token":token,"targets":["17"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(3), good.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(reply.to_text().unwrap().contains("\"type\":\"ready\""));
+            }
+        );
+        let session = accepted
+            .expect("legitimate extension still pairs after a bad peer")
+            .unwrap();
+        assert_eq!(session.selected_targets().len(), 1);
+        assert!(session.selected_targets().contains("17"));
+    }
+
+    #[tokio::test]
+    async fn shared_extension_rejects_stale_extension_version() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (accepted, response) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut invalid, _) = connect_async(&pairing.endpoint).await.unwrap();
+            invalid
+                .send(Message::Text(
+                    json!({"type":"hello","token":"wrong","extension_version":"0.0.9","document_identity":true,"targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                invalid.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello","token":pairing.token,"extension_version":"0.0.9","document_identity":true,"targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let response = socket.next().await.unwrap().unwrap();
+            serde_json::from_str::<Value>(response.to_text().unwrap()).unwrap()
+        });
+        assert!(matches!(
+            accepted,
+            Err(ProviderError::Extension(message)) if message.contains("does not match server version")
+        ));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("reload the matching unpacked extension")
+        );
+    }
+
+    #[tokio::test]
     async fn shared_extension_rejects_wrong_selection_and_token() {
         use crate::sessions::ProviderGrants;
         use serde_json::json;
@@ -1686,7 +3335,7 @@ mod tests {
             let (mut bad_socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             bad_socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":"wrong", "targets":["18"]})
+                    json!({"type":"hello", "token":"wrong", "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -1699,7 +3348,7 @@ mod tests {
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -1767,7 +3416,7 @@ mod tests {
             tokio::join!(failed.accept(&mut registry), async {
                 let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
                 peer.send(Message::Text(
-                    json!({"type":"hello", "token":"bad", "targets":["17"]})
+                    json!({"type":"hello", "token":"bad", "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -1791,7 +3440,7 @@ mod tests {
         let (accepted, _) = tokio::join!(retry.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -1830,7 +3479,7 @@ mod tests {
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -1878,7 +3527,7 @@ mod tests {
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -1928,7 +3577,7 @@ mod tests {
             let (mut rejected, _) = connect_async(&pairing.endpoint).await.unwrap();
             rejected
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -1941,7 +3590,7 @@ mod tests {
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
