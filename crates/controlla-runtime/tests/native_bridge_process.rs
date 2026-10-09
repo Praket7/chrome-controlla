@@ -95,7 +95,7 @@ fn native_host_lists_tabs_before_pairing_and_recovers_from_bad_request() {
     fs::write(
         &pairing,
         json!({"endpoint":"ws://127.0.0.1:12345/","token":"fixture-token",
-        "tab_ids":[42],"request_id":"r1","expires_at_unix":expires})
+        "tab_ids":[42],"request_id":"r1","expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"expires_at_unix":expires})
         .to_string(),
     )
     .unwrap();
@@ -111,6 +111,8 @@ fn native_host_lists_tabs_before_pairing_and_recovers_from_bad_request() {
         }
     };
     assert_eq!(pair["tab_ids"], json!([42]));
+    assert_eq!(pair["expected_urls"], json!({"42":"https://example.test/"}));
+    assert_eq!(pair["expected_document_ids"], json!({"42":"document-42"}));
     write_native(
         &mut input,
         json!({"type":"pair_error","request_id":"r1","error":"fixture refusal"}),

@@ -126,6 +126,15 @@ impl Journal {
                 UNIQUE(principal, session, idem_key)
             );",
         )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS acknowledged_dispatches (
+                operation_id TEXT NOT NULL, correlation TEXT NOT NULL,
+                PRIMARY KEY(operation_id, correlation)
+            );
+            INSERT OR IGNORE INTO acknowledged_dispatches (operation_id, correlation)
+            SELECT id, dispatch_correlation FROM operations
+            WHERE delivery='sent' AND dispatch_correlation IS NOT NULL;",
+        )?;
         let columns = {
             let mut statement = connection.prepare("PRAGMA table_info(operations)")?;
             statement
@@ -205,26 +214,42 @@ impl Journal {
         id: &str,
         correlation: &str,
     ) -> Result<DispatchClaim, JournalError> {
-        let connection = self.0.lock().expect("journal mutex poisoned");
-        expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', dispatch_count=dispatch_count+1, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND (status='accepted' OR (status='running' AND delivery IN ('not_sent','sent'))) AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let mut connection = self.0.lock().expect("journal mutex poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_one(&tx, principal, session, id)?;
+        // Keep acknowledged step correlations after later steps replace the
+        // operation's current correlation.
+        let acknowledged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM acknowledged_dispatches WHERE operation_id=?1 AND correlation=?2)",
+            params![id, correlation],
+            |row| row.get(0),
+        )?;
+        if acknowledged {
+            tx.commit()?;
+            return Err(JournalError::InvalidTransition("dispatch"));
+        }
+        let changed = tx.execute("UPDATE operations SET status='running', dispatch_correlation=?4, delivery='unknown', dispatch_count=dispatch_count+1, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND (status='accepted' OR (status='running' AND delivery IN ('not_sent','sent'))) AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
         if changed == 0 {
-            expire_one(&connection, principal, session, id)?;
-            let current = get_conn(&connection, principal, session, id)?;
+            expire_one(&tx, principal, session, id)?;
+            let current = get_conn(&tx, principal, session, id)?;
             if let Some(op) = current
                 && op.status == JobStatus::Running
                 && op.dispatch_correlation.as_deref() == Some(correlation)
             {
+                tx.commit()?;
                 return Ok(DispatchClaim {
                     operation: op,
                     acquired: false,
                 });
             }
+            tx.commit()?;
             return Err(JournalError::InvalidTransition("dispatch"));
         }
+        let operation = get_conn(&tx, principal, session, id)?
+            .ok_or(JournalError::InvalidTransition("dispatch"))?;
+        tx.commit()?;
         Ok(DispatchClaim {
-            operation: get_conn(&connection, principal, session, id)?
-                .ok_or(JournalError::InvalidTransition("dispatch"))?,
+            operation,
             acquired: true,
         })
     }
@@ -334,7 +359,15 @@ impl Journal {
     ) -> Result<bool, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND dispatch_correlation=?4 AND delivery='unknown' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let tx = connection.unchecked_transaction()?;
+        let changed = tx.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND dispatch_correlation=?4 AND delivery='unknown' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        if changed == 1 {
+            tx.execute(
+                "INSERT OR IGNORE INTO acknowledged_dispatches (operation_id, correlation) VALUES (?1, ?2)",
+                params![id, correlation],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed == 1)
     }
 

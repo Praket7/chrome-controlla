@@ -16,8 +16,8 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
-const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
-const SHARED_TYPE_GUARD_FUNCTION: &str = r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'};}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'};const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'};return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true};}"#;
+const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+const SHARED_TYPE_GUARD_FUNCTION: &str = r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'};}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'};e.scrollIntoView({block:'nearest'});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'};return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true};}"#;
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SessionArgs {
@@ -1610,12 +1610,48 @@ impl App {
                     let host_id = snapshot["host_id"]
                         .as_str()
                         .ok_or_else(|| invalid("native tab inventory has no host ID"))?;
+                    // Bind the pairing to the page identity observed at
+                    // discovery: the extension rechecks each tab's URL just
+                    // before attach and detaches on later navigation.
+                    let mut expected_urls = serde_json::Map::new();
+                    let mut expected_document_ids = serde_json::Map::new();
+                    for selected_id in &target_ids {
+                        let mut matches = tabs.iter().filter(|tab| {
+                            tab["id"]
+                                .as_u64()
+                                .is_some_and(|id| id.to_string() == *selected_id)
+                        });
+                        let tab = matches.next().ok_or_else(|| {
+                            invalid("selected tab is missing from the fresh native inventory")
+                        })?;
+                        if matches.next().is_some() {
+                            return Err(invalid(
+                                "native inventory contains duplicate selected tab IDs",
+                            ));
+                        }
+                        let url = tab["url"]
+                            .as_str()
+                            .ok_or_else(|| invalid("selected native tab has no discovery URL"))?;
+                        let document_id = tab["document_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| {
+                            invalid("selected native tab has no durable document ID; reload the extension and rediscover tabs")
+                        })?;
+                        expected_urls.insert(
+                            selected_id.clone(),
+                            serde_json::Value::String(url.to_owned()),
+                        );
+                        expected_document_ids.insert(
+                            selected_id.clone(),
+                            serde_json::Value::String(document_id.to_owned()),
+                        );
+                    }
                     crate::native_setup::write_pairing(
                         host_id,
                         &pairing.endpoint,
                         &pairing.token,
                         &target_ids,
                         &session_id,
+                        &expected_urls,
+                        &expected_document_ids,
                     )
                     .map_err(invalid)?;
                 }
@@ -2282,11 +2318,11 @@ impl App {
         let expression = if args.action == "fill" {
             let value = serde_json::to_string(&args.value).map_err(|e| invalid(e.to_string()))?;
             format!(
-                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0];e.scrollIntoView({{block:'nearest'}});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
             )
         } else if args.action == "type" {
             format!(
-                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{node:null,identityRoute:'shared_type_handle'}}}};return {{node:es.length===1?es[0]:null,identityRoute:'shared_type_handle'}};}})()"#
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{node:null,identityRoute:'shared_type_handle'}}}};if(es.length!==1)return {{node:null,identityRoute:'shared_type_handle'}};const e=es[0];e.scrollIntoView({{block:'nearest'}});e.focus();return {{node:e,identityRoute:'shared_type_handle'}};}})()"#
             )
         } else {
             let unsafe_predicate = SHARED_CLICK_UNSAFE_PREDICATE;
@@ -2294,7 +2330,7 @@ impl App {
             let postcondition_json =
                 serde_json::to_string(postcondition).map_err(|e| invalid(e.to_string()))?;
             format!(
-                r#"(()=>{{let es,ps;try{{es=[...document.querySelectorAll({selector})];ps=[...document.querySelectorAll({postcondition_selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1||ps.length!==1)return {{ok:false,reason:es.length!==1?(es.length?'ambiguous':'no_match'):(ps.length?'postcondition_ambiguous':'postcondition_no_match')}};const e=es[0],p=ps[0],s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??''),postcondition_before=(p instanceof HTMLInputElement||p instanceof HTMLTextAreaElement||p instanceof HTMLSelectElement)?p.value:(p.innerText??'');if(p===e||!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||p.hasAttribute('data-masked')||p.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked'}};if(typeof current!=='string'||current.length>16384)return {{ok:false,reason:'click_text_too_large'}};if(typeof postcondition_before!=='string'||postcondition_before.length>16384)return {{ok:false,reason:'postcondition_text_too_large'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};const postcondition_before_is_desired=postcondition_before==={postcondition_json};if(postcondition_before_is_desired)return {{ok:false,reason:'postcondition_already_satisfied'}};return {{ok:true,x,y,postcondition_before_is_desired}};}})()"#
+                r#"(()=>{{let es,ps;try{{es=[...document.querySelectorAll({selector})];ps=[...document.querySelectorAll({postcondition_selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1||ps.length!==1)return {{ok:false,reason:es.length!==1?(es.length?'ambiguous':'no_match'):(ps.length?'postcondition_ambiguous':'postcondition_no_match')}};const e=es[0],p=ps[0];e.scrollIntoView({{block:'nearest'}});const s=getComputedStyle(e),b=e.getBoundingClientRect(),t=e.type||'',x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y),visible=b.width>0&&b.height>0&&b.left>=0&&b.top>=0&&b.right<=innerWidth&&b.bottom<=innerHeight&&s.visibility!=='hidden'&&s.display!=='none'&&s.pointerEvents!=='none',unsafe={unsafe_predicate},disabled=e.matches(':disabled'),current=(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e instanceof HTMLSelectElement)?e.value:(e.innerText??''),postcondition_before=(p instanceof HTMLInputElement||p instanceof HTMLTextAreaElement||p instanceof HTMLSelectElement)?p.value:(p.innerText??'');if(p===e||!visible||disabled||unsafe||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||p.hasAttribute('data-masked')||p.hasAttribute('data-requires-trusted')||!h||!(h===e||e.contains(h)))return {{ok:false,reason:'blocked',detail:{{p_is_e:p===e,visible,disabled,unsafe,masked:e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||p.hasAttribute('data-masked')||p.hasAttribute('data-requires-trusted'),covered:!h||!(h===e||e.contains(h)),rect:{{l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b2:Math.round(b.bottom)}},iw:innerWidth,ih:innerHeight,pt:h?h.tagName:null}}}};if(typeof current!=='string'||current.length>16384)return {{ok:false,reason:'click_text_too_large'}};if(typeof postcondition_before!=='string'||postcondition_before.length>16384)return {{ok:false,reason:'postcondition_text_too_large'}};if(current!=={expected})return {{ok:false,reason:'stale_value'}};const postcondition_before_is_desired=postcondition_before==={postcondition_json};if(postcondition_before_is_desired)return {{ok:false,reason:'postcondition_already_satisfied'}};return {{ok:true,x,y,postcondition_before_is_desired}};}})()"#
             )
         };
         let mut typing_object_id = None;
@@ -2335,9 +2371,18 @@ impl App {
             ),
         };
         if args.action != "type" && action_error.is_none() && preflight["ok"] != true {
+            let detail = preflight["detail"]
+                .as_object()
+                .map(|d| serde_json::to_string(d).unwrap_or_default())
+                .unwrap_or_default();
             action_error = Some(format!(
-                "shared input refused: {}",
-                preflight["reason"].as_str().unwrap_or("unverifiable")
+                "shared input refused: {}{}",
+                preflight["reason"].as_str().unwrap_or("unverifiable"),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({detail})")
+                }
             ));
         }
         let observed_value;
@@ -2683,7 +2728,23 @@ impl App {
                 }
                 if action_error.is_none() {
                     if let Some((x, y)) = refreshed["x"].as_f64().zip(refreshed["y"].as_f64()) {
-                        let press = tokio::time::timeout_at(
+                        let moved = tokio::time::timeout_at(
+                            action_deadline,
+                            connection.command(
+                                shared.registry()?,
+                                &shared.handle,
+                                &args.chrome_tab_id,
+                                "Input.dispatchMouseEvent",
+                                json!({"type":"mouseMoved","x":x,"y":y,"button":"left"}),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| "mouse move deadline exceeded".to_owned())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                        let press = if let Err(error) = moved {
+                            Err(error)
+                        } else {
+                            tokio::time::timeout_at(
                             action_deadline,
                             connection.command(
                                 shared.registry()?,
@@ -2692,10 +2753,11 @@ impl App {
                                 "Input.dispatchMouseEvent",
                                 json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
                             ),
-                        )
-                        .await
-                        .map_err(|_| "mouse press deadline exceeded".to_owned())
-                        .and_then(|result| result.map_err(|error| error.to_string()));
+                            )
+                            .await
+                            .map_err(|_| "mouse press deadline exceeded".to_owned())
+                            .and_then(|result| result.map_err(|error| error.to_string()))
+                        };
                         let release = tokio::time::timeout_at(
                             recovery_deadline,
                             connection.command(
@@ -4671,7 +4733,7 @@ mod tests {
             let (mut peer, _) = connect_async(endpoint).await.unwrap();
             peer.send(Message::Text(
                 json!({
-                    "type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"targets":["123"]
+                    "type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"targets":["123"]
                 })
                 .to_string()
                 .into(),
@@ -4900,7 +4962,7 @@ mod tests {
         let extension = async move {
             let (mut peer, _) = connect_async(endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"targets":["123"]})
+                json!({"type":"hello","token":token,"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"targets":["123"]})
                     .to_string()
                     .into(),
             ))
@@ -5317,12 +5379,13 @@ mod tests {
                     .iter()
                     .filter(|method| method.as_str() == "Input.dispatchMouseEvent")
                     .count(),
-                8,
+                12,
                 "attempt a mouse release even when the press acknowledgement is uncertain"
             );
             assert_eq!(
-                &mouse_events.lock().unwrap()[..2],
+                &mouse_events.lock().unwrap()[..3],
                 &[
+                    ("mouseMoved".to_owned(), 14.0, 15.0),
                     ("mousePressed".to_owned(), 14.0, 15.0),
                     ("mouseReleased".to_owned(), 14.0, 15.0)
                 ],
@@ -5474,7 +5537,7 @@ mod tests {
             socket
                 .send(Message::Text(
                     json!({"type":"hello", "token":pair["one_session_token"],
-                "extension_version":env!("CARGO_PKG_VERSION"), "targets":["123"]})
+                "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["123"]})
                     .to_string()
                     .into(),
                 ))

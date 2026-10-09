@@ -2,14 +2,30 @@
 
 Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1.0`. Client setup formats checked against upstream documentation/source on 2026-10-06. OpenCode 1.18.5 completed one read-only guide call using a generated v1 config and local Qwen 2.5 7B; this is a narrow tool-call check, not full client acceptance. On 2026-10-08, a Freebuff CLI 0.2.19 launch with a temporary HOME stopped at login; its bundled runtime reported 0.2.22, and no MCP discovery occurred. A later Freebuff Desktop 0.0.134 run used a temporary project config and isolated state directory. Desktop status was `connected_writable` with write authorization; one model turn returned that no `chrome-controlla` MCP tools were loaded. Result: 0/2 requested actions (`guide`, `session`); its agent only listed/read project files. No browser tool was called. Freebuff CLI authentication remains unverified. See `verification-matrix.md` for bounded evidence and remaining client gates.
 
-MCP runs over local stdio by default. Build the executable, then use its absolute path (normally `target/release/controlla`); the command is `controlla mcp`. The optional HTTP server is authenticated and loopback-only. Each concurrently running MCP process needs a unique absolute `CONTROLLA_STATE_DIR`. Shared-tab control uses Chrome's native messaging bridge; it does not use a remote debugging port.
+MCP runs over local stdio by default. From a checkout, build the executable with `cargo build --locked --release -p controlla-runtime`; its path is `target/release/controlla` (`target/release/controlla.exe` on Windows). Configure the MCP client to run that absolute path with `mcp` as its argument. The optional HTTP server is authenticated and loopback-only. Each concurrently running MCP process needs a unique absolute `CONTROLLA_STATE_DIR`. Shared-tab control uses Chrome's native messaging bridge; it does not use a remote debugging port.
 
 ## One-time Chrome bridge setup
 
-1. In Chrome, open `chrome://extensions`, enable Developer mode, and load `extensions/chrome-controlla` with **Load unpacked**.
-2. Copy the extension ID shown on that page. It is specific to this installation; do not reuse an ID from another machine or a documentation example.
-3. Build/install the `controlla` executable, then register the native host once with that exact ID: `controlla install-bridge YOUR_EXTENSION_ID`.
-4. Reload the extension on `chrome://extensions`. Keep Chrome and the MCP server running.
+1. Build the runtime from the repository root: `cargo build --locked --release -p controlla-runtime`. On macOS/Linux, set `CONTROLLA_BIN="$(pwd)/target/release/controlla"`; on Windows, use the absolute path to `target/release/controlla.exe`.
+2. Use Chrome 106 or later. Open `chrome://extensions`, enable Developer mode, and load the checkout's `extensions/chrome-controlla` directory with **Load unpacked**. Approve the `webNavigation` permission when Chrome prompts.
+3. Copy the 32-character extension ID shown on its card in `chrome://extensions`, then register the native host using the same built executable that the MCP client will run: `"$CONTROLLA_BIN" install-bridge YOUR_EXTENSION_ID` (substitute the Windows path as needed). This writes the native-host manifest with that executable path and allows only that exact extension origin. The ID is specific to this installation; never reuse an ID from another machine or a documentation example.
+4. Reload the extension on `chrome://extensions` so its service worker reconnects to the newly registered host. Configure the local MCP client to run the same executable with argument `mcp`, then restart/reload that client. Keep Chrome and the MCP process running.
+
+For a generic stdio client, the entry is:
+
+```json
+{
+  "mcpServers": {
+    "chrome-controlla": {
+      "command": "/ABSOLUTE/PATH/TO/controlla",
+      "args": ["mcp"],
+      "env": { "CONTROLLA_STATE_DIR": "/ABSOLUTE/PATH/TO/controlla-state" }
+    }
+  }
+}
+```
+
+Use the client-specific format below when its config schema differs. Keep the state directory absolute and unique for each running process. A successful MCP tool listing proves only that the client started the server; it does not prove the Chrome extension/native host connection.
 
 In MCP, call `session` with `action: "discover_shared_tabs"`. Select one or more IDs from `snapshot.tabs` and pass those `target_ids` plus `snapshot.host_id` to `session` with `action: "pair_shared"`; this creates **one session for all selected tabs** over the native bridge. Then call `session` with `action: "accept_shared"` and its returned `session_id`. If you omit `host_id`, pairing uses the manual popup fallback. Discovery includes at most 100 eligible tabs; when `snapshot.truncated` is `true`, later tabs are omitted. Listing does not attach to tabs.
 
@@ -17,7 +33,7 @@ The popup's endpoint/token form is used when `host_id` is omitted, including whe
 
 Pairing trusts the MCP client that supplies the tab IDs: use it only through a client you trust. Chrome displays its debugger indicator for attached tabs; separate browser-side per-tab approval beyond that indicator has not been established.
 
-Live qualification is narrow: Chrome launched the registered host; MCP read its fresh tab inventory, paired the selected testing Classroom tab, observed its heading and a selected accessibility node, and released it. A separate local Chrome fixture completed guarded native-route fill and click with independent DOM readback. Classroom writes, app acceptance/persistence, and broad client compatibility remain unqualified.
+Live qualification is narrow: on 2026-10-09, the enabled local MCP entry and loaded extension paired one agent-created local fixture tab over the native route. Guarded fill, typing, fixture slide clicks, mock in-memory post, navigation invalidation/re-pair, bounded readback, release, and tab cleanup succeeded. The file-input attempt was blocked and no file was selected. These checks do not establish remote app changes or persistence. Classroom writes, app acceptance/persistence, and broad client compatibility remain unqualified; see `verification-matrix.md` for details.
 
 Generate the dated config shape for a client with `node integrations/generate-config.mjs <client> /absolute/path/to/controlla /absolute/path/to/state-root`. Supported IDs are `freebuff`, `opencode-v1`, `opencode-v2`, and `claude`; OpenCode versions have different nesting. Each output gives that client its own state subdirectory. These versioned templates are configuration examples, not proof that an installed client accepts them. ChatGPT is intentionally omitted because this preview has neither local-stdio support there nor an authenticated remote endpoint.
 

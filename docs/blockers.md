@@ -1,5 +1,15 @@
 # Blockers and external dependencies
 
+## Source-audit repair follow-up — 2026-10-08
+
+- The local A1–A8 repair set passes workspace, Clippy, extension, package, documentation, provenance, client, app, benchmark, dependency, and isolated installed-Chrome checks. The four installed-Chrome runs use disposable headless profiles; they do not establish the paired extension/MCP route.
+- The updated native route passed live on a disposable local fixture on 2026-10-09 after the local MCP entry and extension were active: pairing, guarded fill/type/click, navigation invalidation/re-pair, bounded observation, release, and cleanup succeeded. The file-input attempt was blocked; no upload or external app change occurred. See `verification-matrix.md` for exact evidence.
+- Chrome 106+ `webNavigation.documentId` flows through discovery, attach, and each command. Real-site actions, app acceptance/save/persistence, broad browser/platform coverage, and hosted CI on the dirty diff remain unqualified.
+
+## Stalled original testing Classroom tab — 2026-10-08
+
+The paired extension route succeeds on a disposable local fixture and on a newly opened copy of the authorized test Classroom: `Page.getFrameTree` returned promptly, then a bounded `h1` observation returned “Classroom / testing.” The older Classroom tab (`1649771875`) still stalls: its recorded `Page.getFrameTree` debugger request errored after 22,004 ms, beyond the 20-second native request deadline, and even the CUA tab-handle lookup timed out. The `reply:suppressed` event is expected after that deadline, not the root failure. No page write occurred. Chrome inventory still lists that old tab without a provider tab handle, so this session cannot reload it through the supported UI route; use the fresh test tab or manually reload only the old testing Classroom tab. No extension or Codex restart is indicated by the successful fresh-tab check.
+
 ## Phase 8 app workflow gates
 
 Planning-only MCP tools now build a revision-bound Slides text request and a 10-slide editable deck candidate, compile a five-page Canva design candidate, and validate a supplied CapCut licensed-media/timeline recipe. Slides/Canva preconditions are explicitly marked non-authoritative; the Slides compiler never emits delete requests and the Canva sync candidate is advisory. `capcut_web_plan` remains explicitly unsupported until a live versioned control map and independent verifier exist. These offline planners are not app routes: no vendor app is connected and none of these tools edits a document or uploads media.

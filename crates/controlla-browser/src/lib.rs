@@ -1915,7 +1915,7 @@ mod tests {
             let mut guard_started = None;
             let mut measured_window_micros = 0;
             let mut race_event_seen_rx = Some(race_event_seen_rx);
-            let dom_value = |value: &str| serde_json::json!({"ok":true,"count":1,"tag":"INPUT","type":"text","editable":false,"disabled":false,"visible":true,"rect":{"x":0,"y":0,"width":100,"height":20},"hit":true,"value":value,"selectionStart":value.encode_utf16().count(),"selectionEnd":value.encode_utf16().count()});
+            let dom_value = |value: &str| serde_json::json!({"ok":true,"count":1,"tag":"INPUT","type":"text","editable":false,"disabled":false,"visible":true,"rect":{"x":0,"y":0,"width":100,"height":20},"hit":true,"token":"fixture-node","value":value,"selectionStart":value.encode_utf16().count(),"selectionEnd":value.encode_utf16().count()});
             while methods.len() < 32 {
                 let msg = socket.next().await.unwrap().unwrap();
                 let req: Value = serde_json::from_str(&msg.to_string()).unwrap();

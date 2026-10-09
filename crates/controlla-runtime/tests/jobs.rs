@@ -113,6 +113,71 @@ fn admission_is_scoped_durable_and_conflicts_on_changed_request() {
 }
 
 #[test]
+fn acknowledged_correlation_cannot_be_reclaimed_but_new_steps_may() {
+    let path = temp_db();
+    cleanup(&path);
+    let journal = Journal::open(&path).unwrap();
+    let admitted = journal
+        .admit("p", "s", "ack-guard", &json!({"steps":true}))
+        .unwrap();
+    assert!(journal.start("p", "s", &admitted.operation.id).unwrap());
+    let first = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+        .unwrap();
+    assert!(first.acquired);
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .unwrap()
+    );
+    // The acknowledged correlation is confirmed-delivered: re-claiming it must
+    // never admit a second send of the same browser effect.
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .is_err()
+    );
+    // A distinct correlation is the next workflow step and stays allowed.
+    let second = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+        .unwrap();
+    assert!(second.acquired);
+    assert_eq!(second.operation.dispatch_count, 2);
+    assert_eq!(second.operation.delivery, Delivery::Unknown);
+    let repeat = journal
+        .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+        .unwrap();
+    assert!(!repeat.acquired);
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-1")
+            .unwrap()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-2")
+            .unwrap()
+            .acquired
+    );
+    assert!(
+        journal
+            .acknowledge_dispatch("p", "s", &admitted.operation.id, "step-2")
+            .unwrap()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-0")
+            .is_err()
+    );
+    assert!(
+        journal
+            .record_dispatch("p", "s", &admitted.operation.id, "step-1")
+            .is_err()
+    );
+    cleanup(&path);
+}
+
+#[test]
 fn completion_allows_no_dispatch_but_rejects_unacknowledged_dispatch() {
     let path = temp_db();
     cleanup(&path);

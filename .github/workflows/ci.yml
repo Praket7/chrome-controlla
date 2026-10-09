@@ -30,6 +30,11 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check:docs
       - run: npm run check:provenance
+      - run: npm run check:clients
+      - run: npm run check:apps
+      - run: npm run check:bench
+      - run: node extensions/chrome-controlla/test-background.cjs
+      - run: node --check extensions/chrome-controlla/background.js
       - run: ./scripts/check-dependencies.sh
         shell: bash
       - run: ./scripts/package-check.sh

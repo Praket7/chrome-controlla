@@ -55,7 +55,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 let mut socket = accept_async(stream).await.map_err(|e| e.to_string())?;
                 let hello = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "hello timed out".to_owned())?.ok_or("provider socket closed before hello")?.map_err(|e| e.to_string())?;
                 let hello: Value = serde_json::from_str(hello.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION")}) {
+                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true}) {
                     return Err(format!("unexpected provider hello: {hello}"));
                 }
                 socket.send(Message::Text(json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")}).to_string().into())).await.map_err(|e| e.to_string())?;
@@ -134,7 +134,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         let inventory: Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
         let host_id = inventory["host_id"].as_str().unwrap();
         let pairing = state.join(format!("native-pairing-{host_id}.json"));
-        fs::write(&pairing, json!({"endpoint":format!("ws://127.0.0.1:{}/", address.port()),"token":"fixture-secret","tab_ids":[42],"request_id":"roundtrip-1","expires_at_unix":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+60}).to_string()).unwrap();
+        fs::write(&pairing, json!({"endpoint":format!("ws://127.0.0.1:{}/", address.port()),"token":"fixture-secret","tab_ids":[42],"request_id":"roundtrip-1","expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"expires_at_unix":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()+60}).to_string()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -148,11 +148,11 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         };
         assert_eq!(
             pair,
-            json!({"type":"pair","request_id":"roundtrip-1","tab_ids":[42]})
+            json!({"type":"pair","request_id":"roundtrip-1","tab_ids":[42],"expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"}})
         );
         write_native(
             &mut input,
-            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION")}),
+            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true}),
         );
         ready_rx.recv_timeout(TIMEOUT).unwrap_or_else(|e| {
             let _ = std::process::Command::new("kill")

@@ -1,5 +1,21 @@
 # Verification matrix
 
+## Source-audit repair follow-up — 2026-10-08
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Workspace tests | pass | `cargo test --workspace --locked --offline`; installed-Chrome tests are ignored by default. |
+| Installed-Chrome integration | pass, 4 tests | `cargo test -p controlla-browser --locked --offline -- --ignored --nocapture`; three provider tests and one Phase 5 extraction fixture passed in isolated headless profiles. This does not exercise the shared-extension route or the user's Chrome profile. |
+| Rust format and warning-denied Clippy | pass | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`. |
+| Extension harness and syntax | pass | `node extensions/chrome-controlla/test-background.cjs`; `node --check extensions/chrome-controlla/background.js`; includes native/popup replacement races, delayed document lookup with authorization revocation, synchronous per-tab pair reservations across both transports, and retry after a blocked navigation detach. |
+| Final Sol review | pass, scoped | Re-review closed the four reported findings (optional A1 URL, missing A6 token, drag release after move failure, malformed handshake abort) and found no new finding in those areas. Reviewer did not independently rerun commands. |
+| Final Sol review of document binding | approved, source/fixture scope | Reviewer found no remaining pairing, detach, or post-`getFrame` authorization race after the reservation fixes. Reviewer did not rerun tests; the subsequent live fixture result is recorded below, and hosted CI remains open. |
+| Docs, provenance, client/app/benchmark, dependencies | pass | `npm run check:docs`, `check:provenance`, `check:clients`, `check:apps`, `check:bench`, and `./scripts/check-dependencies.sh`. These are local checks. |
+| Package build and consumer lifecycle | pass | `./scripts/package-build.sh` and `./scripts/package-check.sh`; macOS arm64 archive, clean-prefix install, lifecycle/rollback and user-data preservation. Not published. |
+| Live shared-extension/MCP route in this follow-up | pass, disposable local fixture | On 2026-10-09 the enabled local MCP entry and loaded extension paired the exact agent-created fixture tab, completed guarded fill/type/click and mock in-memory post actions, rejected a file-input attempt, invalidated on navigation, re-paired, observed the new document, and released/closed the fixture. See the detailed live battery below; no real app write or persistence is claimed. |
+| Durable document identity | implemented, fixture pass; live fixture pass | Chrome 106+ `webNavigation.getFrame` document IDs flow from discovery through native pairing. The extension compares IDs before/after attach and before every allowed command, then rechecks live authorization and stored identity after the async frame lookup. Per-tab reservations prevent simultaneous native/popup attaches; attachment waits for an in-flight detach. Pairing fails closed if discovery lacks an ID. Live fixture navigation detached the stale pair and fresh pairing observed the new document. The final synchronous check cannot make Chrome command processing atomic with navigation. |
+| Hosted CI | not run for this dirty diff | The CI workflow now includes the lightweight local checks, but no hosted run has qualified these uncommitted changes. |
+
 ## Native shared-tab bridge — local gate, 2026-10-07
 
 | Check | Result | Evidence / boundary |
@@ -445,7 +461,7 @@ This is a short registry-derived bootstrap, not generated documentation or B35 u
 | Release candidate build and package lifecycle | pass | macOS arm64 | `npm run prepare:release-candidate` completed for commit `7d5b95b63201350b806068686ef871d31bd92841`; clean-prefix install and upgrade/rollback/uninstall lifecycle passed; staged SBOM, npm archive, extension archive, and `SHA256SUMS` verified. |
 | Hosted CI | pass | GitHub Actions | Run [37624887673](https://github.com/Praket7/chrome-controlla/actions/runs/37624887673) passed Ubuntu, macOS, and Windows. |
 | Host-matched clean-prefix consumer install | pass | Windows, macOS, Linux; GitHub Actions | Run [37628108314](https://github.com/Praket7/chrome-controlla/actions/runs/37628108314) passed `package-check.sh` on all three hosts; each job packed, installed to a clean prefix, and ran the installed command shim. This was not a published GitHub install. |
-| Live use of this server binary | pending | Locked local Mac | Restart Codex MCP and repeat selected-tab live checks; no extension reload is needed because its source is unchanged. |
+| Live use of this server binary | pass, bounded fixture route (2026-10-09) | Locked local Mac | The current local entry served the live fixture route recorded below. This supersedes the prior pending status; real app workflows remain unqualified. |
 
 ## Live shared-extension pairing and read-only observation — 2026-10-07
 
@@ -557,3 +573,63 @@ The native path is the documented default: one-time `controlla install-bridge <e
 | Live shared typing in Chrome | pass, local fixture | On 2026-10-08, after rebuilding/reloading Hotload revision 3, Controlla typed `Hello, world!` into the exact disposable localhost tab `1649771820`; final value, focus, and caret were verified. Chrome recorded 13 each of `keydown`, `keypress`, `beforeinput`, `input`, and `keyup` (65 events total); the 12 keyDown gaps were 66.7–81 ms, median 71 ms. The native session was released, tab closed, and local server stopped. The unpacked extension was already loaded and had no source changes; no further extension or Codex restart is needed. This does not qualify real app acceptance/persistence, IME, rich editors, canvas, or other OS/browser targets. |
 
 These checks do not close the app-specific acceptance, performance, external-client, benchmark-run, or public-release gates recorded above.
+
+## Paired-extension diagnostics and test-tab isolation — 2026-10-08
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Native discovery, exact test-tab pairing, acceptance, and release | pass | Fresh native bridge discovery paired only the selected Slides tab `1649771881`, then the authorized test Classroom tab `1649771875`; both sessions were released. |
+| First read-only debugger command on old Slides and Classroom tabs | failed, target-specific | The first commands timed out on the selected tabs; no page write was issued. For original Classroom tab `1649771875`, the later service-worker trace shows `Page.getFrameTree` errored after 22,004 ms and the reply was suppressed after the native deadline. |
+| Fresh test Classroom tab | pass, live read-only | A newly opened tab at the same authorized testing Classroom URL returned its frame tree and a bounded `h1` observation (“Classroom / testing”). The paired session was released and the temporary tab closed. This supports a stale/unresponsive old-tab diagnosis; it does not verify Slides, Canva, CapCut, or persistence. |
+| Diagnostic source change | pass, fixture and independent review | Extension logs bounded `dispatch`, debugger `settled`, and native `reply` state, including numeric command IDs. Logs exclude page data, URLs, command parameters, tokens, and error bodies. Fixtures cover pending settlement and stale-generation suppression; focused tests, both `node --check` invocations, and `git diff --check` pass. |
+| Full local workspace and installed-Chrome validation | pass | `cargo test --workspace --locked --offline`, warning-denied Clippy, formatting, dependency/docs/provenance checks pass. Three installed-Chrome provider tests pass with isolated headless profiles; this does not verify the shared extension route or app persistence. |
+| Chrome CDP composition protocol | pass, isolated headless fixture | The installed-Chrome provider smoke fixture exercised `Input.imeSetComposition`, observed compositionstart/update/end and composing input, and verified the resulting Unicode field value. This is Chrome DevTools Protocol composition, not native macOS IME UI or other OS/browser input. |
+| Client/app/benchmark offline suites | pass, fixture-only | `npm run check:clients`, `npm run check:apps`, and `npm run check:bench` pass. The benchmark validator verifies preregistration/manifests and local synthetic counts; it explicitly measures no browser latency or model usage and does not count as pilot or held-out execution. |
+| Slides, Canva, CapCut save/persistence and export | not verified | Current routes are planners/recipe validation only. No app document or media was changed. |
+
+## Source-audit repair queue A1–A8 — 2026-10-08
+
+Fixture-level repairs of the independent source-audit findings in `handoff.md` §6. These are code-level fixes with focused regression fixtures; none of them was reproduced live in Chrome, and none changes the app-save/persistence, external-client, benchmark, or release gates.
+
+| Finding | Fix and test | Result |
+|---|---|---|
+| A1 pairing/page binding | Native discovery captures a stable main-frame document ID alongside the URL. Both are required for selected tabs and compared before/after attach; command dispatch rechecks the current ID, while main-frame navigation/commit events invalidate the attachment. An explicit handshake capability rejects older extension code. Fixtures cover missing identity, same-URL document replacement, event invalidation, and command-time mismatch. | pass, fixture |
+| A2 per-peer handshake deadline | WS handshake and hello for one inbound peer are bounded to 10 s (`PER_PEER_HANDSHAKE_TIMEOUT`) inside the overall pairing window; timeout, malformed upgrade, and invalid hello are skipped so the accept loop continues. The fixture sends a malformed upgrade and oversized hello before proving the legitimate extension still pairs. | pass, fixture |
+| A3 pending-reply leak on cancellation | A `PendingEntryGuard` drop guard now owns each pending command entry: normal reply, timeout, transport error, and early future cancellation all remove it; the guard is disarmed only on a settled reply. New fixture: three timed-out commands against a never-replying extension leave zero pending entries, subsequent commands still work, wire command IDs are never reused, and late replies are not replayed. | pass, fixture |
+| A4 duplicate dispatch claim | `record_dispatch` rejects re-claiming a correlation that is already acknowledged as `sent`; distinct new-step correlations remain allowed. New journal regression covers same-correlation refusal after ack, new-step claim, and non-acquiring same-correlation retry while unacknowledged. | pass, fixture |
+| A5 readonly direct fill | The locator probe reports `readOnly`, admission refuses readonly targets, and the fill mutation rechecks `e.readOnly||e.disabled` inside the same evaluation that writes, refusing to report Applied on a readonly field. | pass, fixture |
+| A6 same-selector replacement | Each resolution stamps the element with a unique `__controllaNodeToken`; guarded input now rejects probes that lack the token, and every dispatch-stage script requires the probed token. | pass, fixture |
+| A7 pointer release recovery | Click/drag release is routed through a scoped helper with one bounded retry only when node identity still passes. A failed drag move after press now attempts guarded release before returning the movement error; an unconfirmed release reports pointer state as uncertain. | pass, fixture |
+| A8 CI coverage | `.github/workflows/ci.yml` now runs `check:clients`, `check:apps`, `check:bench`, the extension fixture, and `node --check` on the extension source. All five pass locally; hosted verification still requires the next CI run. | pass locally, CI pending |
+
+## Earlier live 4-tab window pairing and observation — 2026-10-08
+
+An earlier live session reported that a release binary at this checkout's path served MCP stdio in an isolated state directory while Chrome's pre-existing native host relayed pairing. It observed and released four tabs read-only. The record identifies the binary path and extension ID, but has no binary digest or captured source revision; it therefore remains historical evidence and does not establish that the exact current dirty diff was live-qualified. No page content was modified.
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Native bridge identity | reported pass | Manifest `chrome_controlla_bridge.json` pointed at this checkout's `target/release/controlla`; extension `bhgfjpbajecihfbgaikampminappgodh`; native host process live from Chrome. No binary digest was retained. |
+| Discovery → pair → accept (native route) | pass | Fresh inventory (58 tabs, untruncated) listed all four window tabs; `pair_shared` with `host_id` + the four IDs returned `native_bridge:true`; `accept_shared` returned accepted with all four selected targets. |
+| Frame identity of all four paired tabs | pass | `list_shared_targets` returned root frame trees for Canva (`canva.com/`), Slides (`docs.google.com/presentation/u/0/`), CapCut (`capcut.com/my-edit`), Classroom (`classroom.google.com/c/ODI2NTQ5Mjc1ODU3`). |
+| Bounded observation per tab | pass, sequential sessions | Slides: title "Google Slides", header text read. Canva: title "Home - Canva", skip-navigation text read. CapCut: title "My projects…", banner text read. Classroom: title "testing - Classroom", `h1` = "Classroom\ntesting", main-menu text read. |
+| Shared accessibility per tab | pass | `shared_accessibility` on `body` returned bounded AX nodes for all four tabs. |
+| Clean release | pass | Every session released; debugger attachments detached. |
+| Multi-tab single-session pairing under rapid pair/detach churn | flaky, observed | Repeated multi-tab pairing immediately after prior releases intermittently returned `TargetChanged` on all commands until the extension settled; single-tab sessions and the first post-idle multi-tab session worked. This is attach-churn behavior of the running pre-repair extension build, not a regression from today's changes; it needs the extension reload to re-evaluate. |
+| Field-selector semantics | documented | Observation field values are CSS selectors resolved against each matched element (`*` reads the element itself). Passing a DOM property name such as `innerText` yields a missing-field null, not text. |
+
+These live checks are point-in-time read-only observations on this machine; they do not qualify app writes, save/persistence, external clients, or the remaining phase gates.
+
+## Live local Controlla fixture battery — 2026-10-09
+
+The enabled local `[mcp_servers.chrome-controlla]` entry was served through the current Codex Hotload child (`chrome-controlla`, 21 tools; separate state directory). Tests used only the agent-created fixture tab `1649772132` at `http://127.0.0.1:8977/` and `/nav.html`. The bridge paired this exact Chrome tab through `discover_shared_tabs` → `pair_shared` → `accept_shared`; no other tab was selected.
+
+| Check | Result | Evidence and limit |
+|---|---|---|
+| Shared form fill and type | pass, live fixture | Filled `#post-title` and `#post-body`, then typed into the focused title. Readback was `Phase4/5 live test typed` and `Disposable local fixture body.` |
+| Guarded navigation within fixture | pass, live fixture | Clicked `#next-slide` twice; observed `Slide 2 of 3` then `Slide 3 of 3`. Navigating the fixture to `/nav.html` detached the old document-bound session. |
+| In-memory post action | pass, live fixture only | Clicked `#post-submit`; fixture status became `Posted: Phase4/5 live test typed`. This is a mock local page state, not a remote post or persisted app change. |
+| File input | blocked, fail-closed | `shared_input` fill on `#post-file` returned `CALL_FAILED: shared input refused: blocked`. Follow-up observation found the file input empty; no upload occurred. |
+| Re-pair after document navigation | pass, live fixture | Discovered and paired the same tab again after navigation. `shared_observe` returned heading `Navigation reached` and marker `nav-fixture`; root frame, loader, and URL were unchanged across the read, with no truncation. |
+| Session and tab cleanup | pass | `release_shared` confirmed debugger attachments were released. Closed only the agent-created fixture tab. |
+
+This verifies live shared-route fill, typing, guarded clicks, stale-document rejection, re-pairing, and bounded observation on the local fixture. It does not verify file upload, real Google/Canva/CapCut workflows, app save/persistence, nor execution of any remote action. The earlier pending status for this server binary is superseded by this fixture-only live run; it must not be read as an app qualification.

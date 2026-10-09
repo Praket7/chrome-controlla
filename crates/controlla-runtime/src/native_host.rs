@@ -24,6 +24,10 @@ struct Pairing {
     token: String,
     tab_ids: Vec<u32>,
     request_id: String,
+    #[serde(default)]
+    expected_urls: std::collections::BTreeMap<u32, String>,
+    #[serde(default)]
+    expected_document_ids: std::collections::BTreeMap<u32, String>,
     expires_at_unix: u64,
 }
 
@@ -33,6 +37,7 @@ struct NativeReply {
     kind: String,
     targets: Option<Vec<String>>,
     extension_version: Option<String>,
+    document_identity: Option<bool>,
 }
 
 pub async fn run() -> Result<(), String> {
@@ -157,8 +162,11 @@ where
 {
     write_message(
         output,
-        &json!({
-            "type":"pair", "request_id":pairing.request_id, "tab_ids":pairing.tab_ids
+        &json!(
+            {
+            "type":"pair", "request_id":pairing.request_id, "tab_ids":pairing.tab_ids,
+            "expected_urls":pairing.expected_urls,
+            "expected_document_ids":pairing.expected_document_ids
         }),
     )
     .await?;
@@ -194,6 +202,12 @@ where
     if extension_version != env!("CARGO_PKG_VERSION") {
         return Err("extension/server version mismatch".into());
     }
+    if paired.document_identity != Some(true) {
+        return Err(
+            "extension lacks durable document identity support; reload the updated extension"
+                .into(),
+        );
+    }
     validate_targets(&pairing.tab_ids, &targets)?;
     if expired(pairing.expires_at_unix)? {
         return Err("pairing expired".into());
@@ -213,7 +227,7 @@ where
         .send(Message::Text(
             json!({
                 "type":"hello", "token":pairing.token, "targets":targets,
-                "extension_version":extension_version
+                "extension_version":extension_version, "document_identity":true
             })
             .to_string()
             .into(),
@@ -296,6 +310,15 @@ fn validate_pairing(pairing: &Pairing) -> Result<(), String> {
     ids.dedup();
     if ids.len() != pairing.tab_ids.len() {
         return Err("pairing tab_ids must be unique".into());
+    }
+    if pairing.tab_ids.iter().any(|id| {
+        pairing.expected_urls.get(id).is_none_or(String::is_empty)
+            || pairing
+                .expected_document_ids
+                .get(id)
+                .is_none_or(|value| value.is_empty() || value.len() > 128)
+    }) {
+        return Err("pairing is missing a selected tab URL or durable document ID".into());
     }
     validate_endpoint(&pairing.endpoint)?;
     if expired(pairing.expires_at_unix)? {

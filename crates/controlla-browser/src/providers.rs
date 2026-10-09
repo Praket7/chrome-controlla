@@ -27,8 +27,40 @@ use tokio_tungstenite::{
 
 static NEXT_PROFILE_SUFFIX: AtomicU64 = AtomicU64::new(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-peer WS handshake + hello bound: one silent local connection must not
+/// consume the whole pairing window and starve the legitimate extension.
+const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHARED_MESSAGE_LIMIT: usize = 1_048_576;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// Removes one pending-command entry when dropped unless disarmed. Guarantees
+/// cancellation-safe cleanup of the pending-reply map even when the awaiting
+/// command future is dropped between send and reply.
+struct PendingEntryGuard {
+    pending: PendingReplies,
+    id: u64,
+    armed: bool,
+}
+
+impl PendingEntryGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingEntryGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let pending = Arc::clone(&self.pending);
+            let id = self.id;
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -562,21 +594,28 @@ impl SharedExtensionProvider {
             let mut socket_config = WebSocketConfig::default();
             socket_config.max_message_size = Some(SHARED_MESSAGE_LIMIT);
             socket_config.max_frame_size = Some(SHARED_MESSAGE_LIMIT);
-            let mut socket = tokio::time::timeout_at(
-                deadline,
+            // Bound one peer's WS handshake + hello to a short slice of the
+            // total pairing window so a single silent connection cannot consume
+            // the entire pairing deadline and block the real extension. A timed
+            // out peer is closed and the accept loop continues.
+            let peer_deadline = tokio::time::Instant::now() + PER_PEER_HANDSHAKE_TIMEOUT;
+            let mut socket = match tokio::time::timeout_at(
+                peer_deadline,
                 accept_async_with_config(stream, Some(socket_config)),
             )
             .await
-            .map_err(|_| ProviderError::Extension("extension handshake timed out".into()))?
-            .map_err(|error| ProviderError::Extension(error.to_string()))?;
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let message = tokio::time::timeout(remaining, socket.next())
-                .await
-                .map_err(|_| ProviderError::Extension("extension hello timed out".into()))?
-                .ok_or_else(|| {
-                    ProviderError::Extension("extension disconnected before hello".into())
-                })?
-                .map_err(|error| ProviderError::Extension(error.to_string()))?;
+            {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(_)) => continue,
+                Err(_) => continue,
+            };
+            let message = match tokio::time::timeout_at(peer_deadline, socket.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    continue;
+                }
+            };
             let hello = message
                 .to_text()
                 .ok()
@@ -614,7 +653,11 @@ impl SharedExtensionProvider {
             let valid_token = hello["token"]
                 .as_str()
                 .is_some_and(|token| constant_time_eq(token, &self.pairing.token));
-            if hello["type"] != "hello" || !valid_token || targets != self.expected_targets {
+            if hello["type"] != "hello"
+                || hello["document_identity"] != true
+                || !valid_token
+                || targets != self.expected_targets
+            {
                 let _ = socket.send(Message::Close(None)).await;
                 continue;
             }
@@ -830,13 +873,21 @@ impl SharedExtensionSession {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
+        // The pending entry must be removed no matter how this future ends:
+        // normal reply, timeout, transport error, or the future being dropped
+        // (cancelled) between send and reply. A drop guard guarantees cleanup
+        // even though await points below can be cancelled without running code.
+        let pending_guard = PendingEntryGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+            armed: true,
+        };
         let message = Message::Text(
             json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params})
                 .to_string()
                 .into(),
         );
         if let Err(error) = self.sink.lock().await.send(message).await {
-            self.pending.lock().await.remove(&id);
             return Err(ProviderError::Extension(error.to_string()));
         }
         let result = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
@@ -848,12 +899,12 @@ impl SharedExtensionSession {
                 ));
             }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
                 return Err(ProviderError::Extension(
                     "extension command timed out".into(),
                 ));
             }
         };
+        pending_guard.disarm();
         if let Some(error) = result.get("error") {
             return Err(ProviderError::Extension(error.to_string()));
         }
@@ -898,6 +949,24 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_entry_drop_cleans_up_after_mutex_contention() {
+        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::from([(
+            7,
+            tokio::sync::oneshot::channel().0,
+        )])));
+        let guard = PendingEntryGuard {
+            pending: Arc::clone(&pending),
+            id: 7,
+            armed: true,
+        };
+        let held = pending.lock().await;
+        drop(guard);
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(pending.lock().await.is_empty());
+    }
 
     #[test]
     fn devtools_active_port_requires_loopback_browser_websocket_path() {
@@ -2930,7 +2999,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17", "18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17", "18"]})
                         .to_string()
                         .into(),
                 ))
@@ -2985,8 +3054,126 @@ list.addEventListener('scroll',render);render();
     }
 
     #[tokio::test]
-    async fn shared_extension_rejects_oversized_inbound_message_before_parsing() {
+    async fn cancelled_commands_do_not_leak_pending_entries_or_replay_late_replies() {
         use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (attached, mut socket) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+        });
+        let attached = attached.unwrap();
+        // A connected extension that never replies: each command times out.
+        for _ in 0..3 {
+            let result = tokio::time::timeout(
+                Duration::from_millis(1200),
+                attached.command(
+                    &registry,
+                    &session,
+                    "17",
+                    "Runtime.evaluate",
+                    json!({"expression":"1+1"}),
+                ),
+            )
+            .await;
+            // Timeout can come from either the caller (early cancel) or the
+            // STARTUP_TIMEOUT path; either way no entry may remain.
+            assert!(result.is_err());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !attached.pending.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled command pending entry is removed even after contention");
+        }
+        // After the timeouts, a normal command still works, and the late
+        // replies to the timed-out ids are not replayed onto the new reply.
+        let (result, late_drain) = tokio::join!(
+            attached.command(
+                &registry,
+                &session,
+                "17",
+                "Runtime.evaluate",
+                json!({"expression":"2+2"}),
+            ),
+            async {
+                let mut seen_ids = Vec::new();
+                // Skip the ready confirmation before counting command messages.
+                while let Ok(Some(Ok(message))) =
+                    tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+                {
+                    let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if value["type"] != "ready" {
+                        seen_ids.push(value["id"].as_u64().unwrap());
+                        break;
+                    }
+                }
+                for _ in 0..3 {
+                    if let Ok(Some(Ok(message))) =
+                        tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+                    {
+                        let value: Value =
+                            serde_json::from_str(message.to_text().unwrap()).unwrap();
+                        seen_ids.push(value["id"].as_u64().unwrap());
+                        socket
+                            .send(Message::Text(
+                                json!({"type":"result", "id":value["id"], "result":{"late":true}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                seen_ids
+            }
+        );
+        result.unwrap();
+        let ids = late_drain;
+        assert_eq!(
+            ids.len(),
+            4,
+            "exactly one wire command per issued command id"
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len(),
+            "command ids are never reused after cancellation"
+        );
+        assert_eq!(attached.pending.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_extension_closes_a_bad_peer_and_still_accepts_the_extension() {
+        use crate::sessions::ProviderGrants;
+        use tokio::io::AsyncWriteExt;
         use tokio_tungstenite::{connect_async, tungstenite::Message};
 
         let mut registry = SessionRegistry::new(ProviderGrants {
@@ -3006,15 +3193,57 @@ list.addEventListener('scroll',render);render();
             .await
             .unwrap();
         let endpoint = provider.pairing().endpoint.clone();
+        let token = provider.pairing().token.clone();
+        let listener_addr = provider.listener.local_addr().unwrap();
         let (accepted, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(3), provider.accept(&mut registry)),
+            tokio::time::timeout(Duration::from_secs(5), provider.accept(&mut registry)),
             async {
-                let (mut socket, _) = connect_async(&endpoint).await.unwrap();
+                // A malformed upgrade and an oversized hello must not consume
+                // the pairing window: the provider keeps accepting peers.
+                let mut malformed = tokio::net::TcpStream::connect(listener_addr).await.unwrap();
+                malformed
+                    .write_all(b"not a websocket upgrade\r\n\r\n")
+                    .await
+                    .unwrap();
+                drop(malformed);
+                let (mut legacy, _) = connect_async(&endpoint).await.unwrap();
+                legacy
+                    .send(Message::Text(
+                        serde_json::json!({"type":"hello","token":token,"targets":["17"],"extension_version":env!("CARGO_PKG_VERSION")})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let rejected = tokio::time::timeout(Duration::from_secs(2), legacy.next())
+                    .await
+                    .unwrap();
+                assert!(matches!(rejected, Some(Ok(Message::Close(_))) | None));
+                let (mut bad, _) = connect_async(&endpoint).await.unwrap();
                 let oversized = "x".repeat(SHARED_MESSAGE_LIMIT + 1);
-                let _ = socket.send(Message::Text(oversized.into())).await;
+                let _ = bad.send(Message::Text(oversized.into())).await;
+                // The legitimate extension pairs right after the bad peer.
+                let (mut good, _) = connect_async(&endpoint).await.unwrap();
+                good.send(Message::Text(
+                    serde_json::json!({"type":"hello","token":token,"targets":["17"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(3), good.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(reply.to_text().unwrap().contains("\"type\":\"ready\""));
             }
         );
-        assert!(accepted.unwrap().is_err());
+        let session = accepted
+            .expect("legitimate extension still pairs after a bad peer")
+            .unwrap();
+        assert_eq!(session.selected_targets().len(), 1);
+        assert!(session.selected_targets().contains("17"));
     }
 
     #[tokio::test]
@@ -3044,7 +3273,7 @@ list.addEventListener('scroll',render);render();
             let (mut invalid, _) = connect_async(&pairing.endpoint).await.unwrap();
             invalid
                 .send(Message::Text(
-                    json!({"type":"hello","token":"wrong","extension_version":"0.0.9","targets":["17"]})
+                    json!({"type":"hello","token":"wrong","extension_version":"0.0.9","document_identity":true,"targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -3058,7 +3287,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello","token":pairing.token,"extension_version":"0.0.9","targets":["17"]})
+                    json!({"type":"hello","token":pairing.token,"extension_version":"0.0.9","document_identity":true,"targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -3106,7 +3335,7 @@ list.addEventListener('scroll',render);render();
             let (mut bad_socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             bad_socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":"wrong", "extension_version":env!("CARGO_PKG_VERSION"), "targets":["18"]})
+                    json!({"type":"hello", "token":"wrong", "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -3119,7 +3348,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -3187,7 +3416,7 @@ list.addEventListener('scroll',render);render();
             tokio::join!(failed.accept(&mut registry), async {
                 let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
                 peer.send(Message::Text(
-                    json!({"type":"hello", "token":"bad", "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                    json!({"type":"hello", "token":"bad", "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))
@@ -3211,7 +3440,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, _) = tokio::join!(retry.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -3250,7 +3479,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -3298,7 +3527,7 @@ list.addEventListener('scroll',render);render();
         let (accepted, mut peer) = tokio::join!(provider.accept(&mut registry), async {
             let (mut peer, _) = connect_async(&pairing.endpoint).await.unwrap();
             peer.send(Message::Text(
-                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                     .to_string()
                     .into(),
             ))
@@ -3348,7 +3577,7 @@ list.addEventListener('scroll',render);render();
             let (mut rejected, _) = connect_async(&pairing.endpoint).await.unwrap();
             rejected
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["18"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["18"]})
                         .to_string()
                         .into(),
                 ))
@@ -3361,7 +3590,7 @@ list.addEventListener('scroll',render);render();
             let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
             socket
                 .send(Message::Text(
-                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"), "targets":["17"]})
+                    json!({"type":"hello", "token":pairing.token, "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true, "targets":["17"]})
                         .to_string()
                         .into(),
                 ))

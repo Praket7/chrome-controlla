@@ -89,15 +89,30 @@ pub struct GuardedInput<'a> {
 fn resolve_element_script(locator: &SemanticLocator) -> Result<String, super::BrowserError> {
     let v = serde_json::to_string(locator)
         .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
+    // Stamp once and retain the node token so later resolutions can distinguish
+    // this node from a same-selector replacement between probe and dispatch.
     Ok(format!(
-        r#"(()=>{{const l={v};let es=[];if(l.Css)es=[...document.querySelectorAll(l.Css)];else if(l.TestId)es=[...document.querySelectorAll('[data-testid]')].filter(e=>e.getAttribute('data-testid')===l.TestId);else if(l.Placeholder)es=[...document.querySelectorAll('[placeholder]')].filter(e=>e.getAttribute('placeholder')===l.Placeholder);else if(l.Label)es=[...document.querySelectorAll('label')].filter(e=>e.innerText.trim()===l.Label).map(e=>e.control).filter(Boolean);else if(l.Text)es=[...document.querySelectorAll('button,a,[role],label,[data-testid]')].filter(e=>e.innerText.trim()===l.Text);else if(l.AltText)es=[...document.querySelectorAll('[alt]')].filter(e=>e.getAttribute('alt')===l.AltText);else if(l.Href)es=[...document.querySelectorAll('a[href]')].filter(e=>e.getAttribute('href').includes(l.Href));else if(l.RoleName)es=[...document.querySelectorAll('[role],button,input,textarea,a')].filter(e=>(e.getAttribute('role')||({{BUTTON:'button',INPUT:'textbox',TEXTAREA:'textbox',A:'link'}}[e.tagName])||'')===l.RoleName.role&&(e.getAttribute('aria-label')||e.innerText||e.value||'').trim()===l.RoleName.name);if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match',count:es.length}};return {{ok:true,e:es[0]}};}})()"#
+        r#"(()=>{{const l={v};let es=[];if(l.Css)es=[...document.querySelectorAll(l.Css)];else if(l.TestId)es=[...document.querySelectorAll('[data-testid]')].filter(e=>e.getAttribute('data-testid')===l.TestId);else if(l.Placeholder)es=[...document.querySelectorAll('[placeholder]')].filter(e=>e.getAttribute('placeholder')===l.Placeholder);else if(l.Label)es=[...document.querySelectorAll('label')].filter(e=>e.innerText.trim()===l.Label).map(e=>e.control).filter(Boolean);else if(l.Text)es=[...document.querySelectorAll('button,a,[role],label,[data-testid]')].filter(e=>e.innerText.trim()===l.Text);else if(l.AltText)es=[...document.querySelectorAll('[alt]')].filter(e=>e.getAttribute('alt')===l.AltText);else if(l.Href)es=[...document.querySelectorAll('a[href]')].filter(e=>e.getAttribute('href').includes(l.Href));else if(l.RoleName)es=[...document.querySelectorAll('[role],button,input,textarea,a')].filter(e=>(e.getAttribute('role')||({{BUTTON:'button',INPUT:'textbox',TEXTAREA:'textbox',A:'link'}}[e.tagName])||'')===l.RoleName.role&&(e.getAttribute('aria-label')||e.innerText||e.value||'').trim()===l.RoleName.name);if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match',count:es.length}};const e=es[0];const t=e.__controllaNodeToken||'__controlla_node_'+(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2)+String(performance.now()));try{{if(!e.__controllaNodeToken)Object.defineProperty(e,'__controllaNodeToken',{{value:t,configurable:true}});}}catch(_){{}}return {{ok:true,e,token:e.__controllaNodeToken===t?t:null}};}})()"#
     ))
+}
+
+/// Script fragment that asserts a resolution carries an exact node token.
+/// Replaces the plain `r.ok` admission check whenever a prior probe produced
+/// a token, so dispatch is bound to the probed node identity.
+fn node_guard(token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!(
+            "r.ok&&r.token==={}",
+            serde_json::to_string(token).unwrap_or_else(|_| "null".to_owned())
+        ),
+        None => "false".to_owned(),
+    }
 }
 
 fn locator_script(locator: &SemanticLocator) -> Result<String, super::BrowserError> {
     let resolve = resolve_element_script(locator)?;
     Ok(format!(
-        r#"(()=>{{const r={resolve};if(!r.ok)return r;const e=r.e,b=e.getBoundingClientRect(),s=getComputedStyle(e),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);return {{ok:true,count:1,tag:e.tagName,type:e.type||'',editable:e.isContentEditable,masked:e.hasAttribute('data-masked'),requiresTrustedEvents:e.hasAttribute('data-requires-trusted'),disabled:!!e.disabled,visible:b.width>0&&b.height>0&&s.visibility!=='hidden'&&s.display!=='none',hit:!!h&&(h===e||e.contains(h)),value:e.type==='password'?'':e.value??'',selectionStart:e.selectionStart,selectionEnd:e.selectionEnd}};}})()"#
+        r#"(()=>{{const r={resolve};if(!r.ok)return r;const e=r.e,b=e.getBoundingClientRect(),s=getComputedStyle(e),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);return {{ok:true,count:1,token:r.token,tag:e.tagName,type:e.type||'',editable:e.isContentEditable,masked:e.hasAttribute('data-masked'),requiresTrustedEvents:e.hasAttribute('data-requires-trusted'),disabled:!!e.disabled,readOnly:!!e.readOnly,visible:b.width>0&&b.height>0&&s.visibility!=='hidden'&&s.display!=='none',hit:!!h&&(h===e||e.contains(h)),value:e.type==='password'?'':e.value??'',selectionStart:e.selectionStart,selectionEnd:e.selectionEnd}};}})()"#
     ))
 }
 
@@ -351,6 +366,13 @@ impl super::BrowserConnection {
         let probe = self.target_ref_command(sessions, reference, principal, revisions, "Runtime.evaluate", serde_json::json!({"expression":locator_script(locator)?,"returnByValue":true,"awaitPromise":false})).await?;
         let p = &probe["result"]["value"];
         validate_match_result(p)?;
+        // Bind every later dispatch to the exact node observed here.
+        let node_token = p["token"].as_str().ok_or_else(|| {
+            super::BrowserError::InvalidResponse(
+                "input target could not be bound to a stable DOM node".into(),
+            )
+        })?;
+        let node_guard = node_guard(Some(node_token));
         // Password values are never part of the guarded-input observation contract.
         if p["tag"] == "INPUT" && p["type"] == "password" {
             return Ok(InputOutcome::Unsupported(
@@ -362,9 +384,9 @@ impl super::BrowserConnection {
                 "field value changed since the guarded plan".into(),
             ));
         }
-        if p["visible"] != true || p["disabled"] == true {
+        if p["visible"] != true || p["disabled"] == true || p["readOnly"] == true {
             return Err(super::BrowserError::StaleReference(
-                "input target is not actionable".into(),
+                "input target is not actionable (disabled, readonly, or invisible)".into(),
             ));
         }
         let clipboard_text = if matches!(action, InputAction::PasteInternalClipboard) {
@@ -490,7 +512,7 @@ impl super::BrowserConnection {
         }
         let resolve = resolve_element_script(locator)?;
         let focused = if value.is_some() {
-            self.target_ref_command(sessions,reference,principal,revisions,"Runtime.evaluate",serde_json::json!({"expression":format!("(()=>{{const r={resolve};if(!r.ok)return false;r.e.focus();return document.activeElement===r.e;}})()"),"returnByValue":true})).await?
+            self.target_ref_command(sessions,reference,principal,revisions,"Runtime.evaluate",serde_json::json!({"expression":format!("(()=>{{const r={resolve};if(!({node_guard}))return false;r.e.focus();return document.activeElement===r.e;}})()"),"returnByValue":true})).await?
         } else {
             serde_json::json!({"result":{"value":true}})
         };
@@ -511,7 +533,7 @@ impl super::BrowserConnection {
                 ));
             }
             let check = format!(
-                "(()=>{{const r={resolve};if(!r.ok||{x}>=innerWidth||{y}>=innerHeight)return false;const e=r.e,b=e.getBoundingClientRect(),h=document.elementFromPoint({x},{y});return b.width>0&&b.height>0&&{x}>=b.left&&{x}<=b.right&&{y}>=b.top&&{y}<=b.bottom&&!!h&&(h===e||e.contains(h));}})()"
+                "(()=>{{const r={resolve};if(!({node_guard})||{x}>=innerWidth||{y}>=innerHeight)return false;const e=r.e,b=e.getBoundingClientRect(),h=document.elementFromPoint({x},{y});return b.width>0&&b.height>0&&{x}>=b.left&&{x}<=b.right&&{y}>=b.top&&{y}<=b.bottom&&!!h&&(h===e||e.contains(h));}})()"
             );
             let valid = self
                 .target_ref_command(
@@ -537,7 +559,7 @@ impl super::BrowserConnection {
             }
             // A drag destination can be outside the source element's original bounds.
             let check = format!(
-                "(()=>{{const r={resolve};return r.ok&&{x}<innerWidth&&{y}<innerHeight&&!!document.elementFromPoint({x},{y});}})()"
+                "(()=>{{const r={resolve};return ({node_guard})&&{x}<innerWidth&&{y}<innerHeight&&!!document.elementFromPoint({x},{y});}})()"
             );
             let valid = self
                 .target_ref_command(
@@ -565,7 +587,7 @@ impl super::BrowserConnection {
                 let expected = serde_json::to_string(input.expected_value)
                     .map_err(|e| super::BrowserError::InvalidResponse(e.to_string()))?;
                 let expression = format!(
-                    r#"(() => {{const r={resolve};if(!r.ok)return {{stale:false}};const e=r.e;if(e.value!=={expected})return {{stale:true}};const d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');d?.set?.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{stale:false,applied:true}};}})()"#
+                    r#"(() => {{const r={resolve};if(!({node_guard}))return {{stale:false}};const e=r.e;if(e.readOnly||e.disabled)return {{stale:true,applied:false,reason:'readonly_or_disabled'}};if(e.value!=={expected})return {{stale:true}};const d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');d?.set?.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{stale:false,applied:e.value==={text}}};}})()"#
                 );
                 let sent = self
                     .target_ref_command(
@@ -579,11 +601,13 @@ impl super::BrowserConnection {
                     .await?;
                 if sent["result"]["value"]["stale"] == true {
                     return Ok(InputOutcome::Stale(
-                        "field value changed immediately before fill",
+                        "field value changed, or the target became readonly, disabled, or replaced, immediately before fill",
                     ));
                 }
                 if sent["result"]["value"]["applied"] != true {
-                    return Ok(InputOutcome::Stale("fill target could not be resolved"));
+                    return Ok(InputOutcome::Stale(
+                        "fill target could not be resolved or the value did not stick",
+                    ));
                 }
             }
             InputAction::Insert(_) | InputAction::PasteInternalClipboard => {
@@ -599,6 +623,7 @@ impl super::BrowserConnection {
                         principal,
                         revisions,
                         &resolve,
+                        &node_guard,
                         (input.expected_value, None),
                     )
                     .await?
@@ -627,6 +652,7 @@ impl super::BrowserConnection {
                         principal,
                         revisions,
                         &resolve,
+                        &node_guard,
                         (original, Some(original_caret)),
                     )
                     .await?
@@ -670,6 +696,7 @@ impl super::BrowserConnection {
                         principal,
                         revisions,
                         &resolve,
+                        &node_guard,
                         (composed_value, Some(composed_caret)),
                     )
                     .await;
@@ -717,6 +744,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
+                            &node_guard,
                             (&live_value, Some(caret)),
                         )
                         .await?
@@ -757,6 +785,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
+                            &node_guard,
                             (&live_value, Some(caret)),
                         )
                         .await;
@@ -790,6 +819,7 @@ impl super::BrowserConnection {
                             principal,
                             revisions,
                             &resolve,
+                            &node_guard,
                             (&live_value, Some(caret)),
                         )
                         .await;
@@ -815,7 +845,7 @@ impl super::BrowserConnection {
                 postcondition,
             } => {
                 self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1})).await?;
-                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1})).await?;
+                self.release_mouse(sessions, reference, principal, revisions, &resolve, &node_guard, serde_json::json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1})).await?;
                 let expression = click_postcondition_script(locator, postcondition)?;
                 let result = self
                     .target_ref_command(
@@ -844,8 +874,13 @@ impl super::BrowserConnection {
                 postcondition,
             } => {
                 self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mousePressed","x":from.0,"y":from.1,"button":"left","buttons":1,"clickCount":1})).await?;
-                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseMoved","x":to.0,"y":to.1,"button":"left","buttons":1})).await?;
-                self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseReleased","x":to.0,"y":to.1,"button":"left","buttons":0,"clickCount":1})).await?;
+                if let Err(movement_error) = self.target_ref_command(sessions,reference,principal,revisions,"Input.dispatchMouseEvent",serde_json::json!({"type":"mouseMoved","x":to.0,"y":to.1,"button":"left","buttons":1})).await {
+                    return match self.release_mouse(sessions, reference, principal, revisions, &resolve, &node_guard, serde_json::json!({"type":"mouseReleased","x":to.0,"y":to.1,"button":"left","buttons":0,"clickCount":1})).await {
+                        Ok(()) => Err(movement_error),
+                        Err(release_error) => Err(super::BrowserError::InvalidResponse(format!("drag movement failed and pointer release is uncertain: movement={movement_error}; release={release_error}"))),
+                    };
+                }
+                self.release_mouse(sessions, reference, principal, revisions, &resolve, &node_guard, serde_json::json!({"type":"mouseReleased","x":to.0,"y":to.1,"button":"left","buttons":0,"clickCount":1})).await?;
                 let expression = drag_postcondition_script(locator, *postcondition)?;
                 let result = self
                     .target_ref_command(
@@ -908,6 +943,71 @@ impl super::BrowserConnection {
         })
     }
 
+    /// Release a mouse button after an accepted press. A failed first release
+    /// leaves pointer state uncertain; one bounded scoped retry is attempted
+    /// only when the target/session is still valid, and any unconfirmable
+    /// outcome is reported as an error so the caller reobserves before more input.
+    #[allow(clippy::too_many_arguments)]
+    async fn release_mouse(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+        resolve: &str,
+        node_guard: &str,
+        release_params: serde_json::Value,
+    ) -> Result<(), super::BrowserError> {
+        if let Err(first) = self
+            .target_ref_command(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                "Input.dispatchMouseEvent",
+                release_params.clone(),
+            )
+            .await
+        {
+            // Never release on a substituted target: the guard must still pass
+            // for the same node before any retry.
+            let same_target = self
+                .target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":format!("(()=>{{const r={resolve};return ({node_guard});}})()"),"returnByValue":true}),
+                )
+                .await
+                .map(|v| v["result"]["value"] == true)
+                .unwrap_or(false);
+            if !same_target {
+                return Err(super::BrowserError::InvalidResponse(format!(
+                    "mouse release failed and target identity is no longer confirmable: {first}"
+                )));
+            }
+            if let Err(retry) = self
+                .target_ref_command(
+                    sessions,
+                    reference,
+                    principal,
+                    revisions,
+                    "Input.dispatchMouseEvent",
+                    release_params,
+                )
+                .await
+            {
+                return Err(super::BrowserError::InvalidResponse(format!(
+                    "mouse release failed after one scoped retry; pointer state is uncertain: first={first}; retry={retry}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn text_guard_matches(
         &self,
         sessions: &super::sessions::SessionRegistry,
@@ -915,6 +1015,7 @@ impl super::BrowserConnection {
         principal: &str,
         revisions: super::sessions::IdentityRevisions,
         resolve: &str,
+        node_guard: &str,
         expected: (&str, Option<u64>),
     ) -> Result<bool, super::BrowserError> {
         let (expected_value, expected_caret) = expected;
@@ -924,7 +1025,7 @@ impl super::BrowserConnection {
             format!("&&r.e.selectionStart==={n}&&r.e.selectionEnd==={n}")
         });
         let expression = format!(
-            "(()=>{{const r={resolve};return r.ok&&r.e.value==={expected}&&document.activeElement===r.e{caret};}})()"
+            "(()=>{{const r={resolve};return ({node_guard})&&r.e.value==={expected}&&document.activeElement===r.e{caret};}})()"
         );
         let result = self
             .target_ref_command(
@@ -1064,5 +1165,65 @@ mod tests {
             Some("A👋λB")
         );
         assert_eq!(replacement_value("A👋B", 2, 2, "x"), None);
+    }
+
+    fn node_guard_source() -> String {
+        let locator = SemanticLocator::Css("input[name='x']".into());
+        resolve_element_script(&locator).unwrap()
+    }
+
+    #[test]
+    fn resolution_stamps_a_unique_node_token() {
+        let source = node_guard_source();
+        // The resolver must define a per-resolution token on the element and
+        // return it, so a later resolution can prove same-node identity.
+        assert!(
+            source.contains("__controllaNodeToken"),
+            "resolver stamps a node token: {source}"
+        );
+        assert!(
+            source.contains("crypto.randomUUID"),
+            "token uses a high-entropy source"
+        );
+        assert!(
+            source.contains("e.__controllaNodeToken||"),
+            "repeated resolutions retain the original node token"
+        );
+        assert!(
+            source.contains("token:e.__controllaNodeToken===t?t:null"),
+            "token is reported only when it stuck"
+        );
+    }
+
+    #[test]
+    fn node_guard_binds_dispatch_to_the_probed_token() {
+        assert_eq!(node_guard(None), "false");
+        let guard = node_guard(Some("tok-123"));
+        assert_eq!(guard, "r.ok&&r.token===\"tok-123\"");
+        // Fill/insert/typing admission scripts must embed the guard.
+        let locator = SemanticLocator::Css("#field".into());
+        let resolve = resolve_element_script(&locator).unwrap();
+        let fill_expression = format!(
+            r#"(() => {{const r={resolve};if(!({}))return {{stale:false}};const e=r.e;if(e.readOnly||e.disabled)return {{stale:true,applied:false,reason:'readonly_or_disabled'}};"#,
+            node_guard(Some("tok"))
+        );
+        assert!(
+            fill_expression.contains("e.readOnly||e.disabled"),
+            "fill mutation rechecks readonly/disabled before writing"
+        );
+        assert!(
+            fill_expression.contains("r.token===\"tok\""),
+            "fill mutation requires the probed node token"
+        );
+    }
+
+    #[test]
+    fn locator_probe_reports_readonly_state() {
+        let locator = SemanticLocator::Css("input".into());
+        let script = locator_script(&locator).unwrap();
+        assert!(
+            script.contains("readOnly:!!e.readOnly"),
+            "probe exposes readOnly so admission can refuse readonly targets"
+        );
     }
 }
