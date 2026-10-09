@@ -140,8 +140,6 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
 }
 
 async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
-    // Composition-safe fallback: perform one guarded native value update rather
-    // than fabricating per-key US-layout events for Unicode text.
     let mut result = block_type(app, args).await?;
     result["typing_mode"] = json!("ime");
     result["composition_safe_fallback"] = json!(true);
@@ -195,9 +193,6 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
     shared.snapshots.get_mut(&args.chrome_tab_id).ok_or_else(|| invalid("snapshot disappeared before dispatch"))?.consumed = true;
     let mut dispatch_count = 0_u64;
     for character in text.chars() {
-        // Revalidate immediately before every key. This is intentionally stricter
-        // than the performance cadence: user focus/value changes must never send
-        // a key to the wrong control.
         let guard = {
             let connection = shared.connection.as_ref().unwrap();
             let response = tokio::time::timeout_at(deadline, connection.command(
@@ -314,10 +309,10 @@ impl AppV3 {
     }
 
     #[tool(description = "Perform a guarded mutation. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.")]
-    async fn act(&self, Parameters(args): Parameters<V3ActArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
+    async fn act(&self, Parameters(mut args): Parameters<V3ActArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         let lease = acquire_lease(self, &args).await?;
         let result = match args.action.as_str() {
-            "click" => self.core.browser_act(Parameters(BrowserActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "click".into(), reference: args.reference.clone(), expected_value: None, value: None, outcome: args.outcome.clone(), timeout_ms: args.timeout_ms })).await.map(|Json(v)| v),
+            "click" => self.core.browser_act(Parameters(BrowserActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "click".into(), reference: args.reference.clone(), expected_value: None, value: None, outcome: args.outcome.take(), timeout_ms: args.timeout_ms })).await.map(|Json(v)| v),
             "fill" | "select" => {
                 let reference = args.reference.as_deref().ok_or_else(|| invalid(format!("{} requires reference", args.action)))?;
                 retained_mutation(&self.core, &BrowserActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: args.action.clone(), reference: args.reference.clone(), expected_value: args.expected_value.clone(), value: args.value.clone(), outcome: None, timeout_ms: args.timeout_ms }, reference, &args.action).await
@@ -371,7 +366,7 @@ impl AppV3 {
                     let reference = resolve(reference, &vars)?;
                     self.act(Parameters(V3ActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action:"press".into(), reference:Some(reference), expected_value:None, value:None, key:Some(key), outcome:None, timeout_ms:None, typing_mode:None, delay_ms:None, client_id:args.client_id.clone() })).await?.0
                 }
-                V3WorkflowStep::Extract { selector } => self.core.browser_extract(Parameters(BrowserExtractArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector, max_items: Some(100), max_text_chars: Some(6000), max_bytes: Some(100_000) })).await?.0,
+                V3WorkflowStep::Extract { selector } => self.core.browser_extract(Parameters(BrowserExtractArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector, fields: std::collections::BTreeMap::new(), max_items: Some(100), max_text_chars: Some(6000), max_bytes: Some(100_000) })).await?.0,
                 V3WorkflowStep::Verify { predicate } => verify_impl(&self.core, &BrowserVerifyArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate }).await?,
             };
             receipts.push(value);
@@ -392,15 +387,27 @@ impl AppV3 {
 
 #[tool_handler]
 impl ServerHandler for AppV3 {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(rmcp::model::ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(rmcp::model::Implementation::new("controlla-v3", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Controlla v3 exposes six browser tools. Prefer workflow for multi-step automation, block typing for ordinary text, fast_keys only when real key events are required, and verify after consequential mutations. Background mode must not steal focus. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "controlla-v3",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions("Controlla v3 exposes six browser tools. Prefer workflow for multi-step automation, block typing for ordinary text, fast_keys only when real key events are required, and verify after consequential mutations. Background mode must not steal focus. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
     }
 }
 
 pub(super) async fn run() -> Result<(), String> {
-    let legacy = super::super::App::new().map_err(|error| error.to_string())?;
+    let state_dir = super::super::state_directory();
+    std::fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
+    let _state_lock = super::super::acquire_state_directory_lock(&state_dir)
+        .map_err(|error| error.to_string())?;
+    let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))
+        .map_err(|error| error.to_string())?;
+    journal.recover_after_restart().map_err(|error| error.to_string())?;
+    let legacy = super::super::App::with_journal(journal);
     let app = AppV3::new(AppV2::new(legacy));
     let service = app.serve(rmcp::transport::io::stdio()).await.map_err(|error| error.to_string())?;
     service.waiting().await.map_err(|error| error.to_string())?;
