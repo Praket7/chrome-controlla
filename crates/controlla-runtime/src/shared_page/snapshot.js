@@ -3,7 +3,12 @@ function(q) {
   if (roots.length !== 1) throw Error('snapshot scope must match exactly one element');
   const root = roots[0], nodes = [], items = [];
   const protectedSelector = '[data-masked],[data-requires-trusted],input[type="password"],input[type="file"],input[type="hidden"]';
-  const readable = e => e && !e.closest(protectedSelector) && !e.querySelector(protectedSelector);
+  const trustedText = e => e?.hasAttribute('data-requires-trusted') && (e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(e.type));
+  const readable = e => {
+    if (!e || e.closest('[data-masked],input[type="password"],input[type="file"],input[type="hidden"]') || e.querySelector(protectedSelector)) return false;
+    const trusted = e.closest('[data-requires-trusted]');
+    return !trusted || trusted === e && trustedText(e);
+  };
   const visible = e => {
     const s = getComputedStyle(e), b = e.getBoundingClientRect();
     return b.width > 0 && b.height > 0 && s.visibility === 'visible' && s.display !== 'none' && !e.closest('[hidden],[inert]');
@@ -25,6 +30,7 @@ function(q) {
       // Oversized controls are omitted explicitly; never give the action tool a clipped expected value.
       if (value.length > 16384 || label.length > 2000) { truncated = true; e = walker.nextNode(); continue; }
       const item = {reference:q.token+':'+items.length,role:e.getAttribute('role') || ({A:'link',BUTTON:'button',INPUT:'input',TEXTAREA:'textbox',SELECT:'combobox',SUMMARY:'button'}[e.tagName] || 'control'),name:label,raw_value:value,visible:true,disabled:e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',href:e instanceof HTMLAnchorElement ? e.href : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null};
+      if (trustedText(e)) item.requires_trusted_events = true;
       const size = encoder.encode(JSON.stringify(item)).length;
       if (bytes + size > q.max_bytes - q.max_text_chars * 6 - 2048) { truncated = true; break; }
       bytes += size; nodes.push(e); items.push(item);

@@ -17,7 +17,7 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
-const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||(e.hasAttribute('data-requires-trusted')&&!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(t)))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
 const SHARED_TYPE_GUARD_FUNCTION: &str = r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'};}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'};e.scrollIntoView({block:'nearest'});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'};return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true};}"#;
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -418,6 +418,7 @@ fn snapshot_bytes() -> usize {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum SharedClickOutcome {
     Navigation { url: Option<String> },
+    Focused,
     Visible { selector: String },
     Text { selector: String, text: String },
     Expanded { selector: Option<String> },
@@ -2296,7 +2297,7 @@ impl App {
 
     #[tool(
         name = "shared_click",
-        description = "Click exactly one reference from shared_snapshot. No selectors or raw text needed for the target. Declare a bounded outcome: navigation (optional observed destination URL), visible/text selector (may be absent before click), or expanded/selected (defaults to the target). Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+        description = "Click exactly one reference from shared_snapshot. No selectors or raw text needed for the target. Declare a bounded outcome: navigation (optional observed destination URL), visible/text selector (may be absent before click), expanded/selected (defaults to the target), or focused for a supported text field. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
     async fn shared_click(
         &self,
@@ -4247,21 +4248,23 @@ mod tests {
         let context = rquickjs::Context::full(&runtime).unwrap();
         context.with(|ctx| {
             ctx.eval::<(), _>(
-                "globalThis.HTMLInputElement=class {}; globalThis.HTMLButtonElement=class {};",
+                "globalThis.HTMLInputElement=class {hasAttribute(name){return name==='data-requires-trusted'&&this.trusted}}; globalThis.HTMLTextAreaElement=class {}; globalThis.HTMLButtonElement=class {hasAttribute(name){return name==='data-requires-trusted'&&this.trusted}};",
             )
             .unwrap();
-            let unsafe_for = |tag: &str, kind: &str, in_form: bool| {
+            let unsafe_for = |tag: &str, kind: &str, in_form: bool, trusted: bool| {
                 let form = if in_form { "{}" } else { "null" };
                 let script = format!(
-                    "(()=>{{const e=Object.assign(new {tag}(),{{type:{kind:?},form:{form}}});const t=e.type||'';return {SHARED_CLICK_UNSAFE_PREDICATE};}})()"
+                    "(()=>{{const e=Object.assign(new {tag}(),{{type:{kind:?},form:{form},trusted:{trusted}}});const t=e.type||'';return {SHARED_CLICK_UNSAFE_PREDICATE};}})()"
                 );
                 ctx.eval::<bool, _>(script).unwrap()
             };
-            assert!(!unsafe_for("HTMLButtonElement", "submit", false));
-            assert!(unsafe_for("HTMLButtonElement", "submit", true));
-            assert!(unsafe_for("HTMLButtonElement", "reset", true));
-            assert!(unsafe_for("HTMLInputElement", "password", false));
-            assert!(!unsafe_for("HTMLInputElement", "submit", false));
+            assert!(!unsafe_for("HTMLButtonElement", "submit", false, false));
+            assert!(unsafe_for("HTMLButtonElement", "submit", true, false));
+            assert!(unsafe_for("HTMLButtonElement", "reset", true, false));
+            assert!(unsafe_for("HTMLInputElement", "password", false, false));
+            assert!(!unsafe_for("HTMLInputElement", "submit", false, false));
+            assert!(!unsafe_for("HTMLInputElement", "text", false, true));
+            assert!(unsafe_for("HTMLButtonElement", "button", false, true));
         });
     }
 

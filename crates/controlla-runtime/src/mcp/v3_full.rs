@@ -140,14 +140,24 @@ fn parse_mode(mode: Option<&str>) -> Result<crate::v3::BrowserMode, rmcp::ErrorD
     })
 }
 
-fn parse_typing_mode(mode: Option<&str>) -> Result<crate::v3::TypingMode, rmcp::ErrorData> {
-    Ok(match mode.unwrap_or("block") {
-        "block" => crate::v3::TypingMode::Block,
-        "fast_keys" => crate::v3::TypingMode::FastKeys,
-        "human_keys" => crate::v3::TypingMode::HumanKeys,
-        "ime" => crate::v3::TypingMode::Ime,
-        _ => return Err(invalid("typing_mode must be block, fast_keys, human_keys, or ime")),
-    })
+fn typing_policy(mode: Option<&str>, delay_ms: Option<u64>, text: &str, requires_key_events: bool) -> Result<crate::v3::TypingPolicy, &'static str> {
+    let mode = match mode {
+        None => crate::v3::TypingPolicy::choose(text, requires_key_events, false).mode,
+        Some("block") => crate::v3::TypingMode::Block,
+        Some("fast_keys") => crate::v3::TypingMode::FastKeys,
+        Some("human_keys") => crate::v3::TypingMode::HumanKeys,
+        Some("ime") => crate::v3::TypingMode::Ime,
+        _ => return Err("typing_mode must be block, fast_keys, human_keys, or ime"),
+    };
+    crate::v3::TypingPolicy::new(mode, delay_ms)
+}
+
+async fn requires_key_events(app: &AppV3, args: &V3ActArgs) -> bool {
+    let Some(reference) = args.reference.as_deref() else { return false };
+    app.core.semantic.lock().await
+        .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
+        .and_then(|state| state.items.get(reference))
+        .is_some_and(|item| item["requires_trusted_events"] == true)
 }
 
 async fn acquire_lease(app: &AppV3, args: &V3ActArgs) -> Result<crate::v3::TargetKey, rmcp::ErrorData> {
@@ -293,7 +303,7 @@ async fn key_type(app: &AppV3, args: &V3ActArgs, policy: crate::v3::TypingPolicy
     if before != snapshot.identity {
         return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
     }
-    let guard_function = r#"function(index,expected){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'focus_or_selection_changed'};return {ok:true,value:e.value};}"#;
+    let guard_function = r#"function(index,expected){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'focus_or_selection_changed'};return {ok:true,value:e.value};}"#;
     let mut progress = expected.to_owned();
     let preflight = {
         let connection = shared.connection.as_ref().unwrap();
@@ -656,8 +666,9 @@ impl AppV3 {
                 retained_mutation(&self.core, &BrowserActArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: args.action.clone(), reference: args.reference.clone(), expected_value: args.expected_value.clone(), value: args.value.clone(), outcome: None, timeout_ms: args.timeout_ms }, reference, &args.action).await
             }
             "type" => {
-                let mode = parse_typing_mode(args.typing_mode.as_deref())?;
-                let policy = crate::v3::TypingPolicy::new(mode, args.delay_ms).map_err(invalid)?;
+                let required = requires_key_events(self, &args).await;
+                let policy = typing_policy(args.typing_mode.as_deref(), args.delay_ms, args.value.as_deref().unwrap_or_default(), required).map_err(invalid)?;
+                let mode = policy.mode;
                 match mode {
                     crate::v3::TypingMode::Block => block_type(self, &args).await,
                     crate::v3::TypingMode::Ime => ime_type(self, &args).await,
@@ -774,7 +785,7 @@ pub(super) async fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod v3_batch_delivery_tests {
-    use super::{fast_key_batch_failure, lease_target_key, page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, validate_workflow_steps, workflow_find_reference, workflow_should_stop, BrowserPredicate, V3WorkflowStep};
+    use super::{fast_key_batch_failure, lease_target_key, page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, typing_policy, validate_workflow_steps, workflow_find_reference, workflow_should_stop, BrowserPredicate, V3WorkflowStep};
     use serde_json::json;
 
     #[test]
@@ -843,5 +854,110 @@ mod v3_batch_delivery_tests {
     fn session_aliases_share_the_same_selected_chrome_tab_lease() {
         assert_eq!(lease_target_key("session-a", "17"), lease_target_key("session-b", "17"));
         assert_ne!(lease_target_key("session-a", "17"), lease_target_key("session-a", "18"));
+    }
+
+    #[test]
+    fn typing_policy_uses_required_events_and_composition_by_default_but_honors_explicit_mode() {
+        use crate::v3::TypingMode;
+        assert_eq!(typing_policy(None, None, "hello", true).unwrap().mode, TypingMode::FastKeys);
+        assert_eq!(typing_policy(None, None, "hello", false).unwrap().mode, TypingMode::Block);
+        assert_eq!(typing_policy(None, None, "你好", false).unwrap().mode, TypingMode::Ime);
+        assert_eq!(typing_policy(Some("block"), None, "hello", true).unwrap().mode, TypingMode::Block);
+        assert!(typing_policy(Some("fast_keys"), None, "你好", true).is_ok());
+        assert!(typing_policy(Some("unknown"), None, "hello", false).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Chrome; validates V3 FastKeys through the shared extension bridge"]
+    async fn shared_extension_marked_control_defaults_to_verified_trusted_fast_keys() {
+        use controlla_browser::{providers::DedicatedChromeProvider, sessions::{IndependentTargetObserver, CleanupObservation, ProviderGrants, SessionMode, SessionRegistry, SessionSpec}};
+        use futures_util::{FutureExt, SinkExt, StreamExt};
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        use std::{panic::AssertUnwindSafe, path::Path};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.exists());
+        let mut registry = SessionRegistry::new(ProviderGrants { dedicated_headless:true, ..Default::default() });
+        let handle = registry.create_session(SessionSpec { mode:SessionMode::Headless, selected_target_ids:vec![] }, "v3-fast-keys-fixture").unwrap();
+        let browser = DedicatedChromeProvider::new(executable).launch(&mut registry, &handle, "about:blank").await.unwrap();
+        let connection = browser.connection().clone();
+        let target = browser.target_id().to_owned();
+        let eval = |script: String| {
+            let connection=connection.clone(); let target=target.clone();
+            async move {
+                let (_,targets)=connection.target_snapshot().await;
+                let target_state=targets.iter().find(|item|item.id==target).unwrap();
+                connection.target_command(&target,target_state.generation,&target_state.revision,"Runtime.evaluate",json!({"expression":script,"returnByValue":true})).await.unwrap()
+            }
+        };
+        let result=AssertUnwindSafe(async {
+            eval(r#"document.body.innerHTML='<input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before"><script></script>';window.events=[];const input=document.querySelector('#trusted');for(const type of ['keydown','beforeinput','input','keyup'])input.addEventListener(type,event=>window.events.push({type,trusted:event.isTrusted}));"#.into()).await;
+            let (server_io,client_io)=tokio::io::duplex(65536);
+            let server=rmcp::service::serve_directly::<rmcp::RoleServer,_,_,_,_>(super::AppV3::new(super::AppV2::new(super::super::App::default())),server_io,None);
+            let server_task=tokio::spawn(async move {let _=server.waiting().await;});
+            let client=().serve(client_io).await.unwrap();
+            let call=|name:&str,value:serde_json::Value| CallToolRequestParams::new(name.to_owned()).with_arguments(value.as_object().unwrap().clone());
+            let pair=client.call_tool(call("browser",json!({"action":"pair_shared","target_ids":["123"]}))).await.unwrap().structured_content.unwrap();
+            let session=pair["session_id"].as_str().unwrap().to_owned();
+            let (mut socket,_)=connect_async(pair["endpoint"].as_str().unwrap()).await.unwrap();
+            socket.send(Message::Text(json!({"type":"hello","token":pair["one_session_token"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true,"targets":["123"]}).to_string().into())).await.unwrap();
+            let _=socket.next().await.unwrap();
+            let c=connection.clone(); let t=target.clone();
+            let proxy=tokio::spawn(async move {
+                while let Some(Ok(message))=socket.next().await {
+                    let request:serde_json::Value=serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if request["type"]=="batch" {
+                        let actions=request["actions"].as_array().unwrap();
+                        let mut receipts=Vec::new(); let mut error=None; let mut completed=0;
+                        for (index,action) in actions.iter().enumerate() {
+                            let (_,targets)=c.target_snapshot().await; let state=targets.iter().find(|item|item.id==t).unwrap();
+                            match c.target_command(&t,state.generation,&state.revision,action["method"].as_str().unwrap(),action["params"].clone()).await {
+                                Ok(result)=>{
+                                    let ok=result.pointer("/result/value/ok")==Some(&serde_json::Value::Bool(true));
+                                    receipts.push(json!({"index":index,"method":action["method"],"result":result})); completed=index+1;
+                                    if action["stop_on_not_ok"]==true&&!ok {error=Some("Batch read guard rejected before the next action.".to_owned());break;}
+                                },
+                                Err(problem)=>{error=Some(problem.to_string());break;}
+                            }
+                        }
+                        let mut response=json!({"type":"batch_result","id":request["id"],"result":{"receipts":receipts,"completed":completed,"stopped_before":if error.is_some(){Some(completed)}else{None},"host_round_trips":1,"in_browser_actions":actions.len()}});
+                        if let Some(problem)=error {response["error"]=json!(problem);}
+                        if socket.send(Message::Text(response.to_string().into())).await.is_err(){break;}
+                        continue;
+                    }
+                    let Some(method)=request["method"].as_str() else {continue};
+                    let (_,targets)=c.target_snapshot().await; let state=targets.iter().find(|item|item.id==t).unwrap();
+                    let response=c.target_command(&t,state.generation,&state.revision,method,request["params"].clone()).await;
+                    let response=match response {Ok(value)=>json!({"type":"result","id":request["id"],"result":value}),Err(error)=>json!({"type":"result","id":request["id"],"error":error.to_string()})};
+                    if socket.send(Message::Text(response.to_string().into())).await.is_err(){break;}
+                }
+            });
+            let accepted=client.call_tool(call("browser",json!({"action":"accept_shared","session_id":session}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(accepted["accepted"],true);
+            let snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
+            let target_ref=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
+            let clicked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"click","reference":target_ref,"outcome":{"kind":"focused"}}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(clicked["status"],"verified","{clicked}");
+            let fresh=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
+            let target_ref=fresh["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
+            let type_started=std::time::Instant::now();
+            let typed=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"type","reference":target_ref,"expected_value":"before","value":"XY","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
+            eprintln!("shared-extension V3 FastKeys two-character action: {:.1} ms",type_started.elapsed().as_secs_f64()*1000.0);
+            assert_eq!(typed["typing_mode"],"fast_keys","{typed}");
+            assert_eq!(typed["status"],"verified","{typed}");
+            assert_eq!(typed["readback"],"beforeXY");
+            let events=eval("JSON.stringify({value:document.querySelector('#trusted').value,events:window.events})".into()).await["result"]["value"].as_str().unwrap().to_owned();
+            let events:serde_json::Value=serde_json::from_str(&events).unwrap();
+            assert_eq!(events["value"],"beforeXY");
+            let observed=events["events"].as_array().unwrap();
+            assert_eq!(observed.iter().map(|event|event["type"].as_str().unwrap()).collect::<Vec<_>>(),["keydown","beforeinput","input","keyup","keydown","beforeinput","input","keyup"]);
+            assert!(observed.iter().all(|event|event["trusted"]==true),"untrusted key event: {events}");
+            proxy.abort(); let _=client.cancel().await; server_task.abort();
+        }).catch_unwind().await;
+        struct Observer;
+        impl IndependentTargetObserver for Observer { fn verify_unchanged(&self,_:&CleanupObservation)->Result<(),String>{Ok(())} }
+        let cleanup=browser.shutdown(&mut registry,Some(&Observer)).await;
+        assert!(cleanup.cleanup_error.is_none(),"{:?}",cleanup.cleanup_error);
+        if let Err(error)=result { std::panic::resume_unwind(error); }
     }
 }

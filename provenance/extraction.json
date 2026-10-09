@@ -86,7 +86,7 @@
       "source_path": "../../outputs/research.md",
       "destination_path": "docs/design/research.md",
       "source_sha256": "4ea855401d2a4562887ccb6704fa14fb54a3132fc80b72ad08f9ea6820ef37c6",
-      "destination_sha256": "5204d892e75180efff65e2b64d1501e7b4817e1e35a21e7f3d711a4d18c20599",
+      "destination_sha256": "b7e964fef12c02b8d51494ae6e5973a064be231b553fd7943433a1b2a4e616ad",
       "edits": "none",
       "license": "user-provided design document; no third-party license asserted"
     },

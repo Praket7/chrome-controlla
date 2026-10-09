@@ -69,6 +69,7 @@ struct BrowserFindArgs {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserClickOutcome {
     Navigation { url: Option<String> },
+    Focused,
     Visible { selector: String },
     Text { selector: String, text: String },
     Expanded { selector: Option<String> },
@@ -199,7 +200,7 @@ fn stable_item_keys(items: &[Value]) -> Vec<String> {
 }
 
 fn changed_fields(previous: &Value, current: &Value) -> bool {
-    ["role", "name", "raw_value", "href", "expanded", "selected", "disabled"]
+    ["role", "name", "raw_value", "href", "expanded", "selected", "disabled", "requires_trusted_events"]
         .into_iter()
         .any(|field| previous.get(field) != current.get(field))
 }
