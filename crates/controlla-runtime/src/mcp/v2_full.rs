@@ -583,18 +583,17 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
         }
         dispatch_count = dispatch_count.saturating_add(1);
         expected_progress.push(*character);
-        if position + 1 < characters.len() {
-            if tokio::time::timeout_at(deadline, tokio::time::sleep(STRICT_TYPE_DELAY))
+        if position + 1 < characters.len()
+            && tokio::time::timeout_at(deadline, tokio::time::sleep(STRICT_TYPE_DELAY))
                 .await
                 .is_err()
-            {
-                return Ok(json!({
-                    "status":"unknown",
-                    "action":"type",
-                    "dispatch_acknowledged":true,
-                    "reason":"typing deadline expired after a partial dispatch; inspect state and do not automatically retry"
-                }));
-            }
+        {
+            return Ok(json!({
+                "status":"unknown",
+                "action":"type",
+                "dispatch_acknowledged":true,
+                "reason":"typing deadline expired after a partial dispatch; inspect state and do not automatically retry"
+            }));
         }
     }
     let readback = {
