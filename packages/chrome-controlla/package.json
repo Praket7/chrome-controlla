@@ -1,7 +1,7 @@
 {
   "name": "chrome-controlla",
   "version": "0.1.0",
-  "description": "Package-relative Chrome Controlla CLI launcher and platform binary",
+  "description": "Package-relative Chrome Controlla CLI launcher, compact MCP server, and local plugin",
   "license": "Apache-2.0",
   "bin": {
     "controlla": "bin/controlla.cjs",
@@ -9,6 +9,7 @@
   },
   "files": [
     "bin/",
+    "plugin/",
     "LICENSE",
     "NOTICE"
   ],

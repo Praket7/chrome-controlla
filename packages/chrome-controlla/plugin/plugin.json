@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "chrome-controlla",
+  "version": "0.1.0",
+  "description": "Control explicitly selected Chrome tabs through Controlla's compact local MCP server with guarded actions and verification.",
+  "author": {
+    "name": "Praket7"
+  },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Chrome Controlla",
+        "shortDescription": "Control selected Chrome tabs",
+        "longDescription": "Use Controlla's local MCP server to discover and explicitly pair Chrome tabs, inspect compact semantic state, perform guarded browser actions, and verify mutations without exposing a remote browser endpoint.",
+        "developerName": "Praket7",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive"
+        ],
+        "defaultPrompt": "Use Chrome Controlla to work in my explicitly selected Chrome tabs. Prefer semantic snapshots and bounded workflows, verify mutations, and never blindly retry an unknown browser outcome."
+      }
+    }
+  }
+}

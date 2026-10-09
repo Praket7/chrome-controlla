@@ -44,8 +44,29 @@ assert.match(generate('claude', binary, state), /^claude mcp add .*--transport s
 const quotedClaude = generate('claude', "/tmp/agent's $(touch nope)/controlla", "/tmp/state with spaces");
 assert.ok(quotedClaude.includes("'/tmp/agent'\"'\"'s $(touch nope)/controlla'"));
 assert.ok(quotedClaude.includes(`'CONTROLLA_STATE_DIR=${path.join('/tmp/state with spaces', 'claude')}'`));
-assert.throws(() => generate('chatgpt', binary, state), /Unsupported local-stdio/);
+assert.throws(() => generate('chatgpt', binary, state), /packaged Chrome Controlla local plugin/);
 assert.throws(() => generate('freebuff', 'controlla', state), /absolute paths/);
+
+const pluginRoot = fileURLToPath(new URL('../../packages/chrome-controlla/plugin/', import.meta.url));
+const plugin = JSON.parse(await readFile(path.join(pluginRoot, 'plugin.json'), 'utf8'));
+assert.equal(plugin.name, 'chrome-controlla');
+assert.equal(plugin.version, '0.1.0');
+const shortDescription = plugin.extensions?.['com.openai']?.interface?.shortDescription;
+assert.ok(typeof shortDescription === 'string' && shortDescription.length <= 30, 'plugin short description stays within listing limit');
+const mcp = JSON.parse(await readFile(path.join(pluginRoot, 'mcp.json'), 'utf8'));
+assert.deepEqual(mcp.mcpServers?.['chrome-controlla'], {
+  type: 'stdio',
+  command: 'node',
+  args: ['${PLUGIN_ROOT}/launch.cjs'],
+  cwd: '${PLUGIN_ROOT}',
+});
+const launch = await readFile(path.join(pluginRoot, 'launch.cjs'), 'utf8');
+assert.match(launch, /controlla-v2-core/);
+assert.match(launch, /CONTROLLA_V2_BIN/);
+const skill = await readFile(path.join(pluginRoot, 'skills/browser-control/SKILL.md'), 'utf8');
+assert.match(skill, /Never automatically retry an unknown outcome/);
+assert.match(skill, /explicitly discover and pair only the tabs the user selected/);
+
 const tempDir = await mkdtemp(path.join(os.tmpdir(), 'controlla-config-install-'));
 try {
   const configPath = path.join(tempDir, 'freebuff.json');
@@ -112,5 +133,10 @@ assert.deepEqual(documentedJson('## OpenCode v1'), normalizePathSeparators(gener
 assert.deepEqual(documentedJson('## OpenCode v2'), normalizePathSeparators(generate('opencode-v2')));
 const claudeSection = docs.split('## Claude Code\n')[1]?.split('\n## ')[0] ?? '';
 assert.ok(claudeSection.includes(normalizePathSeparators(generate('claude')).split('\n')[0]), 'Claude command matches generator output');
-assert.match(docs, /ChatGPT does not connect directly to a local stdio process/);
-console.log('Versioned client configs and safe JSON merge installation checks passed.');
+assert.match(docs, /ChatGPT Desktop uses the packaged Chrome Controlla local plugin/);
+const chatgptDocs = await readFile(new URL('../../docs/integrations/chatgpt-desktop.md', import.meta.url), 'utf8');
+assert.match(chatgptDocs, /browser_session/);
+assert.match(chatgptDocs, /browser_verify/);
+assert.match(chatgptDocs, /controlla-v2-core/);
+assert.match(chatgptDocs, /live ChatGPT Desktop acceptance/i);
+console.log('Versioned client configs, safe JSON merge installation, and ChatGPT local plugin checks passed.');

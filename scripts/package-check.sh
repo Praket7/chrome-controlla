@@ -51,24 +51,39 @@ expect_archive_entry() {
 }
 expect_archive_entry 'package/bin/controlla.cjs'
 expect_archive_entry 'package/bin/controlla-client.cjs'
+expect_archive_entry 'package/plugin/plugin.json'
+expect_archive_entry 'package/plugin/mcp.json'
+expect_archive_entry 'package/plugin/launch.cjs'
+expect_archive_entry 'package/plugin/skills/browser-control/SKILL.md'
 expect_archive_entry 'package/LICENSE'
 expect_archive_entry 'package/NOTICE'
 if [ "$(node -p 'process.platform')" = win32 ]; then
     expect_archive_entry 'package/bin/controlla-core.exe'
+    expect_archive_entry 'package/bin/controlla-v2-core.exe'
 else
     expect_archive_entry 'package/bin/controlla-core'
+    expect_archive_entry 'package/bin/controlla-v2-core'
 fi
 printf '%s\n' 'package-check: validating packed target metadata and license'
-tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);if(p.os?.length!==1||p.os[0]!==process.platform||p.cpu?.length!==1||p.cpu[0]!==process.arch){console.error(`package target mismatch: ${p.os}/${p.cpu} != ${process.platform}/${process.arch}`);process.exit(1)}if(p.license!=="Apache-2.0"){console.error(`unexpected license: ${p.license}`);process.exit(1)}})'
+tar -xOf "$archive" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);if(p.os?.length!==1||p.os[0]!==process.platform||p.cpu?.length!==1||p.cpu[0]!==process.arch){console.error(`package target mismatch: ${p.os}/${p.cpu} != ${process.platform}/${process.arch}`);process.exit(1)}if(p.license!=="Apache-2.0"){console.error(`unexpected license: ${p.license}`);process.exit(1)}if(!p.files?.includes("plugin/")){console.error("plugin directory is not included in package files");process.exit(1)}})'
 prefix="$temp/clean prefix"
 printf '%s\n' 'package-check: installing packed archive into clean prefix'
 npm_cmd install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$archive"
 installed="$prefix/node_modules/chrome-controlla/bin/controlla.cjs"
+installed_client="$prefix/node_modules/chrome-controlla/bin/controlla-client.cjs"
+plugin_launch="$prefix/node_modules/chrome-controlla/plugin/launch.cjs"
 "$node_bin" "$installed" --help | grep -F 'Usage: controlla' >/dev/null
 PATH='' "$node_bin" "$installed" --version | grep -F 'controlla 0.1.0' >/dev/null
 printf '%s\n' 'package-check: checking npm command shim'
 # npm exec selects and launches the platform-appropriate command shim (including
 # Windows .cmd under Git Bash) as an installed consumer would.
 npm_cmd exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.0' >/dev/null
-printf 'Verified host-bound npm archive (%s/%s), attribution, and clean-prefix package-local install.\n' "$(node -p 'process.platform')" "$(node -p 'process.arch')"
+printf '%s\n' 'package-check: checking packaged ChatGPT plugin MCP startup and compact v2 tool discovery'
+plugin_request="$temp/plugin-request.jsonl"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$plugin_request"
+plugin_output=$(CONTROLLA_STATE_DIR="$temp/plugin-state" "$node_bin" "$installed_client" --server "$node_bin" --server-arg "$plugin_launch" --timeout-ms 30000 < "$plugin_request")
+printf '%s\n' "$plugin_output" | grep -F '"browser_session"' >/dev/null
+printf '%s\n' "$plugin_output" | grep -F '"browser_snapshot"' >/dev/null
+printf '%s\n' "$plugin_output" | grep -F '"browser_verify"' >/dev/null
+printf 'Verified host-bound npm archive (%s/%s), attribution, clean-prefix install, and local compact MCP plugin startup.\n' "$(node -p 'process.platform')" "$(node -p 'process.arch')"
 node scripts/check-package-lifecycle.mjs

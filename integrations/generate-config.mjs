@@ -75,9 +75,16 @@ export const configs = {
   },
 };
 
+function unsupportedClient(client) {
+  if (client === 'chatgpt') {
+    return new Error('ChatGPT Desktop uses the packaged Chrome Controlla local plugin; see docs/integrations/chatgpt-desktop.md');
+  }
+  return new Error(`Unsupported local-stdio client config: ${client}`);
+}
+
 export function generate(client, binary = binaryDefault, state = stateDefault) {
   const config = configs[client];
-  if (!config) throw new Error(`Unsupported local-stdio client config: ${client}`);
+  if (!config) throw unsupportedClient(client);
   if (!path.isAbsolute(binary) || !path.isAbsolute(state)) {
     throw new Error('Executable and state directory must be absolute paths');
   }
@@ -86,7 +93,7 @@ export function generate(client, binary = binaryDefault, state = stateDefault) {
 
 export async function install(client, configPath, binary = binaryDefault, state = stateDefault) {
   const clientConfig = configs[client];
-  if (!clientConfig) throw new Error(`Unsupported local-stdio client config: ${client}`);
+  if (!clientConfig) throw unsupportedClient(client);
   if (clientConfig.format !== 'json') {
     throw new Error(`${client} uses a client CLI command; run the generated command yourself`);
   }
@@ -166,7 +173,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const binary = (installMode ? args[3] : args[1]) ?? binaryDefault;
   const state = (installMode ? args[4] : args[2]) ?? stateDefault;
   if (!client || client === '--help') {
-    console.log(`Usage: node integrations/generate-config.mjs <client> [absolute-controlla-path] [absolute-state-root]\n       node integrations/generate-config.mjs --install <client> <absolute-json-config> [absolute-controlla-path] [absolute-state-root]\nClients: ${Object.keys(configs).join(', ')}\n--install preserves other settings, atomically adds a missing JSON entry, and refuses conflicts or links. Claude Code outputs a command for you to review and run. ChatGPT has no local-stdio config.`);
+    console.log(`Usage: node integrations/generate-config.mjs <client> [absolute-controlla-path] [absolute-state-root]\n       node integrations/generate-config.mjs --install <client> <absolute-json-config> [absolute-controlla-path] [absolute-state-root]\nClients: ${Object.keys(configs).join(', ')}\n--install preserves other settings, atomically adds a missing JSON entry, and refuses conflicts or links. Claude Code outputs a command for you to review and run. ChatGPT Desktop uses the packaged local plugin; see docs/integrations/chatgpt-desktop.md.`);
     process.exit(client ? 0 : 2);
   }
   try {

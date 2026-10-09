@@ -19,6 +19,7 @@ const rustOs = host.includes('apple-darwin') ? 'darwin' : host.includes('windows
 if (os !== rustOs || cpu !== rustCpu) throw new Error(`Node ${os}/${cpu} and Rust host ${host} differ; refusing to mislabel native binary`);
 
 const core = path.join(root, 'packages/chrome-controlla/bin', os === 'win32' ? 'controlla-core.exe' : 'controlla-core');
+const v2Core = path.join(root, 'packages/chrome-controlla/bin', os === 'win32' ? 'controlla-v2-core.exe' : 'controlla-v2-core');
 await rm(target, { recursive: true, force: true });
 await mkdir(path.join(target, 'bin'), { recursive: true });
 const manifest = JSON.parse(await readFile(path.join(root, 'packages/chrome-controlla/package.json'), 'utf8'));
@@ -29,5 +30,7 @@ for (const file of ['controlla.cjs', 'controlla-client.cjs', 'controlla', 'contr
   await cp(path.join(root, 'packages/chrome-controlla/bin', file), path.join(target, 'bin', file));
 }
 await cp(core, path.join(target, 'bin', path.basename(core)));
+await cp(v2Core, path.join(target, 'bin', path.basename(v2Core)));
+await cp(path.join(root, 'packages/chrome-controlla/plugin'), path.join(target, 'plugin'), { recursive: true });
 await cp(path.join(root, 'LICENSE'), path.join(target, 'LICENSE'));
 await cp(path.join(root, 'NOTICE'), path.join(target, 'NOTICE'));
