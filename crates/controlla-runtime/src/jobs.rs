@@ -350,6 +350,8 @@ impl Journal {
     }
 
     /// Call only when the transport confirms the correlated request was sent.
+    /// Positive transport evidence may arrive after a deadline or uncertainty
+    /// transition; recording it upgrades delivery without reviving the job.
     pub fn acknowledge_dispatch(
         &self,
         principal: &str,
@@ -360,7 +362,7 @@ impl Journal {
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
         let tx = connection.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='running' AND dispatch_correlation=?4 AND delivery='unknown' AND deadline_at_ms>?5", params![id, principal, session, correlation, now_ms() as i64])?;
+        let changed = tx.execute("UPDATE operations SET delivery='sent', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('running','unknown') AND dispatch_correlation=?4 AND delivery='unknown'", params![id, principal, session, correlation])?;
         if changed == 1 {
             tx.execute(
                 "INSERT OR IGNORE INTO acknowledged_dispatches (operation_id, correlation) VALUES (?1, ?2)",
