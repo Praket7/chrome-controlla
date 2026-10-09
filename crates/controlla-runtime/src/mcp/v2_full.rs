@@ -1381,9 +1381,12 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
             }
             FullWorkflowStep::Script { .. } => unreachable!(),
         };
-        let status = receipt.get("status").and_then(Value::as_str).unwrap_or("verified");
+        let should_stop = receipt
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "unknown" | "failed" | "not_dispatched"));
         receipts.push(receipt);
-        if matches!(status, "unknown" | "failed" | "not_dispatched") {
+        if should_stop {
             break;
         }
     }
@@ -1774,7 +1777,7 @@ impl ServerHandler for AppFull {
     }
 }
 
-pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = super::super::state_directory();
     std::fs::create_dir_all(&state_dir)?;
     let _state_lock = super::super::acquire_state_directory_lock(&state_dir)?;
