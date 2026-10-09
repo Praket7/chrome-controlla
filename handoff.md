@@ -57,7 +57,7 @@ All relative paths below are rooted in the active checkout above.
 4. [Original architecture board](https://www.tldraw.com/f/zttVZI5A_8nKRdpXihLUy): freshly fetched during this research. It connects the persistent broker, session/capability registry, exact targets, guarded workflow compiler, independent outcome verification, qualified cache/retirement, compact receipts, and user-change invalidation/yield/reconciliation.
 5. [MASTER_GUIDE](docs/MASTER_GUIDE.md): current user/runtime instructions; check against actual tool schemas.
 6. [Verification matrix](docs/verification-matrix.md), [blockers](docs/blockers.md), [progress](docs/progress.md): dated evidence and limitations. Read latest entries as well as summaries.
-7. [Execution plan](.superpowers/sdd/finish-phases-0-12.md) and [execution ledger](.superpowers/sdd/finish-phases-0-12/progress.md): useful work history, but the ledger has stale candidate/status entries.
+7. The original execution plan and ledger lived under `.superpowers/sdd/finish-phases-0-12.md` and `.superpowers/sdd/finish-phases-0-12/progress.md` in the authoring checkout; those local-only files are not included in this repository. Use the tracked [build plan](docs/design/build.md), [progress](docs/progress.md), and dated [verification matrix](docs/verification-matrix.md) instead.
 8. This handoff and [new improvements.md](improvements.md): current reconciliation, source findings, and proposed next work.
 
 The referenced Codex task **Research Chrome Controlla**, ID `01a110ce-5b18-7833-8177-690c31c44a22`, was read. It documents the original ambition and the Phase 3 commit; it is not the source of current live status. Prefer the checkout and dated receipts over conversation assurances.
