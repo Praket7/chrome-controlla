@@ -90,12 +90,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn sample_page_state(_: &str) -> Result<(u64, Value), String> {
+        Ok((100, json!({"saved":true})))
+    }
+
     #[test]
     fn fresh_runtime_owned_observation_passes_binding_policy() {
         let observer = FreshStateObserver::new(
             "shared-page-runtime",
             VerificationStrength::FreshPageState,
-            |_| Ok::<(u64, Value), String>((100, json!({"saved":true}))),
+            sample_page_state,
         );
         let observation = observer.observe("r7").unwrap();
         assert_eq!(
