@@ -104,6 +104,25 @@ fn workflow_should_stop(value: &Value) -> bool {
     matches!(value.get("status").and_then(Value::as_str), Some("unknown" | "not_dispatched" | "failed"))
 }
 
+fn workflow_find_reference(found: &Value) -> Result<String, rmcp::ErrorData> {
+    let matches = found["matches"].as_array().ok_or_else(|| invalid("workflow find returned invalid matches"))?;
+    if matches.len() != 1 {
+        return Err(invalid("workflow find must resolve exactly one control"));
+    }
+    matches[0]["reference"].as_str().map(str::to_owned)
+        .ok_or_else(|| invalid("workflow find omitted its reference"))
+}
+
+fn validate_workflow_steps(steps: &[V3WorkflowStep]) -> Result<(), rmcp::ErrorData> {
+    if steps.iter().enumerate().any(|(index, step)| {
+        matches!(step, V3WorkflowStep::PageTool { .. })
+            && !matches!(steps.get(index + 1), Some(V3WorkflowStep::Verify { .. }))
+    }) {
+        return Err(invalid("page_tool must be followed immediately by runtime verification"));
+    }
+    Ok(())
+}
+
 fn lease_target_key(_session_id: &str, tab_id: &str) -> crate::v3::TargetKey {
     crate::v3::TargetKey {
         // A tab may be paired through more than one MCP session; session IDs do not identify Chrome.
@@ -663,6 +682,7 @@ impl AppV3 {
     #[tool(description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/page_tool/extract/verify and rejects unresolved refs or >40 steps.")]
     async fn workflow(&self, Parameters(args): Parameters<V3WorkflowArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.steps.is_empty() || args.steps.len() > 40 { return Err(invalid("workflow requires 1..40 steps")); }
+        validate_workflow_steps(&args.steps)?;
         let mut vars = std::collections::BTreeMap::<String,String>::new();
         let mut receipts = Vec::with_capacity(args.steps.len());
         for step in args.steps {
@@ -672,8 +692,8 @@ impl AppV3 {
             let value = match step {
                 V3WorkflowStep::Snapshot => snapshot_impl(&self.core, &BrowserSnapshotArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector: None, max_items: None, max_text_chars: None, max_bytes: None }).await?,
                 V3WorkflowStep::Find { query, role, save_as } => {
-                    let found = find_impl(&self.core, &BrowserFindArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(10) }).await?;
-                    let reference = found.pointer("/matches/0/reference").and_then(Value::as_str).ok_or_else(|| invalid("find returned no reference"))?.to_owned();
+                    let found = find_impl(&self.core, &BrowserFindArgs { session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(2) }).await?;
+                    let reference = workflow_find_reference(&found)?;
                     if save_as.is_empty() || vars.insert(save_as, reference).is_some() { return Err(invalid("save_as must be unique and nonempty")); }
                     found
                 }
@@ -754,7 +774,7 @@ pub(super) async fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod v3_batch_delivery_tests {
-    use super::{fast_key_batch_failure, lease_target_key, page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, workflow_should_stop};
+    use super::{fast_key_batch_failure, lease_target_key, page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, validate_workflow_steps, workflow_find_reference, workflow_should_stop, BrowserPredicate, V3WorkflowStep};
     use serde_json::json;
 
     #[test]
@@ -770,6 +790,24 @@ mod v3_batch_delivery_tests {
         assert!(workflow_should_stop(&json!({"status":"not_dispatched"})));
         assert!(workflow_should_stop(&json!({"status":"failed"})));
         assert!(!workflow_should_stop(&json!({"status":"verified"})));
+    }
+
+    #[test]
+    fn workflow_find_rejects_ambiguous_targets() {
+        let ambiguous = json!({"matches":[{"reference":"@c1"},{"reference":"@c2"}]});
+        assert!(workflow_find_reference(&ambiguous).is_err());
+        let unique = json!({"matches":[{"reference":"@c1"}]});
+        assert_eq!(workflow_find_reference(&unique).unwrap(), "@c1");
+    }
+
+    #[test]
+    fn workflow_requires_runtime_verification_after_page_tools() {
+        let page_tool = V3WorkflowStep::PageTool { name: "submit".into(), input: json!({}) };
+        let fill = V3WorkflowStep::Fill { reference: "@c1".into(), expected_value: "".into(), value: "x".into() };
+        assert!(validate_workflow_steps(&[page_tool, fill]).is_err());
+        let page_tool = V3WorkflowStep::PageTool { name: "submit".into(), input: json!({}) };
+        let verify = V3WorkflowStep::Verify { predicate: BrowserPredicate::Url { equals: "https://example.test/ok".into() } };
+        assert!(validate_workflow_steps(&[page_tool, verify]).is_ok());
     }
 
     #[test]
