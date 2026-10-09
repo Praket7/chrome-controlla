@@ -3,6 +3,7 @@ pub use controlla_runtime::{
     native_host, native_setup, slides_deck, verifier, workflow,
 };
 
+#[allow(dead_code, clippy::unnecessary_sort_by)]
 mod legacy_mcp {
     include!("../mcp.rs");
 
