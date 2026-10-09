@@ -37,6 +37,7 @@ jobs:
       - run: npm run check:release
       - run: npm run check:v3
       - run: node extensions/chrome-controlla/test-background.cjs
+      - run: node extensions/chrome-controlla/test-v3-batch.cjs
       - run: node --check extensions/chrome-controlla/background.js
       - run: ./scripts/check-dependencies.sh
         shell: bash
