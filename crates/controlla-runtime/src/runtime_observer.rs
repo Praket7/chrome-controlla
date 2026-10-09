@@ -95,7 +95,7 @@ mod tests {
         let observer = FreshStateObserver::new(
             "shared-page-runtime",
             VerificationStrength::FreshPageState,
-            |_| Ok((100, json!({"saved":true}))),
+            |_| Ok::<(u64, Value), String>((100, json!({"saved":true}))),
         );
         let observation = observer.observe("r7").unwrap();
         assert_eq!(
