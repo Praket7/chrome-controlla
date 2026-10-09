@@ -29,7 +29,10 @@ fn foreground_background_and_headless_keep_semantic_parity() {
     assert!(foreground.may_activate_window);
     assert!(!background.may_activate_window);
     assert!(!headless.requires_visible_window);
-    assert_eq!(BrowserMode::Headless.default_provider(), "dedicated_headless");
+    assert_eq!(
+        BrowserMode::Headless.default_provider(),
+        "dedicated_headless"
+    );
 }
 
 #[test]
@@ -40,9 +43,18 @@ fn fast_keys_have_zero_intentional_delay_and_human_keys_are_bounded() {
     let human = TypingPolicy::new(TypingMode::HumanKeys, Some(24)).unwrap();
     assert_eq!(human.delay_ms, 24);
     assert!(TypingPolicy::new(TypingMode::HumanKeys, Some(251)).is_err());
-    assert_eq!(TypingPolicy::choose("hello", false, false).mode, TypingMode::Block);
-    assert_eq!(TypingPolicy::choose("hello", true, false).mode, TypingMode::FastKeys);
-    assert_eq!(TypingPolicy::choose("こんにちは", false, false).mode, TypingMode::Ime);
+    assert_eq!(
+        TypingPolicy::choose("hello", false, false).mode,
+        TypingMode::Block
+    );
+    assert_eq!(
+        TypingPolicy::choose("hello", true, false).mode,
+        TypingMode::FastKeys
+    );
+    assert_eq!(
+        TypingPolicy::choose("こんにちは", false, false).mode,
+        TypingMode::Ime
+    );
 }
 
 #[test]
@@ -64,8 +76,14 @@ fn interaction_epoch_rejects_document_focus_selection_and_viewport_drift() {
 #[test]
 fn target_leases_serialize_same_tab_without_blocking_other_tabs() {
     let mut leases = LeaseTable::default();
-    let tab_a = TargetKey { browser_id: "chrome".into(), tab_id: "1".into() };
-    let tab_b = TargetKey { browser_id: "chrome".into(), tab_id: "2".into() };
+    let tab_a = TargetKey {
+        browser_id: "chrome".into(),
+        tab_id: "1".into(),
+    };
+    let tab_b = TargetKey {
+        browser_id: "chrome".into(),
+        tab_id: "2".into(),
+    };
     assert!(leases.acquire(tab_a.clone(), "codex", 100, 1_000).is_ok());
     assert!(leases.acquire(tab_a.clone(), "claude", 101, 1_000).is_err());
     assert!(leases.acquire(tab_b.clone(), "claude", 101, 1_000).is_ok());

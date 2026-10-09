@@ -198,7 +198,11 @@ impl LeaseTable {
     }
 
     pub fn release(&mut self, target: &TargetKey, owner: &str) -> bool {
-        if self.leases.get(target).is_some_and(|lease| lease.owner == owner) {
+        if self
+            .leases
+            .get(target)
+            .is_some_and(|lease| lease.owner == owner)
+        {
             self.leases.remove(target);
             true
         } else {
@@ -231,12 +235,14 @@ pub struct ClientSessions {
 
 impl ClientSessions {
     pub fn register(&mut self, id: &str, label: &str, now_ms: u64) -> &ClientSession {
-        self.sessions.entry(id.to_owned()).or_insert_with(|| ClientSession {
-            id: id.to_owned(),
-            label: label.to_owned(),
-            last_heartbeat_ms: now_ms,
-            targets: BTreeSet::new(),
-        })
+        self.sessions
+            .entry(id.to_owned())
+            .or_insert_with(|| ClientSession {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                last_heartbeat_ms: now_ms,
+                targets: BTreeSet::new(),
+            })
     }
 
     pub fn heartbeat(&mut self, id: &str, now_ms: u64) -> bool {
@@ -258,7 +264,9 @@ impl ClientSessions {
         let stale = self
             .sessions
             .iter()
-            .filter(|(_, session)| now_ms.saturating_sub(session.last_heartbeat_ms) > stale_after_ms)
+            .filter(|(_, session)| {
+                now_ms.saturating_sub(session.last_heartbeat_ms) > stale_after_ms
+            })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         stale
