@@ -18,10 +18,14 @@ mod legacy_mcp {
         pub(super) mod v3 {
             include!("../mcp/v3_full.rs");
         }
+
+        pub(super) async fn run_v3() -> Result<(), String> {
+            v3::run().await
+        }
     }
 
     pub(crate) async fn run_compact() -> Result<(), String> {
-        v2::v3::run().await
+        v2::run_v3().await
     }
 }
 
