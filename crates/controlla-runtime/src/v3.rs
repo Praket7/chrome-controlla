@@ -183,10 +183,10 @@ impl LeaseTable {
         ttl_ms: u64,
     ) -> Result<TargetLease, TargetLease> {
         self.expire(now_ms);
-        if let Some(existing) = self.leases.get(&target) {
-            if existing.owner != owner {
-                return Err(existing.clone());
-            }
+        if let Some(existing) = self.leases.get(&target)
+            && existing.owner != owner
+        {
+            return Err(existing.clone());
         }
         let lease = TargetLease {
             owner: owner.to_owned(),
