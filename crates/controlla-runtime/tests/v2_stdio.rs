@@ -51,7 +51,9 @@ async fn compact_v3_advertises_exactly_six_guarded_tools() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         names,
-        BTreeSet::from(["act", "browser", "extract", "snapshot", "verify", "workflow"])
+        BTreeSet::from([
+            "act", "browser", "extract", "snapshot", "verify", "workflow"
+        ])
     );
     assert_eq!(tools.tools.len(), 6);
 
@@ -61,7 +63,10 @@ async fn compact_v3_advertises_exactly_six_guarded_tools() {
     };
     let browser = schema("browser");
     for property in ["action", "mode", "provider", "session_id", "target_ids"] {
-        assert!(browser["properties"].get(property).is_some(), "browser {property}");
+        assert!(
+            browser["properties"].get(property).is_some(),
+            "browser {property}"
+        );
     }
     let act = schema("act");
     for property in [
@@ -77,11 +82,19 @@ async fn compact_v3_advertises_exactly_six_guarded_tools() {
         assert!(act["properties"].get(property).is_some(), "act {property}");
     }
     let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
-    for step in ["snapshot", "find", "click", "fill", "type", "press", "extract", "verify"] {
-        assert!(workflow_text.contains(step), "workflow schema contains {step}");
+    for step in [
+        "snapshot", "find", "click", "fill", "type", "press", "extract", "verify",
+    ] {
+        assert!(
+            workflow_text.contains(step),
+            "workflow schema contains {step}"
+        );
     }
     let schema_bytes = serde_json::to_vec(&tools.tools).unwrap().len();
-    assert!(schema_bytes <= 48 * 1024, "default tool schema budget is {schema_bytes} bytes");
+    assert!(
+        schema_bytes <= 48 * 1024,
+        "default tool schema budget is {schema_bytes} bytes"
+    );
 
     client.cancel().await.unwrap();
     std::fs::remove_dir_all(state_dir).unwrap();
