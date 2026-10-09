@@ -76,7 +76,7 @@ pub fn select_input_strategy(mode: InputMode, input: InputCharacteristics) -> St
                 requires_app_adapter: false,
             }
         }
-        InputMode::Auto => StrategyDecision {
+        InputMode::Fast | InputMode::Auto => StrategyDecision {
             strategy: None,
             requires_app_adapter: true,
         },
@@ -120,6 +120,13 @@ mod tests {
         ] {
             assert!(select_input_strategy(InputMode::Auto, characteristics).requires_app_adapter);
         }
+    }
+
+    #[test]
+    fn fast_mode_fails_closed_for_unqualified_controls() {
+        let decision = select_input_strategy(InputMode::Fast, InputCharacteristics::default());
+        assert_eq!(decision.strategy, None);
+        assert!(decision.requires_app_adapter);
     }
 
     #[test]
