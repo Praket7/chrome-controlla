@@ -566,7 +566,7 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
         tokio::time::timeout(Duration::from_millis(timeout_ms), connection.command(
             shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
                 "objectId":object_id,"functionDeclaration":crate::v3_runtime::PageToolProgram::invocation(),
-                "arguments":[{"value":name},{"value":input},{"value":descriptor.input_schema}],"awaitPromise":true,"returnByValue":true
+                "arguments":[{"value":name},{"value":input},{"value":descriptor.input_schema},{"value":timeout_ms}],"awaitPromise":true,"returnByValue":true
             }),
         )).await
     };

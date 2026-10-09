@@ -112,10 +112,12 @@ fn page_tools_are_allowlisted_bounded_and_typed() {
 fn page_tool_program_uses_the_document_model_context_api_without_interpolation() {
     let discovery = PageToolProgram::discovery();
     let invocation = PageToolProgram::invocation();
-    assert!(discovery.contains("document.modelContext.getTools()"));
-    assert!(invocation.contains("document.modelContext.executeTool(tool,input)"));
-    assert!(invocation.contains("async function(name,input,expectedSchema)"));
+    assert!(discovery.contains("context.getTools()"));
+    assert!(invocation.contains("context.executeTool(tool,input"));
+    assert!(invocation.contains("async function(name,input,expectedSchema,timeoutMs)"));
     assert!(invocation.contains("expectedSchema"));
+    assert!(invocation.contains("{signal:controller.signal}"));
+    assert!(invocation.contains("controller.abort()"));
     assert!(!invocation.contains("JSON.stringify(name)"));
 }
 
@@ -125,14 +127,14 @@ async fn page_tool_programs_use_webmcp_fixture_and_reject_schema_drift() {
     let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
     let (discovery, invoked, drifted, tool_invoked) = context
         .async_with(async |ctx| {
-            ctx.eval::<(), _>(r#"globalThis.document={modelContext:{getTools:async()=>[{name:"search",description:"Search",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"],additionalProperties:false}}],executeTool:async(tool,input)=>({tool:tool.name,query:input.query})}};"#).unwrap();
+            ctx.eval::<(), _>(r#"globalThis.AbortController=class{constructor(){this.signal={aborted:false}}abort(){this.signal.aborted=true}};globalThis.setTimeout=(callback)=>{callback();return 1};globalThis.clearTimeout=()=>{};globalThis.document={modelContext:{getTools:async()=>[{name:"search",description:"Search",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"],additionalProperties:false}}],executeTool:async(tool,input,options)=>({tool:tool.name,query:input.query,signal_aborted:options.signal.aborted})}};"#).unwrap();
             let discover = format!("(async()=>JSON.stringify(await ({})()))()", PageToolProgram::discovery());
             let discovery = ctx.eval::<rquickjs::Promise, _>(discover).unwrap().into_future::<String>().await.unwrap();
             let schema = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false});
             let name = serde_json::to_string("search").unwrap();
             let input = serde_json::to_string(&json!({"query":"cats"})).unwrap();
             let schema_literal = serde_json::to_string(&schema).unwrap();
-            let invoked = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})({name},{input},{schema_literal})))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
+            let invoked = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})({name},{input},{schema_literal},2000)))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
             ctx.eval::<(), _>("document.modelContext.getTools=async()=>[{name:'search',inputSchema:{type:'object',properties:{query:{type:'string'},limit:{type:'string'}},required:['query'],additionalProperties:false}}];globalThis.toolInvoked=false;document.modelContext.executeTool=async()=>{toolInvoked=true;return 'unexpected'};").unwrap();
             let drifted = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})({name},{input},{schema_literal})))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
             Ok::<_, rquickjs::Error>((discovery, invoked, drifted, ctx.eval::<bool, _>("toolInvoked").unwrap()))
@@ -146,6 +148,7 @@ async fn page_tool_programs_use_webmcp_fixture_and_reject_schema_drift() {
     assert_eq!(discovery["tools"][0]["name"], "search");
     assert_eq!(invoked["result"]["tool"], "search");
     assert_eq!(invoked["result"]["query"], "cats");
+    assert_eq!(invoked["result"]["signal_aborted"], true);
     assert_eq!(drifted["schema_changed"], true);
     assert!(!tool_invoked);
 }

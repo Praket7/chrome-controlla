@@ -22,11 +22,11 @@ pub struct PageToolProgram;
 
 impl PageToolProgram {
     pub fn discovery() -> &'static str {
-        r#"async function(){const context=document.modelContext;if(!context||typeof context.getTools!=="function")return {available:false,tools:[]};const tools=await document.modelContext.getTools();return {available:true,tools:Array.isArray(tools)?tools.slice(0,64).map(t=>({name:String(t.name||"").slice(0,128),description:String(t.description||"").slice(0,512),input_schema:t.inputSchema??{}})):[]};}"#
+        r#"async function(){const context=document.modelContext;if(!context||typeof context.getTools!=="function")return {available:false,tools:[]};const tools=await context.getTools();return {available:true,tools:Array.isArray(tools)?tools.slice(0,64).map(t=>({name:String(t.name||"").slice(0,128),description:String(t.description||"").slice(0,512),input_schema:t.inputSchema??{}})):[]};}"#
     }
 
     pub fn invocation() -> &'static str {
-        r#"async function(name,input,expectedSchema){const context=document.modelContext;if(!context||typeof context.getTools!=="function"||typeof context.executeTool!=="function")return {available:false};const tools=await document.modelContext.getTools();const tool=Array.isArray(tools)?tools.find(t=>t.name===name):undefined;if(!tool)return {available:true,not_found:true};const stable=v=>v&&typeof v==="object"?(Array.isArray(v)?v.map(stable):Object.keys(v).sort().reduce((o,k)=>(o[k]=stable(v[k]),o),{})):v;if(JSON.stringify(stable(tool.inputSchema??{}))!==JSON.stringify(stable(expectedSchema)))return {available:true,schema_changed:true};return {available:true,result:await document.modelContext.executeTool(tool,input)};}"#
+        r#"async function(name,input,expectedSchema,timeoutMs){const context=document.modelContext;if(!context||typeof context.getTools!=="function"||typeof context.executeTool!=="function")return {available:false};const tools=await context.getTools();const tool=Array.isArray(tools)?tools.find(t=>t.name===name):undefined;if(!tool)return {available:true,not_found:true};const stable=v=>v&&typeof v==="object"?(Array.isArray(v)?v.map(stable):Object.keys(v).sort().reduce((o,k)=>(o[k]=stable(v[k]),o),{})):v;if(JSON.stringify(stable(tool.inputSchema??{}))!==JSON.stringify(stable(expectedSchema)))return {available:true,schema_changed:true};const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),Math.max(1,timeoutMs-100));try{return {available:true,result:await context.executeTool(tool,input,{signal:controller.signal})};}finally{clearTimeout(timer);}}"#
     }
 }
 
