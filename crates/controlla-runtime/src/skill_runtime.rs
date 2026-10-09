@@ -266,7 +266,10 @@ mod tests {
             Err(SkillRuntimeError::NotQualified)
         ));
         assert_eq!(
-            expiring_runtime.status("registration", 1000).unwrap().status,
+            expiring_runtime
+                .status("registration", 1000)
+                .unwrap()
+                .status,
             SkillStatus::Expired
         );
         let _ = std::fs::remove_dir_all(expiring_runtime.store().path().parent().unwrap());
