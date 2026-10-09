@@ -1,0 +1,42 @@
+{
+  "schema": "controlla-phase12-agent-workloads-v1",
+  "claimEligibleOnlyWithRealRuns": true,
+  "competitors": [
+    "controlla-v3",
+    "stagehand-v4",
+    "playwright-mcp",
+    "browser-use",
+    "chrome-devtools-mcp",
+    "agent-browser"
+  ],
+  "metrics": [
+    "success",
+    "verified_success",
+    "severe_safety_failures",
+    "wall_ms",
+    "model_round_trips",
+    "browser_round_trips",
+    "command_count",
+    "tokens",
+    "action_count",
+    "stale_target_recoveries",
+    "user_interference_recoveries"
+  ],
+  "workloads": [
+    {"id":"typing-1000-block","category":"typing","mode":"foreground","requirement":"insert 1000 ASCII characters with final value verification"},
+    {"id":"typing-1000-fastkeys","category":"typing","mode":"foreground","requirement":"dispatch ordered key semantics without a fixed per-character delay"},
+    {"id":"live-user-interference","category":"safety","mode":"foreground","requirement":"reject or safely re-ground after focus, selection, and navigation changes"},
+    {"id":"background-headed","category":"browser-mode","mode":"background","requirement":"complete a verified workflow without activating the browser window"},
+    {"id":"headless-parity","category":"browser-mode","mode":"headless","requirement":"same semantic and verification contract as foreground"},
+    {"id":"eight-tab-concurrency","category":"concurrency","mode":"foreground","requirement":"execute independent tab work concurrently without global serialization"},
+    {"id":"research-citations","category":"research","mode":"headless","requirement":"research across 10 pages and return bounded URL-backed evidence"},
+    {"id":"long-form-no-submit","category":"forms","mode":"foreground","requirement":"fill a multi-page form and save draft without final submission"},
+    {"id":"authenticated-persistence","category":"session","mode":"foreground","requirement":"preserve authenticated state across multiple tool calls"},
+    {"id":"webmcp-route","category":"native-tools","mode":"foreground","requirement":"prefer a page-exposed typed tool and fall back safely when absent"},
+    {"id":"dynamic-spa-rerender","category":"staleness","mode":"foreground","requirement":"survive semantic rerender without wrong-target mutation"},
+    {"id":"shadow-dom","category":"dom","mode":"headless","requirement":"interact through nested shadow roots"},
+    {"id":"nested-iframe","category":"dom","mode":"headless","requirement":"interact through nested and out-of-process frames"},
+    {"id":"upload-download","category":"artifacts","mode":"headless","requirement":"upload a file and verify a downloaded artifact"},
+    {"id":"warm-skill-replay","category":"cache","mode":"headless","requirement":"compare first run against qualified deterministic replay"}
+  ]
+}
