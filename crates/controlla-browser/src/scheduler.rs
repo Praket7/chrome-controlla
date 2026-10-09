@@ -187,7 +187,15 @@ impl TargetScheduler {
         })
     }
 
+    /// Preserve the legacy API contract: this reports the scheduler's configured
+    /// starting concurrency, not the adaptive ceiling or transient live limit.
     pub fn max_active_tabs(&self) -> usize {
+        self.adaptive.limits.initial_active
+    }
+
+    /// Maximum concurrency the adaptive controller may reach after sustained
+    /// healthy execution. This is distinct from the legacy starting limit.
+    pub fn adaptive_ceiling(&self) -> usize {
         self.adaptive.limits.max_active
     }
 
@@ -285,6 +293,10 @@ mod tests {
                 max_active: 8
             }
         );
+        let scheduler = TargetScheduler::default();
+        assert_eq!(scheduler.max_active_tabs(), 4);
+        assert_eq!(scheduler.current_active_limit(), 4);
+        assert_eq!(scheduler.adaptive_ceiling(), 8);
         assert_eq!(
             TargetScheduler::with_limits(SchedulerLimits {
                 min_active: 2,
@@ -312,6 +324,19 @@ mod tests {
             scheduler.record_pressure(SchedulerPressure::Healthy);
         }
         assert_eq!(scheduler.current_active_limit(), 2);
+        assert_eq!(scheduler.max_active_tabs(), 4);
+        assert_eq!(scheduler.adaptive_ceiling(), 8);
+    }
+
+    #[test]
+    fn healthy_execution_can_reach_but_not_exceed_adaptive_ceiling() {
+        let scheduler = TargetScheduler::default();
+        for _ in 0..64 {
+            scheduler.record_pressure(SchedulerPressure::Healthy);
+        }
+        assert_eq!(scheduler.current_active_limit(), 8);
+        assert_eq!(scheduler.adaptive_ceiling(), 8);
+        assert_eq!(scheduler.max_active_tabs(), 4);
     }
 
     #[test]
