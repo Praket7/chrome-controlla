@@ -101,7 +101,7 @@ fn fast_key_batch_failure(
 }
 
 fn workflow_should_stop(value: &Value) -> bool {
-    matches!(value.get("status").and_then(Value::as_str), Some("unknown" | "not_dispatched"))
+    matches!(value.get("status").and_then(Value::as_str), Some("unknown" | "not_dispatched" | "failed"))
 }
 
 fn lease_target_key(_session_id: &str, tab_id: &str) -> crate::v3::TargetKey {
@@ -768,6 +768,7 @@ mod v3_batch_delivery_tests {
     fn workflow_stops_after_uncertain_or_undispatched_actions() {
         assert!(workflow_should_stop(&json!({"status":"unknown"})));
         assert!(workflow_should_stop(&json!({"status":"not_dispatched"})));
+        assert!(workflow_should_stop(&json!({"status":"failed"})));
         assert!(!workflow_should_stop(&json!({"status":"verified"})));
     }
 
