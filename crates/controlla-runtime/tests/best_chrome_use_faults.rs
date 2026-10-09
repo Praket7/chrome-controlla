@@ -7,15 +7,21 @@ use controlla_runtime::{
     verifier::Verification,
 };
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 fn runtime() -> SkillRuntime {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     SkillRuntime::new(std::env::temp_dir().join(format!(
-        "controlla-faults-{}-{nonce}/skills.json",
+        "controlla-faults-{}-{nonce}-{unique}/skills.json",
         std::process::id()
     )))
 }
