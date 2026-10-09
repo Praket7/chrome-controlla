@@ -14,6 +14,7 @@ Starting point: `62e6407d0e75b83a1be8d69468476601a6e6da37`
 - Agent-facing MCP v2 exposes session, snapshot, find, act, extract, workflow, probe, verify, and skill tools while retaining v1 compatibility.
 - ChatGPT Desktop/local MCP integration and benchmark/release documentation are present.
 - One-time patch transport used during implementation removed itself from the tree. The source was formatted before the final verification run.
+- The strict typing path has also been normalized for the Rust 1.99 clippy gate before this final matrix run.
 
 ## Safety invariants
 
