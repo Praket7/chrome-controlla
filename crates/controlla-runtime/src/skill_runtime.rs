@@ -7,7 +7,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkillRuntimeError {
@@ -19,6 +22,8 @@ pub enum SkillRuntimeError {
     NotFound,
     #[error("skill replay is not currently qualified")]
     NotQualified,
+    #[error("skill runtime lock is poisoned")]
+    LockPoisoned,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -32,12 +37,14 @@ pub struct SkillReplay {
 #[derive(Clone, Debug)]
 pub struct SkillRuntime {
     store: SkillStore,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 impl SkillRuntime {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             store: SkillStore::new(path),
+            operation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -45,10 +52,17 @@ impl SkillRuntime {
         &self.store
     }
 
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, SkillRuntimeError> {
+        self.operation_lock
+            .lock()
+            .map_err(|_| SkillRuntimeError::LockPoisoned)
+    }
+
     pub fn register_candidate(
         &self,
         definition: SkillDefinition,
     ) -> Result<SkillRecord, SkillRuntimeError> {
+        let _guard = self.lock()?;
         let record = SkillRecord::candidate(definition)?;
         self.store.upsert(record.clone())?;
         Ok(record)
@@ -90,6 +104,7 @@ impl SkillRuntime {
     }
 
     pub fn status(&self, skill_id: &str, now_ms: u64) -> Result<SkillRecord, SkillRuntimeError> {
+        let _guard = self.lock()?;
         let mut record = self
             .store
             .get(skill_id)?
@@ -110,6 +125,7 @@ impl SkillRuntime {
         structural_signature: &str,
         now_ms: u64,
     ) -> Result<SkillReplay, SkillRuntimeError> {
+        let _guard = self.lock()?;
         let mut record = self
             .store
             .get(skill_id)?
@@ -159,6 +175,7 @@ impl SkillRuntime {
         skill_id: &str,
         update: impl FnOnce(&mut SkillRecord) -> Result<(), SkillRuntimeError>,
     ) -> Result<SkillRecord, SkillRuntimeError> {
+        let _guard = self.lock()?;
         let mut record = self
             .store
             .get(skill_id)?
@@ -174,7 +191,10 @@ mod tests {
     use super::*;
     use crate::skills::SKILL_SCHEMA_VERSION;
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{Arc, Barrier},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn runtime() -> SkillRuntime {
         let nonce = SystemTime::now()
@@ -281,5 +301,30 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, SkillStatus::Quarantined);
         let _ = std::fs::remove_dir_all(safety_runtime.store().path().parent().unwrap());
+    }
+
+    #[test]
+    fn concurrent_updates_to_one_skill_do_not_lose_evidence() {
+        const WRITERS: usize = 16;
+        let runtime = runtime();
+        runtime.register_candidate(definition()).unwrap();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut threads = Vec::with_capacity(WRITERS);
+        for index in 0..WRITERS {
+            let runtime = runtime.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                runtime
+                    .record_training_success("registration", format!("train-{index}"))
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let record = runtime.status("registration", 0).unwrap();
+        assert_eq!(record.training_run_ids.len(), WRITERS);
+        let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());
     }
 }
