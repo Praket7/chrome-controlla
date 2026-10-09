@@ -1,0 +1,33 @@
+{
+  "schema": "controlla-client-qualification-v3",
+  "requiredCapabilities": [
+    "startup",
+    "persistent_session",
+    "foreground",
+    "background",
+    "headless",
+    "block_typing",
+    "fast_keys",
+    "human_keys",
+    "ime",
+    "multi_tab",
+    "user_interference",
+    "upload_download",
+    "research_extract",
+    "verified_mutations"
+  ],
+  "clients": {
+    "freebuff": {"contract": "stdio-mcp", "status": "qualified"},
+    "opencode": {"contract": "stdio-mcp", "status": "qualified"},
+    "claude-code": {"contract": "stdio-mcp", "status": "qualified"},
+    "codex": {"contract": "stdio-mcp", "status": "qualified"},
+    "chatgpt-desktop": {"contract": "packaged-local-plugin", "status": "qualified"},
+    "generic-mcp": {"contract": "stdio-mcp", "status": "qualified"}
+  },
+  "qualificationPolicy": {
+    "generatedEvidenceMayQualifyClientContract": true,
+    "generatedEvidenceMaySupportBestClaim": false,
+    "realClientSmokeRequiredForPublicCompatibilityClaim": true,
+    "unknownMutationRetry": false
+  }
+}
