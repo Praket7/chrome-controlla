@@ -89,7 +89,13 @@ mod tests {
 
     #[test]
     fn auto_prefers_native_setter_for_safe_ordinary_fill() {
-        let decision = select_input_strategy(InputMode::Auto, InputCharacteristics { ordinary_text_control: true, ..Default::default() });
+        let decision = select_input_strategy(
+            InputMode::Auto,
+            InputCharacteristics {
+                ordinary_text_control: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(decision.strategy, Some(InputStrategy::NativeSetter));
         assert!(!decision.requires_app_adapter);
     }
@@ -97,9 +103,20 @@ mod tests {
     #[test]
     fn trusted_masked_and_custom_controls_do_not_silently_use_fast_input() {
         for characteristics in [
-            InputCharacteristics { ordinary_text_control: true, masked: true, ..Default::default() },
-            InputCharacteristics { ordinary_text_control: true, requires_trusted_events: true, ..Default::default() },
-            InputCharacteristics { contenteditable: true, ..Default::default() },
+            InputCharacteristics {
+                ordinary_text_control: true,
+                masked: true,
+                ..Default::default()
+            },
+            InputCharacteristics {
+                ordinary_text_control: true,
+                requires_trusted_events: true,
+                ..Default::default()
+            },
+            InputCharacteristics {
+                contenteditable: true,
+                ..Default::default()
+            },
         ] {
             assert!(select_input_strategy(InputMode::Auto, characteristics).requires_app_adapter);
         }
@@ -107,7 +124,28 @@ mod tests {
 
     #[test]
     fn strict_and_ime_modes_are_explicit() {
-        assert_eq!(select_input_strategy(InputMode::Strict, InputCharacteristics { ordinary_text_control: true, ..Default::default() }).strategy, Some(InputStrategy::SequentialKeys));
-        assert_eq!(select_input_strategy(InputMode::Auto, InputCharacteristics { ordinary_text_control: true, ime_required: true, ..Default::default() }).strategy, Some(InputStrategy::Ime));
+        assert_eq!(
+            select_input_strategy(
+                InputMode::Strict,
+                InputCharacteristics {
+                    ordinary_text_control: true,
+                    ..Default::default()
+                }
+            )
+            .strategy,
+            Some(InputStrategy::SequentialKeys)
+        );
+        assert_eq!(
+            select_input_strategy(
+                InputMode::Auto,
+                InputCharacteristics {
+                    ordinary_text_control: true,
+                    ime_required: true,
+                    ..Default::default()
+                }
+            )
+            .strategy,
+            Some(InputStrategy::Ime)
+        );
     }
 }

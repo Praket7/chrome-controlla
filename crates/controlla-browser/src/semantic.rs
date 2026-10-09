@@ -61,7 +61,13 @@ mod tests {
 
     #[test]
     fn spec_is_bounded_before_browser_use() {
-        let spec = SemanticSnapshotSpec { selector: "body".into(), max_items: usize::MAX, max_text_chars: usize::MAX, max_bytes: usize::MAX }.bounded();
+        let spec = SemanticSnapshotSpec {
+            selector: "body".into(),
+            max_items: usize::MAX,
+            max_text_chars: usize::MAX,
+            max_bytes: usize::MAX,
+        }
+        .bounded();
         assert_eq!(spec.max_items, 500);
         assert_eq!(spec.max_text_chars, 10_000);
         assert_eq!(spec.max_bytes, 1_000_000);

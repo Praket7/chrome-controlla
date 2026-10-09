@@ -65,9 +65,19 @@ mod tests {
     #[test]
     fn visual_refs_expire_on_document_revision_or_age() {
         let reference = VisualTargetRef {
-            target_id: "t".into(), target_revision: 2, frame_id: "f".into(), frame_revision: 3,
-            document_revision: 4, region: ProbeRegion { x: 1.0, y: 2.0, width: 20.0, height: 10.0 },
-            content_hash: "abc".into(), observed_at_ms: 100,
+            target_id: "t".into(),
+            target_revision: 2,
+            frame_id: "f".into(),
+            frame_revision: 3,
+            document_revision: 4,
+            region: ProbeRegion {
+                x: 1.0,
+                y: 2.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            content_hash: "abc".into(),
+            observed_at_ms: 100,
         };
         assert!(reference.valid_for("t", 2, "f", 3, 4, 120, 50));
         assert!(!reference.valid_for("t", 2, "f", 3, 5, 120, 50));

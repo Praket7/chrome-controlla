@@ -228,9 +228,7 @@ impl TargetScheduler {
     fn pressure(queue_wait: Duration, execution: Duration) -> SchedulerPressure {
         if queue_wait >= Duration::from_secs(1) || execution >= Duration::from_secs(5) {
             SchedulerPressure::Slow
-        } else if queue_wait <= Duration::from_millis(100)
-            && execution <= Duration::from_secs(2)
-        {
+        } else if queue_wait <= Duration::from_millis(100) && execution <= Duration::from_secs(2) {
             SchedulerPressure::Healthy
         } else {
             // Neutral samples neither grow nor shrink concurrency.
@@ -278,9 +276,27 @@ mod tests {
 
     #[test]
     fn limits_validate_and_default_to_one_four_eight() {
-        assert_eq!(SchedulerLimits::default(), SchedulerLimits { min_active: 1, initial_active: 4, max_active: 8 });
-        assert_eq!(TargetScheduler::with_limits(SchedulerLimits { min_active: 2, initial_active: 1, max_active: 8 }).err(), Some(SchedulerError::InvalidLimits));
-        assert_eq!(TargetScheduler::with_max_active_tabs(0).err(), Some(SchedulerError::ActiveTabLimitMustBePositive));
+        assert_eq!(
+            SchedulerLimits::default(),
+            SchedulerLimits {
+                min_active: 1,
+                initial_active: 4,
+                max_active: 8
+            }
+        );
+        assert_eq!(
+            TargetScheduler::with_limits(SchedulerLimits {
+                min_active: 2,
+                initial_active: 1,
+                max_active: 8
+            })
+            .err(),
+            Some(SchedulerError::InvalidLimits)
+        );
+        assert_eq!(
+            TargetScheduler::with_max_active_tabs(0).err(),
+            Some(SchedulerError::ActiveTabLimitMustBePositive)
+        );
     }
 
     #[test]
@@ -299,17 +315,25 @@ mod tests {
 
     #[tokio::test]
     async fn same_target_is_serialized_without_global_tab_lock() {
-        let scheduler = TargetScheduler::with_limits(SchedulerLimits { min_active: 1, initial_active: 2, max_active: 2 }).unwrap();
+        let scheduler = TargetScheduler::with_limits(SchedulerLimits {
+            min_active: 1,
+            initial_active: 2,
+            max_active: 2,
+        })
+        .unwrap();
         let first = scheduler.clone();
         let first_task = tokio::spawn(async move {
-            first.run_target("a", async {
-                tokio::time::sleep(Duration::from_millis(40)).await;
-                1usize
-            }).await
+            first
+                .run_target("a", async {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    1usize
+                })
+                .await
         });
         tokio::time::sleep(Duration::from_millis(5)).await;
         let second = scheduler.clone();
-        let second_task = tokio::spawn(async move { second.run_target("b", async { 2usize }).await });
+        let second_task =
+            tokio::spawn(async move { second.run_target("b", async { 2usize }).await });
         assert_eq!(second_task.await.unwrap(), 2);
         assert_eq!(first_task.await.unwrap(), 1);
     }
