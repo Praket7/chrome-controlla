@@ -101,10 +101,16 @@ function documentedJson(heading) {
   assert.ok(block, `${heading} has a JSON example`);
   return JSON.parse(block[1]);
 }
-assert.deepEqual(documentedJson('## Freebuff / Codebuff CLI MCP config'), generate('freebuff'));
-assert.deepEqual(documentedJson('## OpenCode v1'), generate('opencode-v1'));
-assert.deepEqual(documentedJson('## OpenCode v2'), generate('opencode-v2'));
+function normalizePathSeparators(value) {
+  if (typeof value === 'string') return value.replaceAll('\\', '/');
+  if (Array.isArray(value)) return value.map(normalizePathSeparators);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizePathSeparators(item)]));
+  return value;
+}
+assert.deepEqual(documentedJson('## Freebuff / Codebuff CLI MCP config'), normalizePathSeparators(generate('freebuff')));
+assert.deepEqual(documentedJson('## OpenCode v1'), normalizePathSeparators(generate('opencode-v1')));
+assert.deepEqual(documentedJson('## OpenCode v2'), normalizePathSeparators(generate('opencode-v2')));
 const claudeSection = docs.split('## Claude Code\n')[1]?.split('\n## ')[0] ?? '';
-assert.ok(claudeSection.includes(generate('claude').split('\n')[0]), 'Claude command matches generator output');
+assert.ok(claudeSection.includes(normalizePathSeparators(generate('claude')).split('\n')[0]), 'Claude command matches generator output');
 assert.match(docs, /ChatGPT does not connect directly to a local stdio process/);
 console.log('Versioned client configs and safe JSON merge installation checks passed.');
