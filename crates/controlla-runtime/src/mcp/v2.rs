@@ -3,7 +3,7 @@ use rmcp::{
     ServerHandler, ServiceExt, handler::server::wrapper::{Json, Parameters}, tool, tool_handler,
     tool_router,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
@@ -340,20 +340,22 @@ async fn retained_mutation(
     if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
         return Err(invalid("stale or consumed reference; take one fresh browser_snapshot"));
     }
-    let connection = shared
-        .connection
-        .as_ref()
-        .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
-    let registry = shared.registry()?;
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
-    let before = tokio::time::timeout_at(
-        deadline,
-        shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
-    )
-    .await
-    .map_err(|_| invalid("action preflight timed out; no mutation dispatched"))?
-    .map_err(invalid)?;
+    let before = {
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = shared.registry()?;
+        tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+        )
+        .await
+        .map_err(|_| invalid("action preflight timed out; no mutation dispatched"))?
+        .map_err(invalid)?
+    };
     if before != snapshot.identity {
         return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
     }
@@ -368,31 +370,42 @@ async fn retained_mutation(
         .get_mut(&args.chrome_tab_id)
         .ok_or_else(|| invalid("snapshot disappeared before dispatch"))?
         .consumed = true;
-    let response = tokio::time::timeout_at(
-        deadline,
-        connection.command(
-            registry,
-            &shared.handle,
-            &args.chrome_tab_id,
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": snapshot.object_id,
-                "functionDeclaration": function,
-                "arguments":[{"value":index},{"value":expected},{"value":value}],
-                "returnByValue":true
-            }),
-        ),
-    )
-    .await;
+    let response = {
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = shared.registry()?;
+        tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": snapshot.object_id,
+                    "functionDeclaration": function,
+                    "arguments":[{"value":index},{"value":expected},{"value":value}],
+                    "returnByValue":true
+                }),
+            ),
+        )
+        .await
+    };
     let mut result = match response {
-        Ok(Ok(response)) => {
-            let value = shared_value(&response).map_err(invalid)?;
-            if value["ok"] == true {
+        Ok(Ok(response)) => match shared_value(&response) {
+            Ok(value) if value["ok"] == true => {
                 json!({"status":"verified","dispatch_acknowledged":true,"action":action,"readback":value})
-            } else {
+            }
+            Ok(value) => {
                 json!({"status":"not_dispatched","dispatch_acknowledged":true,"action":action,"reason":value["reason"],"readback":value})
             }
-        }
+            Err(error) => json!({
+                "status":"unknown","dispatch_acknowledged":true,
+                "reason":format!("browser mutation reply could not be interpreted after dispatch: {error}; inspect state and do not automatically retry")
+            }),
+        },
         Ok(Err(error)) => json!({
             "status":"unknown","dispatch_acknowledged":false,
             "reason":format!("browser mutation delivery is uncertain: {error}; inspect state and do not automatically retry")
@@ -402,11 +415,18 @@ async fn retained_mutation(
             "reason":"browser mutation deadline exceeded; effect may have occurred; inspect state and do not automatically retry"
         }),
     };
-    let after = tokio::time::timeout_at(
-        deadline,
-        shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
-    )
-    .await;
+    let after = {
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = shared.registry()?;
+        tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+        )
+        .await
+    };
     if !matches!(after, Ok(Ok(ref identity)) if identity == &before) && result["status"] == "verified" {
         result = json!({
             "status":"unknown","dispatch_acknowledged":true,
@@ -472,7 +492,8 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
     matches.sort_by(|a, b| b.0.cmp(&a.0));
     let limit = args.limit.unwrap_or(10).clamp(1, 50);
     let matches = matches.into_iter().take(limit).map(|(_, item)| item).collect::<Vec<_>>();
-    Ok(json!({"matches":matches,"count":matches.len(),"semantic_revision":state.snapshot_id}))
+    let count = matches.len();
+    Ok(json!({"matches":matches,"count":count,"semantic_revision":state.snapshot_id}))
 }
 
 async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
@@ -655,9 +676,15 @@ impl AppV2 {
                     session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate,
                 }).await?,
             };
-            let status = receipt.get("status").and_then(Value::as_str);
+            let status = receipt
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             receipts.push(receipt);
-            if status == Some("unknown") || status == Some("failed") || status == Some("not_dispatched") {
+            if matches!(
+                status.as_deref(),
+                Some("unknown" | "failed" | "not_dispatched")
+            ) {
                 break;
             }
         }
