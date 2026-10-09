@@ -153,6 +153,35 @@ async fn page_tool_programs_use_webmcp_fixture_and_reject_schema_drift() {
     assert!(!tool_invoked);
 }
 
+#[tokio::test]
+async fn page_tool_schema_comparison_preserves_proto_named_properties() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let expected = json!({"type":"object","properties":{"__proto__":{"type":"string"}},"required":[],"additionalProperties":false});
+    let current = json!({"type":"object","properties":{"__proto__":{"type":"integer"}},"required":[],"additionalProperties":false});
+    let expected = serde_json::to_string(&expected).unwrap();
+    let expected = serde_json::to_string(&expected).unwrap();
+    let current = serde_json::to_string(&current).unwrap();
+    let current = serde_json::to_string(&current).unwrap();
+    let (result, invoked) = context
+        .async_with(async |ctx| {
+            ctx.eval::<(), _>(format!("globalThis.AbortController=class{{constructor(){{this.signal={{aborted:false}}}}abort(){{this.signal.aborted=true}}}};globalThis.setTimeout=()=>1;globalThis.clearTimeout=()=>{{}};globalThis.toolInvoked=false;globalThis.document={{modelContext:{{getTools:async()=>[{{name:'search',inputSchema:JSON.parse({current})}}],executeTool:async()=>{{toolInvoked=true;return 'unexpected'}}}}}};")).unwrap();
+            let expression = format!("(async()=>{{try{{return JSON.stringify(await ({})('search',{{}},JSON.parse({expected}),2000))}}catch(error){{return JSON.stringify({{error:String(error)}})}}}})()", PageToolProgram::invocation());
+            let result = ctx
+                .eval::<rquickjs::Promise, _>(expression)
+                .unwrap_or_else(|error| panic!("page invocation failed: {error}"))
+                .into_future::<String>()
+                .await
+                .unwrap_or_else(|error| panic!("page promise failed: {error}"));
+            Ok::<_, rquickjs::Error>((result, ctx.eval::<bool, _>("toolInvoked").unwrap()))
+        })
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["schema_changed"], true, "{result}");
+    assert!(!invoked);
+}
+
 #[test]
 fn reconnect_never_blindly_replays_mutations_and_is_bounded() {
     let mut controller = ReconnectController::new(2).unwrap();
