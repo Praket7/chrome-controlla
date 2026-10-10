@@ -31,6 +31,13 @@ test('complete evidence passes', () => {
   assert.deepEqual(evaluateV3Gate(complete), { pass: true, failures: [] });
 });
 
+test('ESPN fixture measurements stay nonblocking release telemetry', () => {
+  assert.deepEqual(evaluateV3Gate({
+    ...complete,
+    espn_latest_story_telemetry: { mcp_calls: 3, workflow_steps: 4, elapsed_ms: 1500 },
+  }), { pass: true, failures: [] });
+});
+
 test('missing real competitor evidence blocks best claim', () => {
   const result = evaluateV3Gate({ ...complete, real_competitor_evidence_complete: false });
   assert.equal(result.pass, false);

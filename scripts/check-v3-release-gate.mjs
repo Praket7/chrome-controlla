@@ -60,5 +60,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error(`V3 release gate blocked:\n- ${result.failures.join('\n- ')}`);
     process.exit(1);
   }
+  if (evidence.espn_latest_story_telemetry) {
+    console.log(`Nonblocking ESPN fixture telemetry: ${JSON.stringify(evidence.espn_latest_story_telemetry)}`);
+  }
   console.log('V3 release gate passed with complete real evidence.');
 }

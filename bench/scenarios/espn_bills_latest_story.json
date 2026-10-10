@@ -1,0 +1,12 @@
+{
+  "id": "espn_bills_latest_story",
+  "kind": "fixture_telemetry",
+  "blocking": false,
+  "entry": "bench/fixtures/espn_bills_latest_story/index.html",
+  "expected_latest": {
+    "href": "/article-newest.html",
+    "timestamp": "2026-10-10T12:00:00Z"
+  },
+  "measure": ["mcp_calls", "workflow_steps", "elapsed_ms"],
+  "claim_scope": "deterministic fixture only; not live ESPN or competitor evidence"
+}
