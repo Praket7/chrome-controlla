@@ -124,7 +124,8 @@ impl SemanticMemory {
         }
 
         let previous = self.items.clone();
-        let stable_keys = stable_item_keys(&items);
+        let snapshot_revision = snapshot_revision.into();
+        let stable_keys = stable_item_keys(&items, &snapshot_revision);
         self.short_to_legacy.clear();
         self.items.clear();
         let mut public_items = Vec::with_capacity(items.len());
@@ -163,7 +164,7 @@ impl SemanticMemory {
             .filter(|reference| !self.items.contains_key(*reference))
             .cloned()
             .collect();
-        self.snapshot_revision = snapshot_revision.into();
+        self.snapshot_revision = snapshot_revision;
         Ok(SemanticSnapshotUpdate {
             snapshot_revision: self.snapshot_revision.clone(),
             items: public_items,
@@ -177,17 +178,41 @@ impl SemanticMemory {
     }
 }
 
-fn stable_item_keys(items: &[Value]) -> Vec<String> {
-    let mut seen = BTreeMap::<String, usize>::new();
-    items
+pub fn stable_item_keys(items: &[Value], revision: &str) -> Vec<String> {
+    let bases = items
         .iter()
         .map(|item| {
-            let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            let href = item.get("href").and_then(Value::as_str).unwrap_or_default();
-            let base = format!("{role}\u{1f}{name}\u{1f}{href}");
+            let field = |name| item.get(name).and_then(Value::as_str).unwrap_or_default();
+            let ancestor = item
+                .pointer("/semantic_ancestor/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                field("source_frame"),
+                field("role"),
+                field("name"),
+                field("href"),
+                field("datetime"),
+                ancestor
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::<String, usize>::new();
+    for base in &bases {
+        *counts.entry(base.clone()).or_default() += 1;
+    }
+    let mut seen = BTreeMap::<String, usize>::new();
+    bases
+        .into_iter()
+        .map(|base| {
             let ordinal = seen.entry(base.clone()).or_default();
-            let key = format!("{base}\u{1f}{ordinal}");
+            // Duplicate controls with no distinguishing evidence cannot retain identity across snapshots.
+            let key = if counts[base.as_str()] > 1 {
+                format!("{base}\u{1f}{revision}\u{1f}{ordinal}")
+            } else {
+                base
+            };
             *ordinal += 1;
             key
         })
@@ -208,6 +233,101 @@ fn changed_fields(previous: &Value, current: &Value) -> bool {
     .any(|field| previous.get(field) != current.get(field))
 }
 
+pub fn choose_newest(items: &[Value], coverage_complete: bool) -> Result<Value, &'static str> {
+    if !coverage_complete || items.is_empty() || items.len() > 200 {
+        return Err("unresolved_latest");
+    }
+    let mut ranked = items
+        .iter()
+        .map(|item| {
+            let time = item
+                .get("datetime_utc_ms")
+                .and_then(Value::as_i64)
+                .ok_or("unresolved_latest")?;
+            if item
+                .get("href")
+                .and_then(Value::as_str)
+                .filter(|href| !href.is_empty())
+                .is_none()
+            {
+                return Err("unresolved_latest");
+            }
+            Ok((time, item))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let ties = ranked
+        .iter()
+        .take_while(|(time, _)| *time == ranked[0].0)
+        .map(|(_, item)| item["href"].clone())
+        .collect::<Vec<_>>();
+    Ok(
+        json!({"selected":ranked[0].1,"freshness_evidence":{"datetime":ranked[0].1["datetime"],"utc_ms":ranked[0].0,"candidate_count":items.len(),"basis":"machine_readable_datetime","unique_latest":ties.len()==1,"tie_count":ties.len(),"equally_newest_hrefs":ties,"tie_break":"page_order"}}),
+    )
+}
+
+pub fn rank_candidates(
+    items: impl Iterator<Item = Value>,
+    query: &str,
+    role: Option<&str>,
+    href_hint: Option<&str>,
+    ancestor_id: Option<&str>,
+    exact: bool,
+) -> Vec<Value> {
+    let query = query.trim().to_lowercase();
+    let mut ranked = items.filter_map(|mut item| {
+        let name = item["name"].as_str().unwrap_or_default().to_lowercase();
+        let href = item["href"].as_str().unwrap_or_default();
+        let raw_value = item["raw_value"].as_str().unwrap_or_default().to_lowercase();
+        if role.is_some_and(|wanted| item["role"].as_str() != Some(wanted))
+            || href_hint.is_some_and(|wanted| !href.contains(wanted))
+            || ancestor_id.is_some_and(|wanted| item.pointer("/semantic_ancestor/id").and_then(Value::as_str) != Some(wanted))
+        { return None; }
+        let exact_name = name == query;
+        if exact && !exact_name { return None; }
+        let contained = name.contains(&query);
+        let href_match = href.to_lowercase().contains(&query);
+        let value_match = raw_value.contains(&query);
+        if !exact_name && !contained && !href_match && !value_match { return None; }
+        let name_score = if exact_name { 100 } else if contained { 60 } else { 0 };
+        let href_score = if href_match { 20 } else { 0 };
+        let role_score = if role.is_some() { 10 } else { 0 };
+        let hint_score = if href_hint.is_some() { 15 } else { 0 };
+        let visible_score = if item["visible"] == true { 5 } else { 0 };
+        let score = name_score + href_score + role_score + hint_score + visible_score;
+        item["score"] = json!(score);
+        item["score_components"] = json!({"name":name_score,"href":href_score,"role":role_score,"href_hint":hint_score,"visible":visible_score});
+        Some(item)
+    }).collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b["score"]
+            .as_i64()
+            .cmp(&a["score"].as_i64())
+            .then_with(|| a["reference"].as_str().cmp(&b["reference"].as_str()))
+    });
+    let top = ranked
+        .first()
+        .and_then(|item| item["score"].as_i64())
+        .unwrap_or(0);
+    let second = ranked
+        .get(1)
+        .and_then(|item| item["score"].as_i64())
+        .unwrap_or(0);
+    for item in &mut ranked {
+        item["confidence"] = json!(if item["score"].as_i64() == Some(top)
+            && top >= 100
+            && top - second >= 20
+        {
+            "high"
+        } else if item["score"].as_i64().unwrap_or(0) >= 60 {
+            "medium"
+        } else {
+            "low"
+        });
+    }
+    ranked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +340,12 @@ mod tests {
             frame_revision: Some("7".into()),
             document_revision: Some("11".into()),
         }
+    }
+
+    #[test]
+    fn find_matches_current_value() {
+        let found = rank_candidates(vec![json!({"reference":"@c1","role":"textbox","name":"Email","raw_value":"user@example.test","visible":true})].into_iter(), "example.test", Some("textbox"), None, None, false);
+        assert_eq!(found[0]["reference"], "@c1");
     }
 
     #[test]
@@ -301,8 +427,8 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(refs[0], second.items[0]["reference"]);
-        assert_eq!(refs[1], second.items[1]["reference"]);
+        assert_ne!(refs[0], second.items[0]["reference"]);
+        assert_ne!(refs[1], second.items[1]["reference"]);
         assert_ne!(refs[0], refs[1]);
     }
 
@@ -327,5 +453,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(update.delta.removed, vec!["@c2"]);
+    }
+
+    #[test]
+    fn reordered_duplicate_cards_never_keep_each_others_reference() {
+        let mut memory = SemanticMemory::default();
+        let first = memory.ingest(document("https://example.test/news"), "s1", vec![
+            json!({"reference":"old:0","role":"link","name":"Story","href":"/story","semantic_ancestor":{"id":"card-a"}}),
+            json!({"reference":"old:1","role":"link","name":"Story","href":"/story","semantic_ancestor":{"id":"card-b"}}),
+        ]).unwrap();
+        let second = memory.ingest(document("https://example.test/news"), "s2", vec![
+            json!({"reference":"new:0","role":"link","name":"Story","href":"/story","semantic_ancestor":{"id":"card-b"}}),
+            json!({"reference":"new:1","role":"link","name":"Story","href":"/story","semantic_ancestor":{"id":"card-a"}}),
+        ]).unwrap();
+        assert_eq!(first.items[0]["reference"], second.items[1]["reference"]);
+        assert_eq!(first.items[1]["reference"], second.items[0]["reference"]);
+    }
+
+    #[test]
+    fn newest_selection_requires_complete_unambiguous_timestamps() {
+        let items = vec![
+            json!({"reference":"@c1","href":"/old","datetime":"2026-10-09T00:00:00Z","datetime_utc_ms":1791504000000_i64}),
+            json!({"reference":"@c2","href":"/new","datetime":"2026-10-10T00:00:00Z","datetime_utc_ms":1791590400000_i64}),
+        ];
+        assert_eq!(
+            choose_newest(&items, true).unwrap()["selected"]["reference"],
+            "@c2"
+        );
+        assert!(choose_newest(&items, false).is_err());
+        let mut missing = items.clone();
+        missing[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("datetime_utc_ms");
+        assert!(choose_newest(&missing, true).is_err());
+        let mut tie = items.clone();
+        tie[0]["datetime_utc_ms"] = tie[1]["datetime_utc_ms"].clone();
+        let chosen = choose_newest(&tie, true).unwrap();
+        assert_eq!(chosen["selected"]["reference"], "@c1");
+        assert_eq!(chosen["freshness_evidence"]["tie_count"], 2);
+        assert_eq!(chosen["freshness_evidence"]["unique_latest"], false);
+    }
+
+    #[test]
+    fn ranking_keeps_ambiguous_titles_separate_until_href_hint_resolves_them() {
+        let items = vec![
+            json!({"reference":"@c1","role":"link","name":"Bills story","href":"/story/old","visible":true}),
+            json!({"reference":"@c2","role":"link","name":"Bills story","href":"/story/new","visible":true}),
+            json!({"reference":"@c3","role":"link","name":"Bills gamecast","href":"/game/3","visible":true}),
+        ];
+        let ambiguous = rank_candidates(
+            items.clone().into_iter(),
+            "Bills story",
+            Some("link"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(ambiguous.len(), 2);
+        assert_eq!(ambiguous[0]["confidence"], "medium");
+        let resolved = rank_candidates(
+            items.into_iter(),
+            "Bills story",
+            Some("link"),
+            Some("/story/new"),
+            None,
+            false,
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0]["reference"], "@c2");
+        assert_eq!(resolved[0]["confidence"], "high");
     }
 }

@@ -1,5 +1,18 @@
 # Verification matrix
 
+## Browser latency continuation — 2026-10-10
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Snapshot host messages | fixture pass | An installed Chrome disposable-profile fixture with a simulated batch-capable extension counted 3 host requests for the first shared snapshot; the previous sequential path used 4. The fixture also exercised guarded click and unknown outcomes. No paired wall-time distribution was measured. |
+| Listing metadata fast path | fixture pass | Real headless Chrome selected and verified the newest fixture story using listing JSON-LD `datePublished`, with `freshness_source=listing_json_ld`. A separate fixture selected using linked article metadata when the listing had no dates. |
+| Workflow timing | fixture pass | The completed 5-step fixture workflow returned five `step_ms` values and `elapsed_ms`. This is instrumentation, not a cross-site performance result. |
+| Initial installed-extension Bills run | failed to verify | The 2026-10-10 foreground shared session observed seven reachable story candidates and two equally newest timestamps. The click returned `unknown`, stopping after step 4; no URL verification ran. AppleScript saw a Bills team URL but could not bind that tab to the paired extension target. The paired session was released and the action was not replayed. Later review found the reported complete coverage was too broad because cross-origin frames were unread. |
+| Lost release acknowledgement | fixture pass | A real-Chrome shared transport fixture executed mouse release but returned a synthetic error. Before the repair, the result was `unknown` despite a fresh snapshot showing the destination URL; after the repair, the requested navigation was observed and returned `verified` with `dispatch_acknowledged:false`. No click replay occurred. |
+| Fresh Bills tab after repair | historical live pass, superseded coverage rule | On a different, newly opened foreground Chrome tab (`1649772862`), the paired extension found seven reachable story links, reported two equal newest timestamps, selected the first by page order, clicked, and verified the exact selected URL. The five-step workflow reported 666 ms (`step_ms`: 18, 0, 298, 245, 102); test wall time including setup was 1.73 s. The session was released and the tab preserved. Review then found unread cross-origin frames, so the current stricter build treats that selection as incomplete and needs a fresh live qualification. |
+| Cross-site / competitor speed | unverified | No same-environment representative corpus, p50/p95 study, or controlled competitor runs have qualified this dirty head. |
+| Phase 10 benchmark check | blocked by existing freeze mismatch | `npm run check:bench` reports `baseline lock digest mismatch`: the held-out manifest expects `75b3ad3f…`, while the unchanged current baseline lock hashes to `9993f07c…`. Neither frozen file was modified in this continuation. |
+
 ## V3 PR #2 local verification — 2026-10-09
 
 | Check | Result | Evidence / limit |

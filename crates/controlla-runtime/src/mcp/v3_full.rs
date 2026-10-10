@@ -116,10 +116,26 @@ struct V3ArtifactReadArgs {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum V3WorkflowStep {
-    Snapshot,
+    Snapshot { href_hint: Option<String> },
     Find {
         query: String,
         role: Option<String>,
+        match_mode: Option<String>,
+        max_matches: Option<usize>,
+        within_reference: Option<String>,
+        href_hint: Option<String>,
+        save_as: String,
+    },
+    FindAll {
+        query: Option<String>,
+        role: Option<String>,
+        href_hint: Option<String>,
+        max_matches: usize,
+        save_as: String,
+    },
+    Choose {
+        from: String,
+        key: String,
         save_as: String,
     },
     Click {
@@ -163,6 +179,35 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+async fn enrich_linked_dates(app: &AppV3, session_id: &str, tab_id: &str, items: &mut [Value]) -> Result<(), String> {
+    if items.len() > 12 { return Err("too many linked articles to inspect".into()); }
+    let live = app.core.legacy.shared_sessions.lock().await.get(session_id).cloned().ok_or("unknown session")?;
+    let live = live.lock().await;
+    let connection = live.connection.as_ref().ok_or("session not accepted")?;
+    let registry = live.registry().map_err(|error| error.to_string())?;
+    let before = super::super::shared_frame_identity(connection, registry, &live.handle, tab_id).await?;
+    let hrefs = items.iter().map(|item| item["href"].as_str().unwrap_or_default()).collect::<Vec<_>>();
+    let expression = format!("({})({})", include_str!("../shared_page/linked_dates.js"), json!(hrefs));
+    let response = tokio::time::timeout(Duration::from_secs(8), connection.command(registry, &live.handle, tab_id, "Runtime.evaluate", json!({"expression":expression,"awaitPromise":true,"returnByValue":true}))).await.map_err(|_| "linked article metadata timed out")?.map_err(|error| error.to_string())?;
+    let dates = super::super::shared_value(&response)?;
+    let after = super::super::shared_frame_identity(connection, registry, &live.handle, tab_id).await?;
+    if before != after { return Err("document changed during linked article metadata read".into()); }
+    let dates = dates.as_array().ok_or("linked article metadata was not an array")?;
+    if dates.len() != items.len() { return Err("linked article metadata count changed".into()); }
+    let mut errors = std::collections::BTreeMap::<String, usize>::new();
+    for (item, date) in items.iter_mut().zip(dates) {
+        if date["href"] == item["href"] && date["datetime_utc_ms"].as_i64().is_some() {
+            item["datetime"] = date["datetime"].clone();
+            item["datetime_utc_ms"] = date["datetime_utc_ms"].clone();
+            item["freshness_source"] = json!(if date["source"] == "listing_json_ld" { "listing_json_ld" } else { "linked_article_metadata" });
+        } else {
+            let reason = date["error"].as_str().unwrap_or("invalid_metadata").to_owned();
+            *errors.entry(reason).or_default() += 1;
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(format!("linked article dates incomplete: {errors:?}")) }
 }
 
 fn fast_key_batch_failure(result: &Value, prior_key_events: u64) -> (&'static str, bool, bool) {
@@ -498,6 +543,7 @@ async fn headless_download(
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            href_hint: None,
         },
     )
     .await?;
@@ -1399,6 +1445,7 @@ async fn key_type(
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            href_hint: None,
         },
     )
     .await
@@ -2075,9 +2122,15 @@ impl AppV3 {
             return Err(invalid("workflow requires 1..40 steps"));
         }
         validate_workflow_steps(&args.steps)?;
+        let started = std::time::Instant::now();
         let mut vars = std::collections::BTreeMap::<String, String>::new();
-        let mut receipts = Vec::with_capacity(args.steps.len());
+        let mut collections = std::collections::BTreeMap::<String, (Vec<Value>, bool)>::new();
+        let mut selected = std::collections::BTreeMap::<String, Value>::new();
+        let mut coverage_complete = false;
+        let mut receipts: Vec<Value> = Vec::with_capacity(args.steps.len());
+        let mut step_ms = Vec::with_capacity(args.steps.len());
         for step in args.steps {
+            let step_started = std::time::Instant::now();
             let resolve = |reference: String,
                            vars: &std::collections::BTreeMap<String, String>|
              -> Result<String, rmcp::ErrorData> {
@@ -2085,8 +2138,8 @@ impl AppV3 {
                     .map_err(invalid)
             };
             let value = match step {
-                V3WorkflowStep::Snapshot => {
-                    snapshot_impl(
+                V3WorkflowStep::Snapshot { href_hint } => {
+                    let snapshot = snapshot_impl(
                         &self.core,
                         &BrowserSnapshotArgs {
                             session_id: args.session_id.clone(),
@@ -2095,13 +2148,20 @@ impl AppV3 {
                             max_items: None,
                             max_text_chars: None,
                             max_bytes: None,
+                            href_hint,
                         },
                     )
-                    .await?
+                    .await?;
+                    coverage_complete = snapshot["truncated"] == false || snapshot["first_party_complete"] == true;
+                    snapshot
                 }
                 V3WorkflowStep::Find {
                     query,
                     role,
+                    match_mode,
+                    max_matches,
+                    within_reference,
+                    href_hint,
                     save_as,
                 } => {
                     let found = find_impl(
@@ -2112,6 +2172,10 @@ impl AppV3 {
                             query,
                             role,
                             limit: Some(2),
+                            max_matches,
+                            match_mode,
+                            within_reference,
+                            href_hint,
                         },
                     )
                     .await?;
@@ -2120,6 +2184,41 @@ impl AppV3 {
                         return Err(invalid("save_as must be unique and nonempty"));
                     }
                     found
+                }
+                V3WorkflowStep::FindAll { query, role, href_hint, max_matches, save_as } => {
+                    if save_as.is_empty() || save_as.len() > 64 || collections.contains_key(&save_as) || vars.contains_key(&save_as) || max_matches == 0 || max_matches > 200 || query.as_ref().is_some_and(|q| q.len() > 512) || href_hint.as_ref().is_some_and(|h| h.is_empty() || h.len() > 512) {
+                        return Err(invalid("find_all requires unique save_as and bounded filters/max_matches"));
+                    }
+                    let state = self.core.semantic.lock().await;
+                    let state = state.get(&super::tab_key(&args.session_id, &args.chrome_tab_id)).ok_or_else(|| invalid("find_all requires a preceding snapshot"))?;
+                    let matches = state.page_ordered_items().into_iter().filter(|item| {
+                        role.as_ref().is_none_or(|wanted| item["role"].as_str() == Some(wanted))
+                            && query.as_ref().is_none_or(|wanted| item["name"].as_str().is_some_and(|name| name.to_lowercase().contains(&wanted.to_lowercase())))
+                            && href_hint.as_ref().is_none_or(|wanted| item["href"].as_str().is_some_and(|href| href.contains(wanted)))
+                    }).take(max_matches + 1).cloned().collect::<Vec<_>>();
+                    let limited = matches.len() > max_matches;
+                    let matches = matches.into_iter().take(max_matches).collect::<Vec<_>>();
+                    collections.insert(save_as, (matches.clone(), coverage_complete && !limited));
+                    json!({"status":"collected","matches":matches,"count":matches.len(),"limited":limited,"coverage_complete":coverage_complete})
+                }
+                V3WorkflowStep::Choose { from, key, save_as } => {
+                    if save_as.is_empty() || save_as.len() > 64 || vars.contains_key(&save_as) || collections.contains_key(&save_as) || key != "datetime" {
+                        return Err(invalid("choose requires unique save_as and supported key datetime"));
+                    }
+                    let (items, complete) = collections.get(&from).ok_or_else(|| invalid("choose source was not collected"))?;
+                    let mut items = items.clone();
+                    let metadata_error = if *complete && items.iter().any(|item| item["datetime_utc_ms"].as_i64().is_none()) {
+                        enrich_linked_dates(self, &args.session_id, &args.chrome_tab_id, &mut items).await.err()
+                    } else { None };
+                    match crate::semantic_state::choose_newest(&items, *complete) {
+                        Ok(choice) => {
+                            let reference = choice["selected"]["reference"].as_str().ok_or_else(|| invalid("selected item omitted reference"))?.to_owned();
+                            vars.insert(save_as.clone(), reference);
+                            selected.insert(save_as, choice["selected"].clone());
+                            json!({"status":"selected","selected":choice["selected"],"freshness_evidence":choice["freshness_evidence"]})
+                        }
+                        Err(reason) => json!({"status":"failed","reason_code":reason,"retry_class":"do_not_retry","next_action":"inspect page coverage and freshness evidence","metadata_error":metadata_error,"candidate_freshness":items.iter().take(12).map(|item| json!({"href":item["href"],"datetime":item["datetime"],"utc_ms":item["datetime_utc_ms"]})).collect::<Vec<_>>()}),
+                    }
                 }
                 V3WorkflowStep::Click { reference, outcome } => {
                     let reference = resolve(reference, &vars)?;
@@ -2262,7 +2361,12 @@ impl AppV3 {
                         BrowserPredicate::Exists { reference } => BrowserPredicate::Exists {
                             reference: resolve(reference, &vars)?,
                         },
-                        BrowserPredicate::Url { equals } => BrowserPredicate::Url { equals },
+                        BrowserPredicate::Url { equals } => {
+                            let equals = if let Some(name) = equals.strip_prefix('$').and_then(|value| value.strip_suffix(".href")) {
+                                selected.get(name).and_then(|item| item["href"].as_str()).ok_or_else(|| invalid("selected href variable is unresolved"))?.to_owned()
+                            } else { equals };
+                            BrowserPredicate::Url { equals }
+                        },
                     };
                     verify_impl(
                         &self.core,
@@ -2277,15 +2381,16 @@ impl AppV3 {
             };
             let stop_status = workflow_should_stop(&value)
                 .then(|| value["status"].as_str().unwrap_or("unknown").to_owned());
+            step_ms.push(step_started.elapsed().as_millis() as u64);
             receipts.push(value);
             if let Some(status) = stop_status {
                 return Ok(Json(
-                    json!({"status":status,"steps":receipts.len(),"receipts":receipts}),
+                    json!({"status":status,"steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64}),
                 ));
             }
         }
         Ok(Json(
-            json!({"status":"completed","steps":receipts.len(),"receipts":receipts}),
+            json!({"status":"completed","steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64}),
         ))
     }
 
@@ -2422,6 +2527,7 @@ impl AppV3 {
                             max_items: None,
                             max_text_chars: None,
                             max_bytes: None,
+                            href_hint: None,
                         },
                     )
                     .await?;
@@ -2490,6 +2596,7 @@ impl AppV3 {
                             max_items: None,
                             max_text_chars: None,
                             max_bytes: None,
+                            href_hint: None,
                         },
                     )
                     .await?;
@@ -2524,6 +2631,7 @@ impl AppV3 {
                             max_items: None,
                             max_text_chars: None,
                             max_bytes: None,
+                            href_hint: None,
                         },
                     )
                     .await?;

@@ -19,6 +19,14 @@ struct SemanticTabState {
     snapshot_id: String,
 }
 
+impl SemanticTabState {
+    fn page_ordered_items(&self) -> Vec<&Value> {
+        let mut items = self.items.values().collect::<Vec<_>>();
+        items.sort_by_key(|item| item["index"].as_u64().unwrap_or(u64::MAX));
+        items
+    }
+}
+
 #[derive(Clone)]
 struct AppV2 {
     legacy: App,
@@ -53,6 +61,7 @@ struct BrowserSnapshotArgs {
     max_items: Option<usize>,
     max_text_chars: Option<usize>,
     max_bytes: Option<usize>,
+    href_hint: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -63,6 +72,10 @@ struct BrowserFindArgs {
     query: String,
     role: Option<String>,
     limit: Option<usize>,
+    max_matches: Option<usize>,
+    match_mode: Option<String>,
+    within_reference: Option<String>,
+    href_hint: Option<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
@@ -182,23 +195,6 @@ fn document_key(snapshot: &Value) -> String {
     format!("{frame}\u{1f}{loader}\u{1f}{url}")
 }
 
-fn stable_item_keys(items: &[Value]) -> Vec<String> {
-    let mut seen = BTreeMap::<String, usize>::new();
-    items
-        .iter()
-        .map(|item| {
-            let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            let href = item.get("href").and_then(Value::as_str).unwrap_or_default();
-            let base = format!("{role}\u{1f}{name}\u{1f}{href}");
-            let ordinal = seen.entry(base.clone()).or_default();
-            let key = format!("{base}\u{1f}{ordinal}");
-            *ordinal += 1;
-            key
-        })
-        .collect()
-}
-
 fn changed_fields(previous: &Value, current: &Value) -> bool {
     ["role", "name", "raw_value", "href", "expanded", "selected", "disabled", "requires_trusted_events"]
         .into_iter()
@@ -215,6 +211,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             max_items: args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200),
             max_text_chars: args.max_text_chars.unwrap_or_else(snapshot_chars).min(6000),
             max_bytes: args.max_bytes.unwrap_or_else(snapshot_bytes).clamp(4096, 100_000),
+            href_hint: args.href_hint.clone(),
         }))
         .await?;
     let Json(mut snapshot) = legacy;
@@ -223,7 +220,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let item_keys = stable_item_keys(&items);
+    let item_keys = crate::semantic_state::stable_item_keys(&items, snapshot["snapshot_id"].as_str().unwrap_or_default());
     let key = tab_key(&args.session_id, &args.chrome_tab_id);
     let doc_key = document_key(&snapshot);
     let snapshot_id = snapshot
@@ -443,6 +440,7 @@ async fn retained_mutation(
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            href_hint: None,
         }).await;
         if let Ok(snapshot) = fresh {
             result["snapshot"] = snapshot;
@@ -464,37 +462,24 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            href_hint: None,
         }).await?;
     }
-    let query = args.query.to_lowercase();
-    let role = args.role.as_deref().map(str::to_lowercase);
+    let mode = args.match_mode.as_deref().unwrap_or("all");
+    if !matches!(mode, "all" | "best" | "exact") || args.href_hint.as_ref().is_some_and(|hint| hint.is_empty() || hint.len() > 512) {
+        return Err(invalid("match_mode must be all, best, or exact and href_hint must be bounded"));
+    }
     let state = app.semantic.lock().await;
     let state = state.get(&key).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
-    let mut matches = state.items.values().filter_map(|item| {
-        let item_role = item.get("role").and_then(Value::as_str).unwrap_or_default();
-        if role.as_deref().is_some_and(|wanted| item_role.to_lowercase() != wanted) {
-            return None;
-        }
-        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-        let raw = item.get("raw_value").and_then(Value::as_str).unwrap_or_default();
-        let href = item.get("href").and_then(Value::as_str).unwrap_or_default();
-        let haystack = format!("{item_role} {name} {raw} {href}").to_lowercase();
-        let score = if name.eq_ignore_ascii_case(&args.query) {
-            4
-        } else if name.to_lowercase().contains(&query) {
-            3
-        } else if haystack.contains(&query) {
-            2
-        } else {
-            0
-        };
-        (score > 0).then(|| (score, item.clone()))
-    }).collect::<Vec<_>>();
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
-    let limit = args.limit.unwrap_or(10).clamp(1, 50);
-    let matches = matches.into_iter().take(limit).map(|(_, item)| item).collect::<Vec<_>>();
+    let ancestor_id = if let Some(reference) = args.within_reference.as_deref() {
+        Some(state.items.get(reference).and_then(|item| item.pointer("/semantic_ancestor/id")).and_then(Value::as_str).ok_or_else(|| invalid("within_reference must identify a stable semantic ancestor"))?)
+    } else { None };
+    let ranked = crate::semantic_state::rank_candidates(state.items.values().cloned(), &args.query, args.role.as_deref(), args.href_hint.as_deref(), ancestor_id, mode == "exact");
+    let ambiguous = mode == "best" && ranked.first().is_some_and(|item| item["confidence"] != "high");
+    let limit = args.max_matches.or(args.limit).unwrap_or(10).clamp(1, 50);
+    let matches = ranked.into_iter().take(if mode == "best" && !ambiguous { 1 } else { limit }).collect::<Vec<_>>();
     let count = matches.len();
-    Ok(json!({"matches":matches,"count":count,"semantic_revision":state.snapshot_id}))
+    Ok(json!({"matches":matches,"count":count,"ambiguous":ambiguous,"semantic_revision":state.snapshot_id}))
 }
 
 async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
@@ -505,6 +490,7 @@ async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmc
         max_items: None,
         max_text_chars: Some(6000),
         max_bytes: Some(60_000),
+        href_hint: None,
     }).await?;
     let state = app.semantic.lock().await;
     let state = state.get(&tab_key(&args.session_id, &args.chrome_tab_id)).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
@@ -632,14 +618,14 @@ impl AppV2 {
             let receipt = match step {
                 BrowserWorkflowStep::Snapshot => snapshot_impl(self, &BrowserSnapshotArgs {
                     session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector: None,
-                    max_items: None, max_text_chars: None, max_bytes: None,
+                    max_items: None, max_text_chars: None, max_bytes: None, href_hint: None,
                 }).await?,
                 BrowserWorkflowStep::Find { query, role, save_as } => {
                     if save_as.is_empty() || save_as.len() > 64 || !save_as.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                         return Err(invalid("workflow save_as must be 1..64 ASCII alphanumeric/underscore characters"));
                     }
                     let found = find_impl(self, &BrowserFindArgs {
-                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(2),
+                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(2), max_matches: None, match_mode: None, within_reference: None, href_hint: None,
                     }).await?;
                     let matches = found["matches"].as_array().cloned().unwrap_or_default();
                     if matches.len() != 1 {
@@ -755,18 +741,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_order_survives_two_digit_reference_keys() {
+        let mut state = SemanticTabState::default();
+        state.items.insert("@c10".into(), json!({"reference":"@c10","index":9}));
+        state.items.insert("@c2".into(), json!({"reference":"@c2","index":1}));
+        assert_eq!(state.page_ordered_items()[0]["reference"], "@c2");
+    }
+
+    #[test]
     fn stable_keys_disambiguate_duplicate_controls_without_using_mutable_values() {
         let items = vec![
             json!({"role":"textbox","name":"Email","raw_value":"a"}),
             json!({"role":"textbox","name":"Email","raw_value":"b"}),
         ];
-        let keys = stable_item_keys(&items);
+        let keys = crate::semantic_state::stable_item_keys(&items, "s1");
         assert_ne!(keys[0], keys[1]);
         let changed = vec![
             json!({"role":"textbox","name":"Email","raw_value":"new-a"}),
             json!({"role":"textbox","name":"Email","raw_value":"new-b"}),
         ];
-        assert_eq!(keys, stable_item_keys(&changed));
+        assert_ne!(keys, crate::semantic_state::stable_item_keys(&changed, "s2"));
     }
 
     #[test]

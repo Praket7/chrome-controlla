@@ -652,18 +652,19 @@ struct SharedSnapshotArgs {
     max_text_chars: usize,
     #[serde(default = "snapshot_bytes")]
     max_bytes: usize,
+    href_hint: Option<String>,
 }
 fn snapshot_scope() -> String {
     "body".into()
 }
 fn snapshot_items() -> usize {
-    60
+    200
 }
 fn snapshot_chars() -> usize {
     2000
 }
 fn snapshot_bytes() -> usize {
-    24000
+    100000
 }
 
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
@@ -696,6 +697,31 @@ fn shared_value(response: &Value) -> Result<Value, String> {
         .ok_or_else(|| "page evaluation omitted value".into())
 }
 
+fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String)), String> {
+    if batch["completed"] != 2 || batch.get("batch_error").is_some() {
+        return Err(format!(
+            "snapshot read batch failed: {}",
+            batch["batch_error"]
+        ));
+    }
+    let receipts = batch["receipts"]
+        .as_array()
+        .filter(|receipts| receipts.len() == 2)
+        .ok_or("snapshot read batch omitted receipts")?;
+    if receipts[0]["method"] != "Runtime.callFunctionOn"
+        || receipts[1]["method"] != "Page.getFrameTree"
+        || receipts
+            .iter()
+            .any(|receipt| receipt.get("error").is_some())
+    {
+        return Err("snapshot read batch returned unexpected or failed commands".into());
+    }
+    Ok((
+        shared_value(&receipts[0]["result"])?,
+        frame_identity_from_tree(&receipts[1]["result"])?,
+    ))
+}
+
 async fn capture_shared_snapshot(
     shared: &mut SharedLiveSession,
     args: &SharedSnapshotArgs,
@@ -707,6 +733,9 @@ async fn capture_shared_snapshot(
         || args.max_text_chars > 6000
         || !(4096..=100000).contains(&args.max_bytes)
         || args.max_bytes < args.max_text_chars * 6 + 4096
+        || args.href_hint.as_ref().is_some_and(|hint| {
+            hint.is_empty() || hint.len() > 512 || hint.chars().any(char::is_control)
+        })
     {
         return Err("snapshot limits: 1..200 items, 0..6000 text chars, 4096..100000 bytes; bytes must cover 6*text chars + 4096".into());
     }
@@ -734,7 +763,7 @@ async fn capture_shared_snapshot(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token});
+    let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token,"href_hint":args.href_hint});
     let expression = format!("({})({})", include_str!("shared_page/snapshot.js"), config);
     let response = connection
         .command(
@@ -751,12 +780,37 @@ async fn capture_shared_snapshot(
         .and_then(Value::as_str)
         .ok_or("snapshot failed to retain target identities")?
         .to_owned();
-    let read=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true})).await.map_err(|e|e.to_string());
+    let read = async { if matches!(connection, PageSessionTransport::Shared(shared) if shared.supports_batch_execution()) {
+        let batch = connection.command_batch(
+            registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+            vec![
+                controlla_browser::providers::SharedBatchAction {
+                    method: "Runtime.callFunctionOn".into(),
+                    params: json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
+                    stop_on_not_ok: false,
+                },
+                controlla_browser::providers::SharedBatchAction {
+                    method: "Page.getFrameTree".into(),
+                    params: Value::Null,
+                    stop_on_not_ok: false,
+                },
+            ],
+            Duration::from_secs(10),
+        ).await?;
+        snapshot_batch_reads(&batch)
+    } else {
+        let response = connection.command(registry, &shared.handle, &args.chrome_tab_id,
+            "Runtime.callFunctionOn",
+            json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
+        ).await?;
+        let value = shared_value(&response)?;
+        let after = shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await?;
+        Ok((value, after))
+    }}.await;
     let result = async {
-        let mut value = shared_value(&read?)?;
-        let after =
-            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
-                .await?;
+        let (mut value, after) = read?;
         if before != after {
             return Err("document changed during snapshot; discard and read once again".into());
         }
@@ -1646,6 +1700,10 @@ async fn shared_frame_identity(
     let response = connection
         .command(registry, handle, tab_id, "Page.getFrameTree", Value::Null)
         .await?;
+    frame_identity_from_tree(&response)
+}
+
+fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String), String> {
     let frame = response
         .get("frameTree")
         .and_then(|tree| tree.get("frame"))
@@ -2755,46 +2813,43 @@ impl App {
         .await;
         let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
         let mut result = json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"});
-        if acknowledged {
-            while tokio::time::Instant::now() < deadline {
-                let check = async {
-                    let identity = shared_frame_identity(
-                        connection,
-                        registry,
-                        &shared.handle,
-                        &args.chrome_tab_id,
-                    )
-                    .await?;
-                    let observed = evaluate_shared_outcome(
-                        &shared,
-                        &args.chrome_tab_id,
-                        &snapshot,
-                        index,
-                        &args.outcome,
-                        &identity,
-                    )
-                    .await?;
-                    let after = shared_frame_identity(
-                        connection,
-                        registry,
-                        &shared.handle,
-                        &args.chrome_tab_id,
-                    )
-                    .await?;
-                    let verified = observed && identity == after;
-                    Ok::<_, String>((identity, verified))
-                };
-                if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
-                    result = json!({"status":"verified","dispatch_acknowledged":true,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity});
-                    break;
-                }
-                let _ = tokio::time::timeout_at(
-                    deadline,
-                    tokio::time::sleep(Duration::from_millis(100)),
+        while tokio::time::Instant::now() < deadline {
+            let check = async {
+                let identity = shared_frame_identity(
+                    connection,
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
                 )
-                .await;
+                .await?;
+                let observed = evaluate_shared_outcome(
+                    &shared,
+                    &args.chrome_tab_id,
+                    &snapshot,
+                    index,
+                    &args.outcome,
+                    &identity,
+                )
+                .await?;
+                let after = shared_frame_identity(
+                    connection,
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                )
+                .await?;
+                let verified = observed && identity == after;
+                Ok::<_, String>((identity, verified))
+            };
+            if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
+                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity});
+                break;
             }
-        } else {
+            let _ =
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(100)))
+                    .await;
+        }
+        if result["status"] == "unknown" && !acknowledged {
             result["reason"] = json!(
                 "mouse dispatch/release uncertain; inspect state before deciding any further action"
             );
@@ -2806,6 +2861,7 @@ impl App {
             max_items: snapshot_items(),
             max_text_chars: snapshot_chars(),
             max_bytes: snapshot_bytes(),
+            href_hint: None,
         };
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -4560,6 +4616,28 @@ mod tests {
         assert!(!super::dedicated_batch_guard_ok(
             &json!({"error":{"message":"failed"}})
         ));
+    }
+
+    #[test]
+    fn snapshot_batch_requires_both_successful_reads_and_a_root_identity() {
+        let valid = json!({"completed":2,"receipts":[
+            {"method":"Runtime.callFunctionOn","result":{"result":{"value":{"items":[]}}}},
+            {"method":"Page.getFrameTree","result":{"frameTree":{"frame":{"id":"f","loaderId":"l","url":"https://example.test/"}}}}
+        ]});
+        assert_eq!(
+            super::snapshot_batch_reads(&valid).unwrap().1.2,
+            "https://example.test/"
+        );
+        assert!(
+            super::snapshot_batch_reads(&json!({"completed":1,"receipts":[valid["receipts"][0]]}))
+                .is_err()
+        );
+        assert!(
+            super::snapshot_batch_reads(
+                &json!({"completed":2,"batch_error":"navigation","receipts":valid["receipts"]})
+            )
+            .is_err()
+        );
     }
 
     #[test]

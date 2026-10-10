@@ -1,5 +1,13 @@
 # Blockers and external dependencies
 
+## Speed claim boundary — 2026-10-10
+
+- The shared snapshot saves one host exchange in a batch-capable extension fixture, but measured wall-clock gains on the installed extension and other sites remain open. Cross-origin frame content, dynamically changing lists, and rich editors still need representative live qualification.
+- Listing JSON-LD can avoid article fetches only when exact same-origin URLs carry unambiguous publication dates. Sites without that evidence still require bounded reads or an explicit incomplete result.
+- The real-browser competitor runner remains a stub. No universal “fastest on all sites/functions/uses” claim is supportable without the scenario matrix and independent verification described in `design/browser-latency-2026-10-10.md`.
+- One installed-extension Bills run on this dirty head returned `unknown` at click after finding and ranking seven stories; it was not replayed. A separate lost-release fixture exposed a verified navigation masked by an uncertain acknowledgement, and a fresh-tab live run passed after a bounded postcondition observation fix. The failed run remains evidence of variability; repeatable p50/p95 and recovery rates are still unmeasured.
+- The fresh-tab Bills run preceded a stricter coverage fix. Unread cross-origin frames now prevent the runtime from declaring the full page complete; a new live qualification needs frame coverage or an explicitly narrower task scope. The Phase 10 `check:bench` gate currently fails on an existing baseline-lock freeze digest mismatch; the frozen files were not changed here.
+
 ## V3 release blockers — 2026-10-09
 
 - The v3 implementation plan is partial. Browser-mode parity, full near-page workflow batching, real 1,000-character typing/event qualification, live user-interference and multi-client races, and crash/reconnect stress still need real-browser evidence.

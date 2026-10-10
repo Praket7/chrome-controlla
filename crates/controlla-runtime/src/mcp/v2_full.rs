@@ -659,6 +659,7 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            href_hint: None,
         },
     )
     .await
@@ -1153,6 +1154,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         max_items: None,
                         max_text_chars: None,
                         max_bytes: None,
+                        href_hint: None,
                     },
                 )
                 .await?
@@ -1189,6 +1191,10 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         query,
                         role,
                         limit: Some(2),
+                        max_matches: None,
+                        match_mode: None,
+                        within_reference: None,
+                        href_hint: None,
                     },
                 )
                 .await?;
@@ -1431,6 +1437,7 @@ async fn current_skill_context(
             max_items: Some(200),
             max_text_chars: Some(6_000),
             max_bytes: Some(100_000),
+            href_hint: None,
         },
     )
     .await?;

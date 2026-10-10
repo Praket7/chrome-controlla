@@ -63,23 +63,39 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let pair=client.call_tool(call("session",json!({"action":"pair_shared","target_ids":["123"]}))).await.unwrap().structured_content.unwrap();
         let session=pair["session_id"].as_str().unwrap().to_owned();
         let (mut socket,_)=connect_async(pair["endpoint"].as_str().unwrap()).await.unwrap();
-        socket.send(Message::Text(json!({"type":"hello","token":pair["one_session_token"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"targets":["123"]}).to_string().into())).await.unwrap();
+        socket.send(Message::Text(json!({"type":"hello","token":pair["one_session_token"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true,"targets":["123"]}).to_string().into())).await.unwrap();
         let _=socket.next().await.unwrap();
         let c=connection.clone(); let t=target.clone();
+        let host_round_trips=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trips=host_round_trips.clone();
+        let lost_release_ack=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lose_ack=lost_release_ack.clone();
         let proxy=tokio::spawn(async move {
             while let Some(Ok(message))=socket.next().await {
                 let request:Value=serde_json::from_str(message.to_text().unwrap()).unwrap();
-                let Some(method)=request["method"].as_str() else {continue};
-                let (_,targets)=c.target_snapshot().await;
-                let target=targets.iter().find(|v|v.id==t).unwrap();
-                let result=c.target_command(&t,target.generation,&target.revision,method,request["params"].clone()).await;
-                let response=match result {Ok(value)=>json!({"type":"result","id":request["id"],"result":value}),Err(e)=>json!({"type":"result","id":request["id"],"error":e.to_string()})};
+                trips.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                let actions=if request["type"]=="batch" {request["actions"].as_array().unwrap().clone()} else {vec![request.clone()]};
+                let mut receipts=Vec::new();
+                for (index,action) in actions.iter().enumerate() {
+                    let (_,targets)=c.target_snapshot().await;
+                    let target=targets.iter().find(|v|v.id==t).unwrap();
+                    let result=c.target_command(&t,target.generation,&target.revision,action["method"].as_str().unwrap(),action["params"].clone()).await;
+                    receipts.push(match result {Ok(value)=>json!({"index":index,"method":action["method"],"result":value}),Err(e)=>json!({"index":index,"method":action["method"],"error":e.to_string()})});
+                    if receipts.last().unwrap().get("error").is_some(){break;}
+                }
+                let response=if request["type"]=="batch" {json!({"type":"batch_result","id":request["id"],"result":{"completed":receipts.len(),"receipts":receipts,"host_round_trips":1}})} else {
+                    let receipt=&receipts[0];
+                    if let Some(error)=receipt.get("error") {json!({"type":"result","id":request["id"],"error":error})}
+                    else if request["method"]=="Input.dispatchMouseEvent" && request["params"]["type"]=="mouseReleased" && lose_ack.swap(false,std::sync::atomic::Ordering::Relaxed) {json!({"type":"result","id":request["id"],"error":"simulated lost release acknowledgement"})}
+                    else {json!({"type":"result","id":request["id"],"result":receipt["result"]})}
+                };
                 if socket.send(Message::Text(response.to_string().into())).await.is_err(){break;}
             }
         });
         let accepted=client.call_tool(call("session",json!({"action":"accept_shared","session_id":session}))).await.unwrap();
         assert_eq!(accepted.structured_content.unwrap()["accepted"],true);
         let mut snapshot=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","max_text_chars":6000,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(host_round_trips.load(std::sync::atomic::Ordering::Relaxed),3,"fresh snapshot uses one identity read, one evaluation, and one readback batch");
         let rendered=snapshot.to_string();
         for secret in ["PRIVATE-SENTINEL","PROTECTED-SENTINEL","LABEL-SENTINEL"] {assert!(!rendered.contains(secret));}
         let item=|snapshot:&Value,name:&str|snapshot["items"].as_array().unwrap().iter().find(|v|v["name"]==name).unwrap().clone();
@@ -107,10 +123,15 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         eval("const old=document.querySelector('#uncertain');old.replaceWith(old.cloneNode(true))".into()).await;
         let stale=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":count_ref,"outcome":{"kind":"visible","selector":"#never"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(stale["status"],"not_dispatched");
+        lost_release_ack.store(true,std::sync::atomic::Ordering::Relaxed);
         let nav=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&unknown["snapshot"],"Story")["reference"],"outcome":{"kind":"navigation"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(nav["status"],"verified","{nav}");
+        assert_eq!(nav["dispatch_acknowledged"],false,"lost release acknowledgement must remain visible");
         assert_eq!(nav["navigation_observed"],true);
         assert!(nav["url"].as_str().unwrap().ends_with("#done"));
+        eval("document.body.insertAdjacentHTML('beforeend','<section><h2 data-masked>HEADING-SENTINEL</h2><a href=\"/story/visible\">Visible story</a></section>')".into()).await;
+        let scoped=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","href_hint":"/story/"}))).await.unwrap().structured_content.unwrap();
+        assert!(!scoped.to_string().contains("HEADING-SENTINEL"),"masked group heading leaked");
         proxy.abort(); let _=client.cancel().await; server_task.abort();
     }).catch_unwind().await;
     struct Observer;

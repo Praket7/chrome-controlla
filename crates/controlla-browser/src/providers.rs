@@ -810,6 +810,10 @@ impl SharedExtensionSession {
         &self.selected_targets
     }
 
+    pub fn supports_batch_execution(&self) -> bool {
+        self.batch_execution && self.batch_deadline
+    }
+
     pub fn add_selected_target(&mut self, target_id: String) -> Result<(), ProviderError> {
         if target_id.parse::<u32>().is_err() || !self.selected_targets.insert(target_id) {
             return Err(ProviderError::Extension(
