@@ -2082,13 +2082,8 @@ impl AppV3 {
             let resolve = |reference: String,
                            vars: &std::collections::BTreeMap<String, String>|
              -> Result<String, rmcp::ErrorData> {
-                if let Some(name) = reference.strip_prefix('$') {
-                    vars.get(name)
-                        .cloned()
-                        .ok_or_else(|| invalid(format!("unresolved workflow variable ${name}")))
-                } else {
-                    Ok(reference)
-                }
+                crate::browser_workflow::resolve_workflow_reference(&reference, vars)
+                    .map_err(invalid)
             };
             let value = match step {
                 V3WorkflowStep::Snapshot => {
@@ -2256,6 +2251,20 @@ impl AppV3 {
                     .0
                 }
                 V3WorkflowStep::Verify { predicate } => {
+                    let predicate = match predicate {
+                        BrowserPredicate::Text { reference, equals } => BrowserPredicate::Text {
+                            reference: resolve(reference, &vars)?,
+                            equals,
+                        },
+                        BrowserPredicate::Value { reference, equals } => BrowserPredicate::Value {
+                            reference: resolve(reference, &vars)?,
+                            equals,
+                        },
+                        BrowserPredicate::Exists { reference } => BrowserPredicate::Exists {
+                            reference: resolve(reference, &vars)?,
+                        },
+                        BrowserPredicate::Url { equals } => BrowserPredicate::Url { equals },
+                    };
                     verify_impl(
                         &self.core,
                         &BrowserVerifyArgs {

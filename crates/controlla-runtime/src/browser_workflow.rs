@@ -16,6 +16,20 @@ pub const MAX_KEY_CHARS: usize = 64;
 pub const MAX_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_STEP_BYTES: usize = 1_000_000;
 
+pub fn resolve_workflow_reference(
+    reference: &str,
+    variables: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(name) = reference.strip_prefix('$') {
+        variables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("workflow variable ${name} is unresolved"))
+    } else {
+        Ok(reference.to_owned())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserWorkflowPredicate {
@@ -331,9 +345,24 @@ fn bounded_nonempty(value: &str, max: usize, label: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn compile(steps: Vec<BrowserWorkflowStep>) -> Result<CompiledBrowserWorkflow, String> {
         compile_browser_workflow(BrowserWorkflowDefinition { steps })
+    }
+
+    #[test]
+    fn saved_control_references_resolve_for_workflow_verification() {
+        let variables = BTreeMap::from([("title".into(), "@c1".into())]);
+        assert_eq!(
+            resolve_workflow_reference("$title", &variables).unwrap(),
+            "@c1"
+        );
+        assert_eq!(
+            resolve_workflow_reference("@c1", &variables).unwrap(),
+            "@c1"
+        );
+        assert!(resolve_workflow_reference("$missing", &variables).is_err());
     }
 
     #[test]
