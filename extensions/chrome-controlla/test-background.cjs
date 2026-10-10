@@ -213,6 +213,9 @@ function message(payload) {
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
   assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", document_identity: true, batch_execution: true, batch_deadline: true }));
+  native.hostMessage({ type: "command", id: "guarded-file", target_id: "41", method: "DOM.setFileInputFiles", params: { files: ["/tmp/example"] } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.at(-1).error, /requires local unrestricted mode/);
   const callsBeforeBatch = debuggerCalls.length;
   native.hostMessage({ type: "batch", id: "guarded-batch", target_id: "41", deadline_ms: 1000, actions: [
     { method: "Runtime.callFunctionOn", params: { functionDeclaration: "guard" }, stop_on_not_ok: true },
@@ -517,26 +520,38 @@ function message(payload) {
   assert.equal(activeSocket.sent.some(reply => reply.id === "old-manual-result"), false,
     "command results from a replaced WebSocket are suppressed");
 
-  // Page-identity binding: pairing validates the tab URL and document ID observed at discovery.
+  // Local unrestricted pairing accepts numeric tab IDs without a prior discovery receipt.
   const liveNative = nativePorts.at(-1);
   liveNative.hostMessage({ type: "pair", request_id: "pair-urls-ok", tab_ids: [60], expected_urls: { 60: "https://example.test/60" }, expected_document_ids: expectedDocuments([60]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).type, "paired", "matching discovery URL pairs");
   liveNative.hostMessage({ type: "release" });
   await new Promise(resolve => setTimeout(resolve, 0));
-  liveNative.hostMessage({ type: "pair", request_id: "pair-url-missing", tab_ids: [66] });
+  liveNative.hostMessage({ type: "pair", request_id: "pair-guarded-missing", tab_ids: [66] });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(liveNative.sent.at(-1).type, "pair_error", "pairing without a discovery URL fails closed");
-  assert.ok(!attached.includes(66), "missing URL binding does not attach the tab");
-  liveNative.hostMessage({ type: "pair", request_id: "pair-document-missing", tab_ids: [69], expected_urls: expectedUrls([69]) });
+  assert.equal(liveNative.sent.at(-1).type, "pair_error", "guarded pairing still requires discovery identity");
+  liveNative.hostMessage({ type: "pair", request_id: "pair-url-missing", tab_ids: [66], unrestricted: true });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(liveNative.sent.at(-1).type, "pair_error", "pairing without a discovered document ID fails closed");
-  assert.ok(!attached.includes(69), "missing document binding does not attach the tab");
+  assert.equal(liveNative.sent.at(-1).type, "paired", "pairing without a discovery URL is allowed");
+  assert.ok(attached.includes(66), "numeric tab ID attaches without a URL receipt");
+  const fileCallsBefore = debuggerCalls.length;
+  liveNative.hostMessage({ type: "command", id: "unrestricted-file", target_id: "66", method: "DOM.setFileInputFiles", params: { files: ["/tmp/example"] } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).id, "unrestricted-file");
+  assert.equal(debuggerCalls.length, fileCallsBefore + 1, "unrestricted shared file selection reaches Chrome");
+  liveNative.hostMessage({ type: "command", id: "unrestricted-unpaired", target_id: "67", method: "DOM.getDocument", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).id, "unrestricted-unpaired");
+  assert.ok(attached.includes(67), "unrestricted native command attaches an unpaired tab ID");
+  liveNative.hostMessage({ type: "pair", request_id: "pair-document-missing", tab_ids: [69], expected_urls: expectedUrls([69]), unrestricted: true });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).type, "paired", "pairing without a discovered document ID is allowed");
+  assert.ok(attached.includes(69), "numeric tab ID attaches without a document receipt");
   tabUrlOverrides.set(60, "https://example.test/navigated");
   liveNative.hostMessage({ type: "pair", request_id: "pair-urls-moved", tab_ids: [60], expected_urls: { 60: "https://example.test/60" }, expected_document_ids: expectedDocuments([60]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).type, "pair_error", "a tab that navigated since discovery refuses to pair");
-  assert.match(liveNative.sent.at(-1).error, /navigated since discovery/);
+  assert.match(liveNative.sent.at(-1).error, /changed during pairing/);
   assert.ok(!attached.includes(60) || detached.includes(60), "refused pairing leaves no debugger attachment");
   tabUrlOverrides.delete(60);
 
@@ -573,13 +588,15 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).type, "paired");
   const priorNavigationAttachCount = attached.filter(tabId => tabId === 67).length;
+  const priorNavigationDetachCount = detached.filter(tabId => tabId === 67).length;
   tabDocumentOverrides.set(67, "replacement-document-67");
   tabUrlOverrides.set(67, "https://example.test/67/story");
   navigationBefore({ tabId: 67, frameId: 0, url: "https://example.test/67/story" });
   debuggerDetached({ tabId: 67 }, "target_closed");
   navigationCommitted({ tabId: 67, frameId: 0, documentId: "replacement-document-67", url: "https://example.test/67/story" });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.ok(!detached.includes(67), "a committed navigation keeps the selected tab attached");
+  assert.equal(detached.filter(tabId => tabId === 67).length, priorNavigationDetachCount,
+    "a committed navigation keeps the selected tab attached");
   assert.equal(attached.filter(tabId => tabId === 67).length, priorNavigationAttachCount + 1,
     "a debugger detach during navigation is restored only for the same selected tab");
   liveNative.hostMessage({ type: "command", id: "command-after-navigation", target_id: "67", method: "DOM.getDocument", params: {} });

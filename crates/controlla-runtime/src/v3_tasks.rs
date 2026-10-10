@@ -8,7 +8,7 @@ pub const MAX_RESEARCH_PAGES: usize = 32;
 pub const MAX_TASK_STEPS: usize = 128;
 pub const MAX_EVIDENCE_SNIPPET_CHARS: usize = 2_000;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskPrimitive {
     Research {
@@ -39,14 +39,14 @@ pub enum TaskPrimitive {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 pub struct FormField {
     pub reference: String,
     pub expected_value: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SaveControl {
     pub reference: String,
@@ -54,7 +54,7 @@ pub struct SaveControl {
     pub confirmation_text: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RepeatAction {
     Click,

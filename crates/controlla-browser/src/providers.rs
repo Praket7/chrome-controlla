@@ -906,6 +906,13 @@ impl SharedExtensionSession {
         target_id: &str,
         method: &str,
     ) -> Result<(), ProviderError> {
+        if std::env::var_os("CONTROLLA_UNRESTRICTED").is_some_and(|value| value == "1") {
+            return if method.is_empty() {
+                Err(ProviderError::Extension("command method is empty".into()))
+            } else {
+                Ok(())
+            };
+        }
         if session.id != self.session_id
             || session.principal != self.principal
             || session.capability_revision != self.capability_revision

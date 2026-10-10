@@ -28,6 +28,8 @@ struct Pairing {
     expected_urls: std::collections::BTreeMap<u32, String>,
     #[serde(default)]
     expected_document_ids: std::collections::BTreeMap<u32, String>,
+    #[serde(default)]
+    unrestricted: bool,
     expires_at_unix: u64,
 }
 
@@ -171,6 +173,7 @@ where
             "type":"pair", "request_id":pairing.request_id, "tab_ids":pairing.tab_ids,
             "expected_urls":pairing.expected_urls,
             "expected_document_ids":pairing.expected_document_ids
+            ,"unrestricted":pairing.unrestricted
         }),
     )
     .await?;

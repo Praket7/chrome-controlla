@@ -54,7 +54,7 @@ struct V3BrowserArgs {
     host_id: Option<String>,
     mode: Option<String>,
     url: Option<String>,
-    task: Option<Value>,
+    task: Option<crate::v3_tasks::TaskPrimitive>,
     filename: Option<String>,
     bytes: Option<Vec<u8>>,
     artifact_handle: Option<String>,
@@ -94,7 +94,7 @@ struct V3WorkflowArgs {
 struct V3TaskArgs {
     session_id: String,
     chrome_tab_id: String,
-    task: Value,
+    task: crate::v3_tasks::TaskPrimitive,
     client_id: Option<String>,
 }
 
@@ -240,6 +240,9 @@ fn fast_key_batch_failure(result: &Value, prior_key_events: u64) -> (&'static st
 }
 
 fn workflow_should_stop(value: &Value) -> bool {
+    if crate::guard_reason::unrestricted_mode() {
+        return false;
+    }
     matches!(
         value.get("status").and_then(Value::as_str),
         Some("unknown" | "not_dispatched" | "failed")
@@ -300,6 +303,37 @@ async fn headless_file_select(
         .cloned()
         .ok_or_else(|| invalid("unknown session_id"))?;
     let live = live.lock().await;
+    if crate::guard_reason::unrestricted_mode()
+        && !super::super::private_headless_cleanup_allowed(&live.handle)
+    {
+        let connection = live.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = live.registry()?;
+        let handle: controlla_browser::sessions::ArtifactHandle = serde_json::from_value(json!(artifact_handle))
+            .map_err(|error| invalid(format!("invalid artifact handle: {error}")))?;
+        let metadata = registry.artifact_metadata(&live.handle, &handle)
+            .map_err(|error| invalid(format!("artifact lookup failed: {error:?}")))?;
+        let path = registry.artifact_path_for(&live.handle.id, &live.handle.principal, &handle)
+            .map_err(|error| invalid(format!("artifact path lookup failed: {error:?}")))?
+            .to_string_lossy().into_owned();
+        let expression = format!("document.querySelector({})", json!(selector));
+        let element = connection.command(registry, &live.handle, tab_id, "Runtime.evaluate",
+            json!({"expression":expression,"returnByValue":false})).await.map_err(invalid)?;
+        let object_id = element["result"]["objectId"].as_str()
+            .ok_or_else(|| invalid("file input selector did not resolve"))?;
+        connection.command(registry, &live.handle, tab_id, "DOM.setFileInputFiles",
+            json!({"files":[path],"objectId":object_id})).await.map_err(invalid)?;
+        let readback = connection.command(registry, &live.handle, tab_id, "Runtime.callFunctionOn",
+            json!({"objectId":object_id,"functionDeclaration":"function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}));}","returnByValue":true})).await.map_err(invalid)?;
+        let files = super::super::shared_value(&readback).map_err(invalid)?;
+        let selected = files.as_array().is_some_and(|items| items.len() == 1
+            && items[0]["name"] == metadata.filename
+            && items[0]["size"].as_u64() == Some(metadata.size as u64));
+        return Ok(if selected {
+            json!({"status":"selected","verified":true,"filename":metadata.filename,"size":metadata.size,"account_marker_checked":false})
+        } else {
+            json!({"status":"unknown","reason":"file selection was dispatched but readback did not match","dispatch_acknowledged":true})
+        });
+    }
     if live.handle.principal != app.core.legacy.principal.as_ref()
         || !super::super::private_headless_cleanup_allowed(&live.handle)
     {
@@ -908,6 +942,9 @@ async fn acquire_lease(
 ) -> Result<crate::v3::TargetKey, rmcp::ErrorData> {
     let owner = args.client_id.as_deref().unwrap_or("local-mcp");
     let key = lease_target_key(&args.session_id, &args.chrome_tab_id);
+    if crate::guard_reason::unrestricted_mode() {
+        return Ok(key);
+    }
     app.leases
         .lock()
         .await
@@ -964,6 +1001,7 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
 }
 
 async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
+    let unrestricted = crate::guard_reason::unrestricted_mode();
     let reference = args
         .reference
         .as_deref()
@@ -987,7 +1025,7 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
         .cloned()
         .ok_or_else(|| invalid("unknown shared session_id"))?;
     let mut shared = live.lock().await;
-    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+    if !unrestricted && shared.handle.principal != app.core.legacy.principal.as_ref() {
         return Err(invalid("session is not owned by this server principal"));
     }
     let snapshot = shared
@@ -1001,7 +1039,7 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
     let index = index
         .parse::<usize>()
         .map_err(|_| invalid("invalid retained reference index"))?;
-    if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+    if index >= snapshot.count || (!unrestricted && (token != snapshot.token || snapshot.consumed)) {
         return Err(invalid(
             "stale or consumed reference; take one fresh browser_snapshot",
         ));
@@ -1020,12 +1058,16 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
         .await
         .map_err(invalid)?
     };
-    if identity != snapshot.identity {
+    if !unrestricted && identity != snapshot.identity {
         return Err(invalid(
             "document changed since snapshot; take a fresh browser_snapshot",
         ));
     }
-    let guard = r#"function(index,expected){const e=this.nodes[index];return !!e&&e.isConnected&&(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))&&!e.disabled&&!e.readOnly&&document.activeElement===e&&e.value===expected&&e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;}"#;
+    let guard = if unrestricted {
+        r#"function(index){const e=this.nodes[index];if(e)e.focus();return !!e;}"#
+    } else {
+        r#"function(index,expected){const e=this.nodes[index];return !!e&&e.isConnected&&(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))&&!e.disabled&&!e.readOnly&&document.activeElement===e&&e.value===expected&&e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;}"#
+    };
     let initial = {
         let connection = shared.connection.as_ref().unwrap();
         connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
@@ -1037,11 +1079,9 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             json!({"status":"not_dispatched","action":"type","typing_mode":"ime","reason":"field, focus, or caret changed before composition"}),
         );
     }
-    shared
-        .snapshots
-        .get_mut(&args.chrome_tab_id)
-        .unwrap()
-        .consumed = true;
+    if !unrestricted {
+        shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed = true;
+    }
     let connection = shared.connection.as_ref().unwrap();
     let final_value = format!("{expected}{text}");
     let composition_len = text.encode_utf16().count();
@@ -1095,6 +1135,9 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             "reason":format!("IME commit delivery is unknown; inspect state and do not retry: {error}")}),
         );
     }
+    if unrestricted {
+        return Ok(json!({"status":"dispatched","action":"type","typing_mode":"ime","dispatch_acknowledged":true,"verified":false}));
+    }
     let readback = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
         "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true
     })).await;
@@ -1124,6 +1167,7 @@ async fn key_type(
     args: &V3ActArgs,
     policy: crate::v3::TypingPolicy,
 ) -> Result<Value, rmcp::ErrorData> {
+    let unrestricted = crate::guard_reason::unrestricted_mode();
     let reference = args
         .reference
         .as_deref()
@@ -1147,7 +1191,7 @@ async fn key_type(
         .cloned()
         .ok_or_else(|| invalid("unknown shared session_id"))?;
     let mut shared = shared.lock().await;
-    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+    if !unrestricted && shared.handle.principal != app.core.legacy.principal.as_ref() {
         return Err(invalid("session is not owned by this server principal"));
     }
     let snapshot = shared
@@ -1161,7 +1205,7 @@ async fn key_type(
     let index = index
         .parse::<usize>()
         .map_err(|_| invalid("invalid retained reference index"))?;
-    if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+    if index >= snapshot.count || (!unrestricted && (token != snapshot.token || snapshot.consumed)) {
         return Err(invalid(
             "stale or consumed reference; take one fresh browser_snapshot",
         ));
@@ -1186,12 +1230,16 @@ async fn key_type(
         .map_err(|_| invalid("type preflight timed out; no key dispatched"))?
         .map_err(invalid)?
     };
-    if before != snapshot.identity {
+    if !unrestricted && before != snapshot.identity {
         return Err(invalid(
             "document changed since snapshot; take a fresh browser_snapshot",
         ));
     }
-    let guard_function = r#"function(index,expected){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'focus_or_selection_changed'};return {ok:true,value:e.value};}"#;
+    let guard_function = if unrestricted {
+        r#"function(index){const e=this.nodes[index];if(e)e.focus();return {ok:!!e,value:e?.value??''};}"#
+    } else {
+        r#"function(index,expected){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'focus_or_selection_changed'};return {ok:true,value:e.value};}"#
+    };
     let mut progress = expected.to_owned();
     let preflight = {
         let connection = shared.connection.as_ref().unwrap();
@@ -1218,11 +1266,9 @@ async fn key_type(
             json!({"status":"not_dispatched","action":"type","reason":preflight["reason"],"readback":preflight}),
         );
     }
-    shared
-        .snapshots
-        .get_mut(&args.chrome_tab_id)
-        .ok_or_else(|| invalid("snapshot disappeared before dispatch"))?
-        .consumed = true;
+    if !unrestricted {
+        shared.snapshots.get_mut(&args.chrome_tab_id).ok_or_else(|| invalid("snapshot disappeared before dispatch"))?.consumed = true;
+    }
     let mut dispatch_count = 0_u64;
     if policy.mode == crate::v3::TypingMode::FastKeys {
         let characters = text.chars().collect::<Vec<_>>();
@@ -1235,7 +1281,9 @@ async fn key_type(
                 stop_on_not_ok: true,
             };
             for character in chunk {
-                actions.push(guard_action(&progress));
+                if !unrestricted {
+                    actions.push(guard_action(&progress));
+                }
                 let key = character.to_string();
                 for (event_index, params) in [
                     json!({"type":"keyDown","key":key}),
@@ -1250,11 +1298,13 @@ async fn key_type(
                         params,
                         stop_on_not_ok: false,
                     });
-                    if event_index == 0 {
+                    if !unrestricted && event_index == 0 {
                         actions.push(guard_action(&progress));
                     } else if event_index == 1 {
                         progress.push(*character);
-                        actions.push(guard_action(&progress));
+                        if !unrestricted {
+                            actions.push(guard_action(&progress));
+                        }
                     }
                 }
             }
@@ -1299,7 +1349,8 @@ async fn key_type(
                     "batch_receipt":result,"reason":format!("fast-key batch stopped; inspect current state and do not automatically retry: {error}")}),
                 );
             }
-            if result["completed"].as_u64() != Some((chunk.len() * 6) as u64) {
+            let expected_actions = chunk.len() * if unrestricted { 3 } else { 6 };
+            if result["completed"].as_u64() != Some(expected_actions as u64) {
                 return Ok(
                     json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,
                     "dispatch_may_have_occurred":true,
@@ -1391,6 +1442,9 @@ async fn key_type(
                 );
             }
         }
+    }
+    if unrestricted {
+        return Ok(json!({"status":"dispatched","action":"type","typing_mode":match policy.mode { crate::v3::TypingMode::FastKeys=>"fast_keys", _=>"human_keys" },"dispatch_acknowledged":true,"verified":false,"cdp_key_events":dispatch_count}));
     }
     let readback = {
         let connection = shared.connection.as_ref().unwrap();
@@ -1488,7 +1542,8 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
     let index = index
         .parse::<usize>()
         .map_err(|_| invalid("invalid retained reference index"))?;
-    if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+    let unrestricted = crate::guard_reason::unrestricted_mode();
+    if index >= snapshot.count || (!unrestricted && (token != snapshot.token || snapshot.consumed)) {
         return Err(invalid("stale or consumed reference"));
     }
     let connection = shared
@@ -1496,7 +1551,7 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
         .as_ref()
         .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
     let preflight = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
-        "objectId":snapshot.object_id,"functionDeclaration":"function(index){const e=this.nodes[index];return {ok:!!e&&e.isConnected&&document.activeElement===e};}",
+        "objectId":snapshot.object_id,"functionDeclaration":if unrestricted {"function(index){const e=this.nodes[index];if(e)e.focus();return {ok:!!e};}"} else {"function(index){const e=this.nodes[index];return {ok:!!e&&e.isConnected&&document.activeElement===e};}"},
         "arguments":[{"value":index}],"returnByValue":true
     })).await.map_err(|error| invalid(error.to_string()))?;
     if super::super::shared_value(&preflight).map_err(invalid)?["ok"] != true {
@@ -1504,11 +1559,9 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
             json!({"status":"not_dispatched","action":"press","reason":"referenced element is not connected and focused"}),
         );
     }
-    shared
-        .snapshots
-        .get_mut(&args.chrome_tab_id)
-        .unwrap()
-        .consumed = true;
+    if !unrestricted {
+        shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed = true;
+    }
     for (index, event) in [
         json!({"type":"keyDown","key":key}),
         json!({"type":"keyUp","key":key}),
@@ -1786,7 +1839,7 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Manage browser sessions and bounded task/file actions. Supports foreground, background, and headless modes; action=task runs bounded work; artifact_register/read use opaque private-headless handles.",
+        description = "Manage browser sessions and bounded task/file actions. Foreground action=open creates an active tab in an accepted shared session; action=task runs bounded work. Shared-session artifacts require local unrestricted mode.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn browser(
@@ -1834,8 +1887,12 @@ impl AppV3 {
             return Ok(Json(json!({
                 "version":"v3","tools":["browser","snapshot","act","workflow","extract","verify"],
                 "modes":{"foreground":crate::v3::BrowserMode::Foreground.policy(),"background":crate::v3::BrowserMode::Background.policy(),"headless":crate::v3::BrowserMode::Headless.policy()},
+                "browser_actions":{"foreground":["discover_shared_tabs","pair_shared","accept_shared","list","open","release","task"],"background":["discover_shared_tabs","pair_shared","accept_shared","list","release","task"],"headless":["launch","list","release","task","artifact_register","artifact_read"]},
+                "act_actions":["click","fill","type","press","select","page_tools","page_tool"],
+                "shared_artifacts":crate::guard_reason::unrestricted_mode(),
                 "typing_modes":["block","fast_keys","human_keys","ime"],
-                "safety":"revision-bound refs, target leases, fresh-state verification, no blind mutation retry"
+                "interaction_policy":if crate::guard_reason::unrestricted_mode() {"local_unrestricted"} else {"guarded"},
+                "safety":if crate::guard_reason::unrestricted_mode() {"native pairing discovery checks, click/fill/select/press target checks, click outcome wait, and target leases are disabled; dispatched is not verified; transport and request validity checks remain"} else {"revision-bound refs, target leases, fresh-state verification, no blind mutation retry"}
             })));
         }
         let mode = parse_mode(args.mode.as_deref())?;
@@ -1847,6 +1904,25 @@ impl AppV3 {
                 "mode {mode:?} requires provider {}",
                 mode.default_provider()
             )));
+        }
+        if args.action == "open" {
+            if mode != crate::v3::BrowserMode::Foreground {
+                return Err(invalid("browser action=open requires foreground mode"));
+            }
+            let session_id = args.session_id.as_deref().ok_or_else(|| invalid("session_id is required"))?;
+            if self.browser_modes.lock().await.get(session_id) != Some(&mode) {
+                return Err(invalid("session was not created in foreground mode"));
+            }
+            let url = args.url.ok_or_else(|| invalid("url is required"))?;
+            let Json(mut result) = self.core.legacy.shared_tab(Parameters(super::SharedTabArgs {
+                session_id: session_id.to_owned(),
+                action: "open".into(),
+                chrome_tab_id: None,
+                url,
+            })).await?;
+            result["session_id"] = json!(session_id);
+            result["mode"] = json!(mode);
+            return Ok(Json(result));
         }
         if mode == crate::v3::BrowserMode::Headless {
             return match args.action.as_str() {
@@ -1972,7 +2048,7 @@ impl AppV3 {
             }
         } else if !matches!(action, "pair_shared" | "discover_shared_tabs") {
             return Err(invalid(
-                "foreground/background browser action must be pair_shared, accept_shared, list, release, or discover_shared_tabs",
+                "foreground/background browser action must be pair_shared, accept_shared, list, release, discover_shared_tabs, or foreground open",
             ));
         }
         let result = self
@@ -2023,7 +2099,7 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Perform a guarded mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.",
+        description = "Perform a mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Guarded mode leases targets and checks drift; local_unrestricted skips those checks and returns dispatched without claiming verification.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn act(
@@ -2043,7 +2119,7 @@ impl AppV3 {
                         reference: args.reference.clone(),
                         expected_value: None,
                         value: None,
-                        outcome: args.outcome.take(),
+                        outcome: args.outcome.take().or_else(|| crate::guard_reason::unrestricted_mode().then_some(BrowserClickOutcome::Focused)),
                         timeout_ms: args.timeout_ms,
                     }))
                     .await
@@ -2129,6 +2205,7 @@ impl AppV3 {
         let mut coverage_complete = false;
         let mut receipts: Vec<Value> = Vec::with_capacity(args.steps.len());
         let mut step_ms = Vec::with_capacity(args.steps.len());
+        let mut unverified_effect = false;
         for step in args.steps {
             let step_started = std::time::Instant::now();
             let resolve = |reference: String,
@@ -2381,6 +2458,7 @@ impl AppV3 {
             };
             let stop_status = workflow_should_stop(&value)
                 .then(|| value["status"].as_str().unwrap_or("unknown").to_owned());
+            unverified_effect |= matches!(value["status"].as_str(), Some("unknown" | "not_dispatched" | "failed"));
             step_ms.push(step_started.elapsed().as_millis() as u64);
             receipts.push(value);
             if let Some(status) = stop_status {
@@ -2390,7 +2468,7 @@ impl AppV3 {
             }
         }
         Ok(Json(
-            json!({"status":"completed","steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64}),
+            json!({"status":if unverified_effect {"completed_unverified"} else {"completed"},"steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64}),
         ))
     }
 
@@ -2415,7 +2493,7 @@ impl AppV3 {
             .ok_or_else(|| invalid("unknown session_id"))?;
         let mut live = live.lock().await;
         if live.handle.principal != self.core.legacy.principal.as_ref()
-            || !super::super::private_headless_cleanup_allowed(&live.handle)
+            || (!crate::guard_reason::unrestricted_mode() && !super::super::private_headless_cleanup_allowed(&live.handle))
         {
             return Err(invalid(
                 "artifact registration requires a dedicated private headless session",
@@ -2430,7 +2508,7 @@ impl AppV3 {
             .map_err(|error| invalid(format!("artifact registration failed: {error:?}")))?;
         Ok(Json(
             json!({"artifact_handle":metadata.handle,"filename":metadata.filename,"size":metadata.size,
-            "scope":"private_headless_session","verified":true}),
+            "scope":if super::super::private_headless_cleanup_allowed(&live.handle) {"private_headless_session"} else {"local_unrestricted_shared_session"},"verified":true}),
         ))
     }
 
@@ -2450,7 +2528,7 @@ impl AppV3 {
             .ok_or_else(|| invalid("unknown session_id"))?;
         let live = live.lock().await;
         if live.handle.principal != self.core.legacy.principal.as_ref()
-            || !super::super::private_headless_cleanup_allowed(&live.handle)
+            || (!crate::guard_reason::unrestricted_mode() && !super::super::private_headless_cleanup_allowed(&live.handle))
         {
             return Err(invalid(
                 "artifact read requires the owning private headless session",
@@ -2465,7 +2543,7 @@ impl AppV3 {
             .map_err(|error| invalid(format!("artifact read failed: {error:?}")))?;
         Ok(Json(json!({"artifact_handle":handle,"size":bytes.len(),
             "sha256":crate::artifacts::ArtifactExpectation::sha256(&bytes),"bytes":bytes,
-            "verified":true,"scope":"private_headless_session"})))
+            "verified":true,"scope":if super::super::private_headless_cleanup_allowed(&live.handle) {"private_headless_session"} else {"local_unrestricted_shared_session"}})))
     }
 
     async fn task(
@@ -2473,13 +2551,12 @@ impl AppV3 {
         Parameters(args): Parameters<V3TaskArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         self.require_v3_session(&args.session_id).await?;
-        use crate::v3_tasks::{ExpandedStep, TaskPrimitive};
-        let primitive: TaskPrimitive =
-            serde_json::from_value(args.task).map_err(|error| invalid(error.to_string()))?;
-        let steps = primitive.expand().map_err(invalid)?;
+        use crate::v3_tasks::ExpandedStep;
+        let steps = args.task.expand().map_err(invalid)?;
         let mut url = String::new();
         let mut active_tab_id = args.chrome_tab_id.clone();
         let mut receipts = Vec::with_capacity(steps.len());
+        let mut unverified_effect = false;
         for step in steps {
             let (kind, reference, result) = match step {
                 ExpandedStep::Open {
@@ -2684,8 +2761,9 @@ impl AppV3 {
             };
             let receipt = task_receipt(kind, &url, reference.as_deref(), &result);
             let verified = receipt["verified"] == true;
+            unverified_effect |= !verified;
             receipts.push(receipt);
-            if !verified || workflow_should_stop(&result) {
+            if (!verified && !crate::guard_reason::unrestricted_mode()) || workflow_should_stop(&result) {
                 let status = if result["status"] == "selected" {
                     "incomplete"
                 } else {
@@ -2697,7 +2775,7 @@ impl AppV3 {
             }
         }
         Ok(Json(
-            json!({"status":"completed","steps":receipts.len(),"receipts":receipts}),
+            json!({"status":if unverified_effect {"completed_unverified"} else {"completed"},"steps":receipts.len(),"receipts":receipts}),
         ))
     }
 
@@ -2736,7 +2814,7 @@ impl ServerHandler for AppV3 {
             "controlla-v3",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions("Controlla v3 exposes six compact tools. Use browser action=task for bounded research and form drafts, and browser action=artifact_register/read for opaque private-headless file handles. Use workflow for explicit multi-step automation, block typing for ordinary text, fast_keys only when real key events are required, and verify after consequential mutations. Background mode must not steal focus. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
+        .with_instructions("Controlla v3 exposes browser, snapshot, act, workflow, extract, and verify. In foreground mode, discover and pair selected tabs, accept the shared session, then use browser action=open with the accepted session_id and HTTP(S) url to create an active tab. Use browser action=task for bounded research and form drafts; research navigates an existing tab. Artifact registration and upload require a private headless session. Use workflow for explicit multi-step automation and verify consequential mutations. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
     }
 }
 

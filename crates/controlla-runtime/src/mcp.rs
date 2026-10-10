@@ -2129,7 +2129,8 @@ impl App {
                 let mut shared_sessions = self.shared_sessions.lock().await;
                 let host_registered = crate::native_setup::host_registered();
                 let native_busy = !shared_sessions.is_empty();
-                if args.host_id.is_some() && native_busy {
+                let unrestricted = crate::guard_reason::unrestricted_mode();
+                if native_busy && args.host_id.is_some() {
                     return Err(invalid(
                         "a shared session is active; release it before starting another native pairing",
                     ));
@@ -2140,7 +2141,7 @@ impl App {
                     ));
                 }
                 let native_snapshot = if !native_busy && host_registered {
-                    if args.host_id.is_some() {
+                    if args.host_id.is_some() || unrestricted {
                         Some(crate::native_setup::read_tabs().map_err(invalid)?)
                     } else {
                         crate::native_setup::read_tabs().ok()
@@ -2148,30 +2149,31 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(requested_host) = args.host_id.as_deref() {
-                    let current = native_snapshot.as_ref().ok_or_else(|| {
-                        invalid(
-                            "the selected native host has no fresh tab inventory; rediscover tabs",
-                        )
-                    })?;
-                    if current["host_id"].as_str() != Some(requested_host) {
-                        return Err(invalid(
-                            "native host changed since discovery; rediscover tabs before pairing",
-                        ));
+                if !unrestricted {
+                    if let Some(requested_host) = args.host_id.as_deref() {
+                        let current = native_snapshot.as_ref().ok_or_else(|| invalid("the selected native host has no fresh tab inventory; rediscover tabs"))?;
+                        if current["host_id"].as_str() != Some(requested_host) {
+                            return Err(invalid(
+                                "native host changed since discovery; rediscover tabs before pairing",
+                            ));
+                        }
                     }
                 }
-                let native_bridge = args.host_id.is_some();
+                let native_bridge =
+                    native_snapshot.is_some() && (args.host_id.is_some() || unrestricted);
                 if let Some(snapshot) = native_snapshot.filter(|_| native_bridge) {
                     let tabs = snapshot["tabs"]
                         .as_array()
                         .ok_or_else(|| invalid("native tab inventory is invalid"))?;
-                    if target_ids.iter().any(|id| {
-                        !tabs.iter().any(|tab| {
-                            tab["id"]
-                                .as_u64()
-                                .is_some_and(|tab_id| tab_id.to_string() == *id)
+                    if !unrestricted
+                        && target_ids.iter().any(|id| {
+                            !tabs.iter().any(|tab| {
+                                tab["id"]
+                                    .as_u64()
+                                    .is_some_and(|tab_id| tab_id.to_string() == *id)
+                            })
                         })
-                    }) {
+                    {
                         return Err(invalid(
                             "target_ids must be present in the fresh native tab inventory",
                         ));
@@ -2190,28 +2192,23 @@ impl App {
                                 .as_u64()
                                 .is_some_and(|id| id.to_string() == *selected_id)
                         });
-                        let tab = matches.next().ok_or_else(|| {
-                            invalid("selected tab is missing from the fresh native inventory")
-                        })?;
-                        if matches.next().is_some() {
-                            return Err(invalid(
-                                "native inventory contains duplicate selected tab IDs",
-                            ));
+                        let tab = matches.next();
+                        if !unrestricted {
+                            let tab = tab.ok_or_else(|| {
+                                invalid("selected tab is missing from the fresh native inventory")
+                            })?;
+                            if matches.next().is_some() {
+                                return Err(invalid(
+                                    "native inventory contains duplicate selected tab IDs",
+                                ));
+                            }
+                            let url = tab["url"].as_str().ok_or_else(|| {
+                                invalid("selected native tab has no discovery URL")
+                            })?;
+                            let document_id = tab["document_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| invalid("selected native tab has no durable document ID; reload the extension and rediscover tabs"))?;
+                            expected_urls.insert(selected_id.clone(), json!(url));
+                            expected_document_ids.insert(selected_id.clone(), json!(document_id));
                         }
-                        let url = tab["url"]
-                            .as_str()
-                            .ok_or_else(|| invalid("selected native tab has no discovery URL"))?;
-                        let document_id = tab["document_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| {
-                            invalid("selected native tab has no durable document ID; reload the extension and rediscover tabs")
-                        })?;
-                        expected_urls.insert(
-                            selected_id.clone(),
-                            serde_json::Value::String(url.to_owned()),
-                        );
-                        expected_document_ids.insert(
-                            selected_id.clone(),
-                            serde_json::Value::String(document_id.to_owned()),
-                        );
                     }
                     crate::native_setup::write_pairing(
                         host_id,
@@ -2221,6 +2218,7 @@ impl App {
                         &session_id,
                         &expected_urls,
                         &expected_document_ids,
+                        unrestricted,
                     )
                     .map_err(invalid)?;
                 }
@@ -2246,7 +2244,7 @@ impl App {
                     "one_session_token":pairing.token,
                     "native_bridge":native_bridge,
                     "pairing_expires_in_seconds":300,
-                    "next":if native_bridge { "The native bridge is pairing the selected tabs. Call accept_shared to confirm; it returns accepted:false while waiting." } else if native_busy { "The native bridge handles one shared session at a time. For this additional session, use the extension popup with the returned endpoint and token, then call accept_shared." } else { "For native pairing, call discover_shared_tabs and pass its host_id. Otherwise use the popup's manual endpoint and token, then call accept_shared." },
+                    "next":if native_bridge { "The native bridge is pairing the requested tab IDs. Call accept_shared to confirm; it returns accepted:false while waiting." } else if native_busy { "The native bridge handles one shared session at a time. For this additional session, use the extension popup with the returned endpoint and token, then call accept_shared." } else { "Native pairing is unavailable; use the popup's manual endpoint and token, then call accept_shared." },
                     "identity":"Chrome tab IDs are not Direct CDP target references"
                 })))
             }
@@ -2697,7 +2695,10 @@ impl App {
         let index = index
             .parse::<usize>()
             .map_err(|_| invalid("invalid reference index"))?;
-        if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
+        let unrestricted = crate::guard_reason::unrestricted_mode();
+        if index >= snapshot.count
+            || (!unrestricted && (token != snapshot.token || snapshot.consumed))
+        {
             return Err(invalid(
                 "stale or consumed reference; take one fresh snapshot before acting",
             ));
@@ -2709,7 +2710,7 @@ impl App {
             let identity =
                 shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
                     .await?;
-            if identity != snapshot.identity {
+            if !unrestricted && identity != snapshot.identity {
                 return Err(ClickRefusal::Guard(crate::guard_reason::refusal(
                     &json!({"ok":false,"reason":"document_changed"}),
                 )));
@@ -2720,15 +2721,16 @@ impl App {
             if value["ok"] != true {
                 return Err(ClickRefusal::Guard(crate::guard_reason::refusal(&value)));
             }
-            if evaluate_shared_outcome(
-                &shared,
-                &args.chrome_tab_id,
-                &snapshot,
-                index,
-                &args.outcome,
-                &identity,
-            )
-            .await?
+            if !unrestricted
+                && evaluate_shared_outcome(
+                    &shared,
+                    &args.chrome_tab_id,
+                    &snapshot,
+                    index,
+                    &args.outcome,
+                    &identity,
+                )
+                .await?
             {
                 return Err("outcome already satisfied; no click needed".into());
             }
@@ -2750,11 +2752,13 @@ impl App {
             }
         };
         // Consume before dispatch: even a lost reply must not permit a duplicate click with this reference.
-        shared
-            .snapshots
-            .get_mut(&args.chrome_tab_id)
-            .unwrap()
-            .consumed = true;
+        if !unrestricted {
+            shared
+                .snapshots
+                .get_mut(&args.chrome_tab_id)
+                .unwrap()
+                .consumed = true;
+        }
         let connection = shared
             .connection
             .as_ref()
@@ -2774,15 +2778,17 @@ impl App {
             refusal["phase"] = json!("revalidation");
             return Ok(rmcp::handler::server::wrapper::Json(refusal));
         }
-        let fresh = tokio::time::timeout_at(
-            deadline,
-            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
-        )
-        .await;
-        if !matches!(fresh, Ok(Ok(ref identity)) if identity == &snapshot.identity) {
-            return Ok(rmcp::handler::server::wrapper::Json(
-                json!({"status":"not_dispatched","reason":"document changed before dispatch; take one fresh snapshot","dispatch_acknowledged":false}),
-            ));
+        if !unrestricted {
+            let fresh = tokio::time::timeout_at(
+                deadline,
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+            )
+            .await;
+            if !matches!(fresh, Ok(Ok(ref identity)) if identity == &snapshot.identity) {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","reason":"document changed before dispatch; take one fresh snapshot","dispatch_acknowledged":false}),
+                ));
+            }
         }
         let (x, y) = (
             checked["x"].as_f64().ok_or_else(|| invalid("missing x"))?,
@@ -2812,8 +2818,12 @@ impl App {
         )
         .await;
         let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
-        let mut result = json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"});
-        while tokio::time::Instant::now() < deadline {
+        let mut result = if unrestricted && acknowledged {
+            json!({"status":"dispatched","dispatch_acknowledged":true,"verified":false})
+        } else {
+            json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"})
+        };
+        while !unrestricted && tokio::time::Instant::now() < deadline {
             let check = async {
                 let identity = shared_frame_identity(
                     connection,

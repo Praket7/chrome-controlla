@@ -1,5 +1,7 @@
 # Chrome Controlla — master usage guide contract
 
+> **Legacy router reference.** This document describes the older multi-tool MCP surface (`session`, `shared_tab`, `shared_click`, and related tools). The locally packaged V3 MCP exposes exactly six tools: `browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`. For the current action names, mode limits, and shared-tab open flow, use [the V3 browser-control skill](../packages/chrome-controlla/plugin/skills/browser-control/SKILL.md) and the live `browser` action `describe` result. Do not call the legacy tool names against the V3 server.
+
 Version: local Phase 9 setup preview `master-2026-10-08-v6`, server `0.1.0`. **Phase 4/5 local gates include guarded text/IME actions, macOS native snapshots, bounded CSS/AX/PNG crop observations, resumable section extraction, and hidden-section expansion checks. Phase 9 adds dated local stdio setup examples and a read-only `guide` tool. MCP/CDP fixtures pass; representative app behavior, real-client acceptance, authenticated remote transport, and production-wide platform qualification remain open.**
 
 Companion documents: [research](design/research.md), [improvement requirements](design/improvements.md), [build prompt](design/build.md).

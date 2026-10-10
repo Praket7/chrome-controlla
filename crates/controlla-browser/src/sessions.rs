@@ -512,7 +512,7 @@ impl SessionRegistry {
         Ok(bytes)
     }
 
-    pub(crate) fn artifact_path_for(
+    pub fn artifact_path_for(
         &self,
         session_id: &str,
         principal: &str,

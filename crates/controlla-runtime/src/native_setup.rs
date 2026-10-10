@@ -70,6 +70,7 @@ pub fn write_pairing(
     request_id: &str,
     expected_urls: &serde_json::Map<String, serde_json::Value>,
     expected_document_ids: &serde_json::Map<String, serde_json::Value>,
+    unrestricted: bool,
 ) -> Result<(), String> {
     let path = pairing_path(host_id)?;
     let dir = path.parent().ok_or("invalid pairing path")?;
@@ -94,6 +95,7 @@ pub fn write_pairing(
         "request_id":request_id,
         "expected_urls":expected_urls,
         "expected_document_ids":expected_document_ids,
+        "unrestricted":unrestricted,
         "expires_at_unix":now + 300,
     });
     let temp = dir.join(format!(

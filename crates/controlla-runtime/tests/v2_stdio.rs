@@ -69,6 +69,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "session_id",
         "target_ids",
         "chrome_tab_id",
+        "url",
         "task",
         "filename",
         "bytes",
@@ -78,6 +79,12 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         assert!(
             browser["properties"].get(property).is_some(),
             "browser {property}"
+        );
+    }
+    for task_kind in ["research", "form_draft", "upload", "download", "repeat"] {
+        assert!(
+            browser.to_string().contains(task_kind),
+            "browser task schema contains {task_kind}"
         );
     }
     let act = schema("act");
@@ -108,6 +115,32 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "default tool schema budget is {schema_bytes} bytes"
     );
 
+    let described = client
+        .call_tool(
+            CallToolRequestParams::new("browser").with_arguments(
+                serde_json::json!({"action":"describe"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert!(
+        described["browser_actions"]["foreground"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("open"))
+    );
+    assert!(
+        !described["act_actions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("upload"))
+    );
+
     let pair = serde_json::json!({"action":"pair_shared","target_ids":["123"],"mode":"foreground"});
     let paired = client
         .call_tool(
@@ -118,6 +151,31 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .structured_content
         .unwrap();
     let session_id = paired["session_id"].as_str().unwrap();
+    let open = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/"});
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("browser").with_arguments(open.as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("unaccepted shared session cannot open a tab");
+    assert!(
+        error
+            .to_string()
+            .contains("shared extension session has not been accepted"),
+        "{error}"
+    );
+    let background_open = serde_json::json!({"action":"open","mode":"background","session_id":session_id,"url":"https://example.test/"});
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("browser")
+                .with_arguments(background_open.as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("background mode cannot activate a new tab");
+    assert!(
+        error.to_string().contains("requires foreground mode"),
+        "{error}"
+    );
     let request = serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":"123",
         "task":{"kind":"download","reference":"@c1"}});
     let result = client

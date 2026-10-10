@@ -154,7 +154,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         };
         assert_eq!(
             pair,
-            json!({"type":"pair","request_id":"roundtrip-1","tab_ids":[42],"expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"}})
+            json!({"type":"pair","request_id":"roundtrip-1","tab_ids":[42],"expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"unrestricted":false})
         );
         write_native(
             &mut input,
