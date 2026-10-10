@@ -3,4 +3,6 @@
 /node_modules/
 /packages/chrome-controlla/bin/controlla-core
 /packages/chrome-controlla/bin/controlla-core.exe
+/packages/chrome-controlla/bin/controlla-v2-core
+/packages/chrome-controlla/bin/controlla-v2-core.exe
 /packages/chrome-controlla/dist/

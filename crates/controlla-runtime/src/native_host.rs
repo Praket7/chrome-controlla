@@ -38,6 +38,10 @@ struct NativeReply {
     targets: Option<Vec<String>>,
     extension_version: Option<String>,
     document_identity: Option<bool>,
+    #[serde(default)]
+    batch_execution: bool,
+    #[serde(default)]
+    batch_deadline: bool,
 }
 
 pub async fn run() -> Result<(), String> {
@@ -227,7 +231,8 @@ where
         .send(Message::Text(
             json!({
                 "type":"hello", "token":pairing.token, "targets":targets,
-                "extension_version":extension_version, "document_identity":true
+                "extension_version":extension_version, "document_identity":true,
+                "batch_execution":paired.batch_execution, "batch_deadline":paired.batch_deadline
             })
             .to_string()
             .into(),
@@ -380,7 +385,7 @@ where
             native = native_rx.recv() => {
                 let message = native.ok_or("native port closed")??;
                 match message["type"].as_str() {
-                    Some("result") if message["id"].as_u64().is_some() => {
+                    Some("result" | "batch_result") if message["id"].as_u64().is_some() => {
                         socket.send(Message::Text(message.to_string().into())).await.map_err(|error| error.to_string())?;
                     }
                     Some("tabs") if message["request_id"] == "inventory" => save_tabs_snapshot(&message, host_id).await?,
@@ -395,7 +400,7 @@ where
                 Some(Ok(Message::Text(text))) => {
                     if text.len() > MAX_MESSAGE { return Err("provider message exceeds size limit".into()); }
                     let value: Value = serde_json::from_str(&text).map_err(|_| "provider sent invalid JSON".to_owned())?;
-                    if value["type"] != "command" { return Err("provider sent an unsupported message".into()); }
+                    if !matches!(value["type"].as_str(), Some("command" | "batch")) { return Err("provider sent an unsupported message".into()); }
                     write_message(output, &value).await?;
                 }
                 Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.map_err(|error| error.to_string())?,

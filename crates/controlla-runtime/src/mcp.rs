@@ -2055,8 +2055,22 @@ impl App {
                 let mut shared_sessions = self.shared_sessions.lock().await;
                 let host_registered = crate::native_setup::host_registered();
                 let native_busy = !shared_sessions.is_empty();
+                if args.host_id.is_some() && native_busy {
+                    return Err(invalid(
+                        "a shared session is active; release it before starting another native pairing",
+                    ));
+                }
+                if args.host_id.is_some() && !host_registered {
+                    return Err(invalid(
+                        "the native messaging host is not registered; register it before pairing",
+                    ));
+                }
                 let native_snapshot = if !native_busy && host_registered {
-                    crate::native_setup::read_tabs().ok()
+                    if args.host_id.is_some() {
+                        Some(crate::native_setup::read_tabs().map_err(invalid)?)
+                    } else {
+                        crate::native_setup::read_tabs().ok()
+                    }
                 } else {
                     None
                 };
@@ -6579,6 +6593,54 @@ mod tests {
             socket.next().await,
             Some(Ok(Message::Close(_))) | None
         ));
+    }
+
+    #[tokio::test]
+    async fn native_pairing_reports_an_active_session_instead_of_stale_inventory() {
+        use super::{Parameters, SessionArgs};
+
+        let app = App::default();
+        let first = app
+            .session(Parameters(SessionArgs {
+                action: "pair_shared".into(),
+                provider: None,
+                session_id: None,
+                target_ids: Some(vec!["123".into()]),
+                host_id: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let result = app
+            .session(Parameters(SessionArgs {
+                action: "pair_shared".into(),
+                provider: None,
+                session_id: None,
+                target_ids: Some(vec!["456".into()]),
+                host_id: Some("0123456789abcdef0123456789abcdef".into()),
+            }))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("native pairing unexpectedly bypassed the active session"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message
+                .contains("release it before starting another native pairing")
+        );
+        assert!(!error.message.contains("fresh tab inventory"));
+
+        app.session(Parameters(SessionArgs {
+            action: "release_shared".into(),
+            provider: None,
+            session_id: first["session_id"].as_str().map(str::to_owned),
+            target_ids: None,
+            host_id: None,
+        }))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

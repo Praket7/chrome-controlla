@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const binary = path.join(__dirname, `controlla-core${process.platform === 'win32' ? '.exe' : ''}`);
+const binaryName = process.argv[2] === 'mcp' ? 'controlla-v2-core' : 'controlla-core';
+const binary = path.join(__dirname, `${binaryName}${process.platform === 'win32' ? '.exe' : ''}`);
 if (!fs.existsSync(binary)) {
   process.stderr.write(`Chrome Controlla binary is missing from this package: ${binary}\n`);
   process.exit(127);

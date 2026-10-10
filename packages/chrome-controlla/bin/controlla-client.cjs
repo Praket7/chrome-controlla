@@ -21,7 +21,7 @@ function parseArgs(argv) {
     else throw new Error(`unknown option: ${flag}`);
   }
   if (!out.server) {
-    out.server = path.join(__dirname, `controlla-core${process.platform === 'win32' ? '.exe' : ''}`);
+    out.server = path.join(__dirname, `controlla-v2-core${process.platform === 'win32' ? '.exe' : ''}`);
     out.serverArgs = ['mcp', ...out.serverArgs];
   }
   if (!Number.isInteger(out.timeout) || out.timeout < 100 || out.timeout > 600_000) throw new Error('--timeout-ms must be 100..600000');

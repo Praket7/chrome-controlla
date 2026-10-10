@@ -1292,9 +1292,6 @@ async fn key_type(
             ];
             for (event_index, event) in events.into_iter().enumerate() {
                 if event_index > 0 {
-                    if event_index == 2 {
-                        progress.push(character);
-                    }
                     let connection = shared.connection.as_ref().unwrap();
                     let guard = tokio::time::timeout_at(deadline, connection.command(
                     shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
@@ -1743,7 +1740,8 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Manage browser sessions and bounded task/file actions. Supports foreground, background, and headless modes; action=task runs bounded work; artifact_register/read use opaque private-headless handles."
+        description = "Manage browser sessions and bounded task/file actions. Supports foreground, background, and headless modes; action=task runs bounded work; artifact_register/read use opaque private-headless handles.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn browser(
         &self,
@@ -1967,7 +1965,8 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Return a compact semantic snapshot/delta with revision-bound @cN refs. Use before mutations and again after user/page changes."
+        description = "Return a compact semantic snapshot/delta with revision-bound @cN refs. Use before mutations and again after user/page changes.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn snapshot(
         &self,
@@ -1978,7 +1977,8 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Perform a guarded mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift."
+        description = "Perform a guarded mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Mutations lease the exact target and fail closed on drift.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn act(
         &self,
@@ -2064,7 +2064,8 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/page_tool/extract/verify and rejects unresolved refs or >40 steps."
+        description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/page_tool/extract/verify and rejects unresolved refs or >40 steps.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn workflow(
         &self,
@@ -2584,7 +2585,10 @@ impl AppV3 {
         ))
     }
 
-    #[tool(description = "Extract bounded structured page data without screenshots.")]
+    #[tool(
+        description = "Extract bounded structured page data without screenshots.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
+    )]
     async fn extract(
         &self,
         Parameters(args): Parameters<BrowserExtractArgs>,
@@ -2594,7 +2598,8 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Independently reobserve the browser and verify a semantic postcondition."
+        description = "Independently reobserve the browser and verify a semantic postcondition.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn verify(
         &self,
@@ -2655,6 +2660,12 @@ mod v3_batch_delivery_tests {
         assert!(tools.iter().all(|tool| {
             ["browser", "snapshot", "act", "workflow", "extract", "verify"]
                 .contains(&tool.name.as_ref())
+        }));
+        assert!(tools.iter().all(|tool| {
+            tool.output_schema
+                .as_ref()
+                .and_then(|schema| schema.get("type"))
+                == Some(&serde_json::Value::String("object".into()))
         }));
         let receipt = task_receipt(
             "extract",
@@ -3026,13 +3037,18 @@ mod v3_batch_delivery_tests {
             assert_eq!(observed.len(),4000);
             assert!(observed.as_chunks::<4>().0.iter().all(|events|events.iter().map(|event|event["type"].as_str().unwrap()).eq(["keydown","beforeinput","input","keyup"])));
             assert!(observed.iter().all(|event|event["trusted"]==true),"untrusted key event: {events}");
+            let human_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
+            let human_ref=human_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
+            let human=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"type","reference":human_ref,"expected_value":format!("before{payload}"),"value":"h","typing_mode":"human_keys","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(human["status"],"verified","{human}");
+            assert_eq!(human["readback"],format!("before{payload}h"));
             let fresh=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
             let target_ref=fresh["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
             eval("window.blurOnKeydown=true".into()).await;
-            let interrupted=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"type","reference":target_ref,"expected_value":format!("before{payload}"),"value":"Z","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
+            let interrupted=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"type","reference":target_ref,"expected_value":format!("before{payload}h"),"value":"Z","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
             assert_eq!(interrupted["status"],"unknown","{interrupted}");
             let values=eval("JSON.stringify([document.querySelector('#trusted').value,document.querySelector('#other').value])".into()).await["result"]["value"].as_str().unwrap().to_owned();
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&values).unwrap(),json!([format!("before{payload}"),""]));
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&values).unwrap(),json!([format!("before{payload}h"),""]));
             let key_events=eval("JSON.stringify({source:window.events.slice(-1),other:window.otherEvents})".into()).await["result"]["value"].as_str().unwrap().to_owned();
             let key_events:serde_json::Value=serde_json::from_str(&key_events).unwrap();
             assert_eq!(key_events["source"][0]["type"],"keydown");
@@ -3041,7 +3057,7 @@ mod v3_batch_delivery_tests {
             eval("document.querySelector('#trusted').focus();window.blurOnKeydown=true".into()).await;
             let fresh=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"124"}))).await.unwrap().structured_content.unwrap();
             let target_ref=fresh["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
-            let interrupted=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"124","action":"type","reference":target_ref,"expected_value":format!("before{payload}"),"value":"Y","typing_mode":"human_keys","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
+            let interrupted=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"124","action":"type","reference":target_ref,"expected_value":format!("before{payload}h"),"value":"Y","typing_mode":"human_keys","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
             assert_eq!(interrupted["status"],"unknown","{interrupted}");
             let key_events=eval("JSON.stringify({source:window.events.slice(-1),other:window.otherEvents})".into()).await["result"]["value"].as_str().unwrap().to_owned();
             let key_events:serde_json::Value=serde_json::from_str(&key_events).unwrap();

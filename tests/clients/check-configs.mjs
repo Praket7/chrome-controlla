@@ -63,6 +63,17 @@ assert.deepEqual(mcp.mcpServers?.['chrome-controlla'], {
 const launch = await readFile(path.join(pluginRoot, 'launch.cjs'), 'utf8');
 assert.match(launch, /controlla-v2-core/);
 assert.match(launch, /CONTROLLA_V2_BIN/);
+const packageBin = fileURLToPath(new URL('../../packages/chrome-controlla/bin/', import.meta.url));
+const [defaultLauncher, shellLauncher, windowsLauncher, clientLauncher] = await Promise.all([
+  readFile(path.join(packageBin, 'controlla.cjs'), 'utf8'),
+  readFile(path.join(packageBin, 'controlla'), 'utf8'),
+  readFile(path.join(packageBin, 'controlla.cmd'), 'utf8'),
+  readFile(path.join(packageBin, 'controlla-client.cjs'), 'utf8'),
+]);
+assert.match(defaultLauncher, /process\.argv\[2\].*mcp[\s\S]*controlla-v2-core/);
+assert.match(shellLauncher, /if \[ "\$\{1-\}" = "mcp" \][\s\S]*controlla-v2-core/);
+assert.match(windowsLauncher, /"%~1".*"mcp"[\s\S]*controlla-v2-core\.exe/);
+assert.match(clientLauncher, /controlla-v2-core/);
 const skill = await readFile(path.join(pluginRoot, 'skills/browser-control/SKILL.md'), 'utf8');
 assert.match(skill, /Never automatically retry an unknown outcome/);
 assert.match(skill, /explicitly discover and pair only the tabs the user selected/);

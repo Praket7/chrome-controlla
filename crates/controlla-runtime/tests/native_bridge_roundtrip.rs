@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -55,7 +55,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 let mut socket = accept_async(stream).await.map_err(|e| e.to_string())?;
                 let hello = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "hello timed out".to_owned())?.ok_or("provider socket closed before hello")?.map_err(|e| e.to_string())?;
                 let hello: Value = serde_json::from_str(hello.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true}) {
+                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true}) {
                     return Err(format!("unexpected provider hello: {hello}"));
                 }
                 socket.send(Message::Text(json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")}).to_string().into())).await.map_err(|e| e.to_string())?;
@@ -65,6 +65,12 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 let result: Value = serde_json::from_str(result.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 if result != json!({"type":"result","id":7,"result":{"result":{"type":"number","value":2}}}) {
                     return Err(format!("unexpected command result: {result}"));
+                }
+                socket.send(Message::Text(json!({"type":"batch","id":8,"target_id":"42","actions":[{"method":"Input.dispatchKeyEvent","params":{"type":"keyDown","key":"x"}}],"deadline_ms":5000}).to_string().into())).await.map_err(|e| e.to_string())?;
+                let batch = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "batch result timed out".to_owned())?.ok_or("provider socket closed before batch result")?.map_err(|e| e.to_string())?;
+                let batch: Value = serde_json::from_str(batch.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                if batch != json!({"type":"batch_result","id":8,"result":{"completed":1}}) {
+                    return Err(format!("unexpected batch result: {batch}"));
                 }
                 Ok(())
             })
@@ -152,7 +158,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         );
         write_native(
             &mut input,
-            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true}),
+            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true}),
         );
         ready_rx.recv_timeout(TIMEOUT).unwrap_or_else(|e| {
             let _ = std::process::Command::new("kill")
@@ -176,6 +182,23 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         write_native(
             &mut input,
             json!({"type":"result","id":7,"result":{"result":{"type":"number","value":2}}}),
+        );
+        let batch_deadline = Instant::now() + TIMEOUT;
+        let batch = loop {
+            assert!(
+                Instant::now() < batch_deadline,
+                "native host did not forward provider batch"
+            );
+            let msg = next();
+            if msg["type"] == "batch" {
+                break msg;
+            }
+        };
+        assert_eq!(batch["id"], 8);
+        assert_eq!(batch["actions"].as_array().unwrap().len(), 1);
+        write_native(
+            &mut input,
+            json!({"type":"batch_result","id":8,"result":{"completed":1}}),
         );
         provider_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
         assert_eq!(
