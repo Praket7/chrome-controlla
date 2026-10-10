@@ -73,6 +73,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "filename",
         "bytes",
         "artifact_handle",
+        "client_id",
     ] {
         assert!(
             browser["properties"].get(property).is_some(),

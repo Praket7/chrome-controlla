@@ -58,6 +58,7 @@ struct V3BrowserArgs {
     filename: Option<String>,
     bytes: Option<Vec<u8>>,
     artifact_handle: Option<String>,
+    client_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -1758,7 +1759,7 @@ impl AppV3 {
                         .chrome_tab_id
                         .ok_or_else(|| invalid("chrome_tab_id is required"))?,
                     task: args.task.ok_or_else(|| invalid("task is required"))?,
-                    client_id: None,
+                    client_id: args.client_id,
                 }))
                 .await;
         }
