@@ -17,7 +17,23 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
-const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||(e.hasAttribute('data-requires-trusted')&&!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(t)))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+pub const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||(e.hasAttribute('data-requires-trusted')&&!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(t)))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+/// Why a click was refused before any input was dispatched.
+enum ClickRefusal {
+    /// Typed guard failure; already shaped as the compact `not_dispatched` result.
+    Guard(Value),
+    Msg(String),
+}
+impl From<String> for ClickRefusal {
+    fn from(message: String) -> Self {
+        ClickRefusal::Msg(message)
+    }
+}
+impl From<&str> for ClickRefusal {
+    fn from(message: &str) -> Self {
+        ClickRefusal::Msg(message.to_owned())
+    }
+}
 const SHARED_TYPE_GUARD_FUNCTION: &str = r#"function(selector,expected,finalCheck){const e=this.node;let es;try{es=[...document.querySelectorAll(selector)]}catch(_){return {ok:false,reason:'invalid_selector'};}if(!e||!e.isConnected||es.length!==1||es[0]!==e)return {ok:false,reason:'target_replaced'};e.scrollIntoView({block:'nearest'});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'typing_requires_focused_end_caret'};return finalCheck?{ok:e.value===expected,value:e.value}:{ok:true};}"#;
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -2636,14 +2652,15 @@ impl App {
                 shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
                     .await?;
             if identity != snapshot.identity {
-                return Err("stale document; take a fresh snapshot".to_owned());
+                return Err(ClickRefusal::Guard(crate::guard_reason::refusal(
+                    &json!({"ok":false,"reason":"document_changed"}),
+                )));
             }
-            let guard = include_str!("shared_page/guard.js")
-                .replace("__UNSAFE__", SHARED_CLICK_UNSAFE_PREDICATE);
+            let guard = crate::guard_reason::click_guard_script(SHARED_CLICK_UNSAFE_PREDICATE);
             let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
             let value = shared_value(&response)?;
             if value["ok"] != true {
-                return Err(format!("target refused: {}", value["reason"]));
+                return Err(ClickRefusal::Guard(crate::guard_reason::refusal(&value)));
             }
             if evaluate_shared_outcome(
                 &shared,
@@ -2655,20 +2672,23 @@ impl App {
             )
             .await?
             {
-                return Err("outcome already satisfied; no click needed".to_owned());
+                return Err("outcome already satisfied; no click needed".into());
             }
             Ok(guard)
         };
         let guard = match tokio::time::timeout_at(deadline, prepare).await {
             Ok(Ok(guard)) => guard,
             result => {
-                let reason = match result {
-                    Ok(Err(e)) => e,
-                    _ => "preflight timed out".into(),
+                let refusal = match result {
+                    Ok(Err(ClickRefusal::Guard(value))) => value,
+                    Ok(Err(ClickRefusal::Msg(reason))) => {
+                        json!({"status":"not_dispatched","reason":reason,"dispatch_acknowledged":false})
+                    }
+                    _ => {
+                        json!({"status":"not_dispatched","reason":"preflight timed out","dispatch_acknowledged":false})
+                    }
                 };
-                return Ok(rmcp::handler::server::wrapper::Json(
-                    json!({"status":"not_dispatched","reason":reason,"dispatch_acknowledged":false}),
-                ));
+                return Ok(rmcp::handler::server::wrapper::Json(refusal));
             }
         };
         // Consume before dispatch: even a lost reply must not permit a duplicate click with this reference.
@@ -2688,9 +2708,13 @@ impl App {
             _ => Value::Null,
         };
         if checked["ok"] != true {
-            return Ok(rmcp::handler::server::wrapper::Json(
-                json!({"status":"not_dispatched","reason":"target changed during revalidation; take one fresh snapshot","dispatch_acknowledged":false}),
-            ));
+            let mut refusal = if checked["reason"].is_string() {
+                crate::guard_reason::refusal(&checked)
+            } else {
+                json!({"status":"not_dispatched","reason":"target_changed_during_revalidation","reason_code":"changed_target","retry_class":"refresh_snapshot","dispatch_acknowledged":false})
+            };
+            refusal["phase"] = json!("revalidation");
+            return Ok(rmcp::handler::server::wrapper::Json(refusal));
         }
         let fresh = tokio::time::timeout_at(
             deadline,

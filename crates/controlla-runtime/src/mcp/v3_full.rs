@@ -544,8 +544,7 @@ async fn headless_download(
     if before != snapshot.identity {
         return Ok(json!({"status":"not_dispatched","reason":"document changed before download"}));
     }
-    let guard = include_str!("../shared_page/guard.js")
-        .replace("__UNSAFE__", super::super::SHARED_CLICK_UNSAFE_PREDICATE);
+    let guard = crate::guard_reason::click_guard_script(super::super::SHARED_CLICK_UNSAFE_PREDICATE);
     let check = |object_id: &str, index: usize| {
         json!({"objectId":object_id,
         "functionDeclaration":guard,"arguments":[{"value":index},{"value":{"kind":"download"}}],"returnByValue":true})
@@ -562,7 +561,7 @@ async fn headless_download(
         .map_err(invalid)?;
     let first = super::super::shared_value(&first).map_err(invalid)?;
     if first["ok"] != true {
-        return Ok(json!({"status":"not_dispatched","reason":first["reason"]}));
+        return Ok(crate::guard_reason::refusal(&first));
     }
     let directory = browser.profile_directory().join("controlla-downloads");
     if directory.exists() {
