@@ -1,5 +1,8 @@
 # Chrome Controlla: extraction and improvement specification
 
+> **Superseded note 2026-10-10:** The five-tool proposal in §5 (session/observe/execute/jobs/guide) is superseded by `compact-agent-surface-v3.md` which defines the authoritative six default tools (`browser`, `snapshot`, `act`, `workflow`, `extract`, `verify`) and 48KiB/512KiB budgets. The six-tool contract is the source of truth for V3; do not implement the five-tool surface.
+
+
 Status: proposed engineering specification, 2026-10-06. Source baseline: Comptrol `38a9d7eae0808a04b66e57d8658167c7667b4935`. Research rationale and primary-source links are in [research.md](research.md). Execution plan: [build.md](build.md). Canonical agent behavior: [MASTER_GUIDE.md](../MASTER_GUIDE.md).
 
 ## 1. Product boundary

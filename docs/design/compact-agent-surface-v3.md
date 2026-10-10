@@ -32,3 +32,11 @@ Foreground, background-headed, and headless sessions share one semantic and veri
 ## Multi-client behavior
 
 Reads may share a target. Conflicting mutations require a target/document lease. Separate tabs may execute concurrently. A client cannot silently steal mutable authority from another client, and disconnect cleanup never expands authority.
+
+## Bounded browser program (2026-10-10)
+
+`workflow` is a single shared contract compiled before execution. Vocabulary: `navigate`, `snapshot`, `find`, `find_all`, `choose`, `click`, `fill`, `type`, `press`, `select`, `wait_for`, `observe`, `extract`, `assert`, `verify`, `checkpoint`, `page_tool`. `script` remains isolated and negotiated.
+
+Typed variables: `Reference`, `References`, `String`, `Number`, `Bool`, bounded `Object`/`Array` (max 64 keys / 128 items). Control flow: `if`, `foreach` (max 32 items, explicit cardinality), `try_fallback` (fallback only after `not_dispatched`, never after `unknown`), `parallel_read` (read-only only), `wait_until`, `project`. Hard limits: no recursion, no unbounded loop, max 64 expanded steps, every probe/candidate/branch bounded at compile or request time.
+
+Collection: `find_all` returns bounded references with scoring metadata; `choose` selects deterministically by `datetime` (HTML `time[datetime]` + visible timestamp parsing), `dom_order`, `numeric`, `text`, returning the selected reference plus freshness evidence or `unresolved_latest` when no trustworthy ordering exists. Verification supports URL equals/prefix/normalized, title equals/contains, selected href equals resulting URL, element/text/value/visible/selected/expanded predicates, producing a compact `EvidenceReceipt` (candidate title/href/freshness, resulting URL/title, verified boolean). Visual probes (`element_focus`, `region_focus`) are bounded inside `snapshot`/`workflow` and evidence memory holds only probed/acted/committed bytes (max 3 / 512KiB).

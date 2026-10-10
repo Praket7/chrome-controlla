@@ -1,18 +1,38 @@
 ---
 name: browser-control
-description: Use when controlling Chrome through Controlla; preserves explicit tab authority, fresh semantic references, verification, and unknown-delivery safety.
+description: Use when controlling Chrome through Controlla; preserves explicit tab authority, fresh semantic references, verification, and unknown-delivery safety. Exposes exactly six V3 tools.
 ---
 
-# Chrome browser control
+# Chrome browser control — Controlla V3
 
-Use the compact Controlla tools as a safety-preserving hierarchy:
+Controlla V3 exposes exactly six default MCP tools:
 
-1. Start with `browser_session` and explicitly discover and pair only the tabs the user selected. Seeing a tab is not authority to mutate it.
-2. Prefer `browser_snapshot` and `browser_find`. Use only the exact `@cN` references returned by the latest semantic state.
-3. Use `browser_workflow` for bounded multi-step work when the references and expected state are known.
-4. Use `browser_act` for guarded mutations. Supply expected values when the schema supports them.
-5. After a mutation, use the returned fresh state or `browser_verify` before claiming success.
-6. If any mutation returns `unknown`, inspect the browser state before deciding what to do next. Never automatically retry an unknown outcome.
-7. Use `browser_probe` only when semantic state is insufficient; avoid full-page visual work by default.
-8. If navigation, document replacement, human edits, or target drift invalidate a reference, take a fresh snapshot and resolve the target again.
-9. Do not bypass selected-tab authority, stale-reference checks, or verification by switching to lower-level browser access.
+- `browser` — create, attach, select, inspect browser sessions and explicit target authority
+- `snapshot` — return compact semantic state or revision-bound delta
+- `act` — perform one guarded action (click, fill, type, press, select, upload, navigate)
+- `workflow` — execute a bounded deterministic action graph with partial receipts
+- `extract` — return bounded structured data, URLs, citations, artifact metadata
+- `verify` — independently observe and evaluate postconditions after a mutation
+
+No other default tools exist. Screenshots, raw trees, skill admin, and benchmark controls are negotiated capabilities.
+
+## Decision table
+
+| Need | Tool |
+|---|---|
+| session/tab/mode/navigation/task | `browser` |
+| fresh semantic state | `snapshot` |
+| known multi-step operation | `workflow` |
+| single mutation | `act` |
+| structured page output | `extract` |
+| proof | `verify` |
+
+Common tasks should use one compiled `workflow` instead of many individual `act` calls. Repeated qualified tasks may use deterministic replay with fresh guards.
+
+## Recovery policy
+
+- Never blind retry `unknown` — delivery status unknown means the side effect may have occurred; observe fresh state instead.
+- Follow `retry_class` and `next_action` from the structured result: `safe_internal` may be repaired inside the same workflow budget (bounded scroll/remeasure), `refresh_snapshot` requires one fresh semantic snapshot, `requires_user` and `do_not_retry` must stop.
+- Prefer a single bounded workflow over repeated `snapshot -> find -> act` loops.
+- Use a targeted visual probe only after semantics fail, within the probe budget (max 3 crops per workflow). Full screenshot is final fallback.
+- Every nonverified result includes `reason_code`, `retry_class`, `next_action`, `dispatch_may_have_occurred`; never use bare `blocked`.

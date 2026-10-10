@@ -5,13 +5,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const binaryName = process.argv[2] === 'mcp' ? 'controlla-v2-core' : 'controlla-core';
-const binary = path.join(__dirname, `${binaryName}${process.platform === 'win32' ? '.exe' : ''}`);
-if (!fs.existsSync(binary)) {
+// Single current MCP binary — no V2 debt
+const binary = path.join(__dirname, `controlla${process.platform === 'win32' ? '.exe' : ''}`);
+const legacyV2 = path.join(__dirname, `controlla-v2-core${process.platform === 'win32' ? '.exe' : ''}`);
+const target = fs.existsSync(binary) ? binary : legacyV2;
+if (!fs.existsSync(target)) {
   process.stderr.write(`Chrome Controlla binary is missing from this package: ${binary}\n`);
   process.exit(127);
 }
-const child = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' });
+if (target === legacyV2) {
+  process.stderr.write('controlla-v2-core is deprecated; use controlla\n');
+}
+const child = spawnSync(target, process.argv.slice(2), { stdio: 'inherit' });
 if (child.error) {
   process.stderr.write(`Could not start the package-local Chrome Controlla binary: ${child.error.message}\n`);
   process.exit(127);

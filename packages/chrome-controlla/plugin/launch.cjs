@@ -5,15 +5,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const override = process.env.CONTROLLA_V2_BIN;
+const override = process.env.CONTROLLA_BIN;
 if (override && !path.isAbsolute(override)) {
-  process.stderr.write('CONTROLLA_V2_BIN must be an absolute path when set.\n');
+  process.stderr.write('CONTROLLA_BIN must be an absolute path when set.\n');
   process.exit(2);
 }
-const binary = override || path.join(__dirname, '..', 'bin', `controlla-v2-core${process.platform === 'win32' ? '.exe' : ''}`);
+const binary = override || path.join(__dirname, '..', 'bin', `controlla${process.platform === 'win32' ? '.exe' : ''}`);
 if (!fs.existsSync(binary) || !fs.statSync(binary).isFile()) {
-  process.stderr.write(`Chrome Controlla v2 binary is missing from this package: ${binary}\n`);
+  process.stderr.write(`Chrome Controlla binary is missing from this package: ${binary}\n`);
   process.exit(127);
+}
+const compat = process.env.CONTROLLA_V2_BIN;
+if (compat) {
+  process.stderr.write('CONTROLLA_V2_BIN is deprecated; use CONTROLLA_BIN.\n');
 }
 
 const child = spawn(binary, [], { stdio: 'inherit', env: process.env });
@@ -26,12 +30,12 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 child.on('error', (error) => {
-  process.stderr.write(`Could not start Chrome Controlla v2: ${error.message}\n`);
+  process.stderr.write(`Could not start Chrome Controlla: ${error.message}\n`);
   process.exitCode = 127;
 });
 child.on('exit', (code, signal) => {
   if (signal) {
-    process.stderr.write(`Chrome Controlla v2 exited after ${signal}.\n`);
+    process.stderr.write(`Chrome Controlla exited after ${signal}.\n`);
     process.exitCode = 1;
   } else {
     process.exitCode = code ?? 1;
