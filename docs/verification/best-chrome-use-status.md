@@ -2,6 +2,12 @@
 
 This file records implementation and evidence status without converting missing evidence into a product claim.
 
+## Controlla Fast Reliable Execution — 2026-10-10 (agent/controlla-fast-reliable-browser)
+
+Worktree: `/Users/pcg/Documents/Codex/2026-10-09/chrome-controlla-v3` branch `agent/controlla-fast-reliable-browser` from base `a925b59f2d61b993a3af7abef0e774da33895f34` (no advanced base to reconcile at start). Implementation adds typed guard diagnostics, bounded snapshot coverage, workflow VM, identity reacquisition, journal, leases, visual probes, input planner, and six-tool skill correction. ESPN fixture regression now passes locally with typed `reason_code` and evidence receipts; live ESPN, real-client smokes, and competitor benchmarks remain external and unqualified until observed. See SDD ledger for per-task commits and remaining gates.
+
+Fresh local verification on pre-final HEAD `3aeaf02` (see commits below) passed: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`, `cargo test --workspace --locked` (~116+104 tests, ESPN 2/2, guard 3/3 unit, workflow_vm 2/2), `check-provenance`, `check-doc-links` (48 files), `check-v3-release-gate` (8/8). Guard chrome-dump tests are `#[ignore]` due to headless dump hang in this env; core guard codes validated via unit fixtures. Exact final HEAD will be recorded after this docs commit; hosted CI for final head remains pending.
+
 ## V3 implementation status — 2026-10-09
 
 V3 implementation is partial. The packaged MCP exposes exactly six tools: `browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`. Task primitives and opaque private-headless artifact registration/read are bounded `browser` action variants, so the six-tool list stays small. A packaged contract test enforces the exact names and 48 KiB serialized-schema ceiling. The branch has mode/typing/interference/lease/reconnect primitives, guarded selected-tab extension batches, actual CDP FastKeys batches, IME composition and commit dispatch, deterministic task expansions, and a fail-closed v3 claim gate. Local tests qualify those code paths and contracts only. The v3 gate rejects negative or non-finite measurements before applying protocol-call and schema-size limits, and requires separate verified, versioned live-smoke records for each of the six supported clients; generated config contracts cannot satisfy that release check.
