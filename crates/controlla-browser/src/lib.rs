@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
 mod blocking;
+pub mod coordination;
 mod input;
+pub mod input_planner;
 mod manager;
 pub mod native;
 mod observe;

@@ -135,6 +135,7 @@ async fn run_latest_story(overlay: bool) -> serde_json::Value {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn espn_latest_story_flow_completes_and_verifies_newest() {
     let _serial = TEST_LOCK.lock().unwrap();
     let result = run_latest_story(false).await;
@@ -162,6 +163,7 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn espn_latest_story_recovers_from_safe_obstruction_without_model_retry() {
     let _serial = TEST_LOCK.lock().unwrap();
     let result = run_latest_story(true).await;

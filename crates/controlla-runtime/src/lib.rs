@@ -7,6 +7,8 @@ pub mod capability;
 pub mod capability_router;
 pub mod capcut_recipe;
 pub mod doctor;
+pub mod execution_journal;
+pub mod guard_reason;
 pub mod http_auth;
 pub mod http_server;
 pub mod jobs;
@@ -14,6 +16,9 @@ pub mod mcp;
 pub mod metrics;
 pub mod native_host;
 pub mod native_setup;
+pub mod page_tool_schema;
+pub mod process_lease;
+pub mod reference_reacquire;
 pub mod runtime_observer;
 pub mod semantic_state;
 pub mod skill_runtime;
@@ -24,7 +29,10 @@ pub mod v3;
 pub mod v3_runtime;
 pub mod v3_tasks;
 pub mod verifier;
+pub mod visual_probe;
 pub mod workflow;
+pub mod workflow_value;
+pub mod workflow_vm;
 
 #[cfg(test)]
 mod tests {

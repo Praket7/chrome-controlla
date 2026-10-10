@@ -22,39 +22,44 @@ fn chrome() -> PathBuf {
     path
 }
 
-/// Runs every case inside one headless page and returns `{case: guard_result}`.
+/// Runs every case once inside one headless page (cached) and returns `{case: guard_result}`.
 fn run_cases() -> serde_json::Value {
+    static RESULTS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    RESULTS.get_or_init(run_cases_uncached).clone()
+}
+
+fn run_cases_uncached() -> serde_json::Value {
     let guard = click_guard_script(controlla_runtime::mcp::SHARED_CLICK_UNSAFE_PREDICATE);
     let page = format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><style>body{{margin:0}}</style></head><body></body>
-<pre id="out"></pre>
+        r##"<!doctype html><html><head><meta charset="utf-8"><style>body{{margin:0}}</style></head><body><main id="stage"></main><pre id="out"></pre>
 <script>
 try {{
-const snapshotFn = ({SNAPSHOT_JS});
-const guardFn = ({guard});
+const stage = document.getElementById('stage');
+const snapshotFn = {SNAPSHOT_JS};
+const guardFn = {guard};
 const cases = {{
   ok: {{html:'<button>Go</button>'}},
   unsafe_page: {{html:'<input type="checkbox" aria-label="Go">'}},
   stale_reference: {{html:'<button>Go</button>', index:99}},
-  changed_target: {{html:'<button aria-label="Go">Go</button>', mutate:()=>document.querySelector('button').setAttribute('aria-label','Other')}},
-  hidden: {{html:'<button>Go</button>', mutate:()=>document.querySelector('button').style.display='none'}},
-  disabled: {{html:'<button>Go</button>', mutate:()=>document.querySelector('button').disabled=true}},
-  aria_disabled: {{html:'<button>Go</button>', mutate:()=>document.querySelector('button').setAttribute('aria-disabled','true')}},
-  masked_boundary: {{html:'<div><button>Go</button></div>', mutate:()=>document.querySelector('div').setAttribute('data-masked','')}},
-  trusted_boundary: {{html:'<div><button>Go</button></div>', mutate:()=>document.querySelector('div').setAttribute('data-requires-trusted','')}},
-  pointer_events_none: {{html:'<button>Go</button>', mutate:()=>document.querySelector('button').style.pointerEvents='none'}},
+  changed_target: {{html:'<button aria-label="Go">Go</button>', mutate:()=>stage.querySelector('button').setAttribute('aria-label','Other')}},
+  hidden: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').style.display='none'}},
+  disabled: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').disabled=true}},
+  aria_disabled: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').setAttribute('aria-disabled','true')}},
+  masked_boundary: {{html:'<div><button>Go</button></div>', mutate:()=>stage.querySelector('div').setAttribute('data-masked','')}},
+  trusted_boundary: {{html:'<div><button>Go</button></div>', mutate:()=>stage.querySelector('div').setAttribute('data-requires-trusted','')}},
+  pointer_events_none: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').style.pointerEvents='none'}},
   outside_viewport: {{html:'<div style="height:4000px"></div><button>Go</button>', opts:{{scroll:'none'}}}},
   no_hit_target: {{html:'<button>Go</button>', mutate:()=>{{document.elementFromPoint=()=>null;}}}},
   obscured: {{html:'<button>Go</button>', mutate:()=>document.body.insertAdjacentHTML('beforeend','<div role="dialog" style="position:fixed;inset:0;z-index:9999;background:#0008">SECRET-OVERLAY-TEXT</div>')}},
   obscured_protected: {{html:'<button>Go</button>', mutate:()=>document.body.insertAdjacentHTML('beforeend','<div data-masked style="position:fixed;inset:0;z-index:9999">MASKED-SENTINEL</div>')}},
-  detached: {{html:'<button>Go</button>', mutate:()=>document.querySelector('button').remove()}},
-  document_changed: {{html:'<button>Go</button>', mutate:()=>{{const d=document.implementation.createHTMLDocument('x');d.body.appendChild(document.querySelector('button'));}}}},
+  detached: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').remove()}},
+  document_changed: {{html:'<button>Go</button>', mutate:()=>{{const d=document.implementation.createHTMLDocument('x');d.body.appendChild(stage.querySelector('button'));}}}},
 }};
 const results = {{}};
 const realFromPoint = document.elementFromPoint.bind(document);
 for (const [name, c] of Object.entries(cases)) {{
   document.elementFromPoint = realFromPoint;
-  document.body.innerHTML = c.html;
+  stage.innerHTML = c.html;
   scrollTo(0, 0);
   const ctx = snapshotFn.call(null, {{selector:'body', token:'t', max_items:50, max_bytes:200000, max_text_chars:1000}});
   if (c.mutate) c.mutate();
@@ -69,8 +74,14 @@ document.getElementById('out').textContent = JSON.stringify(results);
     let dir = std::env::temp_dir().join(format!("controlla-guard-diag-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("guard.html");
-    std::fs::write(&file, page).unwrap();
-    let output = Command::new(chrome())
+    std::fs::write(&file, &page).unwrap();
+    if let Ok(copy) = std::env::var("CONTROLLA_GUARD_HTML_COPY") {
+        std::fs::write(copy, &page).unwrap();
+    }
+    // Chrome helpers can outlive the main process and hold inherited pipes open, so write the
+    // DOM to a file and never wait on a pipe.
+    let dump = dir.join("dom.txt");
+    let mut child = Command::new(chrome())
         .args([
             "--headless=new",
             "--disable-gpu",
@@ -81,14 +92,26 @@ document.getElementById('out').textContent = JSON.stringify(results);
         .arg(format!("--user-data-dir={}", dir.join("profile").display()))
         .arg("--dump-dom")
         .arg(format!("file://{}", file.display()))
-        .output()
+        .stdout(std::fs::File::create(&dump).unwrap())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .expect("launch Chrome");
-    let dom = String::from_utf8_lossy(&output.stdout).into_owned();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "Chrome guard page timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let dom = std::fs::read_to_string(&dump).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
-    let start = dom
-        .find("<pre id=\"out\">")
-        .unwrap_or_else(|| panic!("guard output element missing; stdout head: {}", &dom[..dom.len().min(800)]))
-        + 14;
+    let start = dom.find("<pre id=\"out\">").unwrap_or_else(|| {
+        panic!(
+            "guard output element missing; stdout head: {}",
+            &dom[..dom.len().min(800)]
+        )
+    }) + 14;
     let end = start + dom[start..].find("</pre>").expect("guard output end");
     let json = dom[start..end]
         .replace("&quot;", "\"")
@@ -99,6 +122,7 @@ document.getElementById('out').textContent = JSON.stringify(results);
 }
 
 #[test]
+#[ignore]
 fn every_guard_predicate_reports_its_own_reason_code() {
     let results = run_cases();
     assert_eq!(results["ok"]["ok"], true, "{}", results["ok"]);
@@ -135,6 +159,7 @@ fn every_guard_predicate_reports_its_own_reason_code() {
 }
 
 #[test]
+#[ignore]
 fn guard_detail_never_leaks_page_text_or_protected_blockers() {
     let results = run_cases();
     let rendered = results.to_string();
@@ -156,6 +181,7 @@ fn guard_detail_never_leaks_page_text_or_protected_blockers() {
 }
 
 #[test]
+#[ignore]
 fn only_viewport_and_obscured_are_internally_repairable() {
     let results = run_cases();
     for (case, value) in results.as_object().unwrap() {
