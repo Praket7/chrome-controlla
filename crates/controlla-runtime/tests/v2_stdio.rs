@@ -52,25 +52,28 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert_eq!(
         names,
         BTreeSet::from([
-            "act",
-            "artifact_read",
-            "artifact_register",
-            "browser",
-            "extract",
-            "snapshot",
-            "task",
-            "verify",
-            "workflow"
+            "act", "browser", "extract", "snapshot", "verify", "workflow"
         ])
     );
-    assert_eq!(tools.tools.len(), 9);
+    assert_eq!(tools.tools.len(), 6);
 
     let schema = |name: &str| {
         let tool = tools.tools.iter().find(|tool| tool.name == name).unwrap();
         serde_json::to_value(&tool.input_schema).unwrap()
     };
     let browser = schema("browser");
-    for property in ["action", "mode", "provider", "session_id", "target_ids"] {
+    for property in [
+        "action",
+        "mode",
+        "provider",
+        "session_id",
+        "target_ids",
+        "chrome_tab_id",
+        "task",
+        "filename",
+        "bytes",
+        "artifact_handle",
+    ] {
         assert!(
             browser["properties"].get(property).is_some(),
             "browser {property}"
@@ -90,13 +93,6 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         assert!(act["properties"].get(property).is_some(), "act {property}");
     }
     let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
-    let task = schema("task");
-    for property in ["session_id", "chrome_tab_id", "task"] {
-        assert!(
-            task["properties"].get(property).is_some(),
-            "task {property}"
-        );
-    }
     for step in [
         "snapshot", "find", "click", "fill", "type", "press", "extract", "verify",
     ] {
@@ -121,11 +117,12 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .structured_content
         .unwrap();
     let session_id = paired["session_id"].as_str().unwrap();
-    let request = serde_json::json!({"session_id":session_id,"chrome_tab_id":"123",
+    let request = serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":"123",
         "task":{"kind":"download","reference":"@c1"}});
     let result = client
         .call_tool(
-            CallToolRequestParams::new("task").with_arguments(request.as_object().unwrap().clone()),
+            CallToolRequestParams::new("browser")
+                .with_arguments(request.as_object().unwrap().clone()),
         )
         .await
         .unwrap();
@@ -134,11 +131,11 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert_eq!(receipt["steps"], 1);
     assert_eq!(receipt["receipts"][0]["verified"], false);
 
-    let research = serde_json::json!({"session_id":"unpaired","chrome_tab_id":"123",
+    let research = serde_json::json!({"action":"task","session_id":"unpaired","chrome_tab_id":"123",
         "task":{"kind":"research","urls":["https://example.test/a","https://example.test/b"],"selector":"article"}});
     let result = client
         .call_tool(
-            CallToolRequestParams::new("task")
+            CallToolRequestParams::new("browser")
                 .with_arguments(research.as_object().unwrap().clone()),
         )
         .await
@@ -200,8 +197,8 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
         .unwrap();
     let result = client
         .call_tool(call(
-            "task",
-            serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,
+            "browser",
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
         "task":{"kind":"download","reference":reference}}),
         ))
         .await
@@ -212,8 +209,8 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
     let handle = result["receipts"][0]["artifact_handle"].as_str().unwrap();
     let read = client
         .call_tool(call(
-            "artifact_read",
-            serde_json::json!({"session_id":session_id,"artifact_handle":handle}),
+            "browser",
+            serde_json::json!({"action":"artifact_read","session_id":session_id,"artifact_handle":handle}),
         ))
         .await
         .unwrap()
@@ -226,8 +223,8 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
     assert_eq!(read["sha256"], result["receipts"][0]["sha256"]);
     let registered = client
         .call_tool(call(
-            "artifact_register",
-            serde_json::json!({"session_id":session_id,
+            "browser",
+            serde_json::json!({"action":"artifact_register","session_id":session_id,
         "filename":"upload.txt","bytes":[117,112,108,111,97,100]}),
         ))
         .await
@@ -237,8 +234,8 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
     let upload_handle = registered["artifact_handle"].as_str().unwrap();
     let uploaded = client
         .call_tool(call(
-            "task",
-            serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,
+            "browser",
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
         "task":{"kind":"upload","artifact_handle":upload_handle,"selector":"#file",
             "account_marker":["#account","Account A"]}}),
         ))
@@ -323,8 +320,8 @@ async fn private_headless_task_research_draft_and_repeat() {
     let tab_id = launch["target_ids"][0].as_str().unwrap();
     let research = client
         .call_tool(call(
-            "task",
-            serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,
+            "browser",
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
         "task":{"kind":"research","urls":[url_a,url_b],"selector":"main"}}),
         ))
         .await
@@ -352,7 +349,7 @@ async fn private_headless_task_research_draft_and_repeat() {
     let save = items.iter().find(|item| item["name"] == "Save").unwrap()["reference"]
         .as_str()
         .unwrap();
-    let draft = client.call_tool(call("task", serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,
+    let draft = client.call_tool(call("browser", serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
         "task":{"kind":"form_draft","fields":[{"reference":name,"expected_value":"before","value":"after"}],
             "save_without_submit":true,"save_control":{"reference":save,"confirmation_selector":"#saved","confirmation_text":"Saved"}}})))
         .await.unwrap().structured_content.unwrap();
@@ -360,8 +357,8 @@ async fn private_headless_task_research_draft_and_repeat() {
     assert_eq!(draft["receipts"][1]["kind"], "save_draft");
     let repeat = client
         .call_tool(call(
-            "task",
-            serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,
+            "browser",
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
         "task":{"kind":"repeat","references":[name,save],"action":"verify_visible"}}),
         ))
         .await

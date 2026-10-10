@@ -49,10 +49,15 @@ struct V3BrowserArgs {
     action: String,
     provider: Option<String>,
     session_id: Option<String>,
+    chrome_tab_id: Option<String>,
     target_ids: Option<Vec<String>>,
     host_id: Option<String>,
     mode: Option<String>,
     url: Option<String>,
+    task: Option<Value>,
+    filename: Option<String>,
+    bytes: Option<Vec<u8>>,
+    artifact_handle: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -1737,15 +1742,52 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Manage one browser/session surface. Supports foreground, background, and headless modes; background never requires window activation. action=describe returns the v3 contract."
+        description = "Manage browser sessions and bounded task/file actions. Supports foreground, background, and headless modes; action=task runs bounded work; artifact_register/read use opaque private-headless handles."
     )]
     async fn browser(
         &self,
         Parameters(args): Parameters<V3BrowserArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
+        if args.action == "task" {
+            return self
+                .task(Parameters(V3TaskArgs {
+                    session_id: args
+                        .session_id
+                        .ok_or_else(|| invalid("session_id is required"))?,
+                    chrome_tab_id: args
+                        .chrome_tab_id
+                        .ok_or_else(|| invalid("chrome_tab_id is required"))?,
+                    task: args.task.ok_or_else(|| invalid("task is required"))?,
+                    client_id: None,
+                }))
+                .await;
+        }
+        if args.action == "artifact_register" {
+            return self
+                .artifact_register(Parameters(V3ArtifactRegisterArgs {
+                    session_id: args
+                        .session_id
+                        .ok_or_else(|| invalid("session_id is required"))?,
+                    filename: args.filename.ok_or_else(|| invalid("filename is required"))?,
+                    bytes: args.bytes.ok_or_else(|| invalid("bytes are required"))?,
+                }))
+                .await;
+        }
+        if args.action == "artifact_read" {
+            return self
+                .artifact_read(Parameters(V3ArtifactReadArgs {
+                    session_id: args
+                        .session_id
+                        .ok_or_else(|| invalid("session_id is required"))?,
+                    artifact_handle: args
+                        .artifact_handle
+                        .ok_or_else(|| invalid("artifact_handle is required"))?,
+                }))
+                .await;
+        }
         if args.action == "describe" {
             return Ok(Json(json!({
-                "version":"v3","tools":["browser","snapshot","act","workflow","extract","verify","task","artifact_register","artifact_read"],
+                "version":"v3","tools":["browser","snapshot","act","workflow","extract","verify"],
                 "modes":{"foreground":crate::v3::BrowserMode::Foreground.policy(),"background":crate::v3::BrowserMode::Background.policy(),"headless":crate::v3::BrowserMode::Headless.policy()},
                 "typing_modes":["block","fast_keys","human_keys","ime"],
                 "safety":"revision-bound refs, target leases, fresh-state verification, no blind mutation retry"
@@ -2237,9 +2279,6 @@ impl AppV3 {
         ))
     }
 
-    #[tool(
-        description = "Stage 1..10485760 caller-provided bytes in a private headless session under an opaque handle. No arbitrary filesystem path is accepted."
-    )]
     async fn artifact_register(
         &self,
         Parameters(args): Parameters<V3ArtifactRegisterArgs>,
@@ -2280,9 +2319,6 @@ impl AppV3 {
         ))
     }
 
-    #[tool(
-        description = "Read up to 10 MiB from an opaque artifact handle in its owning private headless session. Returns bytes and SHA-256; no filesystem path is accepted."
-    )]
     async fn artifact_read(
         &self,
         Parameters(args): Parameters<V3ArtifactReadArgs>,
@@ -2317,9 +2353,6 @@ impl AppV3 {
             "verified":true,"scope":"private_headless_session"})))
     }
 
-    #[tool(
-        description = "Run bounded research, form draft, repeated-control, private-headless upload selection, or verified private-headless download through guarded browser operations. Returns compact evidence; unknown effects stop execution."
-    )]
     async fn task(
         &self,
         Parameters(args): Parameters<V3TaskArgs>,
@@ -2581,7 +2614,7 @@ impl ServerHandler for AppV3 {
             "controlla-v3",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions("Controlla v3 exposes nine browser tools. Prefer task for bounded research and form drafts, workflow for explicit multi-step automation, block typing for ordinary text, fast_keys only when real key events are required, and verify after consequential mutations. Background mode must not steal focus. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
+        .with_instructions("Controlla v3 exposes six compact tools. Use browser action=task for bounded research and form drafts, and browser action=artifact_register/read for opaque private-headless file handles. Use workflow for explicit multi-step automation, block typing for ordinary text, fast_keys only when real key events are required, and verify after consequential mutations. Background mode must not steal focus. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
     }
 }
 
@@ -2615,9 +2648,13 @@ mod v3_batch_delivery_tests {
     use serde_json::json;
 
     #[test]
-    fn task_route_is_exposed_and_receipts_do_not_dump_page_state() {
+    fn compact_surface_routes_tasks_and_receipts_do_not_dump_page_state() {
         let tools = AppV3::tool_router().list_all();
-        assert!(tools.iter().any(|tool| tool.name == "task"));
+        assert_eq!(tools.len(), 6);
+        assert!(tools.iter().all(|tool| {
+            ["browser", "snapshot", "act", "workflow", "extract", "verify"]
+                .contains(&tool.name.as_ref())
+        }));
         let receipt = task_receipt(
             "extract",
             "https://example.test/a",
