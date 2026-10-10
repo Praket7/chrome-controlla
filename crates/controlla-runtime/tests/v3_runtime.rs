@@ -196,6 +196,57 @@ async fn page_tool_schema_comparison_preserves_proto_named_properties() {
     assert!(!invoked);
 }
 
+#[tokio::test]
+async fn page_tool_timeout_aborts_the_page_call_and_waits_for_cancellation() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let result = context
+        .async_with(async |ctx| {
+            ctx.eval::<(), _>(
+                r#"globalThis.AbortController=class{constructor(){this.listeners=[];this.signal={aborted:false,addEventListener:(_,listener)=>this.listeners.push(listener)}}abort(){this.signal.aborted=true;for(const listener of this.listeners)listener()}};globalThis.setTimeout=(callback)=>{queueMicrotask(callback);return 1};globalThis.clearTimeout=()=>{};globalThis.document={modelContext:{getTools:async()=>[{name:"save",inputSchema:{type:"object",properties:{},required:[],additionalProperties:false}}],executeTool:async(_tool,_input,{signal})=>new Promise((_,reject)=>signal.addEventListener("abort",()=>reject(new Error("cancelled"))))}};"#,
+            )
+            .unwrap();
+            let schema = json!({"type":"object","properties":{},"required":[],"additionalProperties":false});
+            let schema = serde_json::to_string(&serde_json::to_string(&schema).unwrap()).unwrap();
+            let invocation = format!(
+                "(async()=>{{try{{return JSON.stringify(await ({})('save',{{}},JSON.parse({schema}),1000))}}catch(error){{return JSON.stringify({{error:String(error)}})}}}})()",
+                PageToolProgram::invocation()
+            );
+            let promise = ctx.eval::<rquickjs::Promise, _>(invocation).unwrap();
+            promise.into_future::<String>().await
+        })
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["error"], "Error: cancelled");
+}
+
+#[tokio::test]
+async fn unavailable_webmcp_fixture_routes_to_semantic_ui() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let discovery = context
+        .async_with(async |ctx| {
+            ctx.eval::<(), _>("globalThis.document={};").unwrap();
+            let expression = format!(
+                "(async()=>JSON.stringify(await ({})()))()",
+                PageToolProgram::discovery()
+            );
+            ctx.eval::<rquickjs::Promise, _>(expression)
+                .unwrap()
+                .into_future::<String>()
+                .await
+        })
+        .await
+        .unwrap();
+    let discovery: serde_json::Value = serde_json::from_str(&discovery).unwrap();
+    assert_eq!(discovery, json!({"available":false,"tools":[]}));
+    assert_eq!(
+        controlla_runtime::v3_tasks::route_page_tool(&[], "save", true),
+        controlla_runtime::v3_tasks::PageToolRoute::SemanticUi
+    );
+}
+
 #[test]
 fn reconnect_never_blindly_replays_mutations_and_is_bounded() {
     let mut controller = ReconnectController::new(2).unwrap();

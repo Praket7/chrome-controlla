@@ -28,3 +28,11 @@ Starting point: `62e6407d0e75b83a1be8d69468476601a6e6da37`
 ## Verification gate
 
 The final branch is only considered complete after the repository CI matrix passes on Linux, macOS, and Windows, including rustfmt, clippy with `-D warnings`, workspace tests, package checks, client/app/benchmark/release checks, extension tests, and dependency/package validation.
+
+## V3 execution update — 2026-10-09
+
+- Ruling: reject all V3 data/action routes unless the session was created through the V3 browser route — legacy sessions bypassed mode authority; the cost if wrong is rejecting callers that paired through legacy V2, which is intentional for V3-only tools. The regression fixture now expects the unpaired route to fail before dispatch.
+- Ruling: retain a nine-tool packaged MCP list (six primary browser tools plus task and artifact tools) under a 48 KiB schema budget — task/file workflows need explicit bounded inputs and opaque artifact handles; the cost is that the plan's exact six-tool packaged-surface goal remains open.
+- Ruling: extension native-host reconnect is capped at eight attempts and survives service-worker suspension, then requires extension reload — retries cannot continue indefinitely; the cost is manual recovery after the bound. CDP disconnect invalidates the transport and does not replay uncertain mutations.
+- Fresh local verification passed: Rust format, warning-denied workspace Clippy, full workspace tests, all ignored installed-Chrome tests (Chrome 154.0.8037.99), extension reconnect/full stress, client/app/benchmark/release/v3/docs/provenance checks, dependency check, and clean-prefix package check. Hosted CI for the final commit is pending.
+- Remaining gates: six-tool packaged surface, headed-background and cross-mode live parity, full production extension FastKeys event/latency matrix, OS IME, authenticated app persistence/file acceptance, adversarial cross-process agent races, live client and WebMCP qualification, and controlled competitor measurements. These are not converted into passes by local fixtures; the broad claim remains fail-closed.

@@ -21,6 +21,7 @@ jobs:
           node-version-file: .nvmrc
       - run: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/google-chrome.deb && sudo apt-get update && sudo apt-get install -y /tmp/google-chrome.deb
       - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
+      - run: node extensions/chrome-controlla/test-background.cjs --reconnect-only
       - run: for run in {1..8}; do node extensions/chrome-controlla/test-background.cjs; done
         shell: bash
   rust:

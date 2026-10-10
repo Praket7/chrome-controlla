@@ -1,4 +1,4 @@
-function(index) {
+function(index, outcome) {
   const e = this.nodes[index], saved = this.items[index];
   if (!e || !saved || !e.isConnected || e.ownerDocument !== document) return {ok:false,reason:'stale_reference'};
   if (this.raw(e) !== saved.raw_value || this.name(e) !== saved.name || (e instanceof HTMLAnchorElement && e.href !== saved.href)) return {ok:false,reason:'changed_target'};
@@ -8,6 +8,6 @@ function(index) {
   const unsafe = __UNSAFE__;
   const trustedText = e.hasAttribute('data-requires-trusted') && (e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(t));
   const trustedBoundary = e.closest('[data-requires-trusted]');
-  if (unsafe || !this.visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true' || e.closest('[data-masked]') || e.querySelector('[data-masked],[data-requires-trusted]') || trustedBoundary && (trustedBoundary!==e || !trustedText) || s.pointerEvents==='none' || b.left<0 || b.top<0 || b.right>innerWidth || b.bottom>innerHeight || !h || !(h===e || e.contains(h))) return {ok:false,reason:'blocked'};
+  if (unsafe || !this.visible(e) || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true' || e.closest('[data-masked]') || e.querySelector('[data-masked],[data-requires-trusted]') || trustedBoundary && (trustedBoundary!==e || !trustedText || outcome?.kind!=='focused') || s.pointerEvents==='none' || b.left<0 || b.top<0 || b.right>innerWidth || b.bottom>innerHeight || !h || !(h===e || e.contains(h))) return {ok:false,reason:'blocked'};
   return {ok:true,x,y};
 }

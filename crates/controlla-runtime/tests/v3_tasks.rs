@@ -1,6 +1,6 @@
 use controlla_runtime::v3_tasks::{
     EvidenceReceipt, ExpandedStep, FormField, PageToolDescriptor, PageToolEffect, PageToolRoute,
-    RepeatAction, TaskPrimitive, route_page_tool, validate_page_tool_input,
+    RepeatAction, SaveControl, TaskPrimitive, route_page_tool, validate_page_tool_input,
     validate_page_tool_result,
 };
 use serde_json::json;
@@ -13,6 +13,7 @@ fn research_expands_without_an_autonomous_loop() {
             "https://example.com/b".into(),
         ],
         selector: Some("main".into()),
+        tab_ids: None,
     };
     let steps = task.expand().unwrap();
     assert_eq!(steps.len(), 4);
@@ -27,6 +28,57 @@ fn research_expands_without_an_autonomous_loop() {
 }
 
 #[test]
+fn ten_page_research_is_bounded_and_keeps_each_citation_url() {
+    let task = TaskPrimitive::Research {
+        urls: (0..10)
+            .map(|n| format!("https://example.com/{n}"))
+            .collect(),
+        selector: Some("article".into()),
+        tab_ids: Some((0..10).map(|n| format!("tab-{n}")).collect()),
+    };
+    let steps = task.expand().unwrap();
+    assert_eq!(steps.len(), 20);
+    for (index, pair) in steps.as_chunks::<2>().0.iter().enumerate() {
+        assert!(
+            matches!(&pair[0], ExpandedStep::Open { tab_id: Some(id), .. } if id == &format!("tab-{index}"))
+        );
+        assert!(matches!(
+            pair[1],
+            ExpandedStep::Extract {
+                capture_url: true,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn research_rejects_missing_host_and_mismatched_tab_list() {
+    for (url, tab_ids) in [
+        ("https:///missing", None),
+        (
+            "https://example.test/a",
+            Some(vec!["tab-1".into(), "tab-2".into()]),
+        ),
+    ] {
+        let task = TaskPrimitive::Research {
+            urls: vec![url.into()],
+            selector: None,
+            tab_ids,
+        };
+        assert!(task.expand().is_err());
+    }
+}
+
+#[test]
+fn upload_does_not_accept_raw_filesystem_paths() {
+    let task = serde_json::from_value::<TaskPrimitive>(json!({
+        "kind":"upload","reference":"@c1","path":"/Users/person/private.txt"
+    }));
+    assert!(task.is_err());
+}
+
+#[test]
 fn form_draft_can_save_without_submitting() {
     let task = TaskPrimitive::FormDraft {
         fields: vec![FormField {
@@ -35,9 +87,14 @@ fn form_draft_can_save_without_submitting() {
             value: "Praket".into(),
         }],
         save_without_submit: true,
+        save_control: Some(SaveControl {
+            reference: "@c2".into(),
+            confirmation_selector: "#saved".into(),
+            confirmation_text: "Saved".into(),
+        }),
     };
     let steps = task.expand().unwrap();
-    assert!(matches!(steps.last(), Some(ExpandedStep::SaveDraft)));
+    assert!(matches!(steps.last(), Some(ExpandedStep::SaveDraft { .. })));
     assert!(
         !steps
             .iter()
@@ -50,11 +107,13 @@ fn repeated_actions_are_bounded() {
     let task = TaskPrimitive::Repeat {
         references: vec!["@c1".into(), "@c2".into()],
         action: RepeatAction::VerifyVisible,
+        click_outcome: None,
     };
     assert_eq!(task.expand().unwrap().len(), 2);
     let too_many = TaskPrimitive::Repeat {
         references: (0..65).map(|i| format!("@c{i}")).collect(),
         action: RepeatAction::Click,
+        click_outcome: Some(json!({"kind":"visible","selector":"#done"})),
     };
     assert!(too_many.expand().is_err());
 }

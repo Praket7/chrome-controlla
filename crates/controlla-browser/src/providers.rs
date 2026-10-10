@@ -217,6 +217,10 @@ pub struct ShutdownOutcome {
 }
 
 impl DedicatedBrowserSession {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn connection(&self) -> &Arc<BrowserConnection> {
         &self.connection
     }

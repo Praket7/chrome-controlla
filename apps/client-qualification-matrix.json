@@ -17,12 +17,12 @@
     "verified_mutations"
   ],
   "clients": {
-    "freebuff": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
-    "opencode": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
-    "claude-code": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
-    "codex": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
-    "chatgpt-desktop": {"contract": "packaged-local-plugin", "contractStatus": "verified", "liveSmokeStatus": "unverified"},
-    "generic-mcp": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified"}
+    "freebuff": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["/absolute/path/to/controlla", "mcp"], "surface": "v3-compact", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]},
+    "opencode": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["/absolute/path/to/controlla", "mcp"], "surface": "v3-compact", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]},
+    "claude-code": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["/absolute/path/to/controlla", "mcp"], "surface": "v3-compact", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]},
+    "codex": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["/absolute/path/to/controlla", "mcp"], "surface": "v3-compact", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]},
+    "chatgpt-desktop": {"contract": "packaged-local-plugin", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["node", "${PLUGIN_ROOT}/launch.cjs"], "surface": "packaged-local-plugin", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]},
+    "generic-mcp": {"contract": "stdio-mcp", "contractStatus": "verified", "liveSmokeStatus": "unverified", "serverId": "chrome-controlla", "command": ["/absolute/path/to/controlla", "mcp"], "surface": "v3-compact", "requiredEvidenceCategories": ["startup", "persistent_session", "foreground", "background", "headless", "block_typing", "fast_keys", "human_keys", "ime", "multi_tab", "user_interference", "upload_download", "research_extract", "verified_mutations"]}
   },
   "qualificationPolicy": {
     "generatedEvidenceMayQualifyClientContract": true,

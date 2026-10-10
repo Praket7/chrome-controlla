@@ -158,15 +158,22 @@ fn doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated
 fn doctor_reports_fresh_heartbeat_but_dead_process_and_unreachable_loopback() {
     let root = std::env::temp_dir().join(format!("controlla doctor dead {}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    write_doctor_config(&root, addr, u32::MAX, now);
-    let report = run_doctor(&root);
+    // A port released from the OS ephemeral range can be reused by another
+    // parallel test before the child process probes it. Retry only that race.
+    let report = (0..8)
+        .find_map(|_| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            write_doctor_config(&root, addr, u32::MAX, now);
+            let report = run_doctor(&root);
+            (report["transport"] == "Failed").then_some(report)
+        })
+        .expect("could not reserve a reliably unreachable loopback port");
     let unavailable_process_probe = if cfg!(unix) { "Failed" } else { "Unknown" };
     assert_eq!(report["process"], unavailable_process_probe);
     assert_eq!(report["transport"], "Failed");

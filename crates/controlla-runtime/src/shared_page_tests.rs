@@ -49,7 +49,7 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         }
     };
     let result=AssertUnwindSafe(async {
-        eval(r##"document.body.innerHTML='<style>button,a{display:block;margin:4px}</style>'+ '<div>padding</div>'.repeat(200)+'<button id="account" aria-label="Accounts" aria-expanded="false" onclick="this.setAttribute(\'aria-expanded\',\'true\')"></button><button id="menu" onclick="setTimeout(()=>{document.body.insertAdjacentHTML(\'beforeend\',\'<div id=late>Ready</div>\')},150)">Menu</button><button id="uncertain" onclick="window.clicks=(window.clicks||0)+1">Count</button><a id="nav" href="#done">Story</a><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before"><div data-masked>PRIVATE-SENTINEL</div><button><span data-requires-trusted>PROTECTED-SENTINEL</span></button><span id="secretLabel" data-masked>LABEL-SENTINEL</span><button aria-labelledby="secretLabel" aria-label="Safe">safe</button><button hidden>Hidden</button><div id="late-target">needle</div>';document.querySelector('#account').style.cssText='width:70px;height:25px';"##.into()).await;
+        eval(r##"document.body.innerHTML='<style>button,a{display:block;margin:4px}</style>'+ '<div>padding</div>'.repeat(200)+'<button id="account" aria-label="Accounts" aria-expanded="false" onclick="this.setAttribute(\'aria-expanded\',\'true\')"></button><button id="menu" onclick="setTimeout(()=>{document.body.insertAdjacentHTML(\'beforeend\',\'<div id=late>Ready</div>\')},150)">Menu</button><button id="uncertain" onclick="window.clicks=(window.clicks||0)+1">Count</button><a id="nav" href="#done">Story</a><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before" onclick="window.trustedClicks=(window.trustedClicks||0)+1"><div data-masked>PRIVATE-SENTINEL</div><button><span data-requires-trusted>PROTECTED-SENTINEL</span></button><span id="secretLabel" data-masked>LABEL-SENTINEL</span><button aria-labelledby="secretLabel" aria-label="Safe">safe</button><button hidden>Hidden</button><div id="late-target">needle</div>';document.querySelector('#account').style.cssText='width:70px;height:25px';"##.into()).await;
         let spec=ObserveSpec{selector:"#late-target".into(),fields:BTreeMap::from([("text".into(),"#late-target".into())]),max_items:1,max_text_chars:100,max_bytes:4096,cursor:None};
         let command=observation_command(&spec).unwrap();
         let observed=eval(command["expression"].as_str().unwrap().into()).await;
@@ -86,6 +86,9 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(item(&snapshot,"Trusted keys")["requires_trusted_events"],true);
         assert!(!snapshot["items"].as_array().unwrap().iter().any(|v|v["name"]=="Hidden"));
         assert_eq!(item(&snapshot,"Accounts")["raw_value"],"");
+        let wrong_outcome=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"navigation"}}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(wrong_outcome["status"],"not_dispatched","{wrong_outcome}");
+        assert_eq!(eval("window.trustedClicks||0".into()).await["result"]["value"],0);
         let trusted=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"focused"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(trusted["status"],"verified","{trusted}");
         assert_eq!(eval("document.activeElement.id".into()).await["result"]["value"],"trusted");

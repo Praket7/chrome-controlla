@@ -14,14 +14,19 @@ pub enum TaskPrimitive {
     Research {
         urls: Vec<String>,
         selector: Option<String>,
+        #[serde(default)]
+        tab_ids: Option<Vec<String>>,
     },
     FormDraft {
         fields: Vec<FormField>,
         save_without_submit: bool,
+        #[serde(default)]
+        save_control: Option<SaveControl>,
     },
     Upload {
-        reference: String,
-        path: String,
+        artifact_handle: String,
+        selector: String,
+        account_marker: (String, String),
     },
     Download {
         reference: String,
@@ -29,6 +34,8 @@ pub enum TaskPrimitive {
     Repeat {
         references: Vec<String>,
         action: RepeatAction,
+        #[serde(default)]
+        click_outcome: Option<Value>,
     },
 }
 
@@ -37,6 +44,14 @@ pub struct FormField {
     pub reference: String,
     pub expected_value: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveControl {
+    pub reference: String,
+    pub confirmation_selector: String,
+    pub confirmation_text: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,6 +66,7 @@ pub enum RepeatAction {
 pub enum ExpandedStep {
     Open {
         url: String,
+        tab_id: Option<String>,
     },
     Extract {
         selector: String,
@@ -62,39 +78,58 @@ pub enum ExpandedStep {
         value: String,
     },
     Upload {
-        reference: String,
-        path: String,
+        artifact_handle: String,
+        selector: String,
+        account_marker: (String, String),
     },
     Download {
         reference: String,
     },
     Click {
         reference: String,
+        outcome: Value,
     },
     VerifyVisible {
         reference: String,
     },
-    SaveDraft,
+    SaveDraft {
+        control: SaveControl,
+    },
 }
 
 impl TaskPrimitive {
     pub fn expand(&self) -> Result<Vec<ExpandedStep>, &'static str> {
         let steps = match self {
-            Self::Research { urls, selector } => {
+            Self::Research {
+                urls,
+                selector,
+                tab_ids,
+            } => {
                 if urls.is_empty() || urls.len() > MAX_RESEARCH_PAGES {
                     return Err("research requires 1..32 URLs");
                 }
                 if urls.iter().any(|url| !valid_http_url(url)) {
                     return Err("research URLs must be bounded HTTP(S) URLs without credentials");
                 }
+                if tab_ids.as_ref().is_some_and(|ids| {
+                    ids.len() != urls.len() || ids.iter().any(|id| id.is_empty() || id.len() > 128)
+                }) {
+                    return Err(
+                        "research tab_ids must provide one bounded selected target per URL",
+                    );
+                }
                 let selector = selector.clone().unwrap_or_else(|| "body".to_owned());
                 if selector.is_empty() || selector.len() > 512 {
                     return Err("selector must be 1..512 bytes");
                 }
                 urls.iter()
-                    .flat_map(|url| {
+                    .enumerate()
+                    .flat_map(|(index, url)| {
                         [
-                            ExpandedStep::Open { url: url.clone() },
+                            ExpandedStep::Open {
+                                url: url.clone(),
+                                tab_id: tab_ids.as_ref().map(|ids| ids[index].clone()),
+                            },
                             ExpandedStep::Extract {
                                 selector: selector.clone(),
                                 capture_url: true,
@@ -106,6 +141,7 @@ impl TaskPrimitive {
             Self::FormDraft {
                 fields,
                 save_without_submit,
+                save_control,
             } => {
                 if fields.is_empty() || fields.len() > 64 {
                     return Err("form draft requires 1..64 fields");
@@ -123,17 +159,47 @@ impl TaskPrimitive {
                     });
                 }
                 if *save_without_submit {
-                    steps.push(ExpandedStep::SaveDraft);
+                    let control = save_control
+                        .as_ref()
+                        .ok_or("save draft requires an explicit save control and confirmation")?;
+                    if control.reference.is_empty()
+                        || control.confirmation_selector.is_empty()
+                        || control.confirmation_selector.len() > 512
+                        || control.confirmation_text.is_empty()
+                        || control.confirmation_text.len() > 512
+                    {
+                        return Err("save control or confirmation is invalid or oversized");
+                    }
+                    steps.push(ExpandedStep::SaveDraft {
+                        control: control.clone(),
+                    });
                 }
                 steps
             }
-            Self::Upload { reference, path } => {
-                if reference.is_empty() || path.is_empty() || path.len() > 4_096 {
-                    return Err("upload requires a bounded reference and path");
+            Self::Upload {
+                artifact_handle,
+                selector,
+                account_marker,
+            } => {
+                if artifact_handle.is_empty()
+                    || artifact_handle.len() > 256
+                    || artifact_handle.contains('/')
+                    || artifact_handle.contains('\\')
+                    || selector.is_empty()
+                    || selector.len() > 512
+                    || account_marker.0.is_empty()
+                    || account_marker.0.len() > 512
+                    || account_marker.1.is_empty()
+                    || account_marker.1.len() > 512
+                {
+                    return Err(
+                        "upload requires an opaque artifact handle, bounded file selector, and account marker",
+                    );
                 }
                 vec![ExpandedStep::Upload {
-                    reference: reference.clone(),
-                    path: path.clone(),
+                    artifact_handle: artifact_handle.clone(),
+                    selector: selector.clone(),
+                    account_marker: account_marker.clone(),
                 }]
             }
             Self::Download { reference } => {
@@ -144,18 +210,26 @@ impl TaskPrimitive {
                     reference: reference.clone(),
                 }]
             }
-            Self::Repeat { references, action } => {
+            Self::Repeat {
+                references,
+                action,
+                click_outcome,
+            } => {
                 if references.is_empty()
                     || references.len() > 64
                     || references.iter().any(String::is_empty)
                 {
                     return Err("repeat requires 1..64 references");
                 }
+                if matches!(action, RepeatAction::Click) && click_outcome.is_none() {
+                    return Err("repeat click requires an explicit bounded outcome");
+                }
                 references
                     .iter()
                     .map(|reference| match action {
                         RepeatAction::Click => ExpandedStep::Click {
                             reference: reference.clone(),
+                            outcome: click_outcome.clone().unwrap(),
                         },
                         RepeatAction::VerifyVisible => ExpandedStep::VerifyVisible {
                             reference: reference.clone(),
@@ -172,11 +246,16 @@ impl TaskPrimitive {
 }
 
 fn valid_http_url(url: &str) -> bool {
-    if url.len() > 2_048 {
+    if url.len() > 2_048 || url.chars().any(char::is_whitespace) {
         return false;
     }
     let lower = url.to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.contains('@')
+    let authority = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

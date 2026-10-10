@@ -357,9 +357,245 @@ struct SharedLiveSession {
             >,
         >,
     >,
-    connection: Option<controlla_browser::providers::SharedExtensionSession>,
+    connection: Option<PageSessionTransport>,
     registry: Option<SessionRegistry>,
     handle: controlla_browser::sessions::SessionHandle,
+}
+
+/// The V2/V3 semantic layer uses the same guarded page protocol over either
+/// the explicitly paired extension or a provider-owned dedicated Chrome.
+#[allow(dead_code)] // V2/V3 transports are compiled into the CLI binary, not the library API.
+enum PageSessionTransport {
+    Shared(controlla_browser::providers::SharedExtensionSession),
+    Dedicated(Option<controlla_browser::providers::DedicatedBrowserSession>),
+}
+
+fn dedicated_batch_guard_ok(response: &Value) -> bool {
+    response.pointer("/result/value/ok") == Some(&Value::Bool(true))
+}
+
+fn private_headless_cleanup_allowed(handle: &controlla_browser::sessions::SessionHandle) -> bool {
+    handle.mode == controlla_browser::sessions::SessionMode::Headless
+        && handle.provider == controlla_browser::sessions::ProviderKind::DedicatedHeadless
+}
+
+impl PageSessionTransport {
+    fn selected_targets(&self) -> Vec<String> {
+        match self {
+            Self::Shared(connection) => connection.selected_targets().iter().cloned().collect(),
+            Self::Dedicated(Some(browser)) => vec![browser.target_id().to_owned()],
+            Self::Dedicated(None) => Vec::new(),
+        }
+    }
+
+    fn add_selected_target(&mut self, target_id: String) -> Result<(), String> {
+        match self {
+            Self::Shared(connection) => connection
+                .add_selected_target(target_id)
+                .map_err(|e| e.to_string()),
+            Self::Dedicated(_) => Err("dedicated session target set is fixed at launch".into()),
+        }
+    }
+
+    async fn command(
+        &self,
+        registry: &SessionRegistry,
+        handle: &controlla_browser::sessions::SessionHandle,
+        target_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        match self {
+            Self::Shared(connection) => connection
+                .command(registry, handle, target_id, method, params)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Dedicated(Some(browser)) => {
+                registry
+                    .authorize_direct_cdp(&handle.id)
+                    .map_err(|error| format!("session authorization failed: {error:?}"))?;
+                if !registry.contains_target(handle, target_id) {
+                    return Err("target is not owned by the selected dedicated session".into());
+                }
+                let (_, targets) = browser.connection().target_snapshot().await;
+                let target = targets
+                    .iter()
+                    .find(|target| {
+                        target.id == target_id && target.target_type == "page" && target.attached
+                    })
+                    .ok_or_else(|| {
+                        "selected dedicated target is detached or no longer a page".to_owned()
+                    })?;
+                browser
+                    .connection()
+                    .target_command(
+                        target_id,
+                        target.generation,
+                        &target.revision,
+                        method,
+                        params,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            Self::Dedicated(None) => Err("dedicated browser session is shutting down".into()),
+        }
+    }
+
+    #[allow(dead_code)] // Used by V3 FastKeys in the CLI binary.
+    async fn command_batch(
+        &self,
+        registry: &SessionRegistry,
+        handle: &controlla_browser::sessions::SessionHandle,
+        target_id: &str,
+        actions: Vec<controlla_browser::providers::SharedBatchAction>,
+        deadline: Duration,
+    ) -> Result<Value, String> {
+        if actions.is_empty() || actions.len() > 64 {
+            return Err("batch requires 1..64 actions".into());
+        }
+        match self {
+            Self::Shared(connection) => connection
+                .command_batch(registry, handle, target_id, actions, deadline)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Dedicated(_) => {
+                let mut receipts = Vec::with_capacity(actions.len());
+                let deadline_at = tokio::time::Instant::now() + deadline;
+                for (index, action) in actions.iter().enumerate() {
+                    let result = tokio::time::timeout_at(
+                        deadline_at,
+                        self.command(
+                            registry,
+                            handle,
+                            target_id,
+                            &action.method,
+                            action.params.clone(),
+                        ),
+                    )
+                    .await;
+                    let result = match result {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(error)) => {
+                            let may_have_occurred = action.method == "Input.dispatchKeyEvent"
+                                || receipts.iter().any(|receipt: &Value| {
+                                    receipt["method"] == "Input.dispatchKeyEvent"
+                                });
+                            return Ok(
+                                json!({"receipts":receipts,"completed":index,"failed_at":index,
+                                "failed_method":action.method,"dispatch_may_have_occurred":may_have_occurred,
+                                "batch_error":error}),
+                            );
+                        }
+                        Err(_) => {
+                            let may_have_occurred = action.method == "Input.dispatchKeyEvent"
+                                || receipts.iter().any(|receipt: &Value| {
+                                    receipt["method"] == "Input.dispatchKeyEvent"
+                                });
+                            return Ok(
+                                json!({"receipts":receipts,"completed":index,"failed_at":index,
+                                "failed_method":action.method,"dispatch_may_have_occurred":may_have_occurred,
+                                "batch_error":"dedicated key batch deadline exceeded"}),
+                            );
+                        }
+                    };
+                    let ok = dedicated_batch_guard_ok(&result);
+                    receipts.push(json!({"index":index,"method":action.method,"result":result}));
+                    if action.stop_on_not_ok && !ok {
+                        return Ok(
+                            json!({"receipts":receipts,"completed":index+1,"stopped_before":index+1,"batch_error":"Batch read guard rejected before the next action."}),
+                        );
+                    }
+                }
+                Ok(json!({"receipts":receipts,"completed":actions.len()}))
+            }
+        }
+    }
+
+    async fn release(
+        &mut self,
+        registry: &mut SessionRegistry,
+        handle: &controlla_browser::sessions::SessionHandle,
+    ) -> Result<(), String> {
+        match self {
+            Self::Shared(connection) => connection
+                .release()
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Dedicated(slot) => {
+                if !private_headless_cleanup_allowed(handle) {
+                    return Err(
+                        "private-profile cleanup is restricted to dedicated headless sessions"
+                            .into(),
+                    );
+                }
+                let Some(browser) = slot.take() else {
+                    return Ok(());
+                };
+                let expected_session = browser.session_id().to_owned();
+                let expected_target = browser.target_id().to_owned();
+                let expected_instance = browser.connection().instance_id();
+                let (_, targets) = browser.connection().target_snapshot().await;
+                let Some(target) = targets
+                    .iter()
+                    .find(|target| target.id == expected_target && target.attached)
+                else {
+                    *slot = Some(browser);
+                    return Err(
+                        "dedicated target changed before release; session retained for inspection"
+                            .into(),
+                    );
+                };
+                // This adapter does not inspect page contents independently. It is authorized
+                // only for the provider-owned headless process with a unique private profile;
+                // generic/shared/headed targets still require a real independent observer.
+                let observer = DedicatedOwnedObserver {
+                    expected_session,
+                    expected_target,
+                    expected_instance,
+                    expected_generation: target.generation,
+                    expected_revision: target.revision.clone(),
+                };
+                let outcome = browser.shutdown(registry, Some(&observer)).await;
+                if let Some(recovery) = outcome.recovery {
+                    *slot = Some(recovery);
+                    return Err(outcome
+                        .cleanup_error
+                        .unwrap_or_else(|| "dedicated browser cleanup remains pending".into()));
+                }
+                if let Some(error) = outcome.cleanup_error {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+struct DedicatedOwnedObserver {
+    expected_session: String,
+    expected_target: String,
+    expected_instance: u128,
+    expected_generation: u64,
+    expected_revision: String,
+}
+
+impl controlla_browser::sessions::IndependentTargetObserver for DedicatedOwnedObserver {
+    fn verify_unchanged(
+        &self,
+        observation: &controlla_browser::sessions::CleanupObservation,
+    ) -> Result<(), String> {
+        if observation.session_id == self.expected_session
+            && observation.target_id == self.expected_target
+            && observation.browser_instance_id == self.expected_instance
+            && observation.browser_generation == self.expected_generation
+            && observation.target_revision == self.expected_revision
+        {
+            Ok(())
+        } else {
+            Err("owned headless target identity changed".into())
+        }
+    }
 }
 
 impl SharedLiveSession {
@@ -1305,7 +1541,7 @@ fn shared_typing_minimum_duration(character_count: usize) -> Duration {
 }
 
 async fn shared_type_guard(
-    connection: &controlla_browser::providers::SharedExtensionSession,
+    connection: &PageSessionTransport,
     registry: &SessionRegistry,
     handle: &controlla_browser::sessions::SessionHandle,
     guard: SharedTypeGuard<'_>,
@@ -1327,7 +1563,7 @@ async fn shared_type_guard(
     )
     .await
     .map_err(|_| "typing guard deadline exceeded".to_owned())?
-    .map_err(|error| error.to_string())?;
+    ?;
     Ok(response
         .pointer("/result/value")
         .cloned()
@@ -1335,7 +1571,7 @@ async fn shared_type_guard(
 }
 
 async fn shared_release_key(
-    connection: &controlla_browser::providers::SharedExtensionSession,
+    connection: &PageSessionTransport,
     registry: &SessionRegistry,
     handle: &controlla_browser::sessions::SessionHandle,
     tab_id: &str,
@@ -1363,7 +1599,7 @@ async fn shared_release_key(
         )
         .await
         .map_err(|_| "release acknowledgement timed out".to_owned())
-        .and_then(|result| result.map_err(|error| error.to_string()));
+        .and_then(|result| result);
         match (attempt, result) {
             (0, Ok(_)) => return Ok(()),
             (1, Ok(_)) => {
@@ -1386,15 +1622,14 @@ async fn shared_release_key(
 }
 
 async fn shared_frame_identity(
-    connection: &controlla_browser::providers::SharedExtensionSession,
+    connection: &PageSessionTransport,
     registry: &SessionRegistry,
     handle: &controlla_browser::sessions::SessionHandle,
     tab_id: &str,
 ) -> Result<(String, String, String), String> {
     let response = connection
         .command(registry, handle, tab_id, "Page.getFrameTree", Value::Null)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
     let frame = response
         .get("frameTree")
         .and_then(|tree| tree.get("frame"))
@@ -1415,7 +1650,7 @@ async fn shared_frame_identity(
 }
 
 async fn wait_for_shared_frame_change(
-    connection: &controlla_browser::providers::SharedExtensionSession,
+    connection: &PageSessionTransport,
     registry: &SessionRegistry,
     handle: &controlla_browser::sessions::SessionHandle,
     tab_id: &str,
@@ -1972,12 +2207,12 @@ impl App {
                         }
                     };
                     shared.registry = Some(registry);
-                    shared.connection = Some(connection);
+                    shared.connection = Some(PageSessionTransport::Shared(connection));
                 }
                 Ok(rmcp::handler::server::wrapper::Json(json!({
                     "session_id":id, "accepted":true,
                     "target_ids":shared.connection.as_ref().unwrap().selected_targets(),
-                    "next":"Use list_shared_targets, shared_observe, or guarded shared_input. App save/persistence and Direct CDP extraction are not established by pairing."
+                    "next":"Use list_shared_targets and the guarded V3 snapshot/action surface. App save/persistence is not established by browser control."
                 })))
             }
             "list_shared_targets" => {
@@ -2006,7 +2241,7 @@ impl App {
                         .command(
                             shared.registry()?,
                             &shared.handle,
-                            target_id,
+                            &target_id,
                             "Page.getFrameTree",
                             Value::Null,
                         )
@@ -2035,11 +2270,39 @@ impl App {
                 if shared.handle.principal != self.principal.as_ref() {
                     return Err(invalid("session is not owned by this server principal"));
                 }
-                let release_error = if let Some(connection) = shared.connection.as_mut() {
-                    connection.release().await.err()
-                } else {
-                    None
+                let dedicated = shared.connection.as_ref().is_some_and(|connection| {
+                    matches!(connection, PageSessionTransport::Dedicated(_))
+                });
+                let handle = shared.handle.clone();
+                let release_error = {
+                    let SharedLiveSession {
+                        connection,
+                        registry,
+                        ..
+                    } = &mut *shared;
+                    if let Some(connection) = connection.as_mut() {
+                        connection
+                            .release(
+                                registry
+                                    .as_mut()
+                                    .ok_or_else(|| invalid("session registry is unavailable"))?,
+                                &handle,
+                            )
+                            .await
+                            .err()
+                    } else {
+                        None
+                    }
                 };
+                if shared.connection.as_ref().is_some_and(|connection| {
+                    matches!(connection, PageSessionTransport::Dedicated(Some(_)))
+                }) && release_error.is_some()
+                {
+                    return Err(invalid(format!(
+                        "dedicated Chrome session retained for cleanup retry: {}",
+                        release_error.unwrap_or_default()
+                    )));
+                }
                 shared.connection = None;
                 if let Some(task) = shared.pairing.take() {
                     task.abort();
@@ -2053,7 +2316,7 @@ impl App {
                     )));
                 }
                 Ok(rmcp::handler::server::wrapper::Json(json!({
-                    "session_id":id,"released":true,"effect":"released this provider's debugger attachments"
+                    "session_id":id,"released":true,"effect":if dedicated { "closed the owned dedicated Chrome target and removed its private profile" } else { "released this provider's debugger attachments" }
                 })))
             }
             "discover" => {
@@ -2363,7 +2626,7 @@ impl App {
             }
             let guard = include_str!("shared_page/guard.js")
                 .replace("__UNSAFE__", SHARED_CLICK_UNSAFE_PREDICATE);
-            let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
+            let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
             let value = shared_value(&response)?;
             if value["ok"] != true {
                 return Err(format!("target refused: {}", value["reason"]));
@@ -2405,7 +2668,7 @@ impl App {
             .as_ref()
             .ok_or_else(|| invalid("session not accepted"))?;
         let registry = shared.registry()?;
-        let recheck=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index}],"returnByValue":true}))).await;
+        let recheck=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true}))).await;
         let checked = match recheck {
             Ok(Ok(v)) => shared_value(&v).unwrap_or(Value::Null),
             _ => Value::Null,
@@ -4241,6 +4504,49 @@ mod tests {
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn dedicated_batch_read_guard_accepts_only_explicit_true() {
+        assert!(super::dedicated_batch_guard_ok(
+            &json!({"result":{"value":{"ok":true}}})
+        ));
+        assert!(!super::dedicated_batch_guard_ok(
+            &json!({"result":{"value":{}}})
+        ));
+        assert!(!super::dedicated_batch_guard_ok(
+            &json!({"result":{"value":{"ok":null}}})
+        ));
+        assert!(!super::dedicated_batch_guard_ok(
+            &json!({"result":{"value":{"ok":false}}})
+        ));
+        assert!(!super::dedicated_batch_guard_ok(
+            &json!({"error":{"message":"failed"}})
+        ));
+    }
+
+    #[test]
+    fn dedicated_cleanup_observer_is_limited_to_private_headless_sessions() {
+        let headless = controlla_browser::sessions::SessionHandle {
+            id: "headless".into(),
+            principal: "test".into(),
+            mode: controlla_browser::sessions::SessionMode::Headless,
+            provider: controlla_browser::sessions::ProviderKind::DedicatedHeadless,
+            capability_revision: 1,
+        };
+        let headed = controlla_browser::sessions::SessionHandle {
+            mode: controlla_browser::sessions::SessionMode::Headed,
+            provider: controlla_browser::sessions::ProviderKind::DedicatedHeaded,
+            ..headless.clone()
+        };
+        let shared = controlla_browser::sessions::SessionHandle {
+            mode: controlla_browser::sessions::SessionMode::Shared,
+            provider: controlla_browser::sessions::ProviderKind::SharedExtension,
+            ..headless.clone()
+        };
+        assert!(super::private_headless_cleanup_allowed(&headless));
+        assert!(!super::private_headless_cleanup_allowed(&headed));
+        assert!(!super::private_headless_cleanup_allowed(&shared));
+    }
 
     #[test]
     fn shared_click_guard_allows_implicit_submit_only_outside_forms() {

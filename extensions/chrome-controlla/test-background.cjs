@@ -15,6 +15,7 @@ let releaseBlockedFrame;
 const nativePorts = [];
 const reconnectTimers = [];
 const alarms = [];
+const sessionStorage = {};
 const tabList = Array.from({ length: 102 }, (_, id) => ({ id, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete" }));
 tabList.push({ id: 102, title: "Extension page", url: "chrome://extensions" });
 tabList.push({ title: "Invalid tab", url: "https://example.test/invalid" });
@@ -36,6 +37,7 @@ let debuggerDetached;
 let nextCreatedTab = 500;
 let mockNow = 1_000;
 let advanceClockOnNextDebuggerCall = 0;
+let afterNextDebuggerCall;
 const expectedUrls = ids => Object.fromEntries(ids.map(id => [id, `https://example.test/${id}`]));
 const expectedDocuments = ids => Object.fromEntries(ids.map(id => [id, `document-${id}`]));
 class FakeWebSocket {
@@ -67,6 +69,11 @@ class FakeNativePort {
   disconnect(error) { mockNativeError = error ? { message: error } : undefined; this.disconnected(); mockNativeError = undefined; }
 }
 const chrome = {
+  storage: { session: {
+    async get(key) { return { [key]: sessionStorage[key] }; },
+    async set(values) { Object.assign(sessionStorage, values); },
+    async remove(key) { delete sessionStorage[key]; },
+  } },
   alarms: {
     create(name, info) { alarms.push({ name, info }); },
     onAlarm: { addListener(callback) { this.fire = callback; } },
@@ -122,6 +129,9 @@ const chrome = {
     },
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
+      const afterCall = afterNextDebuggerCall;
+      afterNextDebuggerCall = undefined;
+      afterCall?.(target, method, params);
       mockNow += advanceClockOnNextDebuggerCall;
       advanceClockOnNextDebuggerCall = 0;
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
@@ -134,22 +144,58 @@ const chrome = {
     onDetach: { addListener(callback) { debuggerDetached = callback; } },
   },
 };
-vm.runInNewContext(fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8"), {
-  chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
-  Date: { now() { return mockNow; } },
-  performance: { now() { return mockNow; } },
-  console: { debug(...args) { commandDiagnostics.push(args); } },
-  setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
-  clearTimeout,
-});
+const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
+function runBackground() {
+  vm.runInNewContext(backgroundSource, {
+    chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
+    Date: { now() { return mockNow; } },
+    performance: { now() { return mockNow; } },
+    console: { debug(...args) { commandDiagnostics.push(args); } },
+    setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
+    clearTimeout,
+  });
+}
+runBackground();
 
 function message(payload) {
   return new Promise(resolve => listener(payload, {}, resolve));
 }
 
 (async () => {
+  await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(nativePorts[0].name, "chrome_controlla_bridge", "connect native host on worker startup");
   const native = nativePorts[0];
+  if (process.argv.includes("--reconnect-only")) {
+    let candidate = native;
+    candidate.hostMessage({ type: "ready" });
+    candidate.disconnect("native host unavailable");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    runBackground();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    candidate = nativePorts.at(-1);
+    candidate.disconnect("native host still unavailable");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(reconnectTimers.at(-1).delay, 2000,
+      "service-worker restart preserves the bounded reconnect backoff attempt");
+    for (let attempt = 2; attempt <= 8; attempt++) {
+      reconnectTimers.at(-1).callback();
+      candidate = nativePorts.at(-1);
+      candidate.disconnect("native host unavailable");
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const status = await message({ type: "native-status" });
+      if (attempt < 8) {
+        assert.equal(status.retry_exhausted, false, "native reconnect remains available within its bounded retry budget");
+      }
+    }
+    const exhausted = await message({ type: "native-status" });
+    assert.equal(exhausted.retry_exhausted, true,
+      "native reconnect reports a terminal state after exhausting its bounded retry budget");
+    assert.match(exhausted.error, /reload the extension to retry/);
+    const portsAtExhaustion = nativePorts.length;
+    chrome.alarms.onAlarm.fire({ name: "controlla-native-reconnect" });
+    assert.equal(nativePorts.length, portsAtExhaustion, "a stale service-worker alarm cannot restart exhausted reconnects");
+    return;
+  }
   native.hostMessage({ type: "list_tabs", request_id: "list-1" });
   await new Promise(resolve => setTimeout(resolve, 0));
   const listed = native.sent[0];
@@ -161,12 +207,12 @@ function message(payload) {
   assert.ok(listed.tabs.every(tab => typeof tab.document_id === "string"));
   assert.ok(listed.tabs.every(tab => tab.title.length <= 256 && tab.url.length <= 2048));
   assert.deepEqual(attached, [], "listing tabs does not attach any tab");
-  native.hostMessage({ type: "pair", request_id: "pair-1", tab_ids: [41, 43], expected_urls: expectedUrls([41, 43]), expected_document_ids: expectedDocuments([41, 43]) });
+  native.hostMessage({ type: "pair", request_id: "pair-1", tab_ids: [41, 43, 47], expected_urls: expectedUrls([41, 43, 47]), expected_document_ids: expectedDocuments([41, 43, 47]) });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(attached, [41, 43], "native pairing attaches exactly the requested tabs");
-  assert.deepEqual([...new Set(attached)], [41, 43], "native pairing never attaches all tabs");
+  assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
+  assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43"], extension_version: "0.1.0", document_identity: true, batch_execution: true, batch_deadline: true }));
+  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", document_identity: true, batch_execution: true, batch_deadline: true }));
   const callsBeforeBatch = debuggerCalls.length;
   native.hostMessage({ type: "batch", id: "guarded-batch", target_id: "41", deadline_ms: 1000, actions: [
     { method: "Runtime.callFunctionOn", params: { functionDeclaration: "guard" }, stop_on_not_ok: true },
@@ -177,6 +223,20 @@ function message(payload) {
   assert.equal(guardedBatch.type, "batch_result");
   assert.equal(guardedBatch.result.stopped_before, 1);
   assert.equal(debuggerCalls.length, callsBeforeBatch + 1, "a rejected read guard stops before its mutation");
+  rejectNextCommand = "Input.dispatchKeyEvent";
+  const callsBeforeFailedKey = debuggerCalls.length;
+  native.hostMessage({ type: "batch", id: "partial-key-batch", target_id: "41", deadline_ms: 1000, actions: [
+    { method: "Runtime.callFunctionOn", params: { functionDeclaration: "guard" } },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
+    { method: "Input.dispatchKeyEvent", params: { type: "char", text: "a" } },
+  ] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const partialKeyBatch = native.sent.at(-1);
+  assert.equal(partialKeyBatch.result.completed, 1, "partial receipt counts only completed commands");
+  assert.equal(partialKeyBatch.result.failed_at, 1);
+  assert.equal(partialKeyBatch.result.dispatch_may_have_occurred, true,
+    "failed key dispatch reports possible delivery instead of implying no input was sent");
+  assert.equal(debuggerCalls.length, callsBeforeFailedKey + 2, "failed key dispatch stops the remaining batch");
   advanceClockOnNextDebuggerCall = 2;
   const callsBeforeDeadlineBatch = debuggerCalls.length;
   native.hostMessage({ type: "batch", id: "deadline-batch", target_id: "41", deadline_ms: 1, actions: [
@@ -190,6 +250,36 @@ function message(payload) {
   assert.equal(expiredBatch.result.completed, 1);
   assert.equal(debuggerCalls.length, callsBeforeDeadlineBatch + 1,
     "an expired batch must stop before sending the next mutation");
+  const mixedActions = Array.from({ length: 20 }, (_, index) => index % 2
+    ? { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } }
+    : { method: "DOM.getDocument", params: {} });
+  const callsBeforeMixedBatch = debuggerCalls.length;
+  native.hostMessage({ type: "batch", id: "mixed-batch", target_id: "41", deadline_ms: 1000, actions: mixedActions });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const mixedBatch = native.sent.at(-1);
+  assert.equal(mixedBatch.result.completed, 20, "one bounded batch executes mixed read and mutation commands");
+  assert.equal(mixedBatch.result.host_round_trips, 1);
+  assert.equal(debuggerCalls.length, callsBeforeMixedBatch + 20);
+  const callsBeforeStaleBatch = debuggerCalls.length;
+  afterNextDebuggerCall = () => tabDocumentOverrides.set(43, "replaced-document");
+  native.hostMessage({ type: "batch", id: "stale-document-batch", target_id: "43", deadline_ms: 1000, actions: [
+    { method: "DOM.getDocument", params: {} },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
+  ] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const staleBatch = native.sent.at(-1);
+  assert.match(staleBatch.error, /document identity changed/);
+  assert.equal(debuggerCalls.length, callsBeforeStaleBatch + 1, "a changed document stops the next batch mutation");
+  const callsBeforeNavigationBatch = debuggerCalls.length;
+  afterNextDebuggerCall = () => navigationBefore({ tabId: 47, frameId: 0, url: "https://example.test/47/changed" });
+  native.hostMessage({ type: "batch", id: "navigation-batch", target_id: "47", deadline_ms: 1000, actions: [
+    { method: "DOM.getDocument", params: {} },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "a" } },
+  ] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const navigationBatch = native.sent.at(-1);
+  assert.match(navigationBatch.error, /navigating/);
+  assert.equal(debuggerCalls.length, callsBeforeNavigationBatch + 1, "user navigation stops the next batch mutation");
   commandDiagnostics.splice(0);
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/" } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -321,6 +411,7 @@ function message(payload) {
   assert.ok(detached.includes(41) && detached.includes(43), "release detaches only explicitly paired native targets");
 
   native.disconnect();
+  await new Promise(resolve => setTimeout(resolve, 0));
   const disconnectedStatus = await message({ type: "native-status" });
   assert.equal(disconnectedStatus.connected, false);
   assert.deepEqual([...disconnectedStatus.attached], []);
@@ -330,6 +421,7 @@ function message(payload) {
   reconnectTimers.at(-1).callback();
   assert.equal(nativePorts.length, 2, "disconnect reconnects the native host");
   nativePorts[1].disconnect(`Forbidden\n${"x".repeat(300)}`);
+  await new Promise(resolve => setTimeout(resolve, 0));
   const errorStatus = await message({ type: "native-status" });
   assert.equal(errorStatus.connected, false);
   assert.deepEqual([...errorStatus.attached], []);
@@ -341,8 +433,10 @@ function message(payload) {
   nativePorts[2].hostMessage({ type: "ready" });
   assert.equal((await message({ type: "native-status" })).error, undefined, "ready clears stale native error");
   nativePorts[2].disconnect();
+  await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(reconnectTimers.at(-1).delay, 1000, "successful host connection resets capped backoff after ready");
   chrome.alarms.onAlarm.fire({ name: "controlla-native-reconnect" });
+  await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(nativePorts.length, 4, "alarm reconnects after the service worker timer is lost");
 
   const oldNative = nativePorts[3];
@@ -352,6 +446,7 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   blockedDetach = { tabId: 17 };
   oldNative.disconnect();
+  await new Promise(resolve => setTimeout(resolve, 0));
   reconnectTimers.at(-1).callback();
   const newNative = nativePorts[4];
   newNative.hostMessage({ type: "ready" });
@@ -575,7 +670,8 @@ function message(payload) {
   const nativePairFrame = new Promise(resolve => { nativePairFrameStarted = resolve; });
   blockedFrame = { tabId: 73, started: nativePairFrameStarted };
   liveNative.hostMessage({ type: "pair", request_id: "busy-native-pair", tab_ids: [72, 73],
-    expected_urls: expectedUrls([72, 73]), expected_document_ids: expectedDocuments([72, 73]) });
+    expected_urls: { 72: tabUrlOverrides.get(72), 73: "https://example.test/73" },
+    expected_document_ids: { 72: tabDocumentOverrides.get(72), 73: "document-73" } });
   await nativePairFrame;
   assert.ok(attached.includes(72), "native pair attaches its first tab before stalling on the next");
   blockedDetach = { tabId: 72 };
@@ -632,7 +728,6 @@ function message(payload) {
   assert.equal(liveNative.sent.at(-1).type, "paired", "native pairing completes with its document identity intact");
   liveNative.hostMessage({ type: "release" });
   await new Promise(resolve => setTimeout(resolve, 0));
-
   // Popup pairings use the same loading-generation guard.
   reloadDuringAttach.add(63);
   const sameUrlManual = await message({ type: "pair", endpoint: "ws://127.0.0.1:1234/", token: "same-url", tabIds: [63] });
@@ -645,5 +740,6 @@ function message(payload) {
   assert.equal(stalePair.ok, false, "stale server handshake must not report connected");
   assert.match(stalePair.error, /Pairing rejected/);
   assert.ok(detached.includes(19), "failed stale pairing must release its debugger attachment");
+
   console.log("Extension version handshake, pairing cleanup, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -2,15 +2,24 @@ let socket;
 const NATIVE_HOST = "chrome_controlla_bridge";
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
+const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
+const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
 const MAX_BATCH_ACTIONS = 64;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
   "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "Accessibility.getPartialAXTree"]);
 let nativePort;
 let nativeReady = false;
 let nativeError;
+let reconnectExhausted = false;
 let reconnectTimer;
 let reconnectAttempts = 0;
+const reconnectStateReady = chrome.storage.session.get(RECONNECT_STORAGE_KEY).then(state => {
+  reconnectAttempts = Number.isSafeInteger(state[RECONNECT_STORAGE_KEY])
+    ? Math.max(0, Math.min(state[RECONNECT_STORAGE_KEY], MAX_RECONNECT_ATTEMPTS)) : 0;
+  reconnectExhausted = reconnectAttempts >= MAX_RECONNECT_ATTEMPTS;
+  if (reconnectExhausted) nativeError = "Native host reconnect limit reached; reload the extension to retry.";
+}).catch(() => { reconnectExhausted = true; nativeError = "Native host reconnect state unavailable; reload the extension to retry."; });
 let manualAttachedTabs = new Set();
 let nativeAttachedTabs = new Set();
 const pairedTabUrls = new Map();
@@ -55,15 +64,19 @@ function traceSharedCommand(phase, request, tabId, startedAt, details = {}) {
   const commandId = typeof request.id === "string" || Number.isSafeInteger(request.id) ? String(request.id).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128) : "";
   try { console.debug("[Chrome Controlla] shared command", { phase, commandId, targetId: tabId, method: request.method, elapsedMs: Math.max(0, Date.now() - startedAt), ...details }); } catch {}
 }
-function scheduleNativeReconnect() {
+async function scheduleNativeReconnect() {
   if (reconnectTimer || nativePort) return;
-  const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts++), RECONNECT_MAX_MS);
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { reconnectExhausted = true; nativeError = "Native host reconnect limit reached; reload the extension to retry."; return; }
+  const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
+  reconnectAttempts++;
+  try { await chrome.storage.session.set({ [RECONNECT_STORAGE_KEY]: reconnectAttempts }); }
+  catch { reconnectExhausted = true; nativeError = "Native host reconnect budget could not be saved; reload the extension to retry."; return; }
   chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: Math.max(delay, 30000) / 60000 });
   reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connectNative(); }, delay);
 }
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM) return; if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = undefined; connectNative(); });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM) return; void reconnectStateReady.then(() => { if (reconnectExhausted) return; if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = undefined; connectNative(); }); });
 function connectNative() {
-  if (nativePort) return;
+  if (nativePort || reconnectExhausted) return;
   try {
     const port = chrome.runtime.connectNative(NATIVE_HOST); nativePort = port; const portGeneration = ++nativePortGeneration; nativeReady = false;
     port.onMessage.addListener(message => { void handleNativeMessage(port, portGeneration, message); });
@@ -75,7 +88,7 @@ function connectNative() {
 }
 async function handleNativeMessage(port, portGeneration, message) {
   if (port !== nativePort || portGeneration !== nativePortGeneration || !message || typeof message.type !== "string") return;
-  if (message.type === "ready") { nativeReady = true; nativeError = undefined; reconnectAttempts = 0; return; }
+  if (message.type === "ready") { nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false; void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {}); return; }
   if (message.type === "list_tabs") {
     try {
       const tabs = await chrome.tabs.query({}); const eligible = tabs.filter(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//i.test(tab.url || ""));
@@ -136,20 +149,21 @@ async function dispatchBatch(request, isAuthorized, respond) {
   if (!Array.isArray(actions) || actions.length === 0 || actions.length > MAX_BATCH_ACTIONS) { respond({ type: "batch_result", id: request.id, error: "Batch requires 1..64 actions." }); return; }
   if (!Number.isSafeInteger(request.deadline_ms) || request.deadline_ms < 1 || request.deadline_ms > 60000) { respond({ type: "batch_result", id: request.id, error: "Batch deadline must be within 1..60000ms." }); return; }
   const receipts = [];
+  const acknowledgedKeyEvent = () => receipts.some(receipt => receipt.method === "Input.dispatchKeyEvent" && !receipt.error);
   for (let index = 0; index < actions.length; index++) {
-    if (performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
+    if (performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
     const action = actions[index];
     if (!action || typeof action.method !== "string" || action.method.length > 128 || (action.target_id !== undefined && Number(action.target_id) !== tabId) || (action.stop_on_not_ok !== undefined && typeof action.stop_on_not_ok !== "boolean")) {
-      respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Invalid batch action or target mismatch." }); return;
+      respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Invalid batch action or target mismatch." }); return;
     }
     let settled;
     await dispatchCommand({ type: "command", id: `${String(request.id).slice(0, 96)}:${index}`, target_id: String(tabId), method: action.method, params: action.params || {} }, isAuthorized, response => { settled = response; });
     const receipt = { index, method: action.method };
     if (settled?.error) receipt.error = settled.error; else receipt.result = settled?.result;
     receipts.push(receipt);
-    if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: settled.error }); return; }
-    if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
-    if (index + 1 < actions.length && performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
+    if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, failed_at: index, stopped_before: index, dispatch_may_have_occurred: action.method === "Input.dispatchKeyEvent" || acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: settled.error }); return; }
+    if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
+    if (index + 1 < actions.length && performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
   }
   respond({ type: "batch_result", id: request.id, result: { receipts, completed: actions.length, stopped_before: null, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt } });
 }
@@ -206,7 +220,7 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   if (message?.type === "pair") { pair(message.endpoint, message.token, message.tabIds).then(() => respond({ ok: true })).catch(error => respond({ ok: false, error: String(error) })); return true; }
   if (message?.type === "status") respond({ connected: socket?.readyState === WebSocket.OPEN, attached: [...manualAttachedTabs] });
   if (message?.type === "release") { const current = socket; const generation = ++manualGeneration; socket = undefined; current?.close(); detachManual(generation).then(() => respond({ ok: true })); return true; }
-  if (message?.type === "native-status") respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, transport: "native" });
+  if (message?.type === "native-status") respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, transport: "native" });
 });
 async function pair(endpoint, token, selectedTabIds) {
   if (!Array.isArray(selectedTabIds) || selectedTabIds.length === 0 || !token || !endpoint) throw new Error("Choose tabs and provide the local pairing endpoint and token.");
@@ -277,4 +291,4 @@ chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
   tabNavigationGenerations.set(removedTabId, (tabNavigationGenerations.get(removedTabId) || 0) + 1); if (!pairedTabUrls.has(removedTabId)) return;
   navigatingTabs.delete(removedTabId); debuggerDetachedDuringNavigation.delete(removedTabId); pairedTabUrls.delete(removedTabId); pairedTabDocumentIds.delete(removedTabId); manualAttachedTabs.delete(removedTabId); nativeAttachedTabs.delete(removedTabId); void detachDebugger(removedTabId);
 });
-connectNative();
+void reconnectStateReady.then(() => { if (!reconnectExhausted) connectNative(); });
