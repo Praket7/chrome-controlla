@@ -37,7 +37,7 @@ This ledger supersedes the initial unchecked template only where it cites curren
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked` passed after updating the V2/unknown-session fixture to expect pre-dispatch rejection by the V3 route guard.
 - `cargo test --workspace --locked -- --ignored` passed with installed Chrome 154.0.8037.99, including the real-CDP input tests, eight-profile headless stress, shared-extension browser regression, and private-headless research/form/repeat/upload-selection/download-readback fixtures.
 - The extension reconnect-only and full stress harnesses, npm client/app/benchmark/release/v3/docs/provenance checks, dependency check, and clean-prefix package check passed.
-- Hosted CI for the final commit is pending. Real client smokes, authenticated app persistence, OS-level IME, production extension-path FastKeys timing, adversarial concurrent-client browser races, real WebMCP cancellation, and controlled competitor measurements remain unqualified. The broad superiority claim stays fail-closed.
+- Exact-head hosted CI passed on source commit `54ec59f5eeb7df1bbca9ba9b53b7aa8933f93dce`: push run [38013128986](https://github.com/Praket7/chrome-controlla/actions/runs/38013128986) and PR run [38013131341](https://github.com/Praket7/chrome-controlla/actions/runs/38013131341) both passed Linux, macOS, Windows, and headless/background stress. Real client smokes, authenticated app persistence, OS-level IME, production extension-path FastKeys timing, adversarial concurrent-client browser races, real WebMCP cancellation, and controlled competitor measurements remain unqualified. The broad superiority claim stays fail-closed.
 
 ## Global Constraints
 
