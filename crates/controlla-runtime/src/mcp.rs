@@ -2210,6 +2210,16 @@ impl App {
                             let document_id = tab["document_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| invalid("selected native tab has no durable document ID; reload the extension and rediscover tabs"))?;
                             expected_urls.insert(selected_id.clone(), json!(url));
                             expected_document_ids.insert(selected_id.clone(), json!(document_id));
+                        } else if let Some(tab) = tab {
+                            // Preserve discovery receipts for extensions predating unrestricted pairing.
+                            if let (Some(url), Some(document_id)) = (
+                                tab["url"].as_str(),
+                                tab["document_id"].as_str().filter(|id| !id.is_empty()),
+                            ) {
+                                expected_urls.insert(selected_id.clone(), json!(url));
+                                expected_document_ids
+                                    .insert(selected_id.clone(), json!(document_id));
+                            }
                         }
                     }
                     crate::native_setup::write_pairing(
