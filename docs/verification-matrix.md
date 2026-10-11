@@ -1,5 +1,16 @@
 # Verification matrix
 
+## Local post-reload check — 2026-10-10
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Workspace and static checks | pass | Fresh workspace tests, warning-denied Clippy, formatting, docs, provenance, client/app/V3 checks, extension background and batch harnesses, dependencies, and the packed npm lifecycle passed locally. |
+| Installed Chrome fixtures | pass | Four ignored provider tests, headless stress, Phase 5 extraction, three guard diagnostics, two private-headless MCP tests, and three V3 binary fixtures passed. The intermittent virtualized extraction case passed five further fresh real-Chrome repeats after waiting for scroll rendering. |
+| Codex direct MCP | pass, headless | The reloaded task exposed all six V3 tools and `local_unrestricted`; it launched `https://example.com/` in a private profile, snapshotted the page, and released the profile. |
+| Foreground shared MCP | pending | The initial native pairing exposed an unconditional URL/document-ID check; a regression and rebuilt host fix it. After host restart, the extension's tab inventory stopped refreshing, so this turn has no accepted shared session or foreground page action yet. |
+| Phase 10 freeze and release gate | structure pass, claim disabled | Removed two placeholder competitor entries from the baseline lock, restoring the preregistered digest. `check:bench` and `check:release` pass; the real competitor runner remains a stub and superiority has no measured evidence. |
+| Manual ESPN tests | not run | The ignored shared test can select the first user tab and the foreground test depends on live external page state; neither is a safe deterministic automated gate. |
+
 ## Browser latency continuation — 2026-10-10
 
 | Check | Result | Evidence / limit |
@@ -11,7 +22,7 @@
 | Lost release acknowledgement | fixture pass | A real-Chrome shared transport fixture executed mouse release but returned a synthetic error. Before the repair, the result was `unknown` despite a fresh snapshot showing the destination URL; after the repair, the requested navigation was observed and returned `verified` with `dispatch_acknowledged:false`. No click replay occurred. |
 | Fresh Bills tab after repair | historical live pass, superseded coverage rule | On a different, newly opened foreground Chrome tab (`1649772862`), the paired extension found seven reachable story links, reported two equal newest timestamps, selected the first by page order, clicked, and verified the exact selected URL. The five-step workflow reported 666 ms (`step_ms`: 18, 0, 298, 245, 102); test wall time including setup was 1.73 s. The session was released and the tab preserved. Review then found unread cross-origin frames, so the current stricter build treats that selection as incomplete and needs a fresh live qualification. |
 | Cross-site / competitor speed | unverified | No same-environment representative corpus, p50/p95 study, or controlled competitor runs have qualified this dirty head. |
-| Phase 10 benchmark check | blocked by existing freeze mismatch | `npm run check:bench` reports `baseline lock digest mismatch`: the held-out manifest expects `75b3ad3f…`, while the unchanged current baseline lock hashes to `9993f07c…`. Neither frozen file was modified in this continuation. |
+| Phase 10 benchmark check | historical failure, resolved above | The baseline lock once contained placeholder competitor entries that broke its preregistered digest. The local post-reload check restored the reviewed lock and the check passes. |
 
 ## V3 PR #2 local verification — 2026-10-09
 

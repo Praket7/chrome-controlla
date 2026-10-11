@@ -14,7 +14,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "8978dc22dcdf0f151814b277abe438ec1a7bd49a04b2ee56c4d96cc55522bb41",
+      "destination_sha256": "1ce6a1e636fe1e04c70c4b89aa8a20182758bcad26487b5dafbb166da8dac91f",
       "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1\u2013A8 follow-up updates guarded-input regression fixture with the required stable DOM node token",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
@@ -94,8 +94,8 @@
       "source_path": "../../outputs/improvements.md",
       "destination_path": "docs/design/improvements.md",
       "source_sha256": "f333236504419021b4c36810acc17a795d6dc7898a14e79ba490058e873b5592",
-      "destination_sha256": "8b0a13156b62ae5c580f56b8a21231e5d84236f81ca431f3f2a1d484b9978446",
-      "edits": "updated relative link to relocated master guide; Phase 7 review records canonical cache preconditions and unqualified observer/cache admission gates",
+      "destination_sha256": "768c3b7cde23d6f32809c67aba152093852c4e69dcbd9345a755197913c94099",
+      "edits": "updated relative link to relocated master guide; Phase 7 review records canonical cache preconditions and unqualified observer/cache admission gates; V3 note marks the five-tool proposal superseded by the six-tool contract",
       "license": "user-provided design document; no third-party license asserted"
     },
     {
@@ -110,7 +110,7 @@
       "source_path": "../../outputs/MASTER_GUIDE.md",
       "destination_path": "docs/MASTER_GUIDE.md",
       "source_sha256": "adb6ac4f93d0e846077bc24aae05bd5ec4ca6717c25eaaef75a2ead6a7f3197d",
-      "destination_sha256": "36d533eb46bdffd993efc32ff3dfc7cc91783aba65c8048116303bac4d91be9b",
+      "destination_sha256": "380d7aa71e49e97431d062a4fdc0f38c8e3dd8e207bd7848ace466458801d9e8",
       "edits": "Phase 1 status distinguishes local evaluator from live workflows; Phase 4/5 documents bounded observation, extraction/resume and file-selection boundaries; Phase 6/9 describes supported workflow and client surface; Phase 8 explicitly marks app recipes as unqualified; examples now match current MCP schemas including strict typed file-selection locators; versioned local setup preview updated to v3; immediately listening shared-tab pairing and nonblocking acceptance status; current shared accessibility and changed-state click semantics with fixture/live evidence boundaries; native host one-time registration and tab discovery; bounded child-process script worker with remaining OS-isolation caveat.; Phase 4/5 native bridge setup is authoritative with one-time install, reload, exact tab discovery/pairing/acceptance, live discovery evidence, and explicit fixture-only reconnect/status boundary; native shared-tab setup passes discover_shared_tabs.snapshot.host_id with exact IDs to pair_shared, documents 100-tab truncation, 15-second freshness, and fixture/local-only host binding, pair-error, serialized cleanup evidence; 2026-10-08: default client config uses native messaging without legacy auto-connect, and live selected-tab attachment/AX/fixture input evidence supersedes earlier unverified statement; 2026-10-09: setup now names Chrome 106+, webNavigation approval, absolute built executable for native-host registration, and current disposable-fixture evidence; Controlla efficiency repair documents schema-first connection, actionable snapshots, declared click outcomes, uncertainty handling and legacy limits.",
       "license": "user-provided design document; no third-party license asserted"
     }

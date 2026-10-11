@@ -62,6 +62,8 @@ pub fn read_tabs() -> Result<serde_json::Value, String> {
     Ok(body)
 }
 
+// shortcut: one internal caller, group pairing fields if another caller needs this API.
+#[allow(clippy::too_many_arguments)]
 pub fn write_pairing(
     host_id: &str,
     endpoint: &str,

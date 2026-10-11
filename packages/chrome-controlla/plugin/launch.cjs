@@ -20,7 +20,7 @@ if (compat) {
   process.stderr.write('CONTROLLA_V2_BIN is deprecated; use CONTROLLA_BIN.\n');
 }
 
-const child = spawn(binary, [], { stdio: 'inherit', env: process.env });
+const child = spawn(binary, ['mcp'], { stdio: 'inherit', env: process.env });
 let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {

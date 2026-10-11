@@ -6,7 +6,8 @@
 - Listing JSON-LD can avoid article fetches only when exact same-origin URLs carry unambiguous publication dates. Sites without that evidence still require bounded reads or an explicit incomplete result.
 - The real-browser competitor runner remains a stub. No universal “fastest on all sites/functions/uses” claim is supportable without the scenario matrix and independent verification described in `design/browser-latency-2026-10-10.md`.
 - One installed-extension Bills run on this dirty head returned `unknown` at click after finding and ranking seven stories; it was not replayed. A separate lost-release fixture exposed a verified navigation masked by an uncertain acknowledgement, and a fresh-tab live run passed after a bounded postcondition observation fix. The failed run remains evidence of variability; repeatable p50/p95 and recovery rates are still unmeasured.
-- The fresh-tab Bills run preceded a stricter coverage fix. Unread cross-origin frames now prevent the runtime from declaring the full page complete; a new live qualification needs frame coverage or an explicitly narrower task scope. The Phase 10 `check:bench` gate currently fails on an existing baseline-lock freeze digest mismatch; the frozen files were not changed here.
+- The fresh-tab Bills run preceded a stricter coverage fix. Unread cross-origin frames now prevent the runtime from declaring the full page complete; a new live qualification needs frame coverage or an explicitly narrower task scope. The Phase 10 baseline-lock mismatch was resolved by removing placeholder competitor entries; this does not supply measured competitor evidence.
+- Direct Codex MCP headless launch, snapshot, and cleanup passed after reload. A shared native pairing fix is built locally, but the extension's tab inventory stopped refreshing after the native host restarted; accepted foreground control remains unverified in this check.
 
 ## V3 release blockers — 2026-10-09
 

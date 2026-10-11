@@ -2149,14 +2149,16 @@ impl App {
                 } else {
                     None
                 };
-                if !unrestricted {
-                    if let Some(requested_host) = args.host_id.as_deref() {
-                        let current = native_snapshot.as_ref().ok_or_else(|| invalid("the selected native host has no fresh tab inventory; rediscover tabs"))?;
-                        if current["host_id"].as_str() != Some(requested_host) {
-                            return Err(invalid(
-                                "native host changed since discovery; rediscover tabs before pairing",
-                            ));
-                        }
+                if !unrestricted && let Some(requested_host) = args.host_id.as_deref() {
+                    let current = native_snapshot.as_ref().ok_or_else(|| {
+                        invalid(
+                            "the selected native host has no fresh tab inventory; rediscover tabs",
+                        )
+                    })?;
+                    if current["host_id"].as_str() != Some(requested_host) {
+                        return Err(invalid(
+                            "native host changed since discovery; rediscover tabs before pairing",
+                        ));
                     }
                 }
                 let native_bridge =

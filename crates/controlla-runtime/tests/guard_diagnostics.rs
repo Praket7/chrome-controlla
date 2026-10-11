@@ -97,14 +97,29 @@ document.getElementById('out').textContent = JSON.stringify(results);
         .spawn()
         .expect("launch Chrome");
     let started = std::time::Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(60),
-            "Chrome guard page timed out"
-        );
+    let dom = loop {
+        let dom = std::fs::read_to_string(&dump).unwrap_or_default();
+        if let Some(start) = dom.find("<pre id=\"out\">") {
+            let output = &dom[start + 14..];
+            if output
+                .find("</pre>")
+                .is_some_and(|end| !output[..end].is_empty())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                break dom;
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            break dom;
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Chrome guard page timed out");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let dom = std::fs::read_to_string(&dump).unwrap_or_default();
+    };
     let _ = std::fs::remove_dir_all(&dir);
     let start = dom.find("<pre id=\"out\">").unwrap_or_else(|| {
         panic!(

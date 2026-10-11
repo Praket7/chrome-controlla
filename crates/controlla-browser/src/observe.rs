@@ -316,8 +316,9 @@ async fn issue_cursor(
 }
 
 fn extraction_page_script(config: &str) -> String {
+    // shortcut: 250 ms settles ordinary virtualized scrolls; add a site-specific wait for slower renderers.
     format!(
-        r#"(()=>{{const q={config};let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false,blocked:[]}};const blocked=[];for(const x of q.expand||[]){{const e=document.querySelector(x.selector);if(!e){{blocked.push(x.selector);continue}}let content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'&&(!content||content.getClientRects().length===0))e.click();content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'||!content||content.getClientRects().length===0)blocked.push(x.selector)}}if(blocked.length)return {{account:true,blocked,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop;c.scrollTop=Math.min(c.scrollTop+c.clientHeight,c.scrollHeight);const result={{items,end,before,after:c.scrollTop,account,limited,missingFields:[...missingFields],clipped}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};return result}})()"#,
+        r#"(()=>{{const q={config};let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false,blocked:[]}};const blocked=[];for(const x of q.expand||[]){{const e=document.querySelector(x.selector);if(!e){{blocked.push(x.selector);continue}}let content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'&&(!content||content.getClientRects().length===0))e.click();content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'||!content||content.getClientRects().length===0)blocked.push(x.selector)}}if(blocked.length)return {{account:true,blocked,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop,next=Math.min(before+c.clientHeight,Math.max(0,c.scrollHeight-c.clientHeight));const result={{items,end,before,after:next,account,limited,missingFields:[...missingFields],clipped,scrollSettled:true}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};if(next===before)return result;return new Promise(resolve=>{{let done=false;const finish=settled=>{{if(done)return;done=true;result.scrollSettled=settled;result.after=c.scrollTop;resolve(result)}};c.addEventListener('scroll',()=>requestAnimationFrame(()=>finish(true)),{{once:true}});c.scrollTop=next;setTimeout(()=>finish(false),250)}})}})()"#,
         config = config
     )
 }
@@ -729,9 +730,6 @@ impl BrowserConnection {
             );
         }
         for step in 0..spec.max_steps {
-            if step > 0 || start_step > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
             if rows.len() >= spec.max_records {
                 truncated = true;
                 missing.insert("record limit reached".to_owned());
@@ -751,10 +749,15 @@ impl BrowserConnection {
                     principal,
                     revisions,
                     "Runtime.evaluate",
-                    json!({"expression":script,"returnByValue":true,"awaitPromise":false}),
+                    json!({"expression":script,"returnByValue":true,"awaitPromise":true}),
                 )
                 .await?;
             let v = evaluate_object(&response)?;
+            if v["scrollSettled"] == false {
+                missing
+                    .insert("scroll update did not settle before the observation deadline".into());
+                break;
+            }
             if v["budgetError"] == true {
                 return Err(BrowserError::InvalidResponse(
                     "byte budget is too small for page extraction metadata".into(),
@@ -1302,6 +1305,8 @@ mod tests {
         assert!(script.contains("q.maxTextChars"));
         assert!(script.contains("q.maxBytes-512"));
         assert!(script.contains("budgetError:true"));
+        assert!(script.contains("c.scrollHeight-c.clientHeight"));
+        assert!(script.contains("addEventListener('scroll'"));
 
         let observation = observation_page_script("config");
         assert!(observation.contains("while(scanned<q.maxScanNodes"));

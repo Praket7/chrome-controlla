@@ -61,7 +61,7 @@ assert.deepEqual(mcp.mcpServers?.['chrome-controlla'], {
   cwd: '${PLUGIN_ROOT}',
 });
 const launch = await readFile(path.join(pluginRoot, 'launch.cjs'), 'utf8');
-assert.match(launch, /controlla-v2-core/);
+assert.match(launch, /spawn\(binary, \['mcp'\]/);
 assert.match(launch, /CONTROLLA_V2_BIN/);
 const packageBin = fileURLToPath(new URL('../../packages/chrome-controlla/bin/', import.meta.url));
 const [defaultLauncher, shellLauncher, windowsLauncher, clientLauncher] = await Promise.all([
@@ -70,13 +70,13 @@ const [defaultLauncher, shellLauncher, windowsLauncher, clientLauncher] = await 
   readFile(path.join(packageBin, 'controlla.cmd'), 'utf8'),
   readFile(path.join(packageBin, 'controlla-client.cjs'), 'utf8'),
 ]);
-assert.match(defaultLauncher, /process\.argv\[2\].*mcp[\s\S]*controlla-v2-core/);
+assert.match(defaultLauncher, /spawnSync\(target, process\.argv\.slice\(2\)/);
 assert.match(shellLauncher, /if \[ "\$\{1-\}" = "mcp" \][\s\S]*controlla-v2-core/);
 assert.match(windowsLauncher, /"%~1".*"mcp"[\s\S]*controlla-v2-core\.exe/);
 assert.match(clientLauncher, /controlla-v2-core/);
 const skill = await readFile(path.join(pluginRoot, 'skills/browser-control/SKILL.md'), 'utf8');
-assert.match(skill, /Never automatically retry an unknown outcome/);
-assert.match(skill, /explicitly discover and pair only the tabs the user selected/);
+assert.match(skill, /Never blind retry `unknown`/);
+assert.match(skill, /local_unrestricted/);
 
 const tempDir = await mkdtemp(path.join(os.tmpdir(), 'controlla-config-install-'));
 try {
@@ -146,8 +146,7 @@ const claudeSection = docs.split('## Claude Code\n')[1]?.split('\n## ')[0] ?? ''
 assert.ok(claudeSection.includes(normalizePathSeparators(generate('claude')).split('\n')[0]), 'Claude command matches generator output');
 assert.match(docs, /ChatGPT Desktop uses the packaged Chrome Controlla local plugin/);
 const chatgptDocs = await readFile(new URL('../../docs/integrations/chatgpt-desktop.md', import.meta.url), 'utf8');
-assert.match(chatgptDocs, /browser_session/);
-assert.match(chatgptDocs, /browser_verify/);
-assert.match(chatgptDocs, /controlla-v2-core/);
+assert.match(chatgptDocs, /`browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`/);
+assert.match(chatgptDocs, /bin\/controlla mcp/);
 assert.match(chatgptDocs, /live ChatGPT Desktop acceptance/i);
 console.log('Versioned client configs, safe JSON merge installation, and ChatGPT local plugin checks passed.');

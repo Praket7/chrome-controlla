@@ -319,13 +319,15 @@ fn validate_pairing(pairing: &Pairing) -> Result<(), String> {
     if ids.len() != pairing.tab_ids.len() {
         return Err("pairing tab_ids must be unique".into());
     }
-    if pairing.tab_ids.iter().any(|id| {
-        pairing.expected_urls.get(id).is_none_or(String::is_empty)
-            || pairing
-                .expected_document_ids
-                .get(id)
-                .is_none_or(|value| value.is_empty() || value.len() > 128)
-    }) {
+    if !pairing.unrestricted
+        && pairing.tab_ids.iter().any(|id| {
+            pairing.expected_urls.get(id).is_none_or(String::is_empty)
+                || pairing
+                    .expected_document_ids
+                    .get(id)
+                    .is_none_or(|value| value.is_empty() || value.len() > 128)
+        })
+    {
         return Err("pairing is missing a selected tab URL or durable document ID".into());
     }
     validate_endpoint(&pairing.endpoint)?;
@@ -556,6 +558,23 @@ mod tests {
             assert!(validate_endpoint(bad).is_err());
         }
         assert!(expired(1).unwrap());
+    }
+
+    #[test]
+    fn unrestricted_pairing_accepts_tabs_without_discovery_identity() {
+        let mut pairing = Pairing {
+            endpoint: "ws://127.0.0.1:8123/".into(),
+            token: "token".into(),
+            tab_ids: vec![17],
+            request_id: "request".into(),
+            expected_urls: Default::default(),
+            expected_document_ids: Default::default(),
+            unrestricted: false,
+            expires_at_unix: u64::MAX,
+        };
+        assert!(validate_pairing(&pairing).is_err());
+        pairing.unrestricted = true;
+        assert!(validate_pairing(&pairing).is_ok());
     }
 
     #[cfg(unix)]
