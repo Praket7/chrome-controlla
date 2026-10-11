@@ -75,6 +75,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "bytes",
         "artifact_handle",
         "client_id",
+        "steps",
     ] {
         assert!(
             browser["properties"].get(property).is_some(),
@@ -141,6 +142,33 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             .contains(&serde_json::json!("upload"))
     );
 
+    let invalid_cold_open = client
+        .call_tool(CallToolRequestParams::new("browser").with_arguments(
+            serde_json::json!({"action":"open","mode":"foreground","url":"javascript:alert(1)"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        invalid_cold_open
+            .to_string()
+            .contains("URL must be HTTP(S)"),
+        "reject invalid navigation before pairing: {invalid_cold_open}"
+    );
+    let invalid_open_workflow = client
+        .call_tool(CallToolRequestParams::new("browser").with_arguments(
+            serde_json::json!({"action":"open","mode":"foreground","url":"https://example.test/","steps":[]})
+                .as_object().unwrap().clone(),
+        ))
+        .await.unwrap_err();
+    assert!(
+        invalid_open_workflow
+            .to_string()
+            .contains("workflow requires 1..40 steps")
+    );
+
     let pair = serde_json::json!({"action":"pair_shared","target_ids":["123"],"mode":"foreground"});
     let paired = client
         .call_tool(
@@ -151,6 +179,13 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .structured_content
         .unwrap();
     let session_id = paired["session_id"].as_str().unwrap();
+    let failed_workflow = client.call_tool(CallToolRequestParams::new("workflow").with_arguments(
+        serde_json::json!({"session_id":session_id,"chrome_tab_id":"123","steps":[{"kind":"snapshot"}]})
+            .as_object().unwrap().clone(),
+    )).await.unwrap().structured_content.unwrap();
+    assert_eq!(failed_workflow["status"], "failed");
+    assert_eq!(failed_workflow["failed_step"], 0);
+    assert_eq!(failed_workflow["receipts"][0]["status"], "failed");
     let open = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/"});
     let error = client
         .call_tool(

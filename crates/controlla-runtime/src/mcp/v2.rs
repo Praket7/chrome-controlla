@@ -124,13 +124,14 @@ struct BrowserProbeArgs {
     timeout_ms: Option<u64>,
 }
 
-#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserPredicate {
     Text { reference: String, equals: String },
     Value { reference: String, equals: String },
     Exists { reference: String },
     Url { equals: String },
+    UrlStartsWith { prefix: String },
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -512,6 +513,11 @@ async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmc
         BrowserPredicate::Url { equals } => {
             let actual = snapshot.get("url").and_then(Value::as_str).unwrap_or_default();
             (actual == equals, json!(actual))
+        }
+        BrowserPredicate::UrlStartsWith { prefix } => {
+            if prefix.is_empty() { return Err(invalid("URL prefix cannot be empty")); }
+            let actual = snapshot.get("url").and_then(Value::as_str).unwrap_or_default();
+            (actual.starts_with(prefix), json!(actual))
         }
     };
     Ok(json!({

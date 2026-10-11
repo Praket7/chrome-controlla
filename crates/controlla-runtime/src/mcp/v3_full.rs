@@ -41,6 +41,88 @@ impl AppV3 {
             Err(invalid("session was not created through the V3 browser route"))
         }
     }
+
+    async fn wait_for_new_tab_ready(&self, session_id: &str, tab_id: &str) -> Result<(), rmcp::ErrorData> {
+        for attempt in 0..150 {
+            match snapshot_impl(&self.core, &BrowserSnapshotArgs {
+                session_id: session_id.to_owned(), chrome_tab_id: tab_id.to_owned(),
+                selector: None, max_items: Some(1), max_text_chars: Some(100),
+                max_bytes: None, href_hint: None,
+            }).await {
+                Ok(snapshot) if snapshot["ready_state"] != "loading" && snapshot["url"].as_str().is_some_and(|url| url.starts_with("https://") || url.starts_with("http://")) => return Ok(()),
+                Ok(_) => {},
+                Err(error) if error.to_string().contains("not ready") || error.to_string().contains("navigating") => {},
+                Err(error) => return Err(error),
+            }
+            if attempt < 149 { tokio::time::sleep(Duration::from_millis(100)).await; }
+        }
+        Err(invalid("new tab did not become ready within 15 seconds"))
+    }
+
+    async fn release_cold_session(&self, session_id: &str) {
+        let _ = self.core.browser_session(Parameters(BrowserSessionArgs {
+            action: "release_shared".into(),
+            provider: Some("shared_extension".into()),
+            session_id: Some(session_id.to_owned()),
+            target_ids: None,
+            host_id: None,
+        })).await;
+        self.browser_modes.lock().await.remove(session_id);
+    }
+
+    async fn cold_open_session(&self, args: &V3BrowserArgs) -> Result<String, rmcp::ErrorData> {
+        if !crate::native_setup::host_registered() {
+            return Err(invalid("native Chrome bridge is not registered"));
+        }
+        let target_ids = match args.target_ids.clone() {
+            Some(ids) => ids,
+            None if crate::guard_reason::unrestricted_mode() => {
+                let snapshot = crate::native_setup::read_tabs().map_err(invalid)?;
+                vec![crate::native_setup::bootstrap_tab_id(&snapshot)
+                    .ok_or_else(|| invalid("no stable web tab is available to open a foreground tab"))?]
+            }
+            None => return Err(invalid("guarded cold open requires host_id and target_ids from discover_shared_tabs")),
+        };
+        if !crate::guard_reason::unrestricted_mode() && args.host_id.is_none() {
+            return Err(invalid("guarded cold open requires host_id from discover_shared_tabs"));
+        }
+        let Json(pair) = self.core.browser_session(Parameters(BrowserSessionArgs {
+            action: "pair_shared".into(),
+            provider: Some("shared_extension".into()),
+            session_id: None,
+            target_ids: Some(target_ids),
+            host_id: args.host_id.clone(),
+        })).await?;
+        let session_id = pair["session_id"].as_str()
+            .ok_or_else(|| invalid("pairing omitted session_id"))?.to_owned();
+        self.browser_modes.lock().await.insert(session_id.clone(), crate::v3::BrowserMode::Foreground);
+        if pair["native_bridge"] != true {
+            self.release_cold_session(&session_id).await;
+            return Err(invalid("native Chrome bridge is unavailable for cold open"));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let accepted = self.core.browser_session(Parameters(BrowserSessionArgs {
+                action: "accept_shared".into(),
+                provider: Some("shared_extension".into()),
+                session_id: Some(session_id.clone()),
+                target_ids: None,
+                host_id: None,
+            })).await;
+            match accepted {
+                Ok(Json(value)) if value["accepted"] == true => return Ok(session_id),
+                Ok(_) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
+                Ok(_) => {
+                    self.release_cold_session(&session_id).await;
+                    return Err(invalid("native Chrome pairing timed out; inspect bridge status"));
+                }
+                Err(error) => {
+                    self.release_cold_session(&session_id).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -59,6 +141,7 @@ struct V3BrowserArgs {
     bytes: Option<Vec<u8>>,
     artifact_handle: Option<String>,
     client_id: Option<String>,
+    steps: Option<Vec<V3WorkflowStep>>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -116,7 +199,7 @@ struct V3ArtifactReadArgs {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum V3WorkflowStep {
-    Snapshot { href_hint: Option<String> },
+    Snapshot { href_hint: Option<String>, max_items: Option<usize> },
     Find {
         query: String,
         role: Option<String>,
@@ -160,6 +243,7 @@ enum V3WorkflowStep {
     },
     Extract {
         selector: String,
+        fields: Option<std::collections::BTreeMap<String, String>>,
     },
     PageTool {
         name: String,
@@ -240,13 +324,32 @@ fn fast_key_batch_failure(result: &Value, prior_key_events: u64) -> (&'static st
 }
 
 fn workflow_should_stop(value: &Value) -> bool {
-    if crate::guard_reason::unrestricted_mode() {
-        return false;
-    }
     matches!(
         value.get("status").and_then(Value::as_str),
         Some("unknown" | "not_dispatched" | "failed")
     )
+}
+
+fn workflow_should_verify_next(value: &Value, next: Option<&V3WorkflowStep>) -> bool {
+    matches!(value["status"].as_str(), Some("unknown" | "dispatched"))
+        && matches!(next, Some(V3WorkflowStep::Verify { .. }))
+}
+
+fn workflow_should_stop_before_next(value: &Value, next: Option<&V3WorkflowStep>) -> bool {
+    workflow_should_stop(value) && !workflow_should_verify_next(value, next)
+}
+
+fn compact_workflow_receipt(mut value: Value, intermediate_snapshot: bool, mutation: bool) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        if intermediate_snapshot {
+            object.insert("item_count".into(), json!(object.get("items").and_then(Value::as_array).map_or(0, Vec::len)));
+            object.remove("items");
+            object.remove("text");
+            object.remove("delta");
+        }
+        if mutation { object.remove("snapshot"); }
+    }
+    value
 }
 
 fn task_receipt(kind: &str, url: &str, reference: Option<&str>, value: &Value) -> Value {
@@ -867,7 +970,7 @@ fn workflow_find_reference(found: &Value) -> Result<String, rmcp::ErrorData> {
         .as_array()
         .ok_or_else(|| invalid("workflow find returned invalid matches"))?;
     if matches.len() != 1 {
-        return Err(invalid("workflow find must resolve exactly one control"));
+        return Err(invalid(format!("workflow find resolved {} controls; expected exactly one", matches.len())));
     }
     matches[0]["reference"]
         .as_str()
@@ -1839,13 +1942,16 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Manage browser sessions and bounded task/file actions. Foreground action=open creates an active tab in an accepted shared session; action=task runs bounded work. Shared-session artifacts require local unrestricted mode.",
+        description = "Manage browser sessions and bounded tasks. Foreground action=open with URL cold-starts a shared session and opens a tab; optional steps run a bounded workflow in that tab within the same call. Existing session_id reuses a session.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn browser(
         &self,
         Parameters(args): Parameters<V3BrowserArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
+        if args.steps.is_some() && args.action != "open" {
+            return Err(invalid("steps are supported only by browser action=open"));
+        }
         if args.action == "task" {
             return self
                 .task(Parameters(V3TaskArgs {
@@ -1888,6 +1994,7 @@ impl AppV3 {
                 "version":"v3","tools":["browser","snapshot","act","workflow","extract","verify"],
                 "modes":{"foreground":crate::v3::BrowserMode::Foreground.policy(),"background":crate::v3::BrowserMode::Background.policy(),"headless":crate::v3::BrowserMode::Headless.policy()},
                 "browser_actions":{"foreground":["discover_shared_tabs","pair_shared","accept_shared","list","open","release","task"],"background":["discover_shared_tabs","pair_shared","accept_shared","list","release","task"],"headless":["launch","list","release","task","artifact_register","artifact_read"]},
+                "foreground_open":{"session_id":"optional; omitting it pairs a shared Chrome tab before opening a new foreground tab","steps":"optional bounded workflow executed in the new tab; result is returned in workflow","guarded_cold_open":"requires host_id and target_ids from discovery","local_unrestricted_cold_open":"chooses a stable web tab from the native inventory"},
                 "act_actions":["click","fill","type","press","select","page_tools","page_tool"],
                 "shared_artifacts":crate::guard_reason::unrestricted_mode(),
                 "typing_modes":["block","fast_keys","human_keys","ime"],
@@ -1897,7 +2004,7 @@ impl AppV3 {
         }
         let mode = parse_mode(args.mode.as_deref())?;
         let provider = args
-            .provider
+            .provider.clone()
             .or_else(|| Some(mode.default_provider().to_owned()));
         if provider.as_deref() != Some(mode.default_provider()) {
             return Err(invalid(format!(
@@ -1906,22 +2013,58 @@ impl AppV3 {
             )));
         }
         if args.action == "open" {
+            let open_started = std::time::Instant::now();
             if mode != crate::v3::BrowserMode::Foreground {
                 return Err(invalid("browser action=open requires foreground mode"));
             }
-            let session_id = args.session_id.as_deref().ok_or_else(|| invalid("session_id is required"))?;
-            if self.browser_modes.lock().await.get(session_id) != Some(&mode) {
-                return Err(invalid("session was not created in foreground mode"));
+            let url = args.url.as_deref().ok_or_else(|| invalid("url is required"))?;
+            super::super::validate_shared_url(url)?;
+            if let Some(steps) = args.steps.as_ref() {
+                if steps.is_empty() || steps.len() > 40 {
+                    return Err(invalid("workflow requires 1..40 steps"));
+                }
+                validate_workflow_steps(steps)?;
             }
-            let url = args.url.ok_or_else(|| invalid("url is required"))?;
-            let Json(mut result) = self.core.legacy.shared_tab(Parameters(super::SharedTabArgs {
-                session_id: session_id.to_owned(),
+            let cold = args.session_id.is_none();
+            let session_id = if let Some(session_id) = args.session_id.as_deref() {
+                if self.browser_modes.lock().await.get(session_id) != Some(&mode) {
+                    return Err(invalid("session was not created in foreground mode"));
+                }
+                session_id.to_owned()
+            } else {
+                self.cold_open_session(&args).await?
+            };
+            let opened = self.core.legacy.shared_tab(Parameters(super::SharedTabArgs {
+                session_id: session_id.clone(),
                 action: "open".into(),
                 chrome_tab_id: None,
-                url,
-            })).await?;
+                url: url.to_owned(),
+            })).await;
+            let Json(mut result) = match opened {
+                Ok(result) => result,
+                Err(error) => {
+                    if cold { self.release_cold_session(&session_id).await; }
+                    return Err(error);
+                }
+            };
             result["session_id"] = json!(session_id);
             result["mode"] = json!(mode);
+            if let Some(steps) = args.steps {
+                let tab_id = result["tab_id"].as_str().ok_or_else(|| invalid("open omitted tab_id"))?.to_owned();
+                result["workflow"] = match self.wait_for_new_tab_ready(&session_id, &tab_id).await {
+                    Err(error) => json!({"status":"failed","stage":"ready","reason":error.to_string()}),
+                    Ok(()) => match self.workflow(Parameters(V3WorkflowArgs {
+                        session_id,
+                        chrome_tab_id: tab_id,
+                        steps,
+                        client_id: args.client_id,
+                    })).await {
+                    Ok(Json(value)) => value,
+                    Err(error) => json!({"status":"failed","stage":"workflow","reason":error.to_string()}),
+                    },
+                };
+            }
+            result["elapsed_ms"] = json!(open_started.elapsed().as_millis() as u64);
             return Ok(Json(result));
         }
         if mode == crate::v3::BrowserMode::Headless {
@@ -2182,11 +2325,11 @@ impl AppV3 {
         if !matches!(&result, Ok(value) if value["status"] == "unknown") {
             release_lease(self, &args, &lease).await;
         }
-        result.map(Json)
+        result.map(|value| Json(compact_workflow_receipt(value, false, true)))
     }
 
     #[tool(
-        description = "Run a bounded deterministic browser program in one MCP call. Supports snapshot/find/click/fill/type/press/page_tool/extract/verify and rejects unresolved refs or >40 steps.",
+        description = "Run a bounded browser program in one MCP call. Supports snapshot, find, find_all, choose newest by datetime, click, fill, type, press, page_tool, extract, and verify; up to 40 steps.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn workflow(
@@ -2206,7 +2349,11 @@ impl AppV3 {
         let mut receipts: Vec<Value> = Vec::with_capacity(args.steps.len());
         let mut step_ms = Vec::with_capacity(args.steps.len());
         let mut unverified_effect = false;
-        for step in args.steps {
+        let mut steps = args.steps.into_iter().peekable();
+        let mut pending_readback = false;
+        while let Some(step) = steps.next() {
+            let is_snapshot = matches!(&step, V3WorkflowStep::Snapshot { .. });
+            let is_mutation = matches!(&step, V3WorkflowStep::Click { .. } | V3WorkflowStep::Fill { .. } | V3WorkflowStep::Type { .. } | V3WorkflowStep::Press { .. } | V3WorkflowStep::PageTool { .. });
             let step_started = std::time::Instant::now();
             let resolve = |reference: String,
                            vars: &std::collections::BTreeMap<String, String>|
@@ -2214,21 +2361,29 @@ impl AppV3 {
                 crate::browser_workflow::resolve_workflow_reference(&reference, vars)
                     .map_err(invalid)
             };
-            let value = match step {
-                V3WorkflowStep::Snapshot { href_hint } => {
-                    let snapshot = snapshot_impl(
-                        &self.core,
-                        &BrowserSnapshotArgs {
+            let value = async { Ok::<Value, rmcp::ErrorData>(match step {
+                V3WorkflowStep::Snapshot { href_hint, max_items } => {
+                    let mut attempt = 0;
+                    let snapshot = loop {
+                        let read = snapshot_impl(&self.core, &BrowserSnapshotArgs {
                             session_id: args.session_id.clone(),
                             chrome_tab_id: args.chrome_tab_id.clone(),
                             selector: None,
-                            max_items: None,
+                            max_items,
                             max_text_chars: None,
                             max_bytes: None,
-                            href_hint,
-                        },
-                    )
-                    .await?;
+                            href_hint: href_hint.clone(),
+                        }).await;
+                        match read {
+                            Ok(value) if value["ready_state"] != "loading" => break value,
+                            Ok(value) if attempt == 49 => break value,
+                            Ok(_) => {},
+                            Err(error) if attempt < 49 && (error.to_string().contains("not ready") || error.to_string().contains("navigating")) => {},
+                            Err(error) => return Err(error),
+                        }
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    };
                     coverage_complete = snapshot["truncated"] == false || snapshot["first_party_complete"] == true;
                     snapshot
                 }
@@ -2391,13 +2546,15 @@ impl AppV3 {
                     .await?
                     .0
                 }
-                V3WorkflowStep::Extract { selector } => {
+                V3WorkflowStep::Extract { selector, fields } => {
+                    let fields = fields.unwrap_or_else(|| std::collections::BTreeMap::from([("text".to_owned(), selector.clone())]));
+                    if fields.is_empty() { return Err(invalid("extract fields cannot be empty")); }
                     self.core
                         .browser_extract(Parameters(BrowserExtractArgs {
                             session_id: args.session_id.clone(),
                             chrome_tab_id: args.chrome_tab_id.clone(),
                             selector,
-                            fields: std::collections::BTreeMap::new(),
+                            fields,
                             max_items: Some(100),
                             max_text_chars: Some(6000),
                             max_bytes: Some(100_000),
@@ -2444,23 +2601,42 @@ impl AppV3 {
                             } else { equals };
                             BrowserPredicate::Url { equals }
                         },
+                        BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
                     };
-                    verify_impl(
-                        &self.core,
-                        &BrowserVerifyArgs {
+                    let mut observed = json!({"status":"unknown","reason":"verification did not complete"});
+                    for attempt in 0..if pending_readback { 20 } else { 1 } {
+                        match verify_impl(&self.core, &BrowserVerifyArgs {
                             session_id: args.session_id.clone(),
                             chrome_tab_id: args.chrome_tab_id.clone(),
-                            predicate,
-                        },
-                    )
-                    .await?
+                            predicate: predicate.clone(),
+                        }).await {
+                            Ok(value) => observed = value,
+                            Err(error) if !pending_readback => return Err(error),
+                            Err(error) => observed = json!({"status":"unknown","reason":error.to_string()}),
+                        }
+                        if !pending_readback || observed["status"] == "passed" || attempt == 19 { break; }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    if pending_readback && observed["status"] == "passed" { unverified_effect = false; }
+                    observed
+                }
+            }) }.await;
+            let value = match value {
+                Ok(value) => value,
+                Err(error) => {
+                    receipts.push(json!({"status":"failed","reason":error.to_string()}));
+                    step_ms.push(step_started.elapsed().as_millis() as u64);
+                    return Ok(Json(json!({"status":"failed","failed_step":receipts.len()-1,
+                        "steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,
+                        "elapsed_ms":started.elapsed().as_millis() as u64})));
                 }
             };
-            let stop_status = workflow_should_stop(&value)
+            let stop_status = workflow_should_stop_before_next(&value, steps.peek())
                 .then(|| value["status"].as_str().unwrap_or("unknown").to_owned());
-            unverified_effect |= matches!(value["status"].as_str(), Some("unknown" | "not_dispatched" | "failed"));
+            pending_readback = workflow_should_verify_next(&value, steps.peek()) && stop_status.is_none();
+            unverified_effect |= matches!(value["status"].as_str(), Some("unknown" | "dispatched" | "not_dispatched" | "failed"));
             step_ms.push(step_started.elapsed().as_millis() as u64);
-            receipts.push(value);
+            receipts.push(compact_workflow_receipt(value, is_snapshot && steps.peek().is_some(), is_mutation));
             if let Some(status) = stop_status {
                 return Ok(Json(
                     json!({"status":status,"steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64}),
@@ -2844,8 +3020,11 @@ mod v3_batch_delivery_tests {
         AppV3, BrowserPredicate, V3WorkflowStep, fast_key_batch_failure, lease_target_key,
         page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, task_receipt,
         typing_policy, validate_workflow_steps, workflow_find_reference, workflow_should_stop,
+        workflow_should_stop_before_next, workflow_should_verify_next,
+        compact_workflow_receipt,
     };
     use serde_json::json;
+
 
     #[test]
     fn compact_surface_routes_tasks_and_receipts_do_not_dump_page_state() {
@@ -2918,6 +3097,32 @@ mod v3_batch_delivery_tests {
         assert!(workflow_should_stop(&json!({"status":"failed"})));
         assert!(!workflow_should_stop(&json!({"status":"verified"})));
     }
+
+    #[test]
+    fn unrestricted_workflow_reports_failed_selection_before_resolving_its_reference() {
+        assert!(workflow_should_stop(&json!({"status":"failed","reason_code":"missing_freshness"})));
+    }
+
+    #[test]
+    fn uncertain_click_can_continue_to_read_only_verification() {
+        let next = V3WorkflowStep::Verify { predicate: BrowserPredicate::Url { equals: "https://example.test/ok".into() } };
+        assert!(!workflow_should_stop_before_next(&json!({"status":"unknown"}), Some(&next)));
+        assert!(workflow_should_verify_next(&json!({"status":"dispatched"}), Some(&next)));
+        assert!(workflow_should_stop_before_next(&json!({"status":"unknown"}), None));
+        assert!(workflow_should_stop_before_next(&json!({"status":"failed"}), Some(&next)));
+    }
+
+    #[test]
+    fn combined_workflow_receipts_omit_redundant_page_dumps() {
+        let snapshot = json!({"url":"https://example.test/","items":[{"reference":"@c1"}],"text":"large","delta":{"upsert":[]}});
+        let compact = compact_workflow_receipt(snapshot.clone(), true, false);
+        assert_eq!(compact["item_count"], 1);
+        assert!(compact.get("items").is_none());
+        assert_eq!(compact_workflow_receipt(snapshot.clone(), false, false), snapshot);
+        let click = compact_workflow_receipt(json!({"status":"dispatched","snapshot":snapshot}), false, true);
+        assert!(click.get("snapshot").is_none());
+    }
+
 
     #[test]
     fn workflow_find_rejects_ambiguous_targets() {

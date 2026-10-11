@@ -2806,6 +2806,22 @@ impl App {
             checked["x"].as_f64().ok_or_else(|| invalid("missing x"))?,
             checked["y"].as_f64().ok_or_else(|| invalid("missing y"))?,
         );
+        let moved = tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Input.dispatchMouseEvent",
+                json!({"type":"mouseMoved","button":"none","x":x,"y":y}),
+            ),
+        )
+        .await;
+        if !matches!(moved, Ok(Ok(_))) {
+            return Ok(rmcp::handler::server::wrapper::Json(json!({
+                "status":"not_dispatched","reason":"pointer move failed before click","dispatch_acknowledged":false
+            })));
+        }
         let press = tokio::time::timeout_at(
             deadline,
             connection.command(
@@ -3811,21 +3827,7 @@ impl App {
         &self,
         Parameters(args): Parameters<SharedTabArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        let (scheme, rest) = args
-            .url
-            .split_once("://")
-            .ok_or_else(|| invalid("URL must be HTTP(S) and cannot contain credentials"))?;
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        if !matches!(scheme, "http" | "https")
-            || authority.is_empty()
-            || authority.contains('@')
-            || args.url.len() > 2048
-            || args.url.chars().any(char::is_whitespace)
-        {
-            return Err(invalid(
-                "URL must be HTTP(S), bounded, and cannot contain credentials",
-            ));
-        }
+        validate_shared_url(&args.url)?;
         if args.action != "open" && args.action != "navigate" {
             return Err(invalid("shared_tab action must be open or navigate"));
         }
@@ -4492,6 +4494,24 @@ fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
         return Err("global byte budget is too small for explicit coverage metadata".into());
     }
     Ok(output)
+}
+
+fn validate_shared_url(url: &str) -> Result<(), rmcp::ErrorData> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| invalid("URL must be HTTP(S) and cannot contain credentials"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if !matches!(scheme, "http" | "https")
+        || authority.is_empty()
+        || authority.contains('@')
+        || url.len() > 2048
+        || url.chars().any(char::is_whitespace)
+    {
+        return Err(invalid(
+            "URL must be HTTP(S), bounded, and cannot contain credentials",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> rmcp::ErrorData {

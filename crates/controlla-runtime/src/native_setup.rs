@@ -62,6 +62,19 @@ pub fn read_tabs() -> Result<serde_json::Value, String> {
     Ok(body)
 }
 
+pub fn bootstrap_tab_id(snapshot: &serde_json::Value) -> Option<String> {
+    snapshot["tabs"].as_array()?.iter().find_map(|tab| {
+        let id = u32::try_from(tab["id"].as_u64()?).ok()?;
+        let url = tab["url"].as_str()?;
+        let document_id = tab["document_id"].as_str()?;
+        if (url.starts_with("http://") || url.starts_with("https://")) && !document_id.is_empty() {
+            Some(id.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 // shortcut: one internal caller, group pairing fields if another caller needs this API.
 #[allow(clippy::too_many_arguments)]
 pub fn write_pairing(
@@ -247,6 +260,20 @@ fn registry_default(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cold_open_chooses_a_stable_web_tab_from_the_native_inventory() {
+        let inventory = serde_json::json!({"tabs":[
+            {"id":10,"url":"https://loading.example/"},
+            {"id":11,"url":"chrome://settings/","document_id":"x"},
+            {"id":12,"url":"https://ready.example/","document_id":"document-12"}
+        ]});
+        assert_eq!(super::bootstrap_tab_id(&inventory), Some("12".to_owned()));
+        assert_eq!(
+            super::bootstrap_tab_id(&serde_json::json!({"tabs":[]})),
+            None
+        );
+    }
+
     #[test]
     fn extension_id_must_be_exact() {
         assert!(!super::valid_extension_id("x"));

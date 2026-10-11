@@ -160,6 +160,18 @@ async fn nested_snapshot_reports_read_and_unread_sources() {
     );
     assert_eq!(snapshot["truncation_reason"], "cross_origin_frames_unread");
     assert_eq!(snapshot["first_party_complete"], false);
+    let scoped = client
+        .call_tool(call(
+            "snapshot",
+            serde_json::json!({
+                "session_id":session,"chrome_tab_id":tab,"href_hint":"/article-"
+            }),
+        ))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(scoped["first_party_complete"], true, "{scoped}");
     let _ = client
         .call_tool(call(
             "browser",
@@ -248,13 +260,12 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
     assert_eq!(result["result"]["steps"], 5, "workflow step budget");
     assert!(result["result"]["elapsed_ms"].is_number());
     assert_eq!(result["result"]["step_ms"].as_array().unwrap().len(), 5);
-    assert_eq!(
+    assert_eq!(result["result"]["receipts"][0]["item_count"], 2);
+    assert!(
         result["result"]["receipts"][2]["selected"]["href"]
             .as_str()
-            .unwrap(),
-        result["result"]["receipts"][0]["items"][1]["href"]
-            .as_str()
-            .unwrap(),
+            .unwrap()
+            .ends_with("/article-newest.html"),
         "selected reference must target the candidate with the latest fixture timestamp"
     );
     assert!(

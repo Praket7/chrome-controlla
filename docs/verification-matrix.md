@@ -692,3 +692,15 @@ This verifies live shared-route fill, typing, guarded clicks, stale-document rej
 ## Live extension check after reload — 2026-10-09
 
 Passed through the installed native extension and Hotload: accepted a selected-tab session, opened ESPN in a new foreground tab, read a shared_snapshot, clicked the accessible-label league menu and verified expanded=true, then navigated through an observed Gamecast link. A score-card click first opened a menu rather than navigating; shared_click reported unknown for its unsatisfied navigation outcome, returned the new Gamecast control, and did not replay the action. Clicking that new control verified the destination URL. A subsequent snapshot on the same session reported ready_state=complete, the expected game title and 34 controls. Session release succeeded; the foreground tab was preserved. No re-pair or reconnect was needed after navigation. This qualifies that ESPN flow on this Mac; Classroom account switching and the to-do task remain unverified.
+
+## V3 one-call foreground qualification — 2026-10-10
+
+| Check | Result | Evidence and limit |
+|---|---|---|
+| Cold foreground `open` with workflow | pass, live Chrome | One Controlla call paired, opened the Bills page, selected the latest of eight observed story links by published time, clicked, and verified the article URL; 1,629 ms total in one observed run. |
+| Redirected click and redirected open | pass, live Chrome | Wikipedia language click reached `https://en.wikipedia.org/wiki/Main_Page`; `url_starts_with` verified the canonical redirect. A direct open to English Wikipedia also reached that final URL. |
+| Fill, value readback, navigation | pass, installed-package live fixture | One call completed seven steps against a local foreground page; value and final URL were independently observed, 774 ms with the final installed binary. This is not a remote-app persistence test. |
+| Text extraction | pass, live Chrome | `example.org` paragraph extraction returned six records; the workflow default `text` field was exercised. |
+| Failure receipts and compact output | pass, local and live | Rust regression verifies partial receipts after a runtime failure; combined workflows report item count and omit redundant action snapshots. |
+| Local suite and installed package | pass | `cargo test --workspace --locked`, Clippy with warnings denied, extension/client Node tests, docs/provenance/clients/apps/bench/release/V3 checks; staged release binary matched the built SHA-256 and the installed client listed six V3 tools. |
+| Direct Codex tool exposure and broad comparison | open | This task's tool registry contains no named Controlla tools. The packaged client proves browser execution, while a Codex reload and controlled multi-site competitor runs remain unverified. |

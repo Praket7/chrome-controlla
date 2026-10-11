@@ -212,7 +212,7 @@ fn predicate_references(predicate: &BrowserPredicate) -> Option<&str> {
         BrowserPredicate::Text { reference, .. }
         | BrowserPredicate::Value { reference, .. }
         | BrowserPredicate::Exists { reference } => Some(reference),
-        BrowserPredicate::Url { .. } => None,
+        BrowserPredicate::Url { .. } | BrowserPredicate::UrlStartsWith { .. } => None,
     }
 }
 
@@ -373,6 +373,7 @@ fn substitute_predicate(
             reference: substitute(&reference, vars)?,
         },
         BrowserPredicate::Url { equals } => BrowserPredicate::Url { equals },
+        BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
     })
 }
 

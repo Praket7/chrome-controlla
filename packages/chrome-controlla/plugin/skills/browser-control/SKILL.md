@@ -7,7 +7,7 @@ description: Use when controlling Chrome through Controlla; describes guarded mo
 
 Controlla V3 exposes exactly six default MCP tools:
 
-- `browser` — discover/pair shared tabs, open an active foreground tab in an accepted session, launch private headless, run bounded tasks, and inspect/release sessions
+- `browser` — discover/pair shared tabs, cold-open a foreground tab with an optional workflow, launch private headless, run bounded tasks, and inspect/release sessions
 - `snapshot` — return compact semantic state or revision-bound delta
 - `act` — perform one action (click, fill, type, press, select, page_tools, page_tool)
 - `workflow` — execute a bounded deterministic action graph with partial receipts
@@ -29,9 +29,14 @@ No other default tools exist. Screenshots, raw trees, skill admin, and benchmark
 
 Common tasks should use one compiled `workflow` instead of many individual `act` calls. Repeated qualified tasks may use deterministic replay with fresh guards.
 
+For a cold foreground task, call `browser` once with `action:"open"`, `mode:"foreground"`, `url`, and optional `steps`. The response includes `session_id`, `tab_id`, and `workflow` when steps were supplied. In `local_unrestricted` mode, omit `session_id` and Controlla chooses a stable web tab to bootstrap pairing. In guarded mode, supply fresh `host_id` and decimal `target_ids` from discovery in the same open call. Release the returned session when finished.
+
+Inside `steps`, use `snapshot` before `find` or `find_all`; add `href_hint` or `max_items` when only a small set is needed. `choose` with `key:"datetime"` ranks complete candidate sets by published time. `extract` takes a CSS `selector` and optionally a `fields` map; omitting `fields` reads matching elements into a `text` field. Put `verify` immediately after an action when its outcome needs proof. If a click returns `unknown` or `dispatched`, a following read-only `verify` can establish the outcome without repeating the click.
+For navigation that may redirect within a known destination, use `verify` with `{"kind":"url_starts_with","prefix":"https://example.com/"}`. Use `{"kind":"url","equals":"..."}` when the exact URL matters.
+
 ## Browser actions by mode
 
-- Foreground shared Chrome: `discover_shared_tabs` → `pair_shared` with the returned `host_id` and selected decimal `target_ids` → poll `accept_shared` → `open` with `session_id`, `mode:"foreground"`, and an HTTP(S) `url`. `open` activates a new tab and returns its `tab_id`, URL, and document ID. Use that `tab_id` as `chrome_tab_id` for `snapshot` and `act`.
+- Foreground shared Chrome: `browser` `action:"open"` with an HTTP(S) `url` opens a new active tab; add `steps` to execute a bounded workflow in that same call. An existing accepted `session_id` reuses its session. Use the returned `tab_id` as `chrome_tab_id` for follow-up tools.
 - Background shared Chrome: discover, pair, accept, list, release, and bounded `task`; `open` is unavailable because it activates a tab.
 - Private headless: `launch`, list, release, bounded `task`, `artifact_register`, and `artifact_read`.
 - `browser` action `task` supports `research`, `form_draft`, `upload`, `download`, and `repeat`. `research` navigates a paired tab; it does not create a new tab. In guarded mode, `upload` and `artifact_register` require a dedicated private headless session.
