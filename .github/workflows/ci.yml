@@ -50,6 +50,7 @@ jobs:
       - run: npm run check:docs
       - run: npm run check:provenance
       - run: node --test packages/chrome-controlla/test-client.cjs
+      - run: npm run check:agent-ux
       - run: npm run check:clients
       - run: npm run check:apps
       - run: npm run check:bench
