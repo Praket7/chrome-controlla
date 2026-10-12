@@ -64,41 +64,62 @@ async fn repeated_headless_launch_evaluate_and_cleanup_never_reuses_profile_stat
             .unwrap();
         let connection = session.connection();
         let target_id = session.target_id().to_owned();
-        let frame_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+
+        // A newly launched Chrome can publish an initial root frame and then
+        // replace it when the requested document commits. Read-only references
+        // are allowed to reacquire across that transition; this stress test is
+        // about profile isolation/cleanup, not asserting that the first frame
+        // event is already final.
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Some(frame) = connection
-                    .frames
-                    .read()
+                let frame_id = loop {
+                    if let Some(frame) = connection
+                        .frames
+                        .read()
+                        .await
+                        .frames
+                        .values()
+                        .find(|frame| frame.target_id == target_id && frame.parent_id.is_none())
+                    {
+                        break frame.id.clone();
+                    }
+                    tokio::task::yield_now().await;
+                };
+                let reference = match connection
+                    .capture_target_ref(&registry, &handle, &target_id, &frame_id, 1, 1)
                     .await
-                    .frames
-                    .values()
-                    .find(|frame| frame.target_id == target_id && frame.parent_id.is_none())
                 {
-                    break frame.id.clone();
+                    Ok(reference) => reference,
+                    Err(error) if error.to_string().contains("FrameChanged") => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Err(error) => panic!("headless run {run} failed to capture target: {error}"),
+                };
+                match connection
+                    .observe_accessibility(
+                        &registry,
+                        &reference,
+                        &handle.principal,
+                        controlla_browser::sessions::IdentityRevisions {
+                            account: 1,
+                            document: 1,
+                        },
+                        "main",
+                        65_536,
+                    )
+                    .await
+                {
+                    Ok(observed) => break observed,
+                    Err(error) if error.to_string().contains("FrameChanged") => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("headless run {run} observation failed: {error}"),
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
-        let reference = connection
-            .capture_target_ref(&registry, &handle, &target_id, &frame_id, 1, 1)
-            .await
-            .unwrap();
-        let observed = connection
-            .observe_accessibility(
-                &registry,
-                &reference,
-                &handle.principal,
-                controlla_browser::sessions::IdentityRevisions {
-                    account: 1,
-                    document: 1,
-                },
-                "main",
-                65_536,
-            )
-            .await
-            .unwrap();
+        .expect("headless root frame did not stabilize within five seconds");
         assert!(
             !observed.nodes.is_empty(),
             "headless run {run} missed its fixture main element"
