@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "max_prompt_to_first_browser_ms": 5000,
+    "max_pre_browser_metadata_calls": 0,
+    "max_schema_discovery_calls": 0,
+    "max_repo_reads": 0,
+    "max_documentation_reads": 0,
+    "max_describe_calls": 0,
+    "max_broad_snapshots": 0,
+    "max_navigation_detours": 0,
+    "max_duplicate_observations": 0,
+    "max_model_visible_observations_before_first_mutation": 1
+  },
+  "tasks": [
+    {
+      "id": "espn-newest-bills-story",
+      "prompt": "Open ESPN and navigate to the most recent Buffalo Bills story.",
+      "expected_first_destination": "bills-specific-page",
+      "forbidden_detours": ["espn-homepage", "generic-nfl-homepage"],
+      "required_shape": ["direct_destination", "targeted_candidate_read", "choose_newest", "click", "verify"]
+    },
+    {
+      "id": "github-known-repo-issue",
+      "prompt": "Open the requested known GitHub repository issue.",
+      "expected_first_destination": "specific-repository-or-issue",
+      "forbidden_detours": ["github-homepage"],
+      "required_shape": ["direct_destination", "targeted_read_or_verify"]
+    },
+    {
+      "id": "youtube-newest-known-channel-result",
+      "prompt": "Open the newest matching video on a known YouTube channel.",
+      "expected_first_destination": "channel-or-qualified-search-page",
+      "forbidden_detours": ["youtube-homepage"],
+      "required_shape": ["direct_destination", "targeted_candidate_read", "choose_newest", "click", "verify"]
+    },
+    {
+      "id": "five-field-form",
+      "prompt": "Fill five known independent form fields without submitting.",
+      "expected_first_destination": "known-form-page",
+      "forbidden_detours": [],
+      "required_shape": ["targeted_snapshot", "single_fill_form", "readback"]
+    },
+    {
+      "id": "existing-tab-setting",
+      "prompt": "Change a known setting in the already open tab and verify it.",
+      "expected_first_destination": "existing-tab",
+      "forbidden_detours": ["new-session-discovery", "new-tab"],
+      "required_shape": ["reuse_context", "targeted_snapshot", "bounded_workflow", "verify"]
+    }
+  ]
+}

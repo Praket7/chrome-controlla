@@ -106,6 +106,26 @@ async function main() {
       });
     });
   }
+
+  let tools = [];
+  let schemas = new Map();
+  let schemasStale = false;
+  let schemaGeneration = 0;
+
+  async function refreshSchemas() {
+    const nextTools = [];
+    let cursor;
+    do {
+      const page = await rpc('tools/list', cursor ? { cursor } : {});
+      nextTools.push(...(page.tools ?? []));
+      cursor = page.nextCursor;
+    } while (cursor);
+    tools = nextTools;
+    schemas = new Map(tools.map(tool => [tool.name, tool.inputSchema]));
+    schemasStale = false;
+    schemaGeneration += 1;
+  }
+
   lines.on('line', line => {
     let message;
     try { message = JSON.parse(line); } catch { process.stderr.write(`Ignored malformed MCP server output: ${line.slice(0, 200)}\n`); return; }
@@ -129,23 +149,15 @@ async function main() {
     for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(new Error(`MCP server exited (${signal ?? code})`)); }
     pending.clear();
   });
-  let tools;
-  let schemasStale = false;
   try {
     const initialized = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'chrome-controlla-client', version: '0.1.0' } });
     if (!initialized?.protocolVersion || !initialized?.serverInfo) throw new Error('invalid initialize result');
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-    tools = [];
-    let cursor;
-    do {
-      const page = await rpc('tools/list', cursor ? {cursor} : {});
-      tools.push(...(page.tools ?? [])); cursor = page.nextCursor;
-    } while (cursor);
+    await refreshSchemas();
   } catch (error) {
     process.stderr.write(`Chrome Controlla client initialization failed: ${error.message}\n`);
     input.close(); process.stdin.pause(); stopChild(); process.exitCode = 1; return;
   }
-  const schemas = new Map(tools.map(tool => [tool.name, tool.inputSchema]));
   let chain = Promise.resolve();
   receive = line => { chain = chain.then(async () => {
     let request;
@@ -154,14 +166,36 @@ async function main() {
       process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request?.id??null,error:{code:-32600,message:'Expected a JSON-RPC request with id and method'}})}\n`); return;
     }
     const respond = (result, error) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) })}\n`);
-    if (schemasStale) { respond(null, {code:-32000,message:'Tool schemas changed; restart this client before further calls'}); return; }
+    if (schemasStale) {
+      try { await refreshSchemas(); }
+      catch (error) { respond(null, {code:-32000,message:`Could not refresh changed Controlla schemas: ${error.message}`}); return; }
+      // A tools/call that was already queued while the old generation was
+      // active must never be dispatched under a newly refreshed contract.
+      // The refresh is transparent, but the caller retries the logical call
+      // against the new generation; mutations are never replayed for it.
+      if (request.method === 'tools/call') {
+        respond(null, { code: -32001, message: 'Controlla schemas changed; retry request after automatic refresh' });
+        return;
+      }
+    }
     if (request.method === 'tools/list') {
       const name = request.params?.name;
       respond({ tools: name ? tools.filter(t => t.name === name) : tools.map(t => ({name:t.name,description:t.description})) }, null); return;
     }
     if (request.method !== 'tools/call') { respond(null, { code: -32601, message: `unsupported client method: ${request.method}` }); return; }
     const { name, arguments: args } = request.params ?? {};
-    const schema = schemas.get(name);
+    let schema = schemas.get(name);
+    // Unknown tools can indicate missed schema drift, so refresh once before
+    // rejecting them. Ordinary caller validation errors do not trigger another
+    // tools/list round trip; the cached schema is authoritative until the
+    // server signals a list change.
+    if (!schema) {
+      const generation = schemaGeneration;
+      try { await refreshSchemas(); }
+      catch (error) { respond(null, { code: -32000, message: `Could not refresh Controlla schemas: ${error.message}` }); return; }
+      schema = schemas.get(name);
+      if (schema && schemaGeneration > generation) process.stderr.write('Controlla schemas refreshed automatically after drift.\n');
+    }
     if (!schema) { respond(null, { code: -32602, message: `unknown tool: ${String(name)}` }); return; }
     const issue = validate(schema, args ?? {}, schema);
     if (issue) { respond(null, { code: -32602, message: `invalid arguments: ${issue}` }); return; }
@@ -173,7 +207,7 @@ async function main() {
     catch (error) { respond(null, { code: error.code ?? -32000, message: error.message, ...(error.data === undefined ? {} : { data: error.data }) }); }
   }); };
   for (const line of queued) receive(line);
-  process.stderr.write('Controlla client ready; schemas cached. Keep this process open for the task.\n');
+  process.stderr.write('Controlla client ready; schemas cached and drift refresh is automatic. Keep this process open for the task.\n');
   const finish = async () => {
     await chain;
     stopChild();

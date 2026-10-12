@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "chrome-controlla",
   "version": "0.1.0",
-  "description": "Control explicitly selected Chrome tabs through Controlla's compact local MCP server with guarded actions and verification.",
+  "description": "Control Chrome through Controlla's compact six-tool local MCP with direct routing, bounded workflows, and verification.",
   "author": {
     "name": "Praket7"
   },
@@ -10,14 +10,14 @@
     "com.openai": {
       "interface": {
         "displayName": "Chrome Controlla",
-        "shortDescription": "Control selected Chrome tabs",
-        "longDescription": "Use Controlla's local MCP server to discover and explicitly pair Chrome tabs, inspect compact semantic state, perform guarded browser actions, and verify mutations without exposing a remote browser endpoint.",
+        "shortDescription": "Fast verified Chrome control",
+        "longDescription": "Use Controlla's six stable local MCP tools to open the most specific verified destination, observe only what the next decision needs, execute deterministic browser work in bounded workflows, and verify uncertain mutations without browser-orchestration overhead.",
         "developerName": "Praket7",
         "category": "Productivity",
         "capabilities": [
           "Interactive"
         ],
-        "defaultPrompt": "Use Chrome Controlla to work in my explicitly selected Chrome tabs. Prefer semantic snapshots and bounded workflows, verify mutations, and never blindly retry an unknown browser outcome."
+        "defaultPrompt": "Use Chrome Controlla immediately. If its six tools are already exposed, do not inspect MCP schemas, call describe, search repository source, or reread browser documentation before normal actions. Prefer the most specific user-provided, observed, or qualified Controlla route; take one targeted semantic observation only when needed; compile deterministic work into one browser/workflow call; verify only uncertain mutations; never replay unknown outcomes. Optimize total prompt-to-verified-result latency, not just browser execution time."
       }
     }
   }

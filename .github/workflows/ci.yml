@@ -9,6 +9,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  agent-ux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm run check:agent-ux
   headless-background-stress:
     runs-on: ubuntu-latest
     steps:
@@ -36,7 +44,15 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy production targets
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --lib --bins --locked -- -D warnings
+      - name: Clippy production targets on Windows
+        if: runner.os == 'Windows'
+        run: cargo clippy --workspace --lib --bins --locked -- -D warnings -A unused-variables
+      - name: Clippy all targets including active ESPN integration tests
+        if: runner.os == 'macOS'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: ./scripts/package-build.sh
         shell: bash
@@ -50,6 +66,7 @@ jobs:
       - run: npm run check:docs
       - run: npm run check:provenance
       - run: node --test packages/chrome-controlla/test-client.cjs
+      - run: npm run check:agent-ux
       - run: npm run check:clients
       - run: npm run check:apps
       - run: npm run check:bench
