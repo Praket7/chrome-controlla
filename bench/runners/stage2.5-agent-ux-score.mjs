@@ -12,11 +12,13 @@ const DEFAULT_LIMITS = Object.freeze({
   max_navigation_detours: 0,
   max_duplicate_observations: 0,
   max_model_visible_observations_before_first_mutation: 1,
+  max_agent_tool_calls: 2,
 });
 
 const BROWSER_KINDS = new Set([
   'browser_open',
   'browser_task',
+  'browser_release',
   'snapshot',
   'workflow',
   'act',
@@ -41,6 +43,11 @@ function count(events, predicate) {
 
 function firstTime(events, predicate) {
   return events.find(predicate)?.at_ms ?? null;
+}
+
+function isAgentToolCall(event) {
+  if (typeof event.agent_tool_call === 'boolean') return event.agent_tool_call;
+  return BROWSER_KINDS.has(event.kind) || METADATA_KINDS.has(event.kind);
 }
 
 function nonNegativeDelta(end, start, label) {
@@ -84,6 +91,7 @@ export function summarizeAgentUx(trace, limits = {}) {
       beforeMutation,
       event => event.model_visible_observation === true,
     ),
+    agent_tool_calls: count(trace.events, isAgentToolCall),
     browser_commands: count(trace.events, event => BROWSER_KINDS.has(event.kind)),
   };
   metrics.orchestration_overhead_ms = Math.max(
@@ -102,6 +110,7 @@ export function summarizeAgentUx(trace, limits = {}) {
     ['navigation_detours', 'max_navigation_detours'],
     ['duplicate_observations', 'max_duplicate_observations'],
     ['model_visible_observations_before_first_mutation', 'max_model_visible_observations_before_first_mutation'],
+    ['agent_tool_calls', 'max_agent_tool_calls'],
   ];
   const failures = checks
     .filter(([metric, limit]) => metrics[metric] > effective[limit])
