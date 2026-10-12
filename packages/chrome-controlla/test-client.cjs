@@ -26,7 +26,7 @@ if(m.id!==undefined)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,r
 });
 `);
 
-test('client initializes once, lists cached schemas, validates locally, and routes tool calls', async () => {
+test('client initializes once, uses cached schemas, validates locally, and routes tool calls', async () => {
   const child = spawn(process.execPath, [client, '--server', process.execPath, '--server-arg', fake], { stdio: ['pipe','pipe','pipe'] });
   let output='', error=''; child.stdout.setEncoding('utf8'); child.stdout.on('data',s=>output+=s); child.stderr.on('data',s=>error+=s);
   child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list',params:{}})+'\n');
@@ -38,6 +38,7 @@ test('client initializes once, lists cached schemas, validates locally, and rout
   assert.equal(rows[0].id,1); assert.equal(rows[0].result.tools[0].name,'sum');
   assert.equal(rows[1].id,2); assert.equal(rows[1].result.content[0].text,'5');
   assert.equal(rows[2].id,3); assert.match(rows[2].error.message,/b/);
+  assert.doesNotMatch(error,/schemas requested twice/);
 });
 
 test('client reports server stderr without corrupting JSONL replies', async () => {
@@ -76,9 +77,27 @@ test('tool errors remain tool errors and duplicated content is removed', {timeou
   const result=await fixture(t,'tool-error',`reply(m,{isError:true,structuredContent:{reason:'blocked'},content:[{type:'text',text:'blocked'}]});`,[42,action(2)]);
   assert.equal(result.rows[0].error.code,-32600);assert.equal(result.rows[1].result.isError,true);assert.equal(result.rows[1].result.structuredContent.reason,'blocked');assert.equal(result.rows[1].result.content,undefined);
 });
-test('schema change refuses queued action instead of using stale schema', {timeout:5000}, async t=>{
+test('tools-list-changed notification refreshes internally instead of stopping the agent', {timeout:5000}, async t=>{
   const result=await fixture(t,'schema-change',`process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/tools/list_changed'})+'\\n');reply(m,{content:[]});`,[action(1),action(2)]);
-  assert.match(result.rows[1].error.message,/schemas changed/);
+  assert.equal(result.code,0,result.error);
+  assert.equal(result.rows.length,2);
+  assert.ok(Array.isArray(result.rows[0].result.content));
+  assert.ok(Array.isArray(result.rows[1].result.content));
+  assert.doesNotMatch(result.error,/restart this client/i);
+});
+test('server invalid-params retries once only when refreshed schema actually changed', {timeout:5000}, async t=>{
+  const script=path.join(dir,'invalid-params-drift.cjs');
+  const effects=path.join(dir,'invalid-params-effects');
+  fs.writeFileSync(script, `const fs=require('node:fs');const rl=require('node:readline').createInterface({input:process.stdin});let version=1;let attempts=0;const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');rl.on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')return send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',serverInfo:{name:'fixture',version:'1'},capabilities:{}}});if(m.method==='notifications/initialized')return;if(m.method==='tools/list')return send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'act',inputSchema:version===1?{type:'object',properties:{},additionalProperties:false}:{type:'object',properties:{version:{type:'number'}},additionalProperties:false}}]}});if(m.method==='tools/call'){attempts++;if(attempts===1){version=2;return send({jsonrpc:'2.0',id:m.id,error:{code:-32602,message:'schema changed'}});}fs.appendFileSync(${JSON.stringify(effects)},'1');return send({jsonrpc:'2.0',id:m.id,result:{content:[]}});}});`);
+  const child=spawn(process.execPath,[client,'--server',process.execPath,'--server-arg',script],{stdio:['pipe','pipe','pipe']});
+  t.after(()=>child.kill('SIGKILL'));
+  let output='',error='';child.stdout.on('data',s=>output+=s);child.stderr.on('data',s=>error+=s);
+  child.stdin.write(JSON.stringify(action(1))+'\n');child.stdin.end();
+  const [code]=await once(child,'close');assert.equal(code,0,error);
+  const rows=output.trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
+  assert.equal(rows.length,1);assert.ok(Array.isArray(rows[0].result.content));
+  assert.equal(fs.readFileSync(effects,'utf8'),'1');
+  assert.match(error,/schema drift recovered automatically/i);
 });
 test('unexpected child exit closes client even with input still open', {timeout:5000}, async t=>{
   const result=await fixture(t,'exit',`process.exit(7);`,[action(1)],1000,true);
