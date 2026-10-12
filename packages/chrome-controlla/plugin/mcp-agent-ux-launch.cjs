@@ -10,6 +10,7 @@ function startAgentUxProxy(child, options = {}) {
   let schemaStale = true;
   let serverTools = [];
   let closed = false;
+  let closingPromise = null;
   const pending = new Map();
 
   const sendServer = message => {
@@ -123,6 +124,21 @@ function startAgentUxProxy(child, options = {}) {
     }).catch(error => process.stderr.write(`Chrome Controlla proxy request failed: ${error.stack ?? error}\n`));
   });
 
+  async function closeProxy() {
+    if (closingPromise) return closingPromise;
+    closingPromise = (async () => {
+      await chain;
+      clientLines.close();
+      serverLines.close();
+      if (!closed && child.stdin.writable) child.stdin.end();
+    })();
+    return closingPromise;
+  }
+
+  clientLines.on('close', () => {
+    closeProxy().catch(error => process.stderr.write(`Chrome Controlla proxy close failed: ${error.message}\n`));
+  });
+
   child.on('exit', (code, signal) => {
     closed = true;
     for (const item of pending.values()) {
@@ -131,17 +147,11 @@ function startAgentUxProxy(child, options = {}) {
     }
     pending.clear();
     clientLines.close();
+    serverLines.close();
     process.stdin.pause();
   });
 
-  return {
-    runtime,
-    async close() {
-      await chain;
-      clientLines.close();
-      serverLines.close();
-    }
-  };
+  return { runtime, close: closeProxy };
 }
 
 module.exports = { startAgentUxProxy };
