@@ -26,7 +26,7 @@ Preferred shape:
 
 `most specific destination -> one targeted observation if needed -> one deterministic workflow -> verification only if still needed -> release`
 
-Do not visit a homepage when a user-provided, observed, or qualified Controlla route already identifies the specific destination. Do not take duplicate broad snapshots. Do not return deterministic intermediate state to the model just to issue the next obvious browser command.
+Do not visit a homepage when the specific destination is user-provided, observed, remembered as a qualified route, or can be synthesized safely with high confidence. Do not take duplicate broad snapshots. Do not return deterministic intermediate state to the model just to issue the next obvious browser command.
 
 ## Canonical hot-path calls
 
@@ -64,17 +64,20 @@ Use this route:
 
 For exact publication metadata, `find_all` the narrow candidate set and `choose` with `key:"datetime"`. Do not infer newest from DOM order. If a site exposes only relative ages such as `2h`, use only comparable observed evidence and report that limitation instead of inventing an exact timestamp.
 
-Example behavior for “open the newest Buffalo Bills story on ESPN”: if a qualified/verified Bills destination is available, open that page directly. Do **not** open ESPN home, take general homepage snapshots, browse menus, then rediscover the Bills page. Read the Bills story candidates once, choose the newest supported candidate, click it, and verify the destination.
+Example behavior for “open the newest Buffalo Bills story on ESPN”: go directly to the Bills-specific destination when it is user-provided, already observed/qualified, or can be synthesized from a stable public ESPN team-route pattern with high confidence. Verify that the opened page is actually the Buffalo Bills page. Do **not** open ESPN home, take general homepage snapshots, browse menus, then rediscover the Bills page. Read the Bills story candidates once, choose the newest supported candidate, click it, and verify the destination.
 
-## Direct-route safety
+## Confidence-gated direct routing
 
-A direct destination is allowed when it is:
+A direct destination may come from:
 
-1. supplied by the user,
-2. an observed href from current page evidence, or
-3. supplied by Controlla's qualified route/skill memory.
+1. a URL supplied by the user,
+2. an observed href from current page evidence,
+3. qualified Controlla route/skill memory, or
+4. a high-confidence synthesis of a stable **public** site route.
 
-Do not invent unverified application routes. If no qualified route exists, perform the minimum semantic exploration needed to discover one. Successful independently verified routes/workflows may be learned for later reuse; failed, drifted, credential-bearing, or ambiguous routes must not be replayed.
+For case 4, the URL must be bounded HTTP(S), contain no credentials/secrets, and represent a public navigation route rather than a side-effect endpoint. Open it speculatively, then immediately verify page identity against the requested site/entity. On mismatch, 404, login/account ambiguity, or unexpected redirect, discard the route and fall back once to semantic discovery. Never synthesize private account indexes, hidden authenticated routes, submission/destructive endpoints, or identity-sensitive state.
+
+Only independently verified successful routes may enter reusable memory. Route memory must be origin-scoped, expiring, and quarantined on structural drift or repeated verification failure.
 
 ## Verification and recovery
 
@@ -92,4 +95,4 @@ Load these only when the task requires them:
 
 ## Cleanup
 
-Release the Controlla shared session when finished and preserve the user's tab. A normal browser task should require zero repo reads, zero schema/describe calls, zero MCP-discovery calls, and normally no more than one model-visible observation before deterministic execution when the destination is already known.
+Release the Controlla shared session when finished and preserve the user's tab. A normal browser task should require zero repo reads, zero schema/describe calls, zero MCP-discovery calls, and normally no more than one model-visible observation before deterministic execution when the destination is already known or can be safely routed.
