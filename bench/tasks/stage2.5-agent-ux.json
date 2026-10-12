@@ -10,7 +10,8 @@
     "max_broad_snapshots": 0,
     "max_navigation_detours": 0,
     "max_duplicate_observations": 0,
-    "max_model_visible_observations_before_first_mutation": 1
+    "max_model_visible_observations_before_first_mutation": 1,
+    "max_agent_tool_calls": 2
   },
   "tasks": [
     {
