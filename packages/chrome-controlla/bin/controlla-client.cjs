@@ -169,6 +169,14 @@ async function main() {
     if (schemasStale) {
       try { await refreshSchemas(); }
       catch (error) { respond(null, {code:-32000,message:`Could not refresh changed Controlla schemas: ${error.message}`}); return; }
+      // A tools/call that was already queued while the old generation was
+      // active must never be dispatched under a newly refreshed contract.
+      // The refresh is transparent, but the caller retries the logical call
+      // against the new generation; mutations are never replayed for it.
+      if (request.method === 'tools/call') {
+        respond(null, { code: -32001, message: 'Controlla schemas changed; retry request after automatic refresh' });
+        return;
+      }
     }
     if (request.method === 'tools/list') {
       const name = request.params?.name;
@@ -177,18 +185,19 @@ async function main() {
     if (request.method !== 'tools/call') { respond(null, { code: -32601, message: `unsupported client method: ${request.method}` }); return; }
     const { name, arguments: args } = request.params ?? {};
     let schema = schemas.get(name);
-    let issue = schema ? validate(schema, args ?? {}, schema) : `unknown tool: ${String(name)}`;
-    // Recover schema drift internally. This only pays a tools/list round trip after
-    // a mismatch; successful hot-path calls never perform agent-visible discovery.
-    if (!schema || issue) {
+    // Unknown tools can indicate missed schema drift, so refresh once before
+    // rejecting them. Ordinary caller validation errors do not trigger another
+    // tools/list round trip; the cached schema is authoritative until the
+    // server signals a list change.
+    if (!schema) {
       const generation = schemaGeneration;
       try { await refreshSchemas(); }
       catch (error) { respond(null, { code: -32000, message: `Could not refresh Controlla schemas: ${error.message}` }); return; }
       schema = schemas.get(name);
-      issue = schema ? validate(schema, args ?? {}, schema) : `unknown tool: ${String(name)}`;
-      if (!issue && schemaGeneration > generation) process.stderr.write('Controlla schemas refreshed automatically after drift.\n');
+      if (schema && schemaGeneration > generation) process.stderr.write('Controlla schemas refreshed automatically after drift.\n');
     }
     if (!schema) { respond(null, { code: -32602, message: `unknown tool: ${String(name)}` }); return; }
+    const issue = validate(schema, args ?? {}, schema);
     if (issue) { respond(null, { code: -32602, message: `invalid arguments: ${issue}` }); return; }
     try {
       const result = await rpc('tools/call', { name, arguments: args ?? {} });
