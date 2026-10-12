@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+#[cfg(any(unix, test))]
 use std::io::Read;
 
 const MAX_LOCAL_ARTIFACT_BYTES: u64 = 10 * 1024 * 1024;
@@ -17,6 +18,7 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(any(unix, test))]
 fn read_bounded<R: Read>(reader: R) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     reader
