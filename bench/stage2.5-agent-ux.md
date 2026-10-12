@@ -29,6 +29,7 @@ For ordinary known or safely routable browser tasks:
 | Metric | Gate |
 |---|---:|
 | prompt -> first Controlla browser command | <= 5 s target |
+| model-visible agent tool calls for the common task | <= 2, normally compiled open + release |
 | MCP discovery before browser work | 0 |
 | schema lookups before browser work | 0 |
 | `browser describe` before browser work | 0 |
@@ -50,12 +51,12 @@ Prompt:
 Expected execution shape:
 
 1. Resolve or safely synthesize the Bills-specific public destination.
-2. Open it directly.
-3. Verify that the page is the Buffalo Bills destination.
-4. Read the narrow Bills-story candidate set once.
+2. Compile page-identity readiness, targeted candidate observation, `find_all`, `choose(datetime)`, and click into the initial `browser open` call when possible.
+3. Open the Bills page directly and verify that it is the requested entity before bundled steps continue.
+4. Read the narrow Bills-story candidate set once inside that program.
 5. Choose the newest candidate using the strongest observed publication evidence.
 6. Click once.
-7. Verify the destination when the click receipt does not already prove it.
+7. Only if the click receipt does not prove its declared postcondition, do one read-only verification without replaying the click.
 8. Release the session and leave the story tab open.
 
 The following are explicit failures when the direct route is available:
@@ -66,6 +67,7 @@ The following are explicit failures when the direct route is available:
 - reading `MEMORY.md`, `SKILL.md`, `mcp.rs`, `v3_full.rs`, `observe.rs`, or similar source to learn routine arguments
 - two broad snapshots of the same page
 - repeated `extract`/snapshot probing caused by uncertainty about tool syntax
+- serial model-visible calls for deterministic steps that fit one bounded Controlla program
 
 ## Safe speculative public routes
 
@@ -87,6 +89,7 @@ Every measured run should separately report:
 - `total_prompt_to_verified_ms`
 - measured browser work
 - orchestration overhead = total prompt-to-verified minus measured browser work
+- model-visible agent tool-call count
 - schema/MCP discovery calls
 - repository/source reads
 - documentation/memory reads
