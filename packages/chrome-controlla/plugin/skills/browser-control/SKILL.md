@@ -64,7 +64,15 @@ Use this route:
 
 For exact publication metadata, `find_all` the narrow candidate set and `choose` with `key:"datetime"`. Do not infer newest from DOM order. If a site exposes only relative ages such as `2h`, use only comparable observed evidence and report that limitation instead of inventing an exact timestamp.
 
-Example behavior for “open the newest Buffalo Bills story on ESPN”: go directly to the Bills-specific destination when it is user-provided, already observed/qualified, or can be synthesized from a stable public ESPN team-route pattern with high confidence. Verify that the opened page is actually the Buffalo Bills page. Do **not** open ESPN home, take general homepage snapshots, browse menus, then rediscover the Bills page. Read the Bills story candidates once, choose the newest supported candidate, click it, and verify the destination.
+When the route and filters are known, compile the read/choose/click chain into the initial `browser open` call. For the Bills-on-ESPN pattern, the intended shape is:
+
+```json
+{"action":"open","mode":"foreground","url":"https://www.espn.com/nfl/team/_/name/buf/buffalo-bills","idempotency_key":"espn-bills-latest","ready_when":{"kind":"semantic_match","query":"Buffalo Bills","role":"heading"},"steps":[{"kind":"snapshot","href_hint":"/nfl/","max_items":50,"max_text_chars":0,"goal":{"query":"Bills","roles":["link"],"exhaustive":true},"max_scan_nodes":20000},{"kind":"find_all","query":"Bills","role":"link","href_hint":"/nfl/","max_matches":50,"save_as":"stories"},{"kind":"choose","from":"stories","key":"datetime","save_as":"latest"},{"kind":"click","reference":"$latest","outcome":{"kind":"navigation"}}]}
+```
+
+This is a route pattern, not permission to assume success. `ready_when` must establish the intended page before the bundled steps run. If the route or freshness evidence fails, fall back once to semantic discovery. If the click result is already verified, do not add another verification call; if it is `unknown`/`dispatched`, do one read-only verification without replaying the click.
+
+Example behavior for “open the newest Buffalo Bills story on ESPN”: go directly to the Bills-specific destination when it is user-provided, already observed/qualified, or can be synthesized from a stable public ESPN team-route pattern with high confidence. Verify that the opened page is actually the Buffalo Bills page. Do **not** open ESPN home, take general homepage snapshots, browse menus, then rediscover the Bills page.
 
 ## Confidence-gated direct routing
 
