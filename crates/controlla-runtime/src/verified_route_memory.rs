@@ -447,10 +447,9 @@ fn http_origin(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let (scheme, rest) = if let Some(rest) = lower.strip_prefix("https://") {
         ("https", rest)
-    } else if let Some(rest) = lower.strip_prefix("http://") {
-        ("http", rest)
     } else {
-        return None;
+        let rest = lower.strip_prefix("http://")?;
+        ("http", rest)
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {
