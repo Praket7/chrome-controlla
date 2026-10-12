@@ -15,16 +15,17 @@ For ordinary browser tasks, **act first**. If the six tools are already exposed 
 
 Default execution policy:
 
-1. Start with `browser`. Prefer the most specific destination that is user-provided, observed, or supplied by a qualified/verified Controlla route. Do not visit a site's homepage merely to rediscover a known destination.
-2. Observe only what the next decision needs. Prefer one targeted semantic snapshot with bounded items, scan nodes, and `max_text_chars:0` when body text is unnecessary. Do not take broad duplicate snapshots.
-3. Put deterministic multi-step work in one `browser open` with `steps` or one `workflow`. Do not bounce intermediate deterministic state through the model.
-4. Verify consequential mutations only when the action/workflow receipt does not already prove the requested postcondition. Never replay an `unknown` mutation.
-5. Release the shared session without closing the user's tab.
+1. Start with `browser`. Prefer the most specific destination rather than a site's homepage.
+2. A destination may come from the user, an observed href, qualified Controlla route/skill memory, **or a high-confidence public route synthesis**. Speculative public routing is allowed only for bounded HTTP(S) URLs with no credentials/secrets and must be verified against the requested entity/page immediately after navigation. If verification fails, discard the route and fall back once to semantic discovery. Never synthesize account indexes, private/authenticated routes, destructive-action endpoints, or hidden application state.
+3. Observe only what the next decision needs. Prefer one targeted semantic snapshot with bounded items, scan nodes, and `max_text_chars:0` when body text is unnecessary. Do not take broad duplicate snapshots.
+4. Put deterministic multi-step work in one `browser open` with `steps` or one `workflow`. Do not bounce intermediate deterministic state through the model.
+5. Verify consequential mutations only when the action/workflow receipt does not already prove the requested postcondition. Never replay an `unknown` mutation.
+6. Release the shared session without closing the user's tab.
 
 For newest/latest content, the preferred shape is **direct destination -> one targeted candidate read -> choose by observed publication evidence -> click -> verify**. Avoid homepage navigation, repeated general snapshots, source-code inspection, and manual schema discovery. If exact timestamps are unavailable, report the actual freshness evidence used rather than inventing precision.
 
-A normal browser task should have zero repository reads, zero schema/describe calls, zero MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
+A normal browser task should have zero repository reads, zero schema/describe calls, zero MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known or can be safely routed. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
 
-The route safety rule is: use a user-provided URL, an observed href, or a route produced by Controlla's qualified route/skill memory. Do not invent an unverified application route. If no qualified direct route exists, use the minimum semantic exploration required to discover one, then allow successful verified routes/workflows to be learned for later reuse.
+Successful speculative routes become reusable only after independent page-identity verification. Persisted route/skill memory must be bounded, origin-scoped, expiring, and quarantined on structural drift or repeated verification failure. Failed, ambiguous, credential-bearing, or sensitive routes must not be learned or replayed.
 
 Recovery remains fail-closed: `not_dispatched` may be corrected and retried; `unknown` requires fresh read-only verification and must not replay the side effect. Password values never belong in snapshots, workflows, logs, tests, or persistent route/skill memory.
