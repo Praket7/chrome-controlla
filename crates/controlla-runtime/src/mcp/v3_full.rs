@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+const SHARED_TRIGGER_UPLOAD_DEADLINE: Duration = Duration::from_secs(45);
+
 #[derive(Clone)]
 struct AppV3 {
     core: AppV2,
@@ -47,9 +49,9 @@ impl AppV3 {
             match snapshot_impl(&self.core, &BrowserSnapshotArgs {
                 session_id: session_id.to_owned(), chrome_tab_id: tab_id.to_owned(),
                 selector: None, max_items: Some(1), max_text_chars: Some(100),
-                max_bytes: None, href_hint: None,
+                max_bytes: None, href_hint: None, frame_id: None,
             }).await {
-                Ok(snapshot) if snapshot["ready_state"] != "loading" && snapshot["url"].as_str().is_some_and(|url| url.starts_with("https://") || url.starts_with("http://")) => return Ok(()),
+                Ok(snapshot) if snapshot["ready_state"] == "complete" && snapshot["url"].as_str().is_some_and(|url| url.starts_with("https://") || url.starts_with("http://")) => return Ok(()),
                 Ok(_) => {},
                 Err(error) if error.to_string().contains("not ready") || error.to_string().contains("navigating") => {},
                 Err(error) => return Err(error),
@@ -127,6 +129,7 @@ impl AppV3 {
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("allOf" = [{"if":{"properties":{"action":{"const":"open"}},"required":["action"]},"then":{"required":["idempotency_key"]}}]))]
 struct V3BrowserArgs {
     action: String,
     provider: Option<String>,
@@ -136,11 +139,15 @@ struct V3BrowserArgs {
     host_id: Option<String>,
     mode: Option<String>,
     url: Option<String>,
+    #[schemars(description = "For action=task, pass a tagged task object. Example: {\"kind\":\"research\",\"urls\":[\"https://example.test/\"]}. Research navigates the selected existing tab.")]
     task: Option<crate::v3_tasks::TaskPrimitive>,
     filename: Option<String>,
     bytes: Option<Vec<u8>>,
+    file_path: Option<String>,
     artifact_handle: Option<String>,
     client_id: Option<String>,
+    #[schemars(description = "Required for action=open. Reuse the same key only when retrying the same logical open; choose a new key for a distinct new tab.")]
+    idempotency_key: Option<String>,
     steps: Option<Vec<V3WorkflowStep>>,
 }
 
@@ -153,10 +160,13 @@ struct V3ActArgs {
     reference: Option<String>,
     expected_value: Option<String>,
     value: Option<String>,
+    #[schemars(description = "Explicitly allow filling a password input for this act only. The value is sent to the local MCP and browser and is never returned in snapshots or action results.")]
+    allow_password: Option<bool>,
     key: Option<String>,
     outcome: Option<BrowserClickOutcome>,
     timeout_ms: Option<u64>,
     typing_mode: Option<String>,
+    #[schemars(description = "For human_keys, delay after each character in milliseconds (0–250); defaults to 180 ms per character. Other typing modes ignore this field.")]
     delay_ms: Option<u64>,
     client_id: Option<String>,
     page_tool_name: Option<String>,
@@ -186,7 +196,8 @@ struct V3TaskArgs {
 struct V3ArtifactRegisterArgs {
     session_id: String,
     filename: String,
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
+    file_path: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -224,6 +235,12 @@ enum V3WorkflowStep {
     Click {
         reference: String,
         outcome: Option<BrowserClickOutcome>,
+    },
+    Upload {
+        artifact_handle: String,
+        trigger_reference: String,
+        account_marker: (String, String),
+        acceptance: Option<BrowserPredicate>,
     },
     Fill {
         reference: String,
@@ -380,12 +397,356 @@ fn task_receipt(kind: &str, url: &str, reference: Option<&str>, value: &Value) -
     .bounded();
     json!({"kind":kind,"status":value["status"],"url":bounded.url,"snippet":bounded.snippet,
         "affected_controls":bounded.affected_controls,"verified":bounded.verified,
+        "reason_code":value["reason_code"],"dispatch_acknowledged":value["dispatch_acknowledged"],
+        "dispatch_may_have_occurred":value["dispatch_may_have_occurred"],
+        "root_document_matches":value["root_document_matches"],"account_marker_matches":value["account_marker_matches"],
         "artifact_handle": if kind == "download" { value["artifact_handle"].clone() } else { Value::Null },
         "filename": if matches!(kind, "download" | "upload") { value["filename"].clone() } else { Value::Null },
         "size": if matches!(kind, "download" | "upload") { value["size"].clone() } else { Value::Null },
+        "chrome_selected_file": if kind == "upload" { value["chrome_selected_file"].clone() } else { Value::Null },
+        "selection_readback_verified": if kind == "upload" { value["selection_readback_verified"].clone() } else { Value::Null },
+        "file_input_consumed_by_page": if kind == "upload" { value["file_input_consumed_by_page"].clone() } else { Value::Null },
+        "application_accepted": if kind == "upload" { value["application_accepted"].clone() } else { Value::Null },
+        "network_events": if kind == "upload" { value["network_events"].clone() } else { Value::Null },
+        "network_observation_window_ms": if kind == "upload" { value["network_observation_window_ms"].clone() } else { Value::Null },
+        "persisted": if kind == "upload" { value["persisted"].clone() } else { Value::Null },
         "sha256": if kind == "download" { value["sha256"].clone() } else { Value::Null },
         "item_count": if kind == "extract" { value["items"].as_array().map(Vec::len) } else { None },
         "limited": if kind == "extract" { value["truncated"].as_bool() } else { None }})
+}
+
+async fn shared_file_select_trigger(
+    app: &AppV3,
+    session_id: &str,
+    tab_id: &str,
+    artifact_handle: &str,
+    trigger_reference: &str,
+    account_marker: &(String, String),
+    acceptance: Option<Value>,
+) -> Result<Value, rmcp::ErrorData> {
+    let acceptance_predicate: Option<BrowserPredicate> = acceptance.map(serde_json::from_value)
+        .transpose().map_err(|error|invalid(format!("invalid upload acceptance predicate: {error}")))?;
+    let live=app.core.legacy.shared_sessions.lock().await.get(session_id).cloned().ok_or_else(||invalid("unknown session_id"))?;
+    let (filename,size,path,before)= {
+        let live=live.lock().await;
+        if live.handle.principal!=app.core.legacy.principal.as_ref() || !crate::guard_reason::unrestricted_mode() || super::super::private_headless_cleanup_allowed(&live.handle) {
+            return Ok(json!({"status":"unsupported","reason":"trigger-based upload requires the owning local unrestricted shared Chrome session"}));
+        }
+        let registry=live.registry()?;
+        let handle:controlla_browser::sessions::ArtifactHandle=serde_json::from_value(json!(artifact_handle)).map_err(|error|invalid(format!("invalid artifact handle: {error}")))?;
+        let metadata=registry.artifact_metadata(&live.handle,&handle).map_err(|error|invalid(format!("artifact lookup failed: {error:?}")))?;
+        let path=registry.artifact_path_for(&live.handle.id,&live.handle.principal,&handle).map_err(|error|invalid(format!("artifact path lookup failed: {error:?}")))?.to_string_lossy().into_owned();
+        let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+        let before=super::super::shared_frame_identity(connection,registry,&live.handle,tab_id).await.map_err(invalid)?;
+        let marker_selector = shared_upload_account_marker_selector(&account_marker.0).map_err(invalid)?;
+        controlla_browser::identity_marker_command(marker_selector,&account_marker.1).map_err(|error|invalid(format!("invalid account marker: {error}")))?;
+        (metadata.filename,metadata.size,path,before)
+    };
+    if !shared_upload_account_marker_matches(app, session_id, tab_id, &account_marker.0, &account_marker.1).await.map_err(invalid)? {
+        return Ok(json!({"status":"not_dispatched","reason_code":"account_marker_mismatch","reason":"account marker did not match before file selection"}));
+    }
+    let acceptance_previously_passed = if let Some(predicate)=&acceptance_predicate {
+        verify_impl(&app.core,&BrowserVerifyArgs{session_id:session_id.to_owned(),chrome_tab_id:tab_id.to_owned(),predicate:predicate.clone()}).await?["status"]=="passed"
+    } else { false };
+    if let Some(frame_reference) = trigger_reference.strip_prefix("@f:") {
+        let parts=frame_reference.split(':').collect::<Vec<_>>();
+        let backend=parts.get(2).and_then(|value|value.parse::<u64>().ok());
+        if parts.len()!=3 || parts[0].is_empty() || parts[1].is_empty() || backend.is_none() {
+            return Ok(json!({"status":"not_dispatched","reason_code":"invalid_frame_reference","dispatch_may_have_occurred":false}));
+        }
+        let selection=async {
+            let live=live.lock().await;
+            let registry=live.registry()?;
+            let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+            connection.command(registry,&live.handle,tab_id,"Controlla.frameSelectFile",json!({"frame_id":parts[0],"frame_loader_id":parts[1],"trigger_backend_node_id":backend.unwrap(),"file_path":path})).await.map_err(invalid)
+        }.await;
+        let selection=match selection {
+            Ok(value)=>shared_extension_value(&value).map_err(invalid)?,
+            Err(error)=>return Ok(json!({"status":"unknown","reason_code":"frame_upload_transport_uncertain","reason":error.to_string(),"dispatch_may_have_occurred":true})),
+        };
+        let input_consumed_by_page = upload_picker_consumed_input(&selection);
+        if selection["status"]!="selected" && !input_consumed_by_page {
+            let reason_code=upload_selection_reason_code(&selection["status"]);
+            return Ok(json!({"status":selection["status"],"reason_code":reason_code,"reason":selection["reason"],"dispatch_acknowledged":selection["dispatch_acknowledged"],"network_events":selection["network_events"],"network_observation_window_ms":selection["network_observation_window_ms"]}));
+        }
+        let files=selection["files"].as_array();
+        let readback_matches=files.is_some_and(|files|files.len()==1&&files[0]["name"]==filename&&files[0]["size"].as_u64()==Some(size as u64));
+        let document_matches=async {
+            let live=live.lock().await;
+            let registry=live.registry()?;
+            let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+            let current=super::super::shared_frame_identity(connection,registry,&live.handle,tab_id).await;
+            Ok::<_,rmcp::ErrorData>(matches!(current,Ok(ref current) if current==&before))
+        }.await?;
+        let marker_matches=shared_upload_account_marker_matches(app, session_id, tab_id, &account_marker.0, &account_marker.1).await.is_ok_and(|matches| matches);
+        if !document_matches || !marker_matches {
+            return Ok(json!({"status":"unknown","reason_code":"file_selection_unverified","chrome_selected_file":readback_matches,"root_document_matches":document_matches,"account_marker_matches":marker_matches,"dispatch_acknowledged":true,"reason":"frame file readback, document identity, or account marker did not match"}));
+        }
+        let mut application_accepted=Value::Null;
+        if let Some(predicate)=acceptance_predicate {
+            for attempt in 0..10 {
+                let observed=verify_impl(&app.core,&BrowserVerifyArgs{session_id:session_id.to_owned(),chrome_tab_id:tab_id.to_owned(),predicate:predicate.clone()}).await?;
+                if upload_acceptance_transition(acceptance_previously_passed,observed["status"]=="passed") {application_accepted=Value::Bool(true);break;}
+                if attempt<9 {tokio::time::sleep(Duration::from_millis(100)).await;}
+            }
+            if application_accepted!=Value::Bool(true) {application_accepted=Value::Bool(false);}
+        }
+        let accepted=application_accepted==Value::Bool(true);
+        if !readback_matches {
+            if upload_input_selection_confirmed(input_consumed_by_page, document_matches, marker_matches, accepted) {
+                return Ok(json!({"status":"verified","verified":true,"dispatch_acknowledged":true,"chrome_selected_file":true,"selection_readback_verified":false,"file_input_consumed_by_page":true,"application_accepted":true,"persisted":null,"filename":filename,"size":size,"file_chooser_frame_id":parts[0],"upload_route":"frame_trigger","scope":"local_unrestricted_shared_session","network_events":selection["network_events"],"network_observation_window_ms":selection["network_observation_window_ms"],"reason":"The picker consumed the file input; the requested application acceptance was observed"}));
+            }
+            return Ok(json!({"status":"unknown","reason_code":"file_selection_unverified","chrome_selected_file":false,"selection_readback_verified":false,"file_input_consumed_by_page":input_consumed_by_page,"root_document_matches":document_matches,"account_marker_matches":marker_matches,"application_accepted":application_accepted,"dispatch_acknowledged":true,"reason":"file input readback was empty and application acceptance was not observed"}));
+        }
+        return Ok(json!({"status":if accepted {"verified"} else {"selected"},"verified":accepted,"dispatch_acknowledged":true,"chrome_selected_file":true,"application_accepted":application_accepted,"persisted":null,"filename":filename,"size":size,"file_chooser_frame_id":parts[0],"upload_route":"frame_trigger","scope":"local_unrestricted_shared_session"}));
+    }
+    let baseline = async {
+        let live=live.lock().await;
+        let registry=live.registry().map_err(|error|error.to_string())?;
+        let connection=live.connection.as_ref().ok_or_else(||"shared extension session has not been accepted".to_owned())?;
+        let response=connection.command(registry,&live.handle,tab_id,"Controlla.fileInputSnapshot",Value::Null).await?;
+        shared_file_input_baseline(&response)
+    }.await;
+    let baseline = match baseline {
+        Ok(baseline) => baseline,
+        Err(reason) => return Ok(json!({"status":"not_dispatched","reason_code":"file_input_baseline_unavailable","dispatch_may_have_occurred":false,"reason":format!("file-input baseline failed before the upload trigger: {reason}")})),
+    };
+    let cleanup_runtime = tokio::runtime::Handle::current();
+    let mut chooser_cleanup = FileChooserCleanupGuard::new({
+        let live = live.clone();
+        let tab_id = tab_id.to_owned();
+        move || {
+            cleanup_runtime.spawn(async move { disable_file_chooser_interception(&live, &tab_id).await; });
+        }
+    });
+    {
+        let live=live.lock().await;
+        let registry=live.registry()?;
+        let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+        connection.command(registry,&live.handle,tab_id,"Page.enable",Value::Null).await.map_err(invalid)?;
+        connection.command(registry,&live.handle,tab_id,"Page.setInterceptFileChooserDialog",json!({"enabled":true})).await.map_err(invalid)?;
+    }
+    let clicked_result=app.act(Parameters(V3ActArgs {
+        session_id:session_id.to_owned(),chrome_tab_id:tab_id.to_owned(),action:"click".into(),reference:Some(trigger_reference.to_owned()),expected_value:None,value:None,key:None,
+        outcome:Some(BrowserClickOutcome::Focused),timeout_ms:Some(2_000),typing_mode:None,delay_ms:None,client_id:None,page_tool_name:None,page_tool_input:None,
+
+        allow_password: None,
+    })).await;
+    let clicked=match clicked_result { Ok(result)=>result.0, Err(error)=>{chooser_cleanup.disable(disable_file_chooser_interception(&live,tab_id)).await;return Err(error)} };
+    if !upload_trigger_may_have_dispatched(&clicked) {
+        chooser_cleanup.disable(disable_file_chooser_interception(&live,tab_id)).await;
+        return Ok(json!({"status":"not_dispatched","reason_code":clicked["reason_code"],"dispatch_acknowledged":false,"dispatch_may_have_occurred":false,"trigger_status":"not_dispatched","reason":clicked["reason"]}));
+    }
+    let event_result = wait_for_chooser_or_cleanup(
+        async {
+            let live=live.lock().await;
+            match (live.connection.as_ref(), live.registry()) {
+                (Some(connection), Ok(registry)) => connection.command(registry,&live.handle,tab_id,"Controlla.waitForFileChooser",json!({"timeout_ms":750})).await.map_err(|error|error.to_string()),
+                (None, _) => Err("shared extension session has not been accepted".to_owned()),
+                (_, Err(error)) => Err(error.to_string()),
+            }
+        },
+        chooser_cleanup.disable(disable_file_chooser_interception(&live,tab_id)),
+    ).await;
+    let (event,upload_route)=match event_result {
+        Ok(event)=>match shared_extension_value(&event) {
+            Ok(event) if event["backend_node_id"].as_i64().is_some() && event["frame_id"].as_str().is_some() && event["document_id"].as_str().is_some() => (event,"chooser_event"),
+            _ => {
+                chooser_cleanup.disable(disable_file_chooser_interception(&live,tab_id)).await;
+                return Ok(json!({"status":"unknown","reason_code":"invalid_file_chooser_event","dispatch_may_have_occurred":true,"trigger_status":clicked["status"],"reason":"chooser event identity or backend node was incomplete; inspect state before retrying"}));
+            }
+        },
+        Err(error)=>{
+            let fallback=async {
+                let live=live.lock().await;
+                let registry=live.registry()?;
+                let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+                connection.command(registry,&live.handle,tab_id,"Controlla.findFileInput",json!({"baseline":baseline})).await.map_err(invalid)
+            }.await;
+            let fallback=match fallback.and_then(|value|shared_extension_value(&value).map_err(invalid)) {
+                Ok(value) if value["backend_node_id"].as_i64().is_some() && value["frame_id"].as_str().is_some() && value["frame_loader_id"].as_str().is_some() && value["document_id"].as_str().is_some() => value,
+                Ok(_) => return Ok(json!({"status":"unknown","reason_code":"file_chooser_not_observed","dispatch_may_have_occurred":upload_trigger_may_have_dispatched(&clicked),"trigger_status":clicked["status"],"chooser_wait_ms":750,"lazy_input_fallback":"invalid_result","reason":"no chooser event or valid lazy file input was observed; inspect the page before retrying"})),
+                Err(fallback_error) => return Ok(json!({"status":"unknown","reason_code":"file_chooser_not_observed","dispatch_may_have_occurred":upload_trigger_may_have_dispatched(&clicked),"trigger_status":clicked["status"],"chooser_wait_ms":750,"lazy_input_fallback":"not_found_or_ambiguous","reason":format!("no chooser event ({error}); lazy-input fallback also failed ({fallback_error}); inspect the page before retrying")})),
+            };
+            (fallback,"lazy_input_fallback")
+        }
+    };
+    let selected_result:Result<(bool,bool),rmcp::ErrorData>=async {
+        let live=live.lock().await;
+        let connection=live.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+        let registry=live.registry()?;
+        if event["document_id"].as_str().is_none_or(str::is_empty) || event["frame_id"].as_str().is_none_or(str::is_empty) || event["frame_loader_id"].as_str().is_none_or(str::is_empty) { return Err(invalid("chooser event omitted its paired document or frame identity")); }
+        let tree=connection.command(registry,&live.handle,tab_id,"Page.getFrameTree",Value::Null).await.map_err(invalid)?;
+        if super::super::find_cdp_frame(&tree,event["frame_id"].as_str().unwrap()).is_none_or(|(loader,_)|Some(loader.as_str())!=event["frame_loader_id"].as_str()) { return Err(invalid("chooser frame navigated before file selection")); }
+        let readback=connection.command(registry,&live.handle,tab_id,"Controlla.setFrameFileInputFiles",json!({"frame_id":event["frame_id"],"frame_loader_id":event["frame_loader_id"],"backend_node_id":event["backend_node_id"],"file_path":path})).await.map_err(|error|invalid(format!("file selection delivery is uncertain: {error}")))?;
+        let selection=shared_extension_value(&readback).map_err(invalid)?;
+        let files=selection["files"].clone();
+        let selected=files.as_array().is_some_and(|files|files.len()==1&&files[0]["name"]==filename&&files[0]["size"].as_u64()==Some(size as u64));
+        let current=super::super::shared_frame_identity(connection,registry,&live.handle,tab_id).await;
+        Ok((selected,matches!(current,Ok(ref current) if current==&before)))
+    }.await;
+    {
+        chooser_cleanup.disable(disable_file_chooser_interception(&live,tab_id)).await;
+    }
+    let selected=match selected_result { Ok(value)=>value, Err(error)=>return Ok(json!({"status":"unknown","reason_code":"file_selection_unverified","dispatch_acknowledged":true,"reason":format!("file selection may have occurred but readback failed; inspect before retrying: {error}")})) };
+    let marker_matches=shared_upload_account_marker_matches(app, session_id, tab_id, &account_marker.0, &account_marker.1).await.is_ok_and(|matches| matches);
+    if !selected.0 || !selected.1 || !marker_matches { return Ok(json!({"status":"unknown","chrome_selected_file":selected.0,"reason_code":"file_selection_unverified","reason":"selected file readback, document identity, or account marker did not match; inspect before retrying","dispatch_acknowledged":true})); }
+    let mut application_accepted=Value::Null;
+    if let Some(predicate)=acceptance_predicate {
+        for attempt in 0..10 {
+            let observed=verify_impl(&app.core,&BrowserVerifyArgs{session_id:session_id.to_owned(),chrome_tab_id:tab_id.to_owned(),predicate:predicate.clone()}).await?;
+            if upload_acceptance_transition(acceptance_previously_passed, observed["status"]=="passed") { application_accepted=Value::Bool(true);break; }
+            if attempt<9 { tokio::time::sleep(Duration::from_millis(100)).await; }
+        }
+        if application_accepted!=Value::Bool(true) { application_accepted=Value::Bool(false); }
+    }
+    let accepted=application_accepted==Value::Bool(true);
+    Ok(json!({"status":if accepted {"verified"} else {"selected"},"verified":accepted,"dispatch_acknowledged":true,"chrome_selected_file":true,"application_accepted":application_accepted,"persisted":null,"filename":filename,"size":size,"file_chooser_frame_id":event["frame_id"],"upload_route":upload_route,"scope":"local_unrestricted_shared_session","reason":if accepted {Value::Null} else {json!("Chrome selected and read back the staged file; application acceptance or persistence was not verified")}}))
+}
+
+async fn shared_account_marker_matches(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    selector: &str,
+    expected: &str,
+) -> Result<bool, String> {
+    let value = connection.command(registry, handle, tab_id, "Controlla.checkIdentityMarker", json!({"selector":selector,"expected":expected})).await?;
+    identity_marker_matches(&value)
+}
+
+async fn shared_upload_account_marker_matches(
+    app: &AppV3,
+    session_id: &str,
+    tab_id: &str,
+    selector: &str,
+    expected: &str,
+) -> Result<bool, String> {
+    let selector = shared_upload_account_marker_selector(selector)?;
+    let live = app.core.legacy.shared_sessions.lock().await.get(session_id).cloned()
+        .ok_or_else(|| "unknown session_id".to_owned())?;
+    let live = live.lock().await;
+    let registry = live.registry().map_err(|error| error.to_string())?;
+    let connection = live.connection.as_ref().ok_or_else(|| "shared extension session has not been accepted".to_owned())?;
+    shared_account_marker_matches(connection, registry, &live.handle, tab_id, selector, expected).await
+}
+
+fn shared_upload_account_marker_selector(selector: &str) -> Result<&str, String> {
+    match selector {
+        "ax:button" => Ok("button,[role='button']"),
+        value if value.starts_with("ax:") => Err("account role marker currently supports only ax:button".into()),
+        value => Ok(value),
+    }
+}
+
+fn identity_marker_matches(response: &Value) -> Result<bool, String> {
+    let value = if response.get("matches").is_some() {
+        response
+    } else if response.get("exceptionDetails").is_some() {
+        return Err("page evaluation failed; take a fresh snapshot".into());
+    } else {
+        response
+            .pointer("/result/value")
+            .ok_or_else(|| "identity marker check returned no result".to_owned())?
+    };
+    let matches = value["matches"]
+        .as_bool()
+        .ok_or_else(|| "identity marker check returned no boolean".to_owned())?;
+    let count = value["match_count"]
+        .as_u64()
+        .ok_or_else(|| "identity marker check returned no match count".to_owned())?;
+    Ok(matches && count == 1)
+}
+
+async fn wait_for_chooser_or_cleanup<T, E, C>(
+    wait: impl std::future::Future<Output = Result<T, E>>,
+    cleanup: C,
+) -> Result<T, E>
+where
+    C: std::future::Future,
+{
+    let result = wait.await;
+    if result.is_err() { cleanup.await; }
+    result
+}
+
+async fn disable_file_chooser_interception(
+    live: &Arc<Mutex<super::SharedLiveSession>>,
+    tab_id: &str,
+) -> bool {
+    let live = live.lock().await;
+    if let (Some(connection), Ok(registry)) = (live.connection.as_ref(), live.registry()) {
+        connection.command(registry,&live.handle,tab_id,"Page.setInterceptFileChooserDialog",json!({"enabled":false})).await.is_ok()
+    } else {
+        false
+    }
+}
+
+struct FileChooserCleanupGuard(Option<Box<dyn FnOnce() + Send>>);
+
+impl FileChooserCleanupGuard {
+    fn new(on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(on_drop)))
+    }
+
+    async fn disable(&mut self, result: impl std::future::Future<Output = bool>) {
+        if result.await {
+            self.0 = None;
+        }
+    }
+}
+
+impl Drop for FileChooserCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.0.take() { on_drop(); }
+    }
+}
+
+fn upload_acceptance_transition(was_passed: bool, is_passed: bool) -> bool {
+    !was_passed && is_passed
+}
+
+fn upload_input_selection_confirmed(input_consumed_by_page: bool, document_matches: bool, marker_matches: bool, application_accepted: bool) -> bool {
+    input_consumed_by_page && document_matches && marker_matches && application_accepted
+}
+
+fn upload_picker_consumed_input(selection: &Value) -> bool {
+    selection["status"]=="unknown"
+        && selection["dispatch_acknowledged"]==true
+        && selection["reason"].as_str().is_some_and(|reason| reason.contains("File input did not retain one selected file for readback"))
+}
+
+fn upload_selection_reason_code(status: &Value) -> &'static str {
+    if status=="unknown" { "file_selection_unverified" } else { "frame_upload_failed" }
+}
+
+fn upload_trigger_may_have_dispatched(click: &Value) -> bool {
+    click["status"] != "not_dispatched"
+}
+
+fn shared_extension_value(response: &Value) -> Result<Value, String> {
+    if response.get("exceptionDetails").is_some() {
+        return Err("page evaluation failed; take a fresh snapshot".into());
+    }
+    if let Some(value) = response.pointer("/result/value") {
+        return Ok(value.clone());
+    }
+    response
+        .as_object()
+        .map(|_| response.clone())
+        .ok_or_else(|| "shared extension response omitted an object result".into())
+}
+
+fn shared_file_input_baseline(response: &Value) -> Result<Value, String> {
+    let value = shared_extension_value(response)?;
+    let inputs = value["inputs"]
+        .as_array()
+        .ok_or_else(|| "file-input snapshot omitted its inputs array".to_owned())?;
+    if inputs.len() > 256 {
+        return Err("file-input snapshot exceeded the 256-input limit".into());
+    }
+    Ok(Value::Array(inputs.clone()))
 }
 
 async fn headless_file_select(
@@ -406,11 +767,24 @@ async fn headless_file_select(
         .cloned()
         .ok_or_else(|| invalid("unknown session_id"))?;
     let live = live.lock().await;
+    if live.handle.principal != app.core.legacy.principal.as_ref() {
+        return Err(invalid("session is not owned by this server principal"));
+    }
+    if !super::super::private_headless_cleanup_allowed(&live.handle) && !crate::guard_reason::unrestricted_mode() {
+        return Ok(json!({"status":"unsupported","reason":"file selection requires private headless or local unrestricted shared scope"}));
+    }
+    if selector.is_empty() || selector.len() > 512 || selector.chars().any(char::is_control) {
+        return Ok(json!({"status":"not_dispatched","field":"selector","reason_code":"invalid_selector"}));
+    }
+    let connection = live.connection.as_ref().ok_or_else(|| invalid("browser connection unavailable"))?;
+    let registry = live.registry()?;
+    let preflight = format!("(()=>{{let n;try{{n=[...document.querySelectorAll({})]}}catch{{return {{reason:'invalid_selector'}}}}if(!n.length)return {{reason:'no_match'}};if(n.length!==1)return {{reason:'ambiguous_match',count:n.length}};const e=n[0];if(!(e instanceof HTMLInputElement)||e.type!=='file')return {{reason:'unsupported_target_type'}};return {{ok:true}}}})()",json!(selector));
+    let checked=connection.command(registry,&live.handle,tab_id,"Runtime.evaluate",json!({"expression":preflight,"returnByValue":true})).await.map_err(invalid)?;
+    let checked=super::super::shared_value(&checked).map_err(invalid)?;
+    if let Some(reason)=checked["reason"].as_str() { return Ok(json!({"status":"not_dispatched","field":"selector","reason_code":reason,"count":checked["count"]})); }
     if crate::guard_reason::unrestricted_mode()
         && !super::super::private_headless_cleanup_allowed(&live.handle)
     {
-        let connection = live.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
-        let registry = live.registry()?;
         let handle: controlla_browser::sessions::ArtifactHandle = serde_json::from_value(json!(artifact_handle))
             .map_err(|error| invalid(format!("invalid artifact handle: {error}")))?;
         let metadata = registry.artifact_metadata(&live.handle, &handle)
@@ -419,10 +793,11 @@ async fn headless_file_select(
             .map_err(|error| invalid(format!("artifact path lookup failed: {error:?}")))?
             .to_string_lossy().into_owned();
         let expression = format!("document.querySelector({})", json!(selector));
-        let element = connection.command(registry, &live.handle, tab_id, "Runtime.evaluate",
-            json!({"expression":expression,"returnByValue":false})).await.map_err(invalid)?;
-        let object_id = element["result"]["objectId"].as_str()
-            .ok_or_else(|| invalid("file input selector did not resolve"))?;
+        let element=connection.command(registry,&live.handle,tab_id,"Runtime.evaluate",json!({"expression":expression,"returnByValue":false})).await.map_err(invalid)?;
+        let object_id=element["result"]["objectId"].as_str().ok_or_else(||invalid("unsupported_target_type: selector did not resolve to a file input object"))?;
+        let before=super::super::shared_frame_identity(connection,registry,&live.handle,tab_id).await.map_err(invalid)?;
+        controlla_browser::identity_marker_command(&account_marker.0,&account_marker.1).map_err(|error| invalid(error.to_string()))?;
+        if !shared_account_marker_matches(connection,registry,&live.handle,tab_id,&account_marker.0,&account_marker.1).await.map_err(invalid)? { return Ok(json!({"status":"not_dispatched","reason_code":"account_marker_mismatch","dispatch_acknowledged":false})); }
         connection.command(registry, &live.handle, tab_id, "DOM.setFileInputFiles",
             json!({"files":[path],"objectId":object_id})).await.map_err(invalid)?;
         let readback = connection.command(registry, &live.handle, tab_id, "Runtime.callFunctionOn",
@@ -431,8 +806,13 @@ async fn headless_file_select(
         let selected = files.as_array().is_some_and(|items| items.len() == 1
             && items[0]["name"] == metadata.filename
             && items[0]["size"].as_u64() == Some(metadata.size as u64));
+        let after=super::super::shared_frame_identity(connection,registry,&live.handle,tab_id).await;
+        let marker_after=shared_account_marker_matches(connection,registry,&live.handle,tab_id,&account_marker.0,&account_marker.1).await;
+        let identity_ok=matches!(after,Ok(ref identity) if identity==&before);
+        let account_ok=matches!(marker_after,Ok(true));
+        if !identity_ok||!account_ok{return Ok(json!({"status":"unknown","reason_code":"identity_changed_after_selection","dispatch_acknowledged":true,"chrome_selected_file":selected,"account_marker_checked":true}));}
         return Ok(if selected {
-            json!({"status":"selected","verified":true,"filename":metadata.filename,"size":metadata.size,"account_marker_checked":false})
+            json!({"status":"selected","verified":false,"chrome_selected_file":true,"application_accepted":null,"persisted":null,"filename":metadata.filename,"size":metadata.size,"account_marker_checked":true,"scope":metadata.scope})
         } else {
             json!({"status":"unknown","reason":"file selection was dispatched but readback did not match","dispatch_acknowledged":true})
         });
@@ -553,7 +933,7 @@ async fn headless_file_select(
     }
     // shortcut: selection readback stops before app acceptance, upgrade when the app exposes a persistence verifier.
     Ok(
-        json!({"status":"selected","filename":evidence.filename,"size":evidence.size,
+        json!({"status":"selected","verified":false,"chrome_selected_file":true,"application_accepted":null,"persisted":null,"filename":evidence.filename,"size":evidence.size,
         "reason":"Chrome selected and read back the staged file; application transfer and persistence are unverified"}),
     )
 }
@@ -611,15 +991,31 @@ async fn task_navigate(app: &AppV3, session_id: &str, tab_id: &str, url: &str) -
                     action: "navigate".into(),
                     chrome_tab_id: Some(tab_id.to_owned()),
                     url: url.to_owned(),
+                    idempotency_key: None,
                 }))
                 .await
                 .map(|Json(value)| value)
                 .map_err(|error| error.to_string())
         }
     };
-    if let Err(error) = navigation {
-        return json!({"status":"unknown","reason":format!("navigation delivery uncertain; inspect before retrying: {error}")});
+    if let Ok(value) = &navigation
+        && let Some(error) = page_navigate_error(value)
+    {
+        return json!({"status":"failed","dispatch":"acknowledged","dispatch_acknowledged":true,
+            "document_committed":false,"current_url":null,"destination_match":false,
+            "timed_out_waiting_for":null,"reason":format!("Chrome rejected the navigation: {error}")});
     }
+    let dispatch = if let Err(error) = navigation {
+        let observed = verify_impl(&app.core, &BrowserVerifyArgs {
+            session_id: session_id.to_owned(), chrome_tab_id: tab_id.to_owned(),
+            predicate: BrowserPredicate::Url { equals: url.to_owned() },
+        }).await.ok();
+        return json!({"status":if observed.as_ref().is_some_and(|v| v["status"] == "passed") { "incomplete" } else { "unknown" },
+            "dispatch":"unknown","document_committed":observed.as_ref().is_some_and(|v| v["status"] == "passed"),
+            "current_url":observed.as_ref().and_then(|v| v["observed"].as_str()),
+            "destination_match":observed.as_ref().is_some_and(|v| v["status"] == "passed"),
+            "timed_out_waiting_for":"navigation_receipt","reason":format!("navigation delivery uncertain; inspect before retrying: {error}")});
+    } else { "acknowledged" };
     app.core
         .semantic
         .lock()
@@ -638,11 +1034,74 @@ async fn task_navigate(app: &AppV3, session_id: &str, tab_id: &str, url: &str) -
         )
         .await
         {
-            Ok(value) if value["status"] == "passed" => return value,
+            Ok(value) if value["status"] == "passed" => {
+                let snapshot = snapshot_impl(&app.core, &BrowserSnapshotArgs {
+                    session_id: session_id.to_owned(), chrome_tab_id: tab_id.to_owned(), selector: None,
+                    max_items: Some(1), max_text_chars: Some(128), max_bytes: None, href_hint: None, frame_id: None,
+                }).await.ok();
+                let ready_state = snapshot.as_ref().and_then(|v| v["ready_state"].as_str());
+                if ready_state == Some("complete") { return json!({
+                    "status":"verified","dispatch":dispatch,"dispatch_acknowledged":true,
+                    "document_committed":true,"current_url":value["observed_url"],
+                    "ready_state":ready_state,"destination_match":true,"timed_out_waiting_for":null,
+                    "postcondition":value}); }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
-    json!({"status":"unknown","reason":"navigation was dispatched but the requested URL was not reobserved within the bounded wait"})
+    let snapshot = snapshot_impl(&app.core, &BrowserSnapshotArgs {
+        session_id: session_id.to_owned(), chrome_tab_id: tab_id.to_owned(), selector: None,
+        max_items: Some(1), max_text_chars: Some(128), max_bytes: None, href_hint: None, frame_id: None,
+    }).await.ok();
+    let current_url = snapshot.as_ref().and_then(|v| v["document"]["url"].as_str().or(v["url"].as_str()));
+    let ready_state = snapshot.as_ref().and_then(|v| v["ready_state"].as_str());
+    let destination_match = current_url == Some(url);
+    json!({"status":if destination_match { "incomplete" } else { "unknown" },"dispatch":dispatch,
+        "dispatch_acknowledged":true,"document_committed":destination_match,"current_url":current_url,
+        "ready_state":ready_state,"destination_match":destination_match,
+        "timed_out_waiting_for":if destination_match { "application_readiness" } else { "destination" },
+        "reason":"navigation was acknowledged but its final state was not verified within the bounded wait"})
+}
+
+async fn presentation_state(app: &AppV3, session_id: &str, tab_id: &str) -> Option<Value> {
+    let live = app.core.legacy.shared_sessions.lock().await.get(session_id).cloned()?;
+    let live = live.lock().await;
+    let connection = live.connection.as_ref()?;
+    connection.command(live.registry().ok()?, &live.handle, tab_id, "Controlla.presentationState", Value::Null).await.ok()
+}
+
+fn focus_changed_during_operation(before: &Value, after: &Value) -> Value {
+    if !before.is_object() || !after.is_object() {
+        return json!("unknown");
+    }
+    let state_changed = before["tab_active"] != after["tab_active"]
+        || before["window_focused"] != after["window_focused"];
+    if state_changed {
+        return Value::Bool(true);
+    }
+    match (
+        before["activation_epoch"].as_u64(),
+        after["activation_epoch"].as_u64(),
+        before["focus_epoch"].as_u64(),
+        after["focus_epoch"].as_u64(),
+    ) {
+        (Some(before_activation), Some(after_activation), Some(before_focus), Some(after_focus)) => {
+            Value::Bool(before_activation != after_activation || before_focus != after_focus)
+        }
+        _ => json!("unknown"),
+    }
+}
+
+fn action_timeout_receipt(action: &str) -> Value {
+    json!({"status":"unknown","action":action,"dispatch_acknowledged":null,
+        "dispatch_may_have_occurred":true,
+        "reason":"action exceeded its 60-second bound; inspect state before retrying"})
+}
+
+fn page_navigate_error(value: &Value) -> Option<&str> {
+    value.get("errorText").and_then(Value::as_str)
+        .or_else(|| value.pointer("/result/errorText").and_then(Value::as_str))
 }
 
 async fn headless_download(
@@ -681,6 +1140,7 @@ async fn headless_download(
             max_text_chars: None,
             max_bytes: None,
             href_hint: None,
+            frame_id: None,
         },
     )
     .await?;
@@ -978,16 +1438,74 @@ fn workflow_find_reference(found: &Value) -> Result<String, rmcp::ErrorData> {
         .ok_or_else(|| invalid("workflow find omitted its reference"))
 }
 
+fn resolve_workflow_predicate(
+    predicate: BrowserPredicate,
+    vars: &std::collections::BTreeMap<String, String>,
+    selected: &std::collections::BTreeMap<String, Value>,
+) -> Result<BrowserPredicate, rmcp::ErrorData> {
+    let resolve = |reference: String| {
+        crate::browser_workflow::resolve_workflow_reference(&reference, vars).map_err(invalid)
+    };
+    Ok(match predicate {
+        BrowserPredicate::Text { reference, equals } => BrowserPredicate::Text {
+            reference: resolve(reference)?, equals,
+        },
+        BrowserPredicate::Value { reference, equals } => BrowserPredicate::Value {
+            reference: resolve(reference)?, equals,
+        },
+        BrowserPredicate::Exists { reference } => BrowserPredicate::Exists {
+            reference: resolve(reference)?,
+        },
+        BrowserPredicate::Url { equals } => BrowserPredicate::Url {
+            equals: if let Some(name) = equals.strip_prefix('$').and_then(|value| value.strip_suffix(".href")) {
+                selected.get(name).and_then(|item| item["href"].as_str())
+                    .ok_or_else(|| invalid("selected href variable is unresolved"))?.to_owned()
+            } else { equals },
+        },
+        BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
+    })
+}
+
+fn workflow_upload_requires_stop(value: &Value) -> bool {
+    value["status"] != "verified" || value["application_accepted"] != true
+}
+
 fn validate_workflow_steps(steps: &[V3WorkflowStep]) -> Result<(), rmcp::ErrorData> {
-    if steps.iter().enumerate().any(|(index, step)| {
-        matches!(
-            step,
-            V3WorkflowStep::PageTool { .. } | V3WorkflowStep::Press { .. }
-        ) && !matches!(steps.get(index + 1), Some(V3WorkflowStep::Verify { .. }))
-    }) {
-        return Err(invalid(
-            "press and page_tool steps must be followed immediately by runtime verification",
-        ));
+    for (index, step) in steps.iter().enumerate() {
+        if matches!(step, V3WorkflowStep::PageTool { .. } | V3WorkflowStep::Press { .. })
+            && !matches!(steps.get(index + 1), Some(V3WorkflowStep::Verify { .. }))
+        {
+            return Err(invalid(
+                "press and page_tool steps must be followed immediately by runtime verification",
+            ));
+        }
+        if let V3WorkflowStep::Upload {
+            artifact_handle,
+            trigger_reference,
+            account_marker,
+            acceptance,
+        } = step
+        {
+            let valid_acceptance = acceptance.as_ref().is_none_or(|predicate| {
+                serde_json::to_vec(predicate).is_ok_and(|bytes| bytes.len() <= 8192)
+            });
+            if artifact_handle.is_empty()
+                || artifact_handle.len() > 256
+                || artifact_handle.contains('/')
+                || artifact_handle.contains('\\')
+                || trigger_reference.is_empty()
+                || trigger_reference.len() > 1024
+                || account_marker.0.is_empty()
+                || account_marker.0.len() > 512
+                || account_marker.1.is_empty()
+                || account_marker.1.len() > 512
+                || !valid_acceptance
+            {
+                return Err(invalid(
+                    "upload requires an opaque artifact handle, bounded trigger reference and account marker, with an optional bounded acceptance predicate",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1039,6 +1557,16 @@ async fn requires_key_events(app: &AppV3, args: &V3ActArgs) -> bool {
         .is_some_and(|item| item["requires_trusted_events"] == true)
 }
 
+// shortcut: rich key entry collapses Enter-created innerText runs in pairs; use structured block readback for editors with different semantics.
+const EDITOR_GUARD: &str = r#"function(index,expected,prepare=false,normalizeParagraphs=false,requireFocus=true){let e=this.nodes[index],rebound=false;const valueOf=n=>{const rich=n instanceof HTMLElement&&!(n instanceof HTMLInputElement||n instanceof HTMLTextAreaElement)&&(n.isContentEditable||n.getAttribute('role')==='textbox');const raw=rich?(n.innerText??n.textContent??'').replace(/\r\n/g,'\n').replace(/\u00a0/g,' '):n.value;return rich?(raw==='\n'?'':normalizeParagraphs?raw.replace(/\n{2,}/g,breaks=>'\n'.repeat(Math.ceil(breaks.length/2))):raw):raw};if(!e||!e.isConnected){if(!prepare||!e)return {ok:false,reason:'target_replaced'};const candidates=Array.from(document.querySelectorAll('[contenteditable],[role=\"textbox\"]')).filter(n=>n.tagName===e.tagName&&n.className===e.className&&n.getAttribute('role')===e.getAttribute('role')&&n.getAttribute('aria-label')===e.getAttribute('aria-label')&&n.getAttribute('data-placeholder')===e.getAttribute('data-placeholder')&&valueOf(n)===(n instanceof HTMLElement&&!(n instanceof HTMLInputElement||n instanceof HTMLTextAreaElement)&&(n.isContentEditable||n.getAttribute('role')==='textbox')&&expected==='\n'?'':expected));if(candidates.length!==1)return {ok:false,reason:'target_replaced',candidates:candidates.length};this.nodes[index]=e=candidates[0];rebound=true}const rich=e instanceof HTMLElement&&!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)&&e.getAttribute('aria-readonly')!=='true'&&e.getAttribute('contenteditable')?.toLowerCase()!=='false'&&(e.isContentEditable||e.getAttribute('role')==='textbox'),plain=e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type);if(!rich&&!plain)return {ok:false,reason:'not_editable'};const trustedBoundary=e.closest('[data-requires-trusted]');if(e.matches(':disabled,[aria-disabled=\"true\"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||trustedBoundary&&trustedBoundary!==e)return {ok:false,reason:'blocked'};const value=valueOf(e);if(value!==(rich&&expected==='\n'?'':expected))return {ok:false,reason:'stale_value',value};if(prepare){e.focus();if(rich){const s=e.ownerDocument.getSelection(),r=e.ownerDocument.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r)}else e.setSelectionRange(e.value.length,e.value.length)}const s=e.ownerDocument.getSelection(),focused=e.ownerDocument.activeElement===e,atEnd=rich?s?.isCollapsed&&s.anchorNode&&e.contains(s.anchorNode)&&(()=>{const after=e.ownerDocument.createRange();after.selectNodeContents(e);after.setStart(s.anchorNode,s.anchorOffset);return after.toString()===''})():e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;if(requireFocus&&(!focused||!atEnd))return {ok:false,reason:'focus_or_selection_changed',value,focused,atEnd,rebound};return {ok:true,rich,value,focused,atEnd,rebound}}"#;
+
+async fn rich_editor_reference(app: &AppV3, args: &V3ActArgs, reference: &str) -> bool {
+    app.core.semantic.lock().await
+        .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
+        .and_then(|state| state.items.get(reference))
+        .is_some_and(|item| item["editable_kind"] == "rich_text")
+}
+
 async fn acquire_lease(
     app: &AppV3,
     args: &V3ActArgs,
@@ -1078,6 +1606,10 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
             "type value must be nonempty and final value <= 16384 bytes",
         ));
     }
+    let rich = rich_editor_reference(app,args,reference).await;
+    if rich {
+        return rich_block_type(app, args, reference, &expected, &appended, "block").await;
+    }
     let mut final_value = expected.clone();
     final_value.push_str(&appended);
     retained_mutation(
@@ -1093,6 +1625,7 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
             timeout_ms: args.timeout_ms,
         },
         reference,
+        false,
         "fill",
     )
     .await
@@ -1101,6 +1634,34 @@ async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorD
         value["typing_mode"] = json!("block");
         value
     })
+}
+
+async fn rich_block_type(app: &AppV3, args: &V3ActArgs, reference: &str, expected: &str, text: &str, typing_mode: &str) -> Result<Value, rmcp::ErrorData> {
+    let legacy_reference = resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
+    let live = app.core.legacy.shared_sessions.lock().await.get(&args.session_id).cloned().ok_or_else(|| invalid("unknown shared session_id"))?;
+    let mut shared = live.lock().await;
+    if shared.handle.principal != app.core.legacy.principal.as_ref() { return Err(invalid("session is not owned by this server principal")); }
+    let snapshot = shared.snapshots.get(&args.chrome_tab_id).cloned().ok_or_else(|| invalid("take browser_snapshot first"))?;
+    let (token,index)=legacy_reference.rsplit_once(':').ok_or_else(||invalid("invalid retained reference"))?;
+    let index=index.parse::<usize>().map_err(|_|invalid("invalid retained reference index"))?;
+    if index>=snapshot.count || token!=snapshot.token || snapshot.consumed { return Err(invalid("stale or consumed reference; take one fresh browser_snapshot")); }
+    let identity={let connection=shared.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;super::super::shared_frame_identity(connection,shared.registry()?,&shared.handle,&args.chrome_tab_id).await.map_err(invalid)?};
+    if identity!=snapshot.identity { return Err(invalid("document changed since snapshot; take a fresh browser_snapshot")); }
+    let prepared={let connection=shared.connection.as_ref().unwrap();connection.command(shared.registry()?,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":EDITOR_GUARD,"arguments":[{"value":index},{"value":expected},{"value":true}],"returnByValue":true})).await.map_err(|error|invalid(error.to_string()))?};
+    let prepared=super::super::shared_value(&prepared).map_err(invalid)?;
+    if prepared["ok"]!=true { return Ok(json!({"status":"not_dispatched","action":"type","typing_mode":"block","reason":prepared["reason"],"readback":prepared})); }
+    shared.snapshots.get_mut(&args.chrome_tab_id).unwrap().consumed=true;
+    let dispatched={let connection=shared.connection.as_ref().unwrap();connection.command(shared.registry()?,&shared.handle,&args.chrome_tab_id,"Input.insertText",json!({"text":text})).await};
+    if let Err(error)=dispatched { return Ok(json!({"status":"unknown","action":"type","typing_mode":"block","dispatch_may_have_occurred":true,"reason":format!("text insertion delivery is unknown; inspect state and do not retry: {error}")})); }
+    let final_value=format!("{expected}{text}");
+    let readback={let connection=shared.connection.as_ref().unwrap();connection.command(shared.registry()?,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":EDITOR_GUARD,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true})).await};
+    let after={let connection=shared.connection.as_ref().unwrap();super::super::shared_frame_identity(connection,shared.registry()?,&shared.handle,&args.chrome_tab_id).await};
+    let readback_value=readback.as_ref().ok().and_then(|value|super::super::shared_value(value).ok());
+    let guard_ok=readback_value.as_ref().is_some_and(|value|value["ok"]==true);
+    let identity_same=matches!(after,Ok(ref current) if current==&identity);
+    let verified=guard_ok&&identity_same;
+    drop(shared);
+    Ok(if verified { json!({"status":"verified","action":"type","typing_mode":typing_mode,"dispatch_acknowledged":true,"readback":final_value}) } else { json!({"status":"unknown","action":"type","typing_mode":typing_mode,"dispatch_acknowledged":true,"reason":"inserted text did not pass editor readback and document identity; inspect before retrying","readback_guard":readback_value.as_ref().and_then(|value|value["reason"].as_str()),"identity_same":identity_same}) })
 }
 
 async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
@@ -1166,18 +1727,15 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             "document changed since snapshot; take a fresh browser_snapshot",
         ));
     }
-    let guard = if unrestricted {
-        r#"function(index){const e=this.nodes[index];if(e)e.focus();return !!e;}"#
-    } else {
-        r#"function(index,expected){const e=this.nodes[index];return !!e&&e.isConnected&&(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))&&!e.disabled&&!e.readOnly&&document.activeElement===e&&e.value===expected&&e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;}"#
-    };
+    let guard = EDITOR_GUARD;
     let initial = {
         let connection = shared.connection.as_ref().unwrap();
         connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
-            "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":expected}],"returnByValue":true
+            "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":expected},{"value":true}],"returnByValue":true
         })).await.map_err(|error| invalid(error.to_string()))?
     };
-    if super::super::shared_value(&initial).map_err(invalid)? != json!(true) {
+    let initial=super::super::shared_value(&initial).map_err(invalid)?;
+    if initial!=json!(true)&&initial["ok"]!=true {
         return Ok(
             json!({"status":"not_dispatched","action":"type","typing_mode":"ime","reason":"field, focus, or caret changed before composition"}),
         );
@@ -1207,7 +1765,7 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
     let composed = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
         "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true
     })).await;
-    if !matches!(composed, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value == true))
+    if !matches!(composed, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value==json!(true)||value["ok"]==true))
     {
         let _ = connection
             .command(
@@ -1238,9 +1796,6 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             "reason":format!("IME commit delivery is unknown; inspect state and do not retry: {error}")}),
         );
     }
-    if unrestricted {
-        return Ok(json!({"status":"dispatched","action":"type","typing_mode":"ime","dispatch_acknowledged":true,"verified":false}));
-    }
     let readback = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
         "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":final_value}],"returnByValue":true
     })).await;
@@ -1251,7 +1806,7 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
         &args.chrome_tab_id,
     )
     .await;
-    let verified = matches!(readback, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value == json!(true)))
+    let verified = matches!(readback, Ok(ref value) if super::super::shared_value(value).is_ok_and(|value| value==json!(true)||value["ok"]==true))
         && matches!(after, Ok(ref current) if current == &identity);
     drop(shared);
     if !verified {
@@ -1265,6 +1820,35 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
     )
 }
 
+fn cdp_character_events(character: char) -> Vec<(Value, bool)> {
+    if character == '\n' {
+        return vec![
+            (json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":36,"text":"\r","unmodifiedText":"\r"}), true),
+            (json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":36}), false),
+        ];
+    }
+    let key = character.to_string();
+    vec![
+        (json!({"type":"keyDown","key":key}), false),
+        (json!({"type":"char","key":key,"text":key,"unmodifiedText":key}), true),
+        (json!({"type":"keyUp","key":key}), false),
+    ]
+}
+
+fn normalize_key_text(text: &str, rich_editor: bool) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut result = String::with_capacity(normalized.len());
+    let mut previous_newline = false;
+    for character in normalized.chars() {
+        if rich_editor && character == '\n' && previous_newline {
+            continue;
+        }
+        result.push(character);
+        previous_newline = character == '\n';
+    }
+    result
+}
+
 async fn key_type(
     app: &AppV3,
     args: &V3ActArgs,
@@ -1276,11 +1860,17 @@ async fn key_type(
         .as_deref()
         .ok_or_else(|| invalid("type requires reference"))?;
     let expected = args.expected_value.as_deref().unwrap_or_default();
-    let text = args.value.as_deref().unwrap_or_default();
-    if text.is_empty() || expected.len().saturating_add(text.len()) > 16_384 || !text.is_ascii() {
+    let rich_editor = rich_editor_reference(app, args, reference).await;
+    let text = normalize_key_text(args.value.as_deref().unwrap_or_default(), rich_editor);
+    if text.is_empty() || expected.len().saturating_add(text.len()) > 16_384 {
         return Err(invalid(
-            "key typing requires nonempty ASCII text and final value <= 16384 bytes",
+            "key typing requires nonempty text and final value <= 16384 bytes",
         ));
+    }
+    if rich_editor {
+        if !text.is_ascii() { return Err(invalid("HumanKeys requires ASCII text; use IME for Unicode composition")); }
+    } else if !text.is_ascii() {
+        return Err(invalid("key typing requires ASCII text; use IME for Unicode input"));
     }
     let legacy_reference =
         resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
@@ -1313,7 +1903,12 @@ async fn key_type(
             "stale or consumed reference; take one fresh browser_snapshot",
         ));
     }
-    let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30_000).clamp(1_000, 60_000));
+    let default_timeout = if policy.mode == crate::v3::TypingMode::HumanKeys {
+        crate::v3::human_typing_timeout_ms(text.chars().count(), policy.delay_ms)
+    } else {
+        30_000
+    };
+    let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(default_timeout).clamp(1_000, 600_000));
     let deadline = tokio::time::Instant::now() + timeout;
     let before = {
         let connection = shared
@@ -1338,12 +1933,8 @@ async fn key_type(
             "document changed since snapshot; take a fresh browser_snapshot",
         ));
     }
-    let guard_function = if unrestricted {
-        r#"function(index){const e=this.nodes[index];if(e)e.focus();return {ok:!!e,value:e?.value??''};}"#
-    } else {
-        r#"function(index,expected){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type))||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(document.activeElement!==e||e.selectionStart!==e.selectionEnd||e.selectionEnd!==e.value.length)return {ok:false,reason:'focus_or_selection_changed'};return {ok:true,value:e.value};}"#
-    };
-    let mut progress = expected.to_owned();
+    let guard_function = EDITOR_GUARD;
+    let progress = expected.to_owned();
     let preflight = {
         let connection = shared.connection.as_ref().unwrap();
         let response = crate::v3_runtime::await_key_batch(
@@ -1355,7 +1946,7 @@ async fn key_type(
                 "Runtime.callFunctionOn",
                 json!({
                     "objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                    "arguments":[{"value":index},{"value":progress}],"returnByValue":true
+                    "arguments":[{"value":index},{"value":progress},{"value":true},{"value":true}],"returnByValue":true
                 }),
             ),
         )
@@ -1369,6 +1960,7 @@ async fn key_type(
             json!({"status":"not_dispatched","action":"type","reason":preflight["reason"],"readback":preflight}),
         );
     }
+    let mut progress = preflight["value"].as_str().unwrap_or(&progress).to_owned();
     if !unrestricted {
         shared.snapshots.get_mut(&args.chrome_tab_id).ok_or_else(|| invalid("snapshot disappeared before dispatch"))?.consumed = true;
     }
@@ -1380,37 +1972,29 @@ async fn key_type(
             let guard_action = |expected: &str| controlla_browser::providers::SharedBatchAction {
                 method: "Runtime.callFunctionOn".into(),
                 params: json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                    "arguments":[{"value":index},{"value":expected}],"returnByValue":true}),
+                    "arguments":[{"value":index},{"value":expected},{"value":false},{"value":true}],"returnByValue":true}),
                 stop_on_not_ok: true,
             };
             for character in chunk {
                 if !unrestricted {
                     actions.push(guard_action(&progress));
                 }
-                let key = character.to_string();
-                for (event_index, params) in [
-                    json!({"type":"keyDown","key":key}),
-                    json!({"type":"char","key":key,"text":key,"unmodifiedText":key}),
-                    json!({"type":"keyUp","key":key}),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                for (event_index, (params, inserts_character)) in cdp_character_events(*character).into_iter().enumerate() {
                     actions.push(controlla_browser::providers::SharedBatchAction {
                         method: "Input.dispatchKeyEvent".into(),
                         params,
                         stop_on_not_ok: false,
                     });
-                    if !unrestricted && event_index == 0 {
-                        actions.push(guard_action(&progress));
-                    } else if event_index == 1 {
+                    if inserts_character {
                         progress.push(*character);
-                        if !unrestricted {
-                            actions.push(guard_action(&progress));
-                        }
+                    }
+                    if !unrestricted && (event_index == 0 || inserts_character) {
+                        actions.push(guard_action(&progress));
                     }
                 }
             }
+            let expected_actions = actions.len();
+            let chunk_key_events = chunk.iter().map(|character| cdp_character_events(*character).len() as u64).sum::<u64>();
             let connection = shared.connection.as_ref().unwrap();
             let result = match crate::v3_runtime::await_key_batch(
                 deadline,
@@ -1452,7 +2036,6 @@ async fn key_type(
                     "batch_receipt":result,"reason":format!("fast-key batch stopped; inspect current state and do not automatically retry: {error}")}),
                 );
             }
-            let expected_actions = chunk.len() * if unrestricted { 3 } else { 6 };
             if result["completed"].as_u64() != Some(expected_actions as u64) {
                 return Ok(
                     json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count > 0,
@@ -1460,76 +2043,85 @@ async fn key_type(
                     "batch_receipt":result,"reason":"fast-key batch returned an incomplete receipt; inspect state and do not automatically retry"}),
                 );
             }
-            dispatch_count = dispatch_count.saturating_add((chunk.len() * 3) as u64);
+            dispatch_count = dispatch_count.saturating_add(chunk_key_events);
         }
     } else {
         for character in text.chars() {
-            let guard =
-                {
+            let mut attempts = 0;
+            loop {
+                let guard = {
                     let connection = shared.connection.as_ref().unwrap();
                     let response = tokio::time::timeout_at(deadline, connection.command(
-                shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
-                json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                    "arguments":[{"value":index},{"value":progress}],"returnByValue":true})
-            )).await;
+                        shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
+                        json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
+                            "arguments":[{"value":index},{"value":progress},{"value":true},{"value":true}],"returnByValue":true})
+                    )).await;
                     match response {
                         Ok(Ok(response)) => super::super::shared_value(&response).ok(),
                         _ => None,
                     }
                 };
-            if guard.as_ref().is_none_or(|value| value["ok"] != true) {
-                return Ok(
-                    json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
-                "reason":"focus, value, selection, target, or document changed during typing; inspect before retrying"}),
-                );
-            }
-            let key = character.to_string();
-            let events = [
-                json!({"type":"keyDown","key":key}),
-                json!({"type":"char","key":key,"text":key,"unmodifiedText":key}),
-                json!({"type":"keyUp","key":key}),
-            ];
-            for (event_index, event) in events.into_iter().enumerate() {
-                if event_index > 0 {
-                    let connection = shared.connection.as_ref().unwrap();
-                    let guard = tokio::time::timeout_at(deadline, connection.command(
-                    shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
-                    json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                        "arguments":[{"value":index},{"value":progress}],"returnByValue":true})
-                )).await;
-                    let guard = match guard {
-                        Ok(Ok(response)) => super::super::shared_value(&response).ok(),
-                        _ => None,
-                    };
-                    if guard.as_ref().is_none_or(|value| value["ok"] != true) {
-                        return Ok(
-                            json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
-                        "reason":"focus, value, selection, target, or document changed between key events; inspect before retrying"}),
-                        );
+                if guard.as_ref().is_none_or(|value| value["ok"] != true) {
+                    return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
+                        "reason":"focus, value, selection, target, or document changed during typing; inspect before retrying","guard_failure":guard}));
+                }
+                if guard.as_ref().is_some_and(|value| value["rebound"] == true) {
+                    let current = super::super::shared_frame_identity(
+                        shared.connection.as_ref().unwrap(), shared.registry()?, &shared.handle, &args.chrome_tab_id,
+                    ).await;
+                    if !matches!(current, Ok(ref identity) if identity == &before) {
+                        return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
+                            "reason":"editor was replaced after the document changed; no more keys dispatched"}));
                     }
                 }
-                let connection = shared.connection.as_ref().unwrap();
-                let sent = tokio::time::timeout_at(
-                    deadline,
-                    connection.command(
-                        shared.registry()?,
-                        &shared.handle,
-                        &args.chrome_tab_id,
-                        "Input.dispatchKeyEvent",
-                        event,
-                    ),
-                )
-                .await;
-                if !matches!(sent, Ok(Ok(_))) {
-                    return Ok(
-                        json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
-                    "reason":"key dispatch became uncertain; inspect state and do not automatically retry"}),
-                    );
+                for (event, _) in cdp_character_events(character) {
+                    let connection = shared.connection.as_ref().unwrap();
+                    let sent = tokio::time::timeout_at(deadline, connection.command(
+                        shared.registry()?, &shared.handle, &args.chrome_tab_id, "Input.dispatchKeyEvent", event,
+                    )).await;
+                    if !matches!(sent, Ok(Ok(_))) {
+                        return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
+                            "reason":"key dispatch became uncertain; inspect state and do not automatically retry"}));
+                    }
+                    dispatch_count = dispatch_count.saturating_add(1);
                 }
-                dispatch_count = dispatch_count.saturating_add(1);
-                if event_index == 1 {
-                    progress.push(character);
+                let mut candidate = progress.clone();
+                candidate.push(character);
+                let after_key = {
+                    let connection = shared.connection.as_ref().unwrap();
+                    let response = tokio::time::timeout_at(deadline, connection.command(
+                        shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
+                        json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
+                            "arguments":[{"value":index},{"value":candidate},{"value":true},{"value":true},{"value":false}],"returnByValue":true})
+                    )).await;
+                    match response {
+                        Ok(Ok(response)) => super::super::shared_value(&response).ok(),
+                        _ => None,
+                    }
+                };
+                if after_key.as_ref().is_some_and(|value| value["ok"] == true) {
+                    progress = candidate;
+                    break;
                 }
+                let unchanged = {
+                    let connection = shared.connection.as_ref().unwrap();
+                    let response = tokio::time::timeout_at(deadline, connection.command(
+                        shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn",
+                        json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
+                            "arguments":[{"value":index},{"value":progress},{"value":true},{"value":true},{"value":false}],"returnByValue":true})
+                    )).await;
+                    match response {
+                        Ok(Ok(response)) => super::super::shared_value(&response).ok(),
+                        _ => None,
+                    }
+                };
+                if attempts == 0 && unchanged.as_ref().is_some_and(|value| value["ok"] == true) {
+                    attempts += 1;
+                    continue;
+                }
+                return Ok(json!({"status":"unknown","action":"type","dispatch_acknowledged":dispatch_count>0,
+                    "reason":"key events were acknowledged but the expected character could not be verified; inspect before retrying",
+                    "character_readback":after_key,"unchanged_readback":unchanged}));
             }
             if policy.delay_ms > 0
                 && tokio::time::timeout_at(
@@ -1546,9 +2138,6 @@ async fn key_type(
             }
         }
     }
-    if unrestricted {
-        return Ok(json!({"status":"dispatched","action":"type","typing_mode":match policy.mode { crate::v3::TypingMode::FastKeys=>"fast_keys", _=>"human_keys" },"dispatch_acknowledged":true,"verified":false,"cdp_key_events":dispatch_count}));
-    }
     let readback = {
         let connection = shared.connection.as_ref().unwrap();
         let response = tokio::time::timeout_at(
@@ -1559,7 +2148,7 @@ async fn key_type(
                 &args.chrome_tab_id,
                 "Runtime.callFunctionOn",
                 json!({"objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                "arguments":[{"value":index},{"value":progress}],"returnByValue":true}),
+                "arguments":[{"value":index},{"value":progress},{"value":false},{"value":true},{"value":false}],"returnByValue":true}),
             ),
         )
         .await;
@@ -1592,7 +2181,8 @@ async fn key_type(
     }
     let mut result = json!({"status":"verified","action":"type","dispatch_acknowledged":true,
         "typing_mode":match policy.mode { crate::v3::TypingMode::FastKeys=>"fast_keys", _=>"human_keys" },
-        "readback":progress,"cdp_key_events":dispatch_count,"intentional_delay_ms":policy.delay_ms});
+        "readback":progress,"cdp_key_events":dispatch_count,"intentional_delay_ms":policy.delay_ms,
+        "intentional_delay_total_ms":(text.chars().count() as u64).saturating_mul(policy.delay_ms)});
     if let Ok(snapshot) = snapshot_impl(
         &app.core,
         &BrowserSnapshotArgs {
@@ -1603,6 +2193,7 @@ async fn key_type(
             max_text_chars: None,
             max_bytes: None,
             href_hint: None,
+            frame_id: None,
         },
     )
     .await
@@ -1942,7 +2533,7 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Manage browser sessions and bounded tasks. Foreground action=open with URL cold-starts a shared session and opens a tab; optional steps run a bounded workflow in that tab within the same call. Existing session_id reuses a session.",
+        description = "Manage browser sessions and bounded tasks. For action=task, provide a tagged task; valid Research example: {\"kind\":\"research\",\"urls\":[\"https://example.test/\"]}. Research navigates the selected existing tab. Foreground action=open requires a stable idempotency_key: reuse it only to recover the same open; use a new key for a distinct tab. It cold-starts a shared session and opens a tab; optional steps run in one bounded workflow call. Password controls appear only as redacted credential_input references. To fill one, use act action=fill with its fresh reference and allow_password=true; the supplied value is transmitted to the local MCP/browser but never returned in snapshots or action results. Do not use workflow fill for credentials. The visible-trigger workflow Upload and foreground artifact_register file_path are available only in local_unrestricted shared sessions; guarded uploads use the dedicated headless task upload route. Upload requires an artifact_handle registered in that same session, an observed trigger reference, an account marker, and (for continuation) an acceptance predicate. Use [\"ax:button\",\"exact visible accessible name\"] when a button lacks a unique CSS selector; this is checked against the root DOM's computed name, excluding picker/menu scopes. Files are limited to 10 MiB. If a trigger opens a child-frame picker, list_shared_targets, snapshot its frame, then pass the observed Browse @f reference.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn browser(
@@ -1973,7 +2564,8 @@ impl AppV3 {
                         .session_id
                         .ok_or_else(|| invalid("session_id is required"))?,
                     filename: args.filename.ok_or_else(|| invalid("filename is required"))?,
-                    bytes: args.bytes.ok_or_else(|| invalid("bytes are required"))?,
+                    bytes: args.bytes,
+                    file_path: args.file_path,
                 }))
                 .await;
         }
@@ -1990,16 +2582,25 @@ impl AppV3 {
                 .await;
         }
         if args.action == "describe" {
+            let tools = AppV3::tool_router().list_all();
+            let mut surface = tools.iter().map(|tool| serde_json::to_value(tool).unwrap_or(Value::Null)).collect::<Vec<_>>();
+            surface.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            let schema_sha256 = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(serde_json::to_vec(&surface).unwrap_or_default()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            };
             return Ok(Json(json!({
                 "version":"v3","tools":["browser","snapshot","act","workflow","extract","verify"],
+                "surface":"v3-compact","server_version":env!("CARGO_PKG_VERSION"),"schema_sha256":schema_sha256,
                 "modes":{"foreground":crate::v3::BrowserMode::Foreground.policy(),"background":crate::v3::BrowserMode::Background.policy(),"headless":crate::v3::BrowserMode::Headless.policy()},
                 "browser_actions":{"foreground":["discover_shared_tabs","pair_shared","accept_shared","list","open","release","task"],"background":["discover_shared_tabs","pair_shared","accept_shared","list","release","task"],"headless":["launch","list","release","task","artifact_register","artifact_read"]},
-                "foreground_open":{"session_id":"optional; omitting it pairs a shared Chrome tab before opening a new foreground tab","steps":"optional bounded workflow executed in the new tab; result is returned in workflow","guarded_cold_open":"requires host_id and target_ids from discovery","local_unrestricted_cold_open":"chooses a stable web tab from the native inventory"},
+                "foreground_open":{"session_id":"optional; omitting it pairs a shared Chrome tab before opening a new foreground tab","idempotency_key":"required; reuse only to retry the same logical open, and use a new key for a distinct tab","steps":"optional bounded workflow executed in the new tab; result is returned in workflow","guarded_cold_open":"requires host_id and target_ids from discovery","local_unrestricted_cold_open":"chooses a stable web tab from the native inventory"},
                 "act_actions":["click","fill","type","press","select","page_tools","page_tool"],
-                "shared_artifacts":crate::guard_reason::unrestricted_mode(),
+                "artifact_scopes":{"guarded":["private_headless_session"],"local_unrestricted":["private_headless_session","local_unrestricted_shared_session"]},
+                "client_loaded_tool_state":"unverified_until_client_acknowledges_surface_fingerprint",
                 "typing_modes":["block","fast_keys","human_keys","ime"],
                 "interaction_policy":if crate::guard_reason::unrestricted_mode() {"local_unrestricted"} else {"guarded"},
-                "safety":if crate::guard_reason::unrestricted_mode() {"native pairing discovery checks, click/fill/select/press target checks, click outcome wait, and target leases are disabled; dispatched is not verified; transport and request validity checks remain"} else {"revision-bound refs, target leases, fresh-state verification, no blind mutation retry"}
+                "safety":if crate::guard_reason::unrestricted_mode() {"native pairing discovery checks, click/fill/select/press target checks, and target leases are disabled; explicit click outcomes are still observed before verified is returned; transport and request validity checks remain"} else {"revision-bound refs, target leases, fresh-state verification, no blind mutation retry"}
             })));
         }
         let mode = parse_mode(args.mode.as_deref())?;
@@ -2025,6 +2626,9 @@ impl AppV3 {
                 }
                 validate_workflow_steps(steps)?;
             }
+            if args.idempotency_key.as_deref().is_none_or(str::is_empty) {
+                return Err(invalid("browser action=open requires idempotency_key so retries reuse the same tab"));
+            }
             let cold = args.session_id.is_none();
             let session_id = if let Some(session_id) = args.session_id.as_deref() {
                 if self.browser_modes.lock().await.get(session_id) != Some(&mode) {
@@ -2039,6 +2643,7 @@ impl AppV3 {
                 action: "open".into(),
                 chrome_tab_id: None,
                 url: url.to_owned(),
+                idempotency_key: args.idempotency_key.as_deref().map(|key| format!("{}:{key}", args.client_id.as_deref().unwrap_or("local-stdio"))),
             })).await;
             let Json(mut result) = match opened {
                 Ok(result) => result,
@@ -2230,7 +2835,7 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Return a compact semantic snapshot/delta with revision-bound @cN refs. Use before mutations and again after user/page changes.",
+        description = "Return a compact semantic snapshot/delta with revision-bound @cN refs. Visible password fields are included as credential_input references with raw_value=null and requires_user_input=true; their value is never returned. Set frame_id for bounded child-frame accessibility, which returns loader-bound @f refs usable by click. Use before mutations and again after user/page changes.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn snapshot(
@@ -2242,7 +2847,7 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Perform a mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. type supports block, fast_keys (real zero-delay CDP key events), human_keys, and ime. Guarded mode leases targets and checks drift; local_unrestricted skips those checks and returns dispatched without claiming verification.",
+        description = "Perform a mutation, discover selected page tools with action=page_tools, or explicitly invoke one with action=page_tool. Password inputs remain redacted and can be filled only with action=fill plus allow_password=true and a fresh reference that resolves to an enabled visible password input. The value is sent to the local MCP/browser and never returned in snapshots or action results. Omit allow_password for normal fills; action=type and workflows do not accept password values. type supports block, fast_keys (zero-delay trusted CDP keys; rich-editor newline runs become Enter), human_keys (trusted keys with a default 180 ms per character, about 55 WPM; override with delay_ms), and ime. Human typing gets a text-length-based deadline. Guarded mode leases targets and checks drift; local_unrestricted skips target checks. Click still waits for its explicit postcondition and reports unknown until observed.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn act(
@@ -2250,8 +2855,21 @@ impl AppV3 {
         Parameters(mut args): Parameters<V3ActArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         self.require_v3_session(&args.session_id).await?;
+        if args.allow_password == Some(true) && args.action != "fill" {
+            return Err(invalid("allow_password is supported only for action=fill"));
+        }
+        let background_mutation = self.browser_modes.lock().await.get(&args.session_id) == Some(&crate::v3::BrowserMode::Background)
+            && matches!(args.action.as_str(), "click" | "fill" | "type" | "press" | "select" | "page_tool");
+        let presentation_before = if background_mutation { presentation_state(self, &args.session_id, &args.chrome_tab_id).await } else { None };
         let lease = acquire_lease(self, &args).await?;
-        let result = match tokio::time::timeout(Duration::from_secs(60), async {
+        let operation_timeout = if args.action == "type" && args.typing_mode.as_deref() == Some("human_keys") {
+            let delay_ms = args.delay_ms.unwrap_or(180);
+            let default = crate::v3::human_typing_timeout_ms(args.value.as_deref().unwrap_or_default().chars().count(), delay_ms);
+            Duration::from_millis(args.timeout_ms.unwrap_or(default).clamp(1_000, 600_000))
+        } else {
+            Duration::from_secs(60)
+        };
+        let result = match tokio::time::timeout(operation_timeout, async {
             match args.action.as_str() {
                 "click" => self
                     .core
@@ -2285,6 +2903,7 @@ impl AppV3 {
                             timeout_ms: args.timeout_ms,
                         },
                         reference,
+                        args.allow_password.unwrap_or(false),
                         &args.action,
                     )
                     .await
@@ -2317,11 +2936,20 @@ impl AppV3 {
         .await
         {
             Ok(result) => result,
-            Err(_) => Ok(
-                json!({"status":"unknown","action":args.action,"dispatch_acknowledged":false,
-                "reason":"action exceeded its 60-second bound; inspect state before retrying"}),
-            ),
+            Err(_) => Ok(action_timeout_receipt(&args.action)),
         };
+        let result = if background_mutation { match result {
+            Ok(mut value) => {
+                let before = presentation_before.unwrap_or(Value::Null);
+                let after = presentation_state(self, &args.session_id, &args.chrome_tab_id).await.unwrap_or(Value::Null);
+                value["mode"] = json!("background");
+                value["presentation_before"] = before.clone();
+                value["presentation_after"] = after.clone();
+                value["focus_changed_during_operation"] = focus_changed_during_operation(&before, &after);
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }} else { result };
         if !matches!(&result, Ok(value) if value["status"] == "unknown") {
             release_lease(self, &args, &lease).await;
         }
@@ -2329,7 +2957,7 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Run a bounded browser program in one MCP call. Supports snapshot, find, find_all, choose newest by datetime, click, fill, type, press, page_tool, extract, and verify; up to 40 steps.",
+        description = "Run a bounded browser program in one MCP call. Supports snapshot, find, find_all, choose newest by datetime, click, fill, type, press, upload a previously registered artifact through an observed trigger with an explicit account marker and optional acceptance predicate, page_tool, extract, and verify; up to 40 steps. Visible-trigger Upload is available only in local_unrestricted shared sessions; guarded uploads use the dedicated headless task route. For upload account_marker, use [\"ax:button\",\"exact visible accessible name\"] when no unique CSS selector exists; it checks the visible root-DOM button name and excludes picker/menu scopes. Otherwise pass [\"<CSS selector>\",\"exact visible name\"]. Upload stops the workflow unless the receipt proves application acceptance.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn workflow(
@@ -2353,7 +2981,8 @@ impl AppV3 {
         let mut pending_readback = false;
         while let Some(step) = steps.next() {
             let is_snapshot = matches!(&step, V3WorkflowStep::Snapshot { .. });
-            let is_mutation = matches!(&step, V3WorkflowStep::Click { .. } | V3WorkflowStep::Fill { .. } | V3WorkflowStep::Type { .. } | V3WorkflowStep::Press { .. } | V3WorkflowStep::PageTool { .. });
+            let is_upload = matches!(&step, V3WorkflowStep::Upload { .. });
+            let is_mutation = matches!(&step, V3WorkflowStep::Click { .. } | V3WorkflowStep::Fill { .. } | V3WorkflowStep::Type { .. } | V3WorkflowStep::Press { .. } | V3WorkflowStep::PageTool { .. } | V3WorkflowStep::Upload { .. });
             let step_started = std::time::Instant::now();
             let resolve = |reference: String,
                            vars: &std::collections::BTreeMap<String, String>|
@@ -2373,6 +3002,7 @@ impl AppV3 {
                             max_text_chars: None,
                             max_bytes: None,
                             href_hint: href_hint.clone(),
+                            frame_id: None,
                         }).await;
                         match read {
                             Ok(value) if value["ready_state"] != "loading" => break value,
@@ -2384,7 +3014,7 @@ impl AppV3 {
                         attempt += 1;
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
-                    coverage_complete = snapshot["truncated"] == false || snapshot["first_party_complete"] == true;
+                    coverage_complete = snapshot["scope_complete"] == true;
                     snapshot
                 }
                 V3WorkflowStep::Find {
@@ -2396,21 +3026,31 @@ impl AppV3 {
                     href_hint,
                     save_as,
                 } => {
-                    let found = find_impl(
-                        &self.core,
-                        &BrowserFindArgs {
-                            session_id: args.session_id.clone(),
-                            chrome_tab_id: args.chrome_tab_id.clone(),
-                            query,
-                            role,
-                            limit: Some(2),
-                            max_matches,
-                            match_mode,
-                            within_reference,
-                            href_hint,
-                        },
-                    )
-                    .await?;
+                    let find_args = BrowserFindArgs {
+                        session_id: args.session_id.clone(),
+                        chrome_tab_id: args.chrome_tab_id.clone(),
+                        query,
+                        role,
+                        limit: Some(2),
+                        max_matches,
+                        match_mode,
+                        within_reference,
+                        href_hint,
+                    };
+                    let mut found = find_impl(&self.core, &find_args).await?;
+                    if controlla_runtime::semantic_state::workflow_find_needs_refresh(&found) {
+                        let _ = snapshot_impl(&self.core, &BrowserSnapshotArgs {
+                            session_id: find_args.session_id.clone(),
+                            chrome_tab_id: find_args.chrome_tab_id.clone(),
+                            selector: None,
+                            max_items: None,
+                            max_text_chars: None,
+                            max_bytes: None,
+                            href_hint: find_args.href_hint.clone(),
+                            frame_id: None,
+                        }).await?;
+                        found = find_impl(&self.core, &find_args).await?;
+                    }
                     let reference = workflow_find_reference(&found)?;
                     if save_as.is_empty() || vars.insert(save_as, reference).is_some() {
                         return Err(invalid("save_as must be unique and nonempty"));
@@ -2469,9 +3109,35 @@ impl AppV3 {
                         client_id: args.client_id.clone(),
                         page_tool_name: None,
                         page_tool_input: None,
+
+                        allow_password: None,
                     }))
                     .await?
                     .0
+                }
+                V3WorkflowStep::Upload { artifact_handle, trigger_reference, account_marker, acceptance } => {
+                    let trigger_reference = resolve(trigger_reference, &vars)?;
+                    let acceptance = acceptance
+                        .map(|predicate| resolve_workflow_predicate(predicate, &vars, &selected))
+                        .transpose()?
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|error| invalid(format!("invalid upload acceptance predicate: {error}")))?;
+                    match tokio::time::timeout(
+                        SHARED_TRIGGER_UPLOAD_DEADLINE,
+                        shared_file_select_trigger(
+                            self,
+                            &args.session_id,
+                            &args.chrome_tab_id,
+                            &artifact_handle,
+                            &trigger_reference,
+                            &account_marker,
+                            acceptance,
+                        ),
+                    ).await {
+                        Ok(result) => result?,
+                        Err(_) => json!({"status":"unknown","reason_code":"upload_deadline_exceeded","dispatch_may_have_occurred":true,"reason":"Upload exceeded the 45-second operation deadline; inspect page state before retrying."}),
+                    }
                 }
                 V3WorkflowStep::Fill {
                     reference,
@@ -2494,6 +3160,8 @@ impl AppV3 {
                         client_id: args.client_id.clone(),
                         page_tool_name: None,
                         page_tool_input: None,
+
+                        allow_password: None,
                     }))
                     .await?
                     .0
@@ -2521,6 +3189,8 @@ impl AppV3 {
                         client_id: args.client_id.clone(),
                         page_tool_name: None,
                         page_tool_input: None,
+
+                        allow_password: None,
                     }))
                     .await?
                     .0
@@ -2542,6 +3212,8 @@ impl AppV3 {
                         client_id: args.client_id.clone(),
                         page_tool_name: None,
                         page_tool_input: None,
+
+                        allow_password: None,
                     }))
                     .await?
                     .0
@@ -2578,31 +3250,14 @@ impl AppV3 {
                         client_id: args.client_id.clone(),
                         page_tool_name: Some(name),
                         page_tool_input: Some(input),
+
+                        allow_password: None,
                     }))
                     .await?
                     .0
                 }
                 V3WorkflowStep::Verify { predicate } => {
-                    let predicate = match predicate {
-                        BrowserPredicate::Text { reference, equals } => BrowserPredicate::Text {
-                            reference: resolve(reference, &vars)?,
-                            equals,
-                        },
-                        BrowserPredicate::Value { reference, equals } => BrowserPredicate::Value {
-                            reference: resolve(reference, &vars)?,
-                            equals,
-                        },
-                        BrowserPredicate::Exists { reference } => BrowserPredicate::Exists {
-                            reference: resolve(reference, &vars)?,
-                        },
-                        BrowserPredicate::Url { equals } => {
-                            let equals = if let Some(name) = equals.strip_prefix('$').and_then(|value| value.strip_suffix(".href")) {
-                                selected.get(name).and_then(|item| item["href"].as_str()).ok_or_else(|| invalid("selected href variable is unresolved"))?.to_owned()
-                            } else { equals };
-                            BrowserPredicate::Url { equals }
-                        },
-                        BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
-                    };
+                    let predicate = resolve_workflow_predicate(predicate, &vars, &selected)?;
                     let mut observed = json!({"status":"unknown","reason":"verification did not complete"});
                     for attempt in 0..if pending_readback { 20 } else { 1 } {
                         match verify_impl(&self.core, &BrowserVerifyArgs {
@@ -2631,7 +3286,8 @@ impl AppV3 {
                         "elapsed_ms":started.elapsed().as_millis() as u64})));
                 }
             };
-            let stop_status = workflow_should_stop_before_next(&value, steps.peek())
+            let stop_status = (workflow_should_stop_before_next(&value, steps.peek())
+                || (is_upload && workflow_upload_requires_stop(&value)))
                 .then(|| value["status"].as_str().unwrap_or("unknown").to_owned());
             pending_readback = workflow_should_verify_next(&value, steps.peek()) && stop_status.is_none();
             unverified_effect |= matches!(value["status"].as_str(), Some("unknown" | "dispatched" | "not_dispatched" | "failed"));
@@ -2652,12 +3308,8 @@ impl AppV3 {
         &self,
         Parameters(args): Parameters<V3ArtifactRegisterArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
+        let started = std::time::Instant::now();
         self.require_v3_session(&args.session_id).await?;
-        if args.bytes.is_empty() || args.bytes.len() > 10 * 1024 * 1024 {
-            return Err(invalid(
-                "artifact bytes must be between 1 and 10485760 bytes",
-            ));
-        }
         let live = self
             .core
             .legacy
@@ -2675,16 +3327,34 @@ impl AppV3 {
                 "artifact registration requires a dedicated private headless session",
             ));
         }
+        let bytes = match (args.bytes, args.file_path) {
+            (Some(bytes), None) if !bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024 => bytes,
+            (Some(_), None) => return Err(invalid("artifact bytes must be between 1 and 10485760 bytes")),
+            (None, Some(path)) if crate::guard_reason::unrestricted_mode() && !super::super::private_headless_cleanup_allowed(&live.handle) => crate::artifacts::read_local_file(&path).map_err(invalid)?,
+            (None, Some(_)) => return Err(invalid("file_path staging requires a local unrestricted shared session")),
+            (Some(_), Some(_)) => return Err(invalid("provide exactly one of bytes or file_path")),
+            (None, None) => return Err(invalid("provide one of bytes or file_path")),
+        };
         let handle = live.handle.clone();
+        let private_headless = super::super::private_headless_cleanup_allowed(&handle);
         let metadata = live
             .registry
             .as_mut()
             .ok_or_else(|| invalid("session registry unavailable"))?
-            .put_artifact_bytes(&handle, &args.filename, &args.bytes)
+            .put_artifact_bytes_scoped(
+                &handle,
+                &args.filename,
+                &bytes,
+                if private_headless {
+                    controlla_browser::sessions::ArtifactScope::PrivateHeadlessSession
+                } else {
+                    controlla_browser::sessions::ArtifactScope::LocalUnrestrictedSharedSession
+                },
+            )
             .map_err(|error| invalid(format!("artifact registration failed: {error:?}")))?;
         Ok(Json(
             json!({"artifact_handle":metadata.handle,"filename":metadata.filename,"size":metadata.size,
-            "scope":if super::super::private_headless_cleanup_allowed(&live.handle) {"private_headless_session"} else {"local_unrestricted_shared_session"},"verified":true}),
+            "scope":if super::super::private_headless_cleanup_allowed(&live.handle) {"private_headless_session"} else {"local_unrestricted_shared_session"},"verified":true,"elapsed_ms":started.elapsed().as_millis() as u64}),
         ))
     }
 
@@ -2733,8 +3403,13 @@ impl AppV3 {
         let mut active_tab_id = args.chrome_tab_id.clone();
         let mut receipts = Vec::with_capacity(steps.len());
         let mut unverified_effect = false;
+        let task_started = std::time::Instant::now();
         for step in steps {
-            let (kind, reference, result) = match step {
+            let step_started = std::time::Instant::now();
+            let is_mutation = matches!(&step, ExpandedStep::Fill { .. } | ExpandedStep::Upload { .. } | ExpandedStep::Download { .. } | ExpandedStep::Click { .. } | ExpandedStep::SaveDraft { .. });
+            let background_mode = self.browser_modes.lock().await.get(&args.session_id) == Some(&crate::v3::BrowserMode::Background);
+            let presentation_before = if background_mode && is_mutation { presentation_state(self, &args.session_id, &active_tab_id).await } else { None };
+            let (kind, reference, mut result) = match step {
                 ExpandedStep::Open {
                     url: next_url,
                     tab_id,
@@ -2781,6 +3456,7 @@ impl AppV3 {
                             max_text_chars: None,
                             max_bytes: None,
                             href_hint: None,
+                            frame_id: None,
                         },
                     )
                     .await?;
@@ -2800,6 +3476,8 @@ impl AppV3 {
                             client_id: args.client_id.clone(),
                             page_tool_name: None,
                             page_tool_input: None,
+
+                            allow_password: None,
                         }))
                         .await?
                         .0;
@@ -2850,6 +3528,7 @@ impl AppV3 {
                             max_text_chars: None,
                             max_bytes: None,
                             href_hint: None,
+                            frame_id: None,
                         },
                     )
                     .await?;
@@ -2869,6 +3548,8 @@ impl AppV3 {
                             client_id: args.client_id.clone(),
                             page_tool_name: None,
                             page_tool_input: None,
+
+                            allow_password: None,
                         }))
                         .await?
                         .0;
@@ -2885,6 +3566,7 @@ impl AppV3 {
                             max_text_chars: None,
                             max_bytes: None,
                             href_hint: None,
+                            frame_id: None,
                         },
                     )
                     .await?;
@@ -2907,6 +3589,8 @@ impl AppV3 {
                             client_id: args.client_id.clone(),
                             page_tool_name: None,
                             page_tool_input: None,
+
+                            allow_password: None,
                         }))
                         .await?
                         .0;
@@ -2915,17 +3599,29 @@ impl AppV3 {
                 ExpandedStep::Upload {
                     artifact_handle,
                     selector,
+                    trigger_reference,
+                    acceptance,
                     account_marker,
                 } => {
-                    let value = headless_file_select(
-                        self,
-                        &args.session_id,
-                        &args.chrome_tab_id,
-                        &artifact_handle,
-                        &selector,
-                        &account_marker,
-                    )
-                    .await?;
+                    let value = if let Some(reference)=trigger_reference {
+                        match tokio::time::timeout(SHARED_TRIGGER_UPLOAD_DEADLINE, shared_file_select_trigger(self,&args.session_id,&args.chrome_tab_id,&artifact_handle,&reference,&account_marker,acceptance)).await {
+                            Ok(result) => result?,
+                            Err(_) => json!({"status":"unknown","reason_code":"upload_deadline_exceeded","dispatch_may_have_occurred":true,"reason":"Upload exceeded the 45-second operation deadline; inspect Classroom before retrying."}),
+                        }
+                    } else {
+                        let mut value=headless_file_select(self,&args.session_id,&args.chrome_tab_id,&artifact_handle,selector.as_deref().unwrap(),&account_marker).await?;
+                        if let Some(acceptance)=acceptance {
+                            let predicate:BrowserPredicate=serde_json::from_value(acceptance).map_err(|error|invalid(format!("invalid upload acceptance predicate: {error}")))?;
+                            let mut accepted=false;
+                            for attempt in 0..10 {
+                                if verify_impl(&self.core,&BrowserVerifyArgs{session_id:args.session_id.clone(),chrome_tab_id:args.chrome_tab_id.clone(),predicate:predicate.clone()}).await?["status"]=="passed" { accepted=true;break; }
+                                if attempt<9 {tokio::time::sleep(Duration::from_millis(100)).await;}
+                            }
+                            value["application_accepted"]=json!(accepted);
+                            if accepted {value["status"]=json!("verified");value["verified"]=json!(true);}
+                        }
+                        value
+                    };
                     ("upload", None, value)
                 }
                 ExpandedStep::Download { reference } => {
@@ -2935,7 +3631,18 @@ impl AppV3 {
                     ("download", Some(reference), value)
                 }
             };
-            let receipt = task_receipt(kind, &url, reference.as_deref(), &result);
+            if background_mode && is_mutation {
+                let after = presentation_state(self, &args.session_id, &active_tab_id).await;
+                let before = presentation_before.unwrap_or(Value::Null);
+                let after_value = after.unwrap_or(Value::Null);
+                let changed = focus_changed_during_operation(&before, &after_value);
+                result["mode"] = json!("background");
+                result["presentation_before"] = before;
+                result["presentation_after"] = after_value;
+                result["focus_changed_during_operation"] = changed;
+            }
+            let mut receipt = task_receipt(kind, &url, reference.as_deref(), &result);
+            receipt["elapsed_ms"] = json!(step_started.elapsed().as_millis() as u64);
             let verified = receipt["verified"] == true;
             unverified_effect |= !verified;
             receipts.push(receipt);
@@ -2946,12 +3653,12 @@ impl AppV3 {
                     result["status"].as_str().unwrap_or("incomplete")
                 };
                 return Ok(Json(
-                    json!({"status":status,"steps":receipts.len(),"receipts":receipts}),
+                    json!({"status":status,"steps":receipts.len(),"receipts":receipts,"elapsed_ms":task_started.elapsed().as_millis() as u64}),
                 ));
             }
         }
         Ok(Json(
-            json!({"status":if unverified_effect {"completed_unverified"} else {"completed"},"steps":receipts.len(),"receipts":receipts}),
+            json!({"status":if unverified_effect {"completed_unverified"} else {"completed"},"steps":receipts.len(),"receipts":receipts,"elapsed_ms":task_started.elapsed().as_millis() as u64}),
         ))
     }
 
@@ -2990,7 +3697,7 @@ impl ServerHandler for AppV3 {
             "controlla-v3",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions("Controlla v3 exposes browser, snapshot, act, workflow, extract, and verify. In foreground mode, discover and pair selected tabs, accept the shared session, then use browser action=open with the accepted session_id and HTTP(S) url to create an active tab. Use browser action=task for bounded research and form drafts; research navigates an existing tab. Artifact registration and upload require a private headless session. Use workflow for explicit multi-step automation and verify consequential mutations. Reobserve after user/page drift; never blindly retry an unknown mutation outcome.")
+        .with_instructions("Controlla V3 exposes browser, snapshot, act, workflow, extract, and verify. Read these tool schemas once per session; after an MCP reload, confirm browser schema exposes idempotency_key as required for action=open and a tagged task shape before calling it. If offered schema rejects a runtime-required field, stop and reload/repair the MCP contract instead of probing retries. For action=task use {\"kind\":\"research\",\"urls\":[\"https://example.test/\"]}; research navigates the selected tab. For a new foreground tab, call browser action=open with a unique logical-operation idempotency_key; reuse it only for that operation's retry, and omit open when the selected tab should be reused. Password controls appear only as redacted credential_input references with raw_value=null; fill one only with act action=fill, its fresh reference, and allow_password=true. This sends the value through the local MCP/browser, but snapshots and results remain redacted. Do not use credential values in workflows. Use one compact snapshot scoped by href_hint or visible query, then workflow find/find_all/choose(datetime) for ranked candidates. A click Navigation outcome with no URL means any document change; a supplied navigation URL is an exact absolute HTTP(S) destination. For canonical redirects, click with navigation-only and follow with verify url_starts_with. A click receipt of unknown is never retried: inspect once or verify read-only. Prefer fast_keys for exact text; rich-editor newline runs become one Enter event each to preserve paragraph boundaries. Use human_keys only when requested or key-event pacing is required; it defaults to 180 ms per character (about 55 words per minute), accepts a delay_ms override, and scales its deadline with text length. For upload, the visible-trigger workflow Upload and foreground file_path artifact registration work only in local_unrestricted shared sessions; guarded uploads use the dedicated headless task upload route. Register the exact file once, pass the observed trigger reference, account marker, and bounded application acceptance predicate; an upload without verified application_accepted stops the workflow. Do not post after selected/unknown upload. A verified upload proves visible app acceptance only, not persistence. Measure elapsed time from first call to independently verified result. Release the session without closing user tabs.")
     }
 }
 
@@ -3017,13 +3724,108 @@ pub(super) async fn run() -> Result<(), String> {
 #[cfg(test)]
 mod v3_batch_delivery_tests {
     use super::{
-        AppV3, BrowserPredicate, V3WorkflowStep, fast_key_batch_failure, lease_target_key,
+        AppV3, BrowserPredicate, V3WorkflowStep, SHARED_TRIGGER_UPLOAD_DEADLINE, cdp_character_events, normalize_key_text, fast_key_batch_failure, lease_target_key,
         page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, task_receipt,
         typing_policy, validate_workflow_steps, workflow_find_reference, workflow_should_stop,
         workflow_should_stop_before_next, workflow_should_verify_next,
-        compact_workflow_receipt,
+        compact_workflow_receipt, shared_extension_value, shared_file_input_baseline, upload_acceptance_transition, upload_input_selection_confirmed, upload_picker_consumed_input, upload_selection_reason_code, upload_trigger_may_have_dispatched,
+        action_timeout_receipt, focus_changed_during_operation, identity_marker_matches, page_navigate_error,
+        wait_for_chooser_or_cleanup,
+        FileChooserCleanupGuard,
+        workflow_upload_requires_stop,
     };
     use serde_json::json;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    #[test]
+    fn unknown_upload_receipt_preserves_the_failed_verification_dimension() {
+        let receipt = task_receipt("upload", "https://classroom.google.com/c/test", None, &json!({
+            "status":"unknown","reason_code":"file_selection_unverified",
+            "reason":"file readback did not match","chrome_selected_file":false,
+            "root_document_matches":true,"account_marker_matches":true,
+            "dispatch_acknowledged":true,
+            "network_events":[{"host":"www.googleapis.com","status":403}],
+            "network_observation_window_ms":2500
+        }));
+        assert_eq!(receipt["status"], "unknown");
+        assert_eq!(receipt["reason_code"], "file_selection_unverified");
+        assert_eq!(receipt["chrome_selected_file"], false);
+        assert_eq!(receipt["root_document_matches"], true);
+        assert_eq!(receipt["account_marker_matches"], true);
+        assert_eq!(receipt["dispatch_acknowledged"], true);
+        assert_eq!(receipt["network_events"][0]["status"], 403);
+        assert_eq!(receipt["network_observation_window_ms"], 2500);
+    }
+
+    #[test]
+    fn upload_workflow_stops_without_visible_application_acceptance() {
+        assert!(workflow_upload_requires_stop(&json!({"status":"selected","application_accepted":null})));
+        assert!(workflow_upload_requires_stop(&json!({"status":"unknown","application_accepted":true})));
+        assert!(!workflow_upload_requires_stop(&json!({"status":"verified","application_accepted":true})));
+    }
+
+    #[test]
+    fn workflow_upload_schema_uses_explicit_artifact_trigger_and_acceptance() {
+        let step: V3WorkflowStep = serde_json::from_value(json!({
+            "kind":"upload",
+            "artifact_handle":"opaque-handle",
+            "trigger_reference":"@c7",
+            "account_marker":["#account","fixture-account"],
+            "acceptance":{"kind":"value","reference":"@c8","equals":"Accepted"}
+        })).unwrap();
+        assert!(matches!(step, V3WorkflowStep::Upload { .. }));
+    }
+
+    #[test]
+    fn workflow_rejects_unbounded_upload_references_and_account_markers() {
+        let step: V3WorkflowStep = serde_json::from_value(json!({
+            "kind":"upload",
+            "artifact_handle":"opaque-handle",
+            "trigger_reference":"@c7",
+            "account_marker":["#account","x".repeat(513)]
+        })).unwrap();
+        assert!(validate_workflow_steps(&[step]).is_err());
+    }
+
+    #[test]
+    fn shared_trigger_upload_has_a_hard_subminute_deadline() {
+        assert!(SHARED_TRIGGER_UPLOAD_DEADLINE < Duration::from_secs(60));
+        assert_eq!(SHARED_TRIGGER_UPLOAD_DEADLINE, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn identity_marker_accepts_the_extension_reply_shape_and_cdp_test_envelope() {
+        assert!(identity_marker_matches(&json!({"matches":true,"match_count":1})).unwrap());
+        assert!(!identity_marker_matches(&json!({"matches":false,"match_count":0})).unwrap());
+        assert!(identity_marker_matches(&json!({"result":{"value":{"matches":true,"match_count":1}}})).unwrap());
+        assert!(!identity_marker_matches(&json!({"matches":true,"match_count":2})).unwrap());
+        assert!(identity_marker_matches(&json!({"unrelated":true})).is_err());
+    }
+
+
+    #[test]
+    fn shared_extension_results_accept_direct_objects_and_cdp_value_envelopes() {
+        let direct = json!({"inputs": [], "document_id": "doc-1"});
+        assert_eq!(shared_extension_value(&direct).unwrap(), direct);
+        assert_eq!(
+            shared_extension_value(&json!({"result":{"type":"object","value":{"files":[]}}})).unwrap(),
+            json!({"files":[]})
+        );
+        assert!(shared_extension_value(&json!({"exceptionDetails":{}})).is_err());
+        assert!(shared_extension_value(&json!(null)).is_err());
+    }
+
+    #[test]
+    fn file_input_baseline_preserves_diagnostics_and_requires_a_bounded_array() {
+        assert_eq!(
+            shared_file_input_baseline(&json!({"inputs": [{"backend_node_id": 1}]})).unwrap(),
+            json!([{"backend_node_id": 1}])
+        );
+        assert!(shared_file_input_baseline(&json!({"error":"DOM unavailable"})).is_err());
+        assert!(shared_file_input_baseline(&json!({"inputs": "unavailable"})).is_err());
+        assert!(shared_file_input_baseline(&json!({"inputs": vec![Value::Null; 257]})).is_err());
+    }
 
 
     #[test]
@@ -3056,6 +3858,93 @@ mod v3_batch_delivery_tests {
     async fn v3_actions_require_a_session_created_through_the_v3_browser_route() {
         let app = AppV3::new(super::super::AppV2::new(super::super::App::default()));
         assert!(app.require_v3_session("legacy-session").await.is_err());
+    }
+
+    #[test]
+    fn upload_acceptance_requires_a_newly_satisfied_predicate() {
+        assert!(!upload_acceptance_transition(true, true));
+        assert!(!upload_acceptance_transition(false, false));
+        assert!(upload_acceptance_transition(false, true));
+    }
+
+    #[test]
+    fn consumed_picker_input_is_reported_as_accepted_only_after_app_confirmation() {
+        let consumed = json!({"status":"unknown","dispatch_acknowledged":true,"reason":"Error: File input did not retain one selected file for readback."});
+        assert!(upload_picker_consumed_input(&consumed));
+        assert!(!upload_picker_consumed_input(&json!({"status":"unknown","dispatch_acknowledged":true,"reason":"frame changed during upload"})));
+        assert!(!upload_picker_consumed_input(&json!({"status":"unknown","dispatch_acknowledged":false,"reason":"File input did not retain one selected file for readback."})));
+        assert!(upload_input_selection_confirmed(true, true, true, true));
+        assert!(!upload_input_selection_confirmed(true, true, true, false));
+        assert!(!upload_input_selection_confirmed(true, false, true, true));
+        assert!(!upload_input_selection_confirmed(true, true, false, true));
+        assert_eq!(upload_selection_reason_code(&json!("unknown")), "file_selection_unverified");
+        assert_eq!(upload_selection_reason_code(&json!("not_dispatched")), "frame_upload_failed");
+    }
+
+    #[test]
+    fn upload_receipt_explains_app_accepted_file_when_picker_readback_was_consumed() {
+        let receipt=task_receipt("upload","https://classroom.google.com/c/test",None,&json!({
+            "status":"verified","verified":true,"chrome_selected_file":true,
+            "selection_readback_verified":false,"file_input_consumed_by_page":true,
+            "application_accepted":true,"persisted":null,
+            "reason":"The picker consumed the file input; the requested application acceptance was observed"
+        }));
+        assert_eq!(receipt["status"],"verified");
+        assert_eq!(receipt["verified"],true);
+        assert_eq!(receipt["chrome_selected_file"],true);
+        assert_eq!(receipt["selection_readback_verified"],false);
+        assert_eq!(receipt["file_input_consumed_by_page"],true);
+        assert_eq!(receipt["application_accepted"],true);
+        assert!(receipt["snippet"].as_str().unwrap().contains("application acceptance was observed"));
+    }
+
+    #[tokio::test]
+    async fn failed_chooser_wait_attempts_interception_cleanup() {
+        let disabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_state = disabled.clone();
+        let result: Result<(), &str> = wait_for_chooser_or_cleanup(
+            async { Err("connection unavailable") },
+            async move { cleanup_state.store(true, std::sync::atomic::Ordering::SeqCst); },
+        ).await;
+        assert_eq!(result, Err("connection unavailable"));
+        assert!(disabled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn failed_disable_keeps_upload_cleanup_guard_armed() {
+        let scheduled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scheduled_on_drop = scheduled.clone();
+        let attempts_on_disable = attempts.clone();
+        let mut guard = FileChooserCleanupGuard::new(move || {
+            scheduled_on_drop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        guard.disable(async move {
+            attempts_on_disable.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }).await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(guard);
+        assert!(scheduled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_disable_disarms_upload_cleanup_guard() {
+        let scheduled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scheduled_on_drop = scheduled.clone();
+        let mut guard = FileChooserCleanupGuard::new(move || {
+            scheduled_on_drop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        guard.disable(async { true }).await;
+        drop(guard);
+        assert!(!scheduled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn refused_upload_trigger_is_known_not_dispatched() {
+        assert!(!upload_trigger_may_have_dispatched(&json!({"status":"not_dispatched"})));
+        assert!(upload_trigger_may_have_dispatched(&json!({"status":"verified"})));
+        assert!(upload_trigger_may_have_dispatched(&json!({"status":"unknown"})));
     }
 
     #[test]
@@ -3110,6 +3999,15 @@ mod v3_batch_delivery_tests {
         assert!(workflow_should_verify_next(&json!({"status":"dispatched"}), Some(&next)));
         assert!(workflow_should_stop_before_next(&json!({"status":"unknown"}), None));
         assert!(workflow_should_stop_before_next(&json!({"status":"failed"}), Some(&next)));
+    }
+
+    #[test]
+    fn uncertain_post_mutation_stops_before_another_mutation() {
+        let post = V3WorkflowStep::Click {
+            reference: "@c7".into(),
+            outcome: None,
+        };
+        assert!(workflow_should_stop_before_next(&json!({"status":"unknown"}), Some(&post)));
     }
 
     #[test]
@@ -3236,6 +4134,45 @@ mod v3_batch_delivery_tests {
         assert!(typing_policy(Some("unknown"), None, "hello", false).is_err());
     }
 
+    #[test]
+    fn fast_and_human_newlines_dispatch_enter_and_advance_readback() {
+        let events = cdp_character_events('\n');
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0["key"], "Enter");
+        assert_eq!(events[0].0["code"], "Enter");
+        assert_eq!(events[0].0["windowsVirtualKeyCode"], 13);
+        assert!(events[0].1);
+        assert_eq!(events[1].0["type"], "keyUp");
+        assert!(!events[1].1);
+        assert_eq!(cdp_character_events('a').len(), 3);
+        assert_eq!(normalize_key_text("one\r\n\r\ntwo", true), "one\ntwo");
+        assert_eq!(normalize_key_text("one\r\n\r\ntwo", false), "one\n\ntwo");
+    }
+
+    #[test]
+    fn focus_change_reports_transient_events_without_claiming_who_caused_them() {
+        let before = json!({"tab_active":false,"window_focused":false,"activation_epoch":4,"focus_epoch":8});
+        let after = json!({"tab_active":false,"window_focused":false,"activation_epoch":6,"focus_epoch":10});
+        assert_eq!(focus_changed_during_operation(&before, &after), Value::Bool(true));
+        assert_eq!(focus_changed_during_operation(&json!({"tab_active":false,"window_focused":false}), &json!({"tab_active":false,"window_focused":false})), json!("unknown"));
+        assert_eq!(focus_changed_during_operation(&before, &json!({"tab_active":true,"window_focused":false})), Value::Bool(true));
+    }
+
+    #[test]
+    fn action_timeout_does_not_claim_that_dispatch_was_not_acknowledged() {
+        let receipt = action_timeout_receipt("type");
+        assert_eq!(receipt["status"], "unknown");
+        assert!(receipt["dispatch_acknowledged"].is_null());
+        assert_eq!(receipt["dispatch_may_have_occurred"], true);
+    }
+
+    #[test]
+    fn page_navigate_error_text_is_exposed_as_a_failed_command_result() {
+        assert_eq!(page_navigate_error(&json!({"errorText":"net::ERR_NAME_NOT_RESOLVED"})), Some("net::ERR_NAME_NOT_RESOLVED"));
+        assert_eq!(page_navigate_error(&json!({"result":{"errorText":"blocked"}})), Some("blocked"));
+        assert_eq!(page_navigate_error(&json!({"frameId":"main"})), None);
+    }
+
     #[tokio::test]
     async fn headless_mode_rejects_shared_provider_instead_of_falling_back() {
         use rmcp::{ServiceExt, model::CallToolRequestParams};
@@ -3318,7 +4255,7 @@ mod v3_batch_delivery_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires installed Chrome; validates V3 FastKeys through the shared extension bridge"]
+    #[ignore = "requires installed Chrome; validates shared-bridge FastKeys and visible-trigger file upload"]
     async fn shared_extension_marked_control_defaults_to_verified_trusted_fast_keys() {
         use controlla_browser::{
             providers::DedicatedChromeProvider,
@@ -3330,6 +4267,8 @@ mod v3_batch_delivery_tests {
         use futures_util::{FutureExt, SinkExt, StreamExt};
         use rmcp::{ServiceExt, model::CallToolRequestParams};
         use std::{panic::AssertUnwindSafe, path::Path};
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+        use std::time::Duration;
         use tokio_tungstenite::{connect_async, tungstenite::Message};
         let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
         assert!(executable.exists());
@@ -3371,18 +4310,23 @@ mod v3_batch_delivery_tests {
             }
         };
         let result=AssertUnwindSafe(async {
-            eval(r#"document.body.innerHTML='<input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before"><input id="other" aria-label="Other" type="text"><script></script>';window.events=[];window.otherEvents=[];const input=document.querySelector('#trusted');for(const type of ['keydown','beforeinput','input','keyup'])input.addEventListener(type,event=>{window.events.push({type,trusted:event.isTrusted});if(type==='keydown'&&window.blurOnKeydown){window.blurOnKeydown=false;input.blur();document.querySelector('#other').focus();}});document.querySelector('#other').addEventListener('keyup',event=>window.otherEvents.push({type:event.type,key:event.key,trusted:event.isTrusted}));"#.into()).await;
+            let unrestricted=crate::guard_reason::unrestricted_mode();
+            eval(r#"document.body.innerHTML='<span id="account">fixture-account</span><input id="file" type="file" style="display:none"><button id="upload" aria-label="Upload file">Upload file</button><button id="status" aria-label="Upload status">Waiting</button><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before"><input id="other" aria-label="Other" type="text">';document.querySelector('#upload').addEventListener('click',()=>document.querySelector('#file').click());document.querySelector('#file').addEventListener('change',()=>setTimeout(()=>document.querySelector('#status').innerText='Accepted',300));window.events=[];window.otherEvents=[];const input=document.querySelector('#trusted');for(const type of ['keydown','beforeinput','input','keyup'])input.addEventListener(type,event=>{window.events.push({type,trusted:event.isTrusted});if(type==='keydown'&&window.blurOnKeydown){window.blurOnKeydown=false;input.blur();document.querySelector('#other').focus();}});document.querySelector('#other').addEventListener('keyup',event=>window.otherEvents.push({type:event.type,key:event.key,trusted:event.isTrusted}));"#.into()).await;
             let (server_io,client_io)=tokio::io::duplex(65536);
             let server=rmcp::service::serve_directly::<rmcp::RoleServer,_,_,_,_>(super::AppV3::new(super::AppV2::new(super::super::App::default())),server_io,None);
             let server_task=tokio::spawn(async move {let _=server.waiting().await;});
             let client=().serve(client_io).await.unwrap();
             let call=|name:&str,value:serde_json::Value| CallToolRequestParams::new(name.to_owned()).with_arguments(value.as_object().unwrap().clone());
-            let pair=client.call_tool(call("browser",json!({"action":"pair_shared","target_ids":["123","124"]}))).await.unwrap().structured_content.unwrap();
+            let pair=client.call_tool(call("browser",json!({"action":"pair_shared","target_ids":["123","124","125"]}))).await.unwrap().structured_content.unwrap();
             let session=pair["session_id"].as_str().unwrap().to_owned();
             let (mut socket,_)=connect_async(pair["endpoint"].as_str().unwrap()).await.unwrap();
-            socket.send(Message::Text(json!({"type":"hello","token":pair["one_session_token"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true,"targets":["123","124"]}).to_string().into())).await.unwrap();
+            socket.send(Message::Text(json!({"type":"hello","token":pair["one_session_token"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true,"targets":["123","124","125"]}).to_string().into())).await.unwrap();
             let _=socket.next().await.unwrap();
             let c=connection.clone(); let t=target.clone();
+            let chooser_cursor=Arc::new(AtomicU64::new(connection.latest_event_sequence()));
+            let proxy_chooser_cursor=chooser_cursor.clone();
+            let drop_next_batch=Arc::new(AtomicBool::new(false));
+            let proxy_drop_next_batch=drop_next_batch.clone();
             let proxy=tokio::spawn(async move {
                 while let Some(Ok(message))=socket.next().await {
                     let request:serde_json::Value=serde_json::from_str(message.to_text().unwrap()).unwrap();
@@ -3402,13 +4346,75 @@ mod v3_batch_delivery_tests {
                         }
                         let mut response=json!({"type":"batch_result","id":request["id"],"result":{"receipts":receipts,"completed":completed,"stopped_before":if error.is_some(){Some(completed)}else{None},"host_round_trips":1,"in_browser_actions":actions.len()}});
                         if let Some(problem)=error {response["error"]=json!(problem);}
+                        if proxy_drop_next_batch.swap(false,Ordering::AcqRel) {continue;}
                         if socket.send(Message::Text(response.to_string().into())).await.is_err(){break;}
                         continue;
                     }
                     let Some(method)=request["method"].as_str() else {continue};
                     let (_,targets)=c.target_snapshot().await; let state=targets.iter().find(|item|item.id==t).unwrap();
-                    let response=c.target_command(&t,state.generation,&state.revision,method,request["params"].clone()).await;
-                    let response=match response {Ok(value)=>json!({"type":"result","id":request["id"],"result":value}),Err(error)=>json!({"type":"result","id":request["id"],"error":error.to_string()})};
+                    let response=if method=="Controlla.fileInputSnapshot" {
+                        Ok(json!({"inputs":[],"document_id":"fixture-document"}))
+                    } else if method=="Controlla.waitForFileChooser" {
+                        let cursor=proxy_chooser_cursor.load(Ordering::Acquire);
+                        let event=async {
+                            let timeout=Duration::from_millis(request["params"]["timeout_ms"].as_u64().unwrap_or(8_000).clamp(1,15_000));
+                            let deadline=tokio::time::Instant::now()+timeout;
+                            let mut sequence=cursor;
+                            loop {
+                                let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
+                                if remaining.is_zero(){break;}
+                                let event=c.next_event_after(sequence,remaining).await.map_err(|error|error.to_string())?;
+                                sequence=event.sequence;
+                                if event.value["method"]=="Page.fileChooserOpened" { return Ok(event.value); }
+                            }
+                            Err("timed out waiting for Chrome file chooser event".to_owned())
+                        }.await;
+                        match event {
+                            Ok(event)=>{
+                                let frame_id=event.pointer("/params/frameId").and_then(serde_json::Value::as_str).unwrap_or_default();
+                                let (generation,revision)= {let (_,targets)=c.target_snapshot().await;let state=targets.iter().find(|item|item.id==t).unwrap();(state.generation,state.revision.clone())};
+                                match c.target_command(&t,generation,&revision,"Page.getFrameTree",serde_json::Value::Null).await {
+                                    Ok(tree)=>{
+                                        fn frame_loader(node:&serde_json::Value,id:&str)->Option<String>{if node.pointer("/frame/id").and_then(serde_json::Value::as_str)==Some(id){return node.pointer("/frame/loaderId").and_then(serde_json::Value::as_str).map(str::to_owned);}node.get("childFrames")?.as_array()?.iter().find_map(|child|frame_loader(child,id))}
+                                        let loader=frame_loader(&tree["frameTree"],frame_id).unwrap_or_default();
+                                        Ok(json!({"result":{"value":{"backend_node_id":event["params"]["backendNodeId"],"frame_id":frame_id,"frame_loader_id":loader,"document_id":"fixture-document","root_document_id":"fixture-document"}}}))
+                                    },Err(error)=>Err(error.to_string())
+                                }
+                            },Err(error)=>Err(error)
+                        }
+                    } else if method=="Controlla.setFrameFileInputFiles" {
+                        let backend=request["params"]["backend_node_id"].clone();
+                        let (generation,revision)={let (_,targets)=c.target_snapshot().await;let state=targets.iter().find(|item|item.id==t).unwrap();(state.generation,state.revision.clone())};
+                        let set=c.target_command(&t,generation,&revision,"DOM.setFileInputFiles",json!({"files":[request["params"]["file_path"]],"backendNodeId":backend})).await;
+                        match set {
+                            Ok(_)=>{
+                                let (generation,revision)={let (_,targets)=c.target_snapshot().await;let state=targets.iter().find(|item|item.id==t).unwrap();(state.generation,state.revision.clone())};
+                                let resolved=c.target_command(&t,generation,&revision,"DOM.resolveNode",json!({"backendNodeId":backend})).await;
+                                match resolved.and_then(|value|value.pointer("/object/objectId").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(||controlla_browser::BrowserError::InvalidResponse("missing file input object".into()))) {
+                                    Ok(object_id)=>{
+                                        let (generation,revision)={let (_,targets)=c.target_snapshot().await;let state=targets.iter().find(|item|item.id==t).unwrap();(state.generation,state.revision.clone())};
+                                        match c.target_command(&t,generation,&revision,"Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":"function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}));}","returnByValue":true})).await {
+                                            Ok(readback)=>Ok(json!({"result":{"value":{"files":readback.pointer("/result/value").cloned().unwrap_or(json!([]))}}})),Err(error)=>Err(error.to_string())
+                                        }
+                                    },Err(error)=>Err(error.to_string())
+                                }
+                            },Err(error)=>Err(error.to_string())
+                        }
+                    } else if method == "Controlla.checkIdentityMarker" {
+                        let selector = request.pointer("/params/selector").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        let expected = request.pointer("/params/expected").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        match controlla_browser::identity_marker_command(selector, expected) {
+                            Ok(params) => match c.target_command(&t,state.generation,&state.revision,"Runtime.evaluate",params).await {
+                                Ok(value) => {
+                                    let matches = value.pointer("/result/value").and_then(serde_json::Value::as_bool) == Some(true);
+                                    Ok(json!({"result":{"value":{"matches":matches,"match_count":if matches {1} else {0},"route":"root_dom"}}}))
+                                }
+                                Err(error) => Err(error.to_string()),
+                            },
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else { c.target_command(&t,state.generation,&state.revision,method,request["params"].clone()).await.map_err(|error|error.to_string()) };
+                    let response=match response {Ok(value)=>json!({"type":"result","id":request["id"],"result":value}),Err(error)=>json!({"type":"result","id":request["id"],"error":error})};
                     if socket.send(Message::Text(response.to_string().into())).await.is_err(){break;}
                 }
             });
@@ -3443,6 +4449,7 @@ mod v3_batch_delivery_tests {
             assert_eq!(human["readback"],format!("before{payload}h"));
             let fresh=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
             let target_ref=fresh["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
+            if !unrestricted {
             eval("window.blurOnKeydown=true".into()).await;
             let interrupted=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"type","reference":target_ref,"expected_value":format!("before{payload}h"),"value":"Z","timeout_ms":60000}))).await.unwrap().structured_content.unwrap();
             assert_eq!(interrupted["status"],"unknown","{interrupted}");
@@ -3462,6 +4469,27 @@ mod v3_batch_delivery_tests {
             let key_events:serde_json::Value=serde_json::from_str(&key_events).unwrap();
             assert_eq!(key_events["source"][0]["type"],"keydown");
             assert_eq!(key_events["other"],json!([]),"HumanKeys must also avoid retargeted keyup: {key_events}");
+            let recovery_ref=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"125"}))).await.unwrap().structured_content.unwrap()["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
+            drop_next_batch.store(true,Ordering::Release);
+            let uncertain=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"125","action":"type","reference":recovery_ref,"expected_value":format!("before{payload}h"),"value":"q","timeout_ms":20000}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(uncertain["status"],"unknown","{uncertain}");
+            let observed=client.call_tool(call("verify",json!({"session_id":session,"chrome_tab_id":"125","predicate":{"kind":"value","reference":recovery_ref,"equals":format!("before{payload}hq")}}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(observed["status"],"passed","{observed}");
+            }
+            if unrestricted {
+            let registered=client.call_tool(call("browser",json!({"action":"artifact_register","session_id":session,"filename":"stage1.txt","bytes":[115,116,97,103,101,49]}))).await.unwrap().structured_content.unwrap();
+            let upload_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
+            let upload_ref=upload_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Upload file").unwrap()["reference"].clone();
+            let status_ref=upload_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Upload status").unwrap()["reference"].clone();
+            chooser_cursor.store(connection.latest_event_sequence(),Ordering::Release);
+            let uploaded=client.call_tool(call("workflow",json!({"session_id":session,"chrome_tab_id":"123","steps":[{"kind":"upload","artifact_handle":registered["artifact_handle"],"trigger_reference":upload_ref,"account_marker":["#account","fixture-account"],"acceptance":{"kind":"value","reference":status_ref,"equals":"Accepted"}}]}))).await.unwrap().structured_content.unwrap();
+            assert_eq!(uploaded["status"],"completed","{uploaded}");
+            assert_eq!(uploaded["receipts"][0]["status"],"verified","{uploaded}");
+            assert_eq!(uploaded["receipts"][0]["chrome_selected_file"],true,"{uploaded}");
+            assert_eq!(uploaded["receipts"][0]["application_accepted"],true,"{uploaded}");
+            assert_eq!(uploaded["receipts"][0]["filename"],"stage1.txt");
+            assert!(uploaded["step_ms"][0].as_u64().is_some(),"{uploaded}");
+            }
             proxy.abort(); let _=client.cancel().await; server_task.abort();
         }).catch_unwind().await;
         struct Observer;
@@ -3538,6 +4566,11 @@ mod v3_batch_delivery_tests {
             .find(|item| item["name"] == "Name")
             .unwrap();
         let reference = item["reference"].as_str().unwrap().to_owned();
+        let failed_find=super::find_impl(&app.core,&super::BrowserFindArgs{
+            session_id:session_id.clone(),chrome_tab_id:target_id.clone(),query:"no control has this label".into(),
+            role:None,limit:Some(10),max_matches:None,match_mode:Some("all".into()),within_reference:None,href_hint:None,
+        }).await.unwrap();
+        assert_eq!(failed_find["count"],0,"{failed_find}");
         let filled = client.call_tool(call("act", json!({"session_id":session_id,"chrome_tab_id":target_id,"action":"fill","reference":reference,"expected_value":"before","value":"after"}))).await.unwrap().structured_content.unwrap();
         assert_eq!(filled["status"], "verified", "{filled}");
         let snapshot = client
@@ -3582,6 +4615,48 @@ mod v3_batch_delivery_tests {
         assert_eq!(typed["status"], "verified", "{typed}");
         let verified = client.call_tool(call("verify", json!({"session_id":session_id,"chrome_tab_id":target_id,"predicate":{"kind":"value","reference":reference,"equals":"after!"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(verified["status"], "passed", "{verified}");
+        use tokio::{io::{AsyncReadExt,AsyncWriteExt},net::TcpListener,sync::oneshot};
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let (release_slow,release_receiver)=oneshot::channel::<()>();
+        let release_receiver=std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_receiver)));
+        let local_server=tokio::spawn(async move {
+            loop {
+                let Ok((mut stream,_))=listener.accept().await else {break};
+                let release_receiver=release_receiver.clone();
+                tokio::spawn(async move {
+                    let mut request=Vec::new();let mut byte=[0_u8;1];
+                    while stream.read(&mut byte).await.unwrap_or(0)==1 {request.push(byte[0]);if request.ends_with(b"\r\n\r\n"){break;}}
+                    let request=String::from_utf8_lossy(&request);
+                    if request.starts_with("GET /slow.gif ") {
+                        if let Some(receiver)=release_receiver.lock().await.take(){let _=receiver.await;}
+                        let gif=[71,73,70,56,57,97,1,0,1,0,128,0,0,0,0,0,255,255,255,33,249,4,1,0,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,68,1,0,59];
+                        let _=stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",gif.len()).as_bytes()).await;
+                        let _=stream.write_all(&gif).await;
+                    } else if request.starts_with("GET / ") {
+                        let body=b"<!doctype html><title>Committed</title><img src='/slow.gif'>";
+                        let _=stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await;
+                        let _=stream.write_all(body).await;
+                    } else {let _=stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;}
+                });
+            }
+        });
+        let destination=format!("http://{address}/");
+        let navigation=super::task_navigate(&app,&session_id,&target_id,&destination).await;
+        assert_eq!(navigation["status"],"incomplete","{navigation}");
+        assert_eq!(navigation["document_committed"],true,"{navigation}");
+        assert_eq!(navigation["destination_match"],true,"{navigation}");
+        assert_ne!(navigation["ready_state"],"complete","{navigation}");
+        assert_eq!(navigation["timed_out_waiting_for"],"application_readiness","{navigation}");
+        let _=release_slow.send(());
+        let mut ready=false;
+        for _ in 0..50 {
+            let current=super::snapshot_impl(&app.core,&super::BrowserSnapshotArgs{session_id:session_id.clone(),chrome_tab_id:target_id.clone(),selector:None,max_items:Some(1),max_text_chars:Some(100),max_bytes:None,href_hint:None,frame_id:None}).await.unwrap();
+            if current["ready_state"]=="complete" {ready=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        local_server.abort();
+        assert!(ready,"committed navigation did not finish loading after the fixture released it");
         let profile = {
             let sessions = app.core.legacy.shared_sessions.lock().await;
             let session = sessions.get(&session_id).unwrap().lock().await;
@@ -3610,5 +4685,184 @@ mod v3_batch_delivery_tests {
         );
         let _ = client.cancel().await;
         server_task.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; verifies hidden file selection and delayed app acceptance"]
+    async fn v3_hidden_file_upload_waits_for_delayed_application_acceptance() {
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        let executable = std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let mut app = AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        app.headless_chrome = Some(executable.to_path_buf());
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let server = rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(app.clone(), server_io, None);
+        let server_task = tokio::spawn(async move { let _ = server.waiting().await; });
+        let client = ().serve(client_io).await.unwrap();
+        let call = |name: &str, value: serde_json::Value| CallToolRequestParams::new(name.to_owned()).with_arguments(value.as_object().unwrap().clone());
+        let launch = client.call_tool(call("browser", json!({"action":"launch","mode":"headless","url":"data:text/html,%3Cspan%20id%3D%22account%22%3Efixture-account%3C%2Fspan%3E%3Cinput%20id%3D%22file%22%20type%3D%22file%22%20style%3D%22display%3Anone%22%3E%3Cbutton%20id%3D%22status%22%20aria-label%3D%22Upload%20status%22%3EWaiting%3C%2Fbutton%3E%3Cscript%3Edocument.querySelector%28%22%23file%22%29.addEventListener%28%22change%22%2C%28%29%3D%3EsetTimeout%28%28%29%3D%3Edocument.querySelector%28%22%23status%22%29.innerText%3D%22Accepted%22%2C300%29%29%3C%2Fscript%3E"}))).await.unwrap().structured_content.unwrap();
+        let session = launch["session_id"].as_str().unwrap().to_owned();
+        let tab = launch["target_ids"][0].as_str().unwrap().to_owned();
+        let registered = client.call_tool(call("browser", json!({"action":"artifact_register","session_id":session,"filename":"stage1.txt","bytes":[115,116,97,103,101,49]}))).await.unwrap().structured_content.unwrap();
+        let snapshot = client.call_tool(call("snapshot", json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let status_ref = snapshot["items"].as_array().unwrap().iter().find(|item| item["name"] == "Upload status").unwrap()["reference"].as_str().unwrap();
+        let uploaded = client.call_tool(call("browser", json!({"action":"task","session_id":session,"chrome_tab_id":tab,"task":{"kind":"upload","artifact_handle":registered["artifact_handle"],"selector":"#file","account_marker":["#account","fixture-account"],"acceptance":{"kind":"value","reference":status_ref,"equals":"Accepted"}}}))).await.unwrap().structured_content.unwrap();
+        assert!(uploaded["elapsed_ms"].as_u64().is_some(),"{uploaded}");
+        let receipt = &uploaded["receipts"][0];
+        assert_eq!(receipt["verified"], true, "{uploaded}");
+        assert_eq!(receipt["chrome_selected_file"], true, "{uploaded}");
+        assert_eq!(receipt["application_accepted"], true, "{uploaded}");
+        assert_eq!(receipt["persisted"], serde_json::Value::Null, "the fixture does not claim app persistence");
+        assert_eq!(receipt["filename"], "stage1.txt");
+        let released = client.call_tool(call("browser", json!({"action":"release","mode":"headless","session_id":session}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(released["released"], true, "{released}");
+        let _ = client.cancel().await;
+        server_task.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; exercises all V3 rich-editor typing modes"]
+    async fn v3_rich_editor_fast_paragraphs_and_human_pace_are_verified() {
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        let executable=std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let mut app=AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        app.headless_chrome=Some(executable.to_path_buf());
+        let (server_io,client_io)=tokio::io::duplex(65536);
+        let server=rmcp::service::serve_directly::<rmcp::RoleServer,_,_,_,_>(app.clone(),server_io,None);
+        let server_task=tokio::spawn(async move {let _=server.waiting().await;});
+        let client=().serve(client_io).await.unwrap();
+        let call=|name:&str,value:serde_json::Value|CallToolRequestParams::new(name.to_owned()).with_arguments(value.as_object().unwrap().clone());
+        let launch=client.call_tool(call("browser",json!({"action":"launch","mode":"headless","url":"about:blank"}))).await.unwrap().structured_content.unwrap();
+        let session=launch["session_id"].as_str().unwrap().to_owned();
+        let tab=launch["target_ids"][0].as_str().unwrap().to_owned();
+        let connected=app.core.legacy.shared_sessions.lock().await.get(&session).unwrap().clone();
+        let connection={let state=connected.lock().await;let Some(super::super::PageSessionTransport::Dedicated(Some(browser)))=state.connection.as_ref() else {panic!("headless browser transport missing")};browser.connection().clone()};
+        let (_,targets)=connection.target_snapshot().await;
+        let target=targets.iter().find(|target|target.id==tab).unwrap();
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.body.innerHTML='<div id=editor contenteditable=true aria-label=Announcement style=\"width:400px;height:40px\"></div><div id=readonly contenteditable=\"false\" role=\"textbox\" aria-label=\"Read only\" style=\"width:400px;height:40px\"></div><input id=ariaReadonly type=text aria-readonly=true aria-label=\"ARIA readonly field\" value=locked style=\"width:100px;height:20px\"><input id=ariaDisabledInput type=text aria-disabled=true aria-label=\"ARIA disabled input\" value=locked style=\"width:100px;height:20px\"><select id=ariaDisabled aria-disabled=true aria-label=\"ARIA disabled select\" style=\"width:100px;height:20px\"><option value=one selected>One</option><option value=two>Two</option></select><select id=ariaReadonlySelect aria-readonly=true aria-label=\"ARIA readonly select\" style=\"width:100px;height:20px\"><option value=one selected>One</option><option value=two>Two</option></select>';window.events=[];for(const t of ['beforeinput','input','compositionstart','compositionend','keydown','keyup'])document.addEventListener(t,x=>{if(x.target.closest('#editor'))window.events.push({type:t,key:x.key,inputType:x.inputType,data:x.data,trusted:x.isTrusted})},true)","returnByValue":true})).await.unwrap();
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#editor').innerHTML='<div><br></div>'","returnByValue":true})).await.unwrap();
+        let blank_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let blank_reference=blank_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Announcement").unwrap()["reference"].as_str().unwrap();
+        let blank_typed=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"type","reference":blank_reference,"expected_value":"","value":"Seed","typing_mode":"block","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blank_typed["status"],"verified","empty rich editor newline normalization: {blank_typed}");
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#editor').innerHTML=''","returnByValue":true})).await.unwrap();
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#editor').innerHTML='<div><br></div>'","returnByValue":true})).await.unwrap();
+        let newline_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let newline_reference=newline_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Announcement").unwrap()["reference"].as_str().unwrap();
+        let newline_typed=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"type","reference":newline_reference,"expected_value":"\n","value":"S","typing_mode":"human_keys","delay_ms":0,"timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(newline_typed["status"],"verified","human_keys must canonicalize the blank rich-editor newline before tracking progress: {newline_typed}");
+        assert_eq!(newline_typed["readback"],"S","{newline_typed}");
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#editor').innerHTML='';window.events=[]","returnByValue":true})).await.unwrap();
+        let mut snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let mut reference=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Announcement").unwrap()["reference"].as_str().unwrap().to_owned();
+        assert_eq!(snapshot["items"].as_array().unwrap().iter().find(|item|item["reference"]==reference).unwrap()["editable_kind"],"rich_text");
+        let readonly=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Read only").unwrap_or_else(||panic!("readonly textbox missing: {snapshot}"));
+        assert_eq!(readonly["editable_kind"],serde_json::Value::Null);
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"type","reference":readonly["reference"],"expected_value":"","value":"wrong","typing_mode":"block","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","{blocked}");
+        snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let aria_readonly=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="ARIA readonly field").unwrap();
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"fill","reference":aria_readonly["reference"],"expected_value":"locked","value":"changed","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","{blocked}");
+        snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let aria_disabled=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="ARIA disabled select").unwrap();
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"select","reference":aria_disabled["reference"],"expected_value":"one","value":"two","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","{blocked}");
+        snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let aria_disabled_input=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="ARIA disabled input").unwrap();
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"fill","reference":aria_disabled_input["reference"],"expected_value":"locked","value":"changed","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","{blocked}");
+        snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let aria_readonly_select=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="ARIA readonly select").unwrap();
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"select","reference":aria_readonly_select["reference"],"expected_value":"one","value":"two","timeout_ms":10000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","{blocked}");
+        snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        reference=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Announcement").unwrap()["reference"].as_str().unwrap().to_owned();
+        let steps=[("block","Block<b>"),("fast_keys"," Fast\n\nParagraphs"),("human_keys"," and paced")];
+        let mut expected=String::new();
+        let mut keyed_characters=0;
+        for (mode,text) in steps {
+            if mode=="human_keys" {
+                connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#editor').addEventListener('input',event=>event.target.replaceWith(event.target.cloneNode(true)),{once:true});window.preventedOnce=false;document.addEventListener('beforeinput',event=>{if(event.data==='p'&&!window.preventedOnce){window.preventedOnce=true;event.preventDefault()}},true)","returnByValue":true})).await.unwrap();
+            }
+            let typed=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"type","reference":reference,"expected_value":expected,"value":text,"typing_mode":mode,"timeout_ms":30000}))).await.unwrap().structured_content.unwrap();
+            let normalized=normalize_key_text(text, mode=="fast_keys");
+            expected.push_str(&normalized);
+            if mode!="block" { keyed_characters += normalized.chars().count(); }
+            assert_eq!(typed["status"],"verified","{mode}: {typed}");
+            assert_eq!(typed["readback"],expected,"{mode}: {typed}");
+            if mode == "human_keys" {
+                assert_eq!(typed["intentional_delay_ms"], 180, "{typed}");
+                assert_eq!(typed["intentional_delay_total_ms"], text.chars().count() as u64 * 180, "{typed}");
+            }
+            snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+            let observed=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Announcement").unwrap()["raw_value"].as_str().unwrap();
+            if mode=="fast_keys"&&text=="\n\n" { assert_eq!(observed,format!("{expected}\n\n")); } else { assert_eq!(observed,expected); }
+        }
+        let (_,targets)=connection.target_snapshot().await;let target=targets.iter().find(|target|target.id==tab).unwrap();
+        let events=connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"JSON.stringify({text:document.querySelector('#editor').innerText,html:document.querySelector('#editor').innerHTML,events:window.events,preventedOnce:window.preventedOnce})","returnByValue":true})).await.unwrap()["result"]["value"].as_str().unwrap().to_owned();
+        let events:serde_json::Value=serde_json::from_str(&events).unwrap();
+        assert_eq!(events["text"],expected);
+        assert!(!events["html"].as_str().unwrap().contains("<b>"),"markup-looking text must be inserted as text");
+        assert!(events["events"].as_array().unwrap().iter().any(|event|event["type"]=="beforeinput"));
+        assert!(events["events"].as_array().unwrap().iter().any(|event|event["type"]=="keydown"&&event["trusted"]==true),"FastKeys must dispatch trusted keydown: {events}");
+        assert!(events["events"].as_array().unwrap().iter().any(|event|event["type"]=="keyup"&&event["trusted"]==true),"FastKeys must dispatch trusted keyup: {events}");
+        assert_eq!(events["events"].as_array().unwrap().iter().filter(|event|event["type"]=="keydown").count(),keyed_characters+1);
+        assert_eq!(events["preventedOnce"],true,"the missed character was retried only after readback proved it was absent: {events}");
+        assert_eq!(events["events"].as_array().unwrap().iter().filter(|event|event["type"]=="keydown"&&event["key"]=="Enter").count(),1);
+        let readonly_values=connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"JSON.stringify({textbox:document.querySelector('#readonly').innerText,readonly_input:document.querySelector('#ariaReadonly').value,disabled_input:document.querySelector('#ariaDisabledInput').value,disabled_select:document.querySelector('#ariaDisabled').value,readonly_select:document.querySelector('#ariaReadonlySelect').value})","returnByValue":true})).await.unwrap()["result"]["value"].as_str().unwrap().to_owned();
+        let readonly_values:serde_json::Value=serde_json::from_str(&readonly_values).unwrap();
+        assert_eq!(readonly_values,json!({"textbox":"","readonly_input":"locked","disabled_input":"locked","disabled_select":"one","readonly_select":"one"}));
+        let released=client.call_tool(call("browser",json!({"action":"release","mode":"headless","session_id":session}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(released["released"],true,"{released}");
+        let _=client.cancel().await;server_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Google Chrome; verifies explicit password fill and redaction"]
+    async fn v3_password_fill_requires_opt_in_and_never_returns_the_value() {
+        use rmcp::{ServiceExt, model::CallToolRequestParams};
+        let executable=std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        let mut app=AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        app.headless_chrome=Some(executable.to_path_buf());
+        let (server_io,client_io)=tokio::io::duplex(65536);
+        let server=rmcp::service::serve_directly::<rmcp::RoleServer,_,_,_,_>(app.clone(),server_io,None);
+        let server_task=tokio::spawn(async move {let _=server.waiting().await;});
+        let client=().serve(client_io).await.unwrap();
+        let call=|name:&str,value:serde_json::Value|CallToolRequestParams::new(name.to_owned()).with_arguments(value.as_object().unwrap().clone());
+        let launch=client.call_tool(call("browser",json!({"action":"launch","mode":"headless","url":"about:blank"}))).await.unwrap().structured_content.unwrap();
+        let session=launch["session_id"].as_str().unwrap().to_owned();
+        let tab=launch["target_ids"][0].as_str().unwrap().to_owned();
+        let connected=app.core.legacy.shared_sessions.lock().await.get(&session).unwrap().clone();
+        let connection={let state=connected.lock().await;let Some(super::super::PageSessionTransport::Dedicated(Some(browser)))=state.connection.as_ref() else {panic!("headless browser transport missing")};browser.connection().clone()};
+        let (_,targets)=connection.target_snapshot().await;let target=targets.iter().find(|target|target.id==tab).unwrap();
+        connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.body.innerHTML='<label for=password>Password</label><input id=password type=password style=\"width:200px;height:24px\">'","returnByValue":true})).await.unwrap();
+        let snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let item=snapshot["items"].as_array().unwrap().iter().find(|item|item["credential_input"]==true).expect("password reference missing");
+        assert!(item["raw_value"].is_null());
+        let reference=item["reference"].as_str().unwrap();
+        let sentinel="PASSWORD-TEST-SENTINEL";
+        let blocked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"fill","reference":reference,"value":sentinel}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(blocked["status"],"not_dispatched","ordinary fill must keep password protection: {blocked}");
+        assert!(!blocked.to_string().contains(sentinel),"password leaked in blocked result: {blocked}");
+        let snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let reference=snapshot["items"].as_array().unwrap().iter().find(|item|item["credential_input"]==true).unwrap()["reference"].as_str().unwrap();
+        let result=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":tab,"action":"fill","reference":reference,"value":sentinel,"allow_password":true}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(result["status"],"verified","{result}");
+        assert_eq!(result["readback"]["credential_filled"],true,"{result}");
+        assert!(!result.to_string().contains(sentinel),"password leaked in result: {result}");
+        let snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":tab}))).await.unwrap().structured_content.unwrap();
+        let password=snapshot["items"].as_array().unwrap().iter().find(|item|item["credential_input"]==true).unwrap();
+        assert!(password["raw_value"].is_null());
+        assert!(!snapshot.to_string().contains(sentinel),"password leaked in snapshot: {snapshot}");
+        let actual=connection.target_command(&tab,target.generation,&target.revision,"Runtime.evaluate",json!({"expression":"document.querySelector('#password').value","returnByValue":true})).await.unwrap()["result"]["value"].as_str().unwrap().to_owned();
+        assert_eq!(actual,sentinel);
+        let released=client.call_tool(call("browser",json!({"action":"release","mode":"headless","session_id":session}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(released["released"],true,"{released}");
+        let _=client.cancel().await;server_task.abort();
     }
 }

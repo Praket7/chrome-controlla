@@ -14,7 +14,9 @@ pub enum IdentityConfidence {
 
 #[derive(Clone, Debug)]
 pub struct SemanticIdentity {
+    pub document: SemanticDocumentKey,
     pub frame_id: String,
+    pub frame_revision: String,
     pub backend_node_id: Option<i64>,
     pub role: String,
     pub name: String,
@@ -22,6 +24,46 @@ pub struct SemanticIdentity {
     pub dom_path_fingerprint: String,
     pub rect_bucket: Option<String>,
     pub ancestor_id: Option<String>,
+}
+
+impl SemanticIdentity {
+    pub fn from_item(item: &Value, document: &SemanticDocumentKey) -> Self {
+        Self {
+            document: document.clone(),
+            frame_id: item
+                .get("source_frame")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            frame_revision: item
+                .get("source_frame_revision")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            backend_node_id: item.get("backend_node_id").and_then(Value::as_i64),
+            role: item
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            href: item.get("href").and_then(Value::as_str).map(str::to_owned),
+            dom_path_fingerprint: item
+                .get("dom_path_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            rect_bucket: item.get("rect_bucket").map(Value::to_string),
+            ancestor_id: item
+                .pointer("/semantic_ancestor/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,11 +88,22 @@ pub fn reacquire_reference(
     current_document: &SemanticDocumentKey,
     current_items: &[Value],
 ) -> Result<ReacquiredReference, ReacquireError> {
-    // Document must match
-    // For stub, enforce exact document key match; real impl would compare frames.
-    let _ = current_document;
+    if &expected.document != current_document {
+        return Err(ReacquireError::DocumentChanged);
+    }
     let mut high_matches = Vec::new();
     for item in current_items {
+        if item.get("source_frame").and_then(Value::as_str) != Some(expected.frame_id.as_str()) {
+            continue;
+        }
+        if item
+            .get("source_frame_revision")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            != expected.frame_revision
+        {
+            continue;
+        }
         let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
         let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
         let href = item
@@ -66,9 +119,16 @@ pub fn reacquire_reference(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let legacy = item
-            .get("reference")
+            .get("retained_reference")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let current_backend_node_id = item.get("backend_node_id").and_then(Value::as_i64);
+        if expected
+            .backend_node_id
+            .is_some_and(|expected_id| current_backend_node_id != Some(expected_id))
+        {
+            continue;
+        }
         // Score deterministically
         let mut score = 0;
         if role == expected.role {
@@ -83,14 +143,16 @@ pub fn reacquire_reference(
         if fp == expected.dom_path_fingerprint {
             score += 25;
         }
-        if let Some(bid) = expected.backend_node_id
-            && item.get("backend_node_id").and_then(Value::as_i64) == Some(bid)
-        {
+        let backend_id_matched = expected.backend_node_id.is_some()
+            && current_backend_node_id == expected.backend_node_id;
+        if backend_id_matched {
             score += 50;
         }
-        // High threshold requires at least name+href+fingerprint or backend id
-        let is_high = score >= 40
-            && (fp == expected.dom_path_fingerprint || expected.backend_node_id.is_some());
+        let is_high = (backend_id_matched && score >= 50)
+            || (expected.backend_node_id.is_none()
+                && score >= 40
+                && !fp.is_empty()
+                && fp == expected.dom_path_fingerprint);
         if is_high {
             high_matches.push(ReacquiredReference {
                 reference: ref_str.to_owned(),
@@ -112,8 +174,17 @@ mod tests {
     use serde_json::json;
     #[test]
     fn reacquire_high_confidence_single_match() {
-        let id = SemanticIdentity {
+        let doc = SemanticDocumentKey {
             frame_id: "f".into(),
+            loader_id: "l".into(),
+            url: "https://example.test".into(),
+            frame_revision: None,
+            document_revision: None,
+        };
+        let id = SemanticIdentity {
+            document: doc.clone(),
+            frame_id: "f".into(),
+            frame_revision: String::new(),
             backend_node_id: None,
             role: "link".into(),
             name: "Bills latest".into(),
@@ -122,6 +193,14 @@ mod tests {
             rect_bucket: None,
             ancestor_id: None,
         };
+        let items = vec![
+            json!({"reference":"@c1","source_frame":"f","role":"link","name":"Bills latest","href":"https://example.test/a","dom_path_fingerprint":"a:0"}),
+        ];
+        let r = reacquire_reference(&id, &doc, &items).unwrap();
+        assert_eq!(r.confidence, IdentityConfidence::High);
+    }
+    #[test]
+    fn reacquire_ambiguous_when_reordered_duplicates() {
         let doc = SemanticDocumentKey {
             frame_id: "f".into(),
             loader_id: "l".into(),
@@ -129,16 +208,10 @@ mod tests {
             frame_revision: None,
             document_revision: None,
         };
-        let items = vec![
-            json!({"reference":"@c1","role":"link","name":"Bills latest","href":"https://example.test/a","dom_path_fingerprint":"a:0"}),
-        ];
-        let r = reacquire_reference(&id, &doc, &items).unwrap();
-        assert_eq!(r.confidence, IdentityConfidence::High);
-    }
-    #[test]
-    fn reacquire_ambiguous_when_reordered_duplicates() {
         let id = SemanticIdentity {
+            document: doc.clone(),
             frame_id: "f".into(),
+            frame_revision: String::new(),
             backend_node_id: None,
             role: "link".into(),
             name: "Item".into(),
@@ -147,6 +220,17 @@ mod tests {
             rect_bucket: None,
             ancestor_id: None,
         };
+        let items = vec![
+            json!({"reference":"@c1","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
+            json!({"reference":"@c2","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:0"}),
+        ];
+        // Only one high match (the one with fingerprint a:0) -> still ambiguous if ordering changed? stub treats one match as ok; ensure not silently switching.
+        // Here we expect ok because exactly one high-confidence still exists; reordered test should ensure caller validates not swapping.
+        assert!(reacquire_reference(&id, &doc, &items).is_ok());
+    }
+
+    #[test]
+    fn backend_node_mismatch_cannot_be_reacquired_by_matching_semantics() {
         let doc = SemanticDocumentKey {
             frame_id: "f".into(),
             loader_id: "l".into(),
@@ -154,12 +238,25 @@ mod tests {
             frame_revision: None,
             document_revision: None,
         };
-        let items = vec![
-            json!({"reference":"@c1","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
-            json!({"reference":"@c2","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:0"}),
+        let expected = SemanticIdentity {
+            document: doc.clone(),
+            frame_id: "f".into(),
+            frame_revision: String::new(),
+            backend_node_id: Some(123),
+            role: "link".into(),
+            name: "Latest story".into(),
+            href: Some("https://example.test/latest".into()),
+            dom_path_fingerprint: "a:0".into(),
+            rect_bucket: None,
+            ancestor_id: None,
+        };
+        let current = [
+            json!({"reference":"@c1","source_frame":"f","backend_node_id":456,
+            "role":"link","name":"Latest story","href":"https://example.test/latest","dom_path_fingerprint":"a:0"}),
         ];
-        // Only one high match (the one with fingerprint a:0) -> still ambiguous if ordering changed? stub treats one match as ok; ensure not silently switching.
-        // Here we expect ok because exactly one high-confidence still exists; reordered test should ensure caller validates not swapping.
-        assert!(reacquire_reference(&id, &doc, &items).is_ok());
+        assert!(matches!(
+            reacquire_reference(&expected, &doc, &current),
+            Err(ReacquireError::Ambiguous)
+        ));
     }
 }

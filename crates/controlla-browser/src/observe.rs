@@ -318,14 +318,14 @@ async fn issue_cursor(
 fn extraction_page_script(config: &str) -> String {
     // shortcut: 250 ms settles ordinary virtualized scrolls; add a site-specific wait for slower renderers.
     format!(
-        r#"(()=>{{const q={config};let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false,blocked:[]}};const blocked=[];for(const x of q.expand||[]){{const e=document.querySelector(x.selector);if(!e){{blocked.push(x.selector);continue}}let content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'&&(!content||content.getClientRects().length===0))e.click();content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'||!content||content.getClientRects().length===0)blocked.push(x.selector)}}if(blocked.length)return {{account:true,blocked,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop,next=Math.min(before+c.clientHeight,Math.max(0,c.scrollHeight-c.clientHeight));const result={{items,end,before,after:next,account,limited,missingFields:[...missingFields],clipped,scrollSettled:true}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};if(next===before)return result;return new Promise(resolve=>{{let done=false;const finish=settled=>{{if(done)return;done=true;result.scrollSettled=settled;result.after=c.scrollTop;resolve(result)}};c.addEventListener('scroll',()=>requestAnimationFrame(()=>finish(true)),{{once:true}});c.scrollTop=next;setTimeout(()=>finish(false),250)}})}})()"#,
+        r#"(()=>{{const q={config},one=(s,field)=>{{try{{document.querySelector(s);return null}}catch(_){{return {{selector_error:{{field,reason:'invalid_selector'}}}}}}}},checks=[['container',q.container],['record',q.record],...Object.entries(q.fields).map(([k,s])=>[k,s]),...(q.account||[]).slice(0,1).map(s=>['account',s]),...(q.terminal?[['terminal',q.terminal]]:[])];for(const [f,s] of checks){{const error=one(s,f);if(error)return error}}let account=false;if(q.account){{const a=document.querySelector(q.account[0]);account=!!a&&(a.innerText||a.getAttribute('content')||'').trim()===q.account[1]}}if(!account)return {{account:false,items:[],end:false,limited:false,missingFields:[],clipped:false,blocked:[]}};const blocked=[];for(const x of q.expand||[]){{const error=one(x.selector,'expand');if(error)return error;const errorContent=one(x.content_selector,'expand_content');if(errorContent)return errorContent;const e=document.querySelector(x.selector);if(!e){{blocked.push(x.selector);continue}}let content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'&&(!content||content.getClientRects().length===0))e.click();content=document.querySelector(x.content_selector);if(e.getAttribute('aria-expanded')==='false'||!content||content.getClientRects().length===0)blocked.push(x.selector)}}if(blocked.length)return {{account:true,blocked,items:[],end:false,limited:false,missingFields:[],clipped:false}};const c=document.querySelector(q.container);if(!c)return {{error:'container_missing',account:true}};const walker=document.createTreeWalker(c,NodeFilter.SHOW_ELEMENT),items=[],missingFields=new Set(),encoder=new TextEncoder();let limited=false,clipped=false,bytes=0,scanned=0;while(scanned<q.maxScanNodes){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.record))continue;if(items.length>=q.maxRecords){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missingFields.add(k);continue}}let t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.maxTextChars){{t=t.slice(0,q.maxTextChars);clipped=true}}o[k]=t}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.maxBytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;if(!items.length&&!limited)return {{selector_error:{{field:'record',reason:'no_match'}}}};const end=!!q.terminal&&!!c.querySelector(q.terminal)&&c.scrollTop+c.clientHeight>=c.scrollHeight-2;const before=c.scrollTop,next=Math.min(before+c.clientHeight,Math.max(0,c.scrollHeight-c.clientHeight));const result={{items,end,before,after:next,account,limited,missingFields:[...missingFields],clipped,scrollSettled:true}};while(encoder.encode(JSON.stringify(result)).length>q.maxBytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.maxBytes)return {{budgetError:true}};if(next===before)return result;return new Promise(resolve=>{{let done=false;const finish=settled=>{{if(done)return;done=true;result.scrollSettled=settled;result.after=c.scrollTop;resolve(result)}};c.addEventListener('scroll',()=>requestAnimationFrame(()=>finish(true)),{{once:true}});c.scrollTop=next;setTimeout(()=>finish(false),250)}})}})()"#,
         config = config
     )
 }
 
 fn observation_page_script(config: &str) -> String {
     format!(
-        r#"(()=>{{const q={config},walker=document.createTreeWalker(document,NodeFilter.SHOW_ELEMENT),items=[],missing=new Set(),encoder=new TextEncoder();let bytes=0,clipped=0,limited=false,scanned=0,count=0;while(scanned<q.maxScanNodes&&count<=q.limit){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.selector))continue;count++;if(count>q.limit){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missing.add(k);continue}}const t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.chars)clipped++;o[k]=t.slice(0,q.chars)}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.bytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;const result={{items,count,missing:[...missing],clipped,limited}};while(encoder.encode(JSON.stringify(result)).length>q.bytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.bytes)return {{budgetError:true}};return result}})()"#,
+        r#"(()=>{{const q={config},check=(s,field)=>{{try{{document.querySelector(s);return null}}catch(_){{return {{selector_error:{{field,reason:'invalid_selector'}}}}}}}},checks=[['selector',q.selector],...Object.entries(q.fields)];for(const [f,s] of checks){{const error=check(s,f);if(error)return error}}const walker=document.createTreeWalker(document,NodeFilter.SHOW_ELEMENT),items=[],missing=new Set(),encoder=new TextEncoder();let bytes=0,clipped=0,limited=false,scanned=0,count=0;while(scanned<q.maxScanNodes&&count<=q.limit){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.selector))continue;count++;if(count>q.limit){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missing.add(k);continue}}const t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.chars)clipped++;o[k]=t.slice(0,q.chars)}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.bytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;if(count===0&&!limited)return {{selector_error:{{field:'selector',reason:'no_match'}}}};const result={{items,count,missing:[...missing],clipped,limited}};while(encoder.encode(JSON.stringify(result)).length>q.bytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.bytes)return {{budgetError:true}};return result}})()"#,
         config = config
     )
 }
@@ -368,6 +368,13 @@ pub fn parse_observation(
     response: &Value,
 ) -> Result<Observation, BrowserError> {
     let value = evaluate_object(response)?;
+    if let Some(error) = value.get("selector_error") {
+        return Err(BrowserError::InvalidResponse(format!(
+            "selector_error:{}:{}",
+            error["field"].as_str().unwrap_or("unknown"),
+            error["reason"].as_str().unwrap_or("invalid_selector")
+        )));
+    }
     if value["budgetError"] == true {
         return Err(BrowserError::InvalidResponse(
             "byte budget is too small for page observation metadata".into(),
@@ -448,7 +455,7 @@ pub fn parse_observation(
 fn account_marker_script(marker: &Option<(String, String)>) -> String {
     let marker = serde_json::to_string(marker).expect("account marker serializes");
     format!(
-        "(()=>{{const m={marker};if(!m)return false;const e=document.querySelector(m[0]);return !!e&&(e.innerText||e.getAttribute('content')||'').trim()===m[1]}})()"
+        "(()=>{{const m={marker};if(!m)return false;const matches=Array.from(document.querySelectorAll(m[0])).filter(e=>{{if(!e.isConnected||e.getClientRects().length===0)return false;for(let n=e;n;n=n.parentElement){{const s=getComputedStyle(n);if(s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||n.hasAttribute('hidden')||n.hasAttribute('inert'))return false}}return true}});const norm=s=>String(s||'').replace(/\\s+/g,' ').trim();return matches.length===1&&norm(matches[0].innerText||matches[0].getAttribute('content'))===norm(m[1])}})()"
     )
 }
 
@@ -461,11 +468,7 @@ pub fn identity_marker_command(selector: &str, expected: &str) -> Result<Value, 
             "identity marker text must be 1..=512 printable bytes".into(),
         ));
     }
-    let marker = serde_json::to_string(&(selector, expected))
-        .map_err(|error| BrowserError::InvalidResponse(error.to_string()))?;
-    let expression = format!(
-        "(()=>{{const m={marker};const e=document.querySelector(m[0]);return !!e&&(e.innerText||e.getAttribute('content')||'').trim()===m[1]}})()"
-    );
+    let expression = account_marker_script(&Some((selector.to_owned(), expected.to_owned())));
     Ok(json!({"expression":expression,"returnByValue":true,"awaitPromise":false}))
 }
 
@@ -753,6 +756,13 @@ impl BrowserConnection {
                 )
                 .await?;
             let v = evaluate_object(&response)?;
+            if let Some(error) = v.get("selector_error") {
+                return Err(BrowserError::InvalidResponse(format!(
+                    "selector_error:{}:{}",
+                    error["field"].as_str().unwrap_or("unknown"),
+                    error["reason"].as_str().unwrap_or("invalid_selector")
+                )));
+            }
             if v["scrollSettled"] == false {
                 missing
                     .insert("scroll update did not settle before the observation deadline".into());
@@ -771,8 +781,9 @@ impl BrowserConnection {
                 ));
             }
             if v["error"].as_str() == Some("container_missing") {
-                missing.insert("list container missing".into());
-                break;
+                return Err(BrowserError::InvalidResponse(
+                    "selector_error:container:no_match".into(),
+                ));
             }
             if let Some(blocked) = v["blocked"].as_array() {
                 for selector in blocked.iter().filter_map(Value::as_str) {
@@ -1079,6 +1090,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observation_reports_typed_selector_errors_with_field_identity() {
+        let script = observation_page_script(
+            &json!({"selector":"[","fields":{"title":".title"}}).to_string(),
+        );
+        assert!(script.contains("selector_error"));
+        assert!(script.contains("invalid_selector"));
+        let response = json!({"result":{"value":{"selector_error":{"field":"title","reason":"invalid_selector"}}}});
+        assert!(
+            matches!(parse_observation("tab", 1, &observe_spec(".row"), &response),
+            Err(BrowserError::InvalidResponse(message)) if message == "selector_error:title:invalid_selector")
+        );
+    }
+
     fn extraction_spec() -> ExtractionSpec {
         ExtractionSpec {
             container: "#list".into(),
@@ -1295,6 +1320,26 @@ mod tests {
         let reject = script.find("if(!account)return").unwrap();
         let scroll = script.find("c.scrollTop=").unwrap();
         assert!(reject < scroll);
+    }
+
+    #[test]
+    fn account_markers_require_one_visible_exact_match_in_both_routes() {
+        let marker = Some(("#account".into(), "student@example.edu".into()));
+        let extraction = account_marker_script(&marker);
+        let command =
+            identity_marker_command("#account", "student@example.edu").unwrap()["expression"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        for expression in [extraction, command] {
+            assert!(expression.contains("querySelectorAll"));
+            assert!(expression.contains("getClientRects().length===0"));
+            assert!(expression.contains("matches.length===1"));
+            assert!(expression.contains("replace(/\\s+/g,' ').trim()"));
+            assert!(expression.contains("visibility!=='visible'"));
+            assert!(expression.contains("Number.parseFloat(s.opacity||'1')<=0"));
+            assert!(expression.contains("n=n.parentElement"));
+        }
     }
 
     #[test]

@@ -115,7 +115,8 @@ struct SharedObserveArgs {
 struct SharedAccessibilityArgs {
     session_id: String,
     chrome_tab_id: String,
-    selector: String,
+    selector: Option<String>,
+    frame_id: Option<String>,
     max_bytes: usize,
     timeout_ms: Option<u64>,
 }
@@ -133,11 +134,16 @@ struct SharedInputArgs {
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("allOf" = [{"if":{"properties":{"action":{"const":"open"}},"required":["action"]},"then":{"required":["idempotency_key"]}}]))]
 struct SharedTabArgs {
     session_id: String,
     action: String,
     chrome_tab_id: Option<String>,
     url: String,
+    #[schemars(
+        description = "Required only for action=open. Reuse the same key only when retrying the same logical open; choose a new key for a distinct tab."
+    )]
+    idempotency_key: Option<String>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -670,12 +676,26 @@ fn snapshot_bytes() -> usize {
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum SharedClickOutcome {
-    Navigation { url: Option<String> },
+    Navigation {
+        #[schemars(
+            description = "Optional exact absolute HTTP(S) destination. Omit to accept any observed document change; use a separate URL prefix verification for canonical redirects."
+        )]
+        url: Option<String>,
+    },
     Focused,
-    Visible { selector: String },
-    Text { selector: String, text: String },
-    Expanded { selector: Option<String> },
-    Selected { selector: Option<String> },
+    Visible {
+        selector: String,
+    },
+    Text {
+        selector: String,
+        text: String,
+    },
+    Expanded {
+        selector: Option<String>,
+    },
+    Selected {
+        selector: Option<String>,
+    },
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -864,10 +884,8 @@ async fn evaluate_shared_outcome(
     outcome: &SharedClickOutcome,
     identity: &(String, String, String),
 ) -> Result<bool, String> {
-    if let SharedClickOutcome::Navigation { url } = outcome {
-        return Ok(
-            identity != &snapshot.identity && url.as_ref().is_none_or(|url| url == &identity.2)
-        );
+    if matches!(outcome, SharedClickOutcome::Navigation { .. }) {
+        return shared_navigation_matches(outcome, &snapshot.identity, identity);
     }
     let connection = shared.connection.as_ref().ok_or("session not accepted")?;
     let registry = shared.registry().map_err(|e| e.to_string())?;
@@ -879,6 +897,33 @@ async fn evaluate_shared_outcome(
         connection.command(registry,&shared.handle,tab,"Runtime.evaluate",json!({"expression":expression,"returnByValue":true})).await
     }.map_err(|e|e.to_string())?;
     Ok(shared_value(&response)? == true)
+}
+
+fn shared_navigation_matches(
+    outcome: &SharedClickOutcome,
+    before: &(String, String, String),
+    after: &(String, String, String),
+) -> Result<bool, String> {
+    let SharedClickOutcome::Navigation { url } = outcome else {
+        return Ok(false);
+    };
+    if let Some(url) = url {
+        validate_shared_url(url).map_err(|error| error.message)?;
+    }
+    Ok(before != after
+        && url.as_ref().is_none_or(|expected| {
+            url::Url::parse(expected)
+                .ok()
+                .zip(url::Url::parse(&after.2).ok())
+                .is_some_and(|(expected, actual)| expected == actual)
+        }))
+}
+
+fn validate_shared_click_outcome(outcome: &SharedClickOutcome) -> Result<(), rmcp::ErrorData> {
+    if let SharedClickOutcome::Navigation { url: Some(url) } = outcome {
+        validate_shared_url(url)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1721,6 +1766,31 @@ fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String)
         .ok_or_else(|| "Page.getFrameTree omitted root frame URL".to_owned())?;
     let fragment = frame["urlFragment"].as_str().unwrap_or("");
     Ok((id.to_owned(), loader.to_owned(), format!("{url}{fragment}")))
+}
+
+fn find_cdp_frame(response: &Value, frame_id: &str) -> Option<(String, String)> {
+    fn walk(tree: &Value, id: &str) -> Option<(String, String)> {
+        let frame = tree.get("frame")?;
+        if frame.get("id").and_then(Value::as_str) == Some(id) {
+            return Some((
+                frame
+                    .get("loaderId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                frame
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ));
+        }
+        tree.get("childFrames")?
+            .as_array()?
+            .iter()
+            .find_map(|child| walk(child, id))
+    }
+    walk(response.get("frameTree")?, frame_id)
 }
 
 async fn wait_for_shared_frame_change(
@@ -2664,6 +2734,7 @@ impl App {
         &self,
         Parameters(args): Parameters<SharedClickArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        validate_shared_click_outcome(&args.outcome)?;
         let outcome = json!(args.outcome);
         if outcome
             .get("selector")
@@ -2846,12 +2917,8 @@ impl App {
         )
         .await;
         let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
-        let mut result = if unrestricted && acknowledged {
-            json!({"status":"dispatched","dispatch_acknowledged":true,"verified":false})
-        } else {
-            json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"})
-        };
-        while !unrestricted && tokio::time::Instant::now() < deadline {
+        let mut result = json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"});
+        while tokio::time::Instant::now() < deadline {
             let check = async {
                 let identity = shared_frame_identity(
                     connection,
@@ -3003,19 +3070,21 @@ impl App {
 
     #[tool(
         name = "shared_accessibility",
-        description = "Return the bounded partial accessibility node for one CSS-selected node in an explicitly paired Chrome tab. The root frame, loader, and URL must remain unchanged during the read. The full operation has a 1–60 second deadline."
+        description = "Read one CSS-selected node's partial AX data or a bounded full AX tree for an explicit child frame in an explicitly paired Chrome tab. Child-frame reads use the same-target frameId path first and a bounded OOPIF child session fallback. Root and frame identity must remain unchanged."
     )]
     async fn shared_accessibility(
         &self,
         Parameters(args): Parameters<SharedAccessibilityArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        if args.selector.trim().is_empty()
-            || args.selector.len() > 512
-            || args.selector.contains('\0')
-            || !(4096..=262_144).contains(&args.max_bytes)
+        if args.selector.as_ref().is_some_and(|selector| {
+            selector.trim().is_empty() || selector.len() > 512 || selector.contains('\0')
+        }) || args.frame_id.as_ref().is_some_and(|frame| {
+            frame.is_empty() || frame.len() > 256 || frame.chars().any(char::is_control)
+        }) || args.selector.is_some() == args.frame_id.is_some()
+            || !(4096..=1_000_000).contains(&args.max_bytes)
         {
             return Err(invalid(
-                "selector or accessibility byte budget is out of bounds",
+                "provide exactly one bounded selector or frame_id and a valid accessibility byte budget",
             ));
         }
         let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 60_000));
@@ -3040,6 +3109,37 @@ impl App {
                 shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
                     .await
                     .map_err(invalid)?;
+            if let Some(frame_id) = args.frame_id.as_deref() {
+                let before_tree = connection.command(registry, &shared.handle, &args.chrome_tab_id, "Page.getFrameTree", Value::Null).await.map_err(|error|invalid(error.to_string()))?;
+                let before_frame = find_cdp_frame(&before_tree, frame_id).ok_or_else(||invalid("frame_id is detached or not part of the selected tab"))?;
+                let response = match connection.command(registry, &shared.handle, &args.chrome_tab_id, "Accessibility.getFullAXTree", json!({"frameId":frame_id})).await {
+                    Ok(value) => value,
+                    Err(_) => connection.command(registry, &shared.handle, &args.chrome_tab_id, "Controlla.frameAccessibility", json!({"frame_id":frame_id})).await.map_err(|error|invalid(format!("frame accessibility unavailable in the attached target and OOPIF route: {error}")))?,
+                };
+                let ax = if response.get("nodes").is_some() {
+                    response.clone()
+                } else {
+                    shared_value(&response).map_err(invalid)?
+                };
+                let raw_nodes=ax.get("nodes").and_then(Value::as_array).ok_or_else(||invalid("frame accessibility response omitted nodes"))?;
+                let mut items=Vec::new();
+                let mut truncated=false;
+                for node in raw_nodes {
+                    let Some(backend)=node.get("backendDOMNodeId").and_then(Value::as_i64) else { continue };
+                    if items.len()>=200 { truncated=true; break; }
+                    let role=node.pointer("/role/value").and_then(Value::as_str).unwrap_or("unknown");
+                    let name=node.pointer("/name/value").and_then(Value::as_str).unwrap_or("");
+                    let actionable = matches!(role, "button" | "link" | "checkbox" | "radio" | "option" | "menuitem" | "tab" | "switch");
+                    items.push(json!({"reference":format!("@f:{frame_id}:{}:{backend}",before_frame.0),"source_frame_id":frame_id,"frame_loader_id":before_frame.0,"source_frame_url":before_frame.1,"role":role,"name":name,"backend_node_id":backend,"actionable":actionable}));
+                }
+                let after_tree=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Page.getFrameTree",Value::Null).await.map_err(|error|invalid(error.to_string()))?;
+                let after_frame=find_cdp_frame(&after_tree,frame_id).ok_or_else(||invalid("frame detached during accessibility read; result discarded"))?;
+                if before!=shared_frame_identity(connection,registry,&shared.handle,&args.chrome_tab_id).await.map_err(invalid)? || before_frame!=after_frame { return Err(invalid("tab or frame navigated during accessibility read; result discarded as stale")); }
+                let mut result=json!({"chrome_tab_id":args.chrome_tab_id,"source_frame_id":frame_id,"source_frame_url":before_frame.1,"frame_loader_id":before_frame.0,"routing":ax.get("routing").and_then(Value::as_str).unwrap_or("root_frame_id"),"items":items,"truncated":truncated,"complete":!truncated,"shared_frame_identity":{"frame_id":before.0,"loader_id":before.1,"url":before.2}});
+                if serde_json::to_vec(&result).map(|bytes|bytes.len()).unwrap_or(usize::MAX)>args.max_bytes { result["items"]=json!([]);result["truncated"]=json!(true);result["complete"]=json!(false);result["missing"]=json!(["AX result exceeded the requested byte budget"]); }
+                return Ok(result);
+            }
+            let selector_arg=args.selector.as_deref().expect("selector is required when frame_id is absent");
             let document = connection
                 .command(
                     registry,
@@ -3061,15 +3161,15 @@ impl App {
                     &shared.handle,
                     &args.chrome_tab_id,
                     "DOM.querySelector",
-                    json!({"nodeId":root,"selector":args.selector}),
+                    json!({"nodeId":root,"selector":selector_arg}),
                 )
                 .await
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|_| invalid("selector_error:selector:invalid_selector"))?;
             let node_id = selector
                 .get("nodeId")
                 .and_then(Value::as_u64)
                 .filter(|id| *id > 0)
-                .ok_or_else(|| invalid("accessibility selector matched no DOM node"))?;
+                .ok_or_else(|| invalid("selector_error:selector:no_match"))?;
             let response = connection
                 .command(
                     registry,
@@ -3821,7 +3921,7 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open an active Chrome tab or navigate an explicitly paired tab through the native Controlla extension session. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
+        description = "Open an active Chrome tab or navigate an explicitly paired tab through the native Controlla extension session. `open` requires a stable idempotency_key; reuse it only for the same logical open retry. A different key creates a distinct tab. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
     )]
     async fn shared_tab(
         &self,
@@ -3830,6 +3930,11 @@ impl App {
         validate_shared_url(&args.url)?;
         if args.action != "open" && args.action != "navigate" {
             return Err(invalid("shared_tab action must be open or navigate"));
+        }
+        if args.action == "open" && args.idempotency_key.as_deref().is_none_or(str::is_empty) {
+            return Err(invalid(
+                "shared_tab open requires idempotency_key so retries reuse the same tab",
+            ));
         }
         let shared = self
             .shared_sessions
@@ -3890,7 +3995,7 @@ impl App {
                 &shared.handle,
                 &source,
                 method,
-                json!({"url":args.url}),
+                json!({"url":args.url,"idempotency_key":args.idempotency_key}),
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
@@ -4497,18 +4602,40 @@ fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
 }
 
 fn validate_shared_url(url: &str) -> Result<(), rmcp::ErrorData> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| invalid("URL must be HTTP(S) and cannot contain credentials"))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if !matches!(scheme, "http" | "https")
-        || authority.is_empty()
-        || authority.contains('@')
+    let uri = url
+        .parse::<axum::http::Uri>()
+        .map_err(|_| invalid("URL must be an absolute HTTP(S) URL without credentials"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| invalid("URL must include an HTTP(S) authority"))?;
+    let scheme = uri.scheme_str().unwrap_or_default();
+    let host = authority.host();
+    let authority_suffix = authority
+        .as_str()
+        .strip_prefix(host)
+        .unwrap_or(authority.as_str());
+    let valid_host = match host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        Some(ipv6) => ipv6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => !host.is_empty() && !host.contains('[') && !host.contains(']'),
+    };
+    let valid_port = authority_suffix.is_empty()
+        || authority_suffix.strip_prefix(':').is_some_and(|port| {
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        });
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || !valid_host
+        || authority.as_str().contains('@')
+        || !valid_port
         || url.len() > 2048
         || url.chars().any(char::is_whitespace)
     {
         return Err(invalid(
-            "URL must be HTTP(S), bounded, and cannot contain credentials",
+            "URL must be a bounded, absolute HTTP(S) URL without credentials",
         ));
     }
     Ok(())
@@ -4658,6 +4785,127 @@ mod tests {
         assert!(!super::dedicated_batch_guard_ok(
             &json!({"error":{"message":"failed"}})
         ));
+    }
+
+    #[test]
+    fn navigation_outcomes_match_only_changed_documents_and_absolute_exact_urls() {
+        use super::{SharedClickOutcome, shared_navigation_matches, validate_shared_click_outcome};
+
+        let before = (
+            "frame".into(),
+            "old-loader".into(),
+            "https://site.test/old".into(),
+        );
+        let target = (
+            "frame".into(),
+            "new-loader".into(),
+            "https://site.test/story/1".into(),
+        );
+        assert!(
+            shared_navigation_matches(
+                &SharedClickOutcome::Navigation { url: None },
+                &before,
+                &target,
+            )
+            .unwrap()
+        );
+        assert!(
+            !shared_navigation_matches(
+                &SharedClickOutcome::Navigation { url: None },
+                &before,
+                &before,
+            )
+            .unwrap()
+        );
+        assert!(
+            shared_navigation_matches(
+                &SharedClickOutcome::Navigation {
+                    url: Some(target.2.clone())
+                },
+                &before,
+                &target,
+            )
+            .unwrap()
+        );
+        for (expected, actual) in [
+            ("https://site.test/story/1", "https://site.test/story/1"),
+            ("HTTPS://SITE.TEST:443", "https://site.test/"),
+            ("http://SITE.test:80/", "http://site.test/"),
+        ] {
+            let actual = ("frame".into(), "new-loader".into(), actual.into());
+            assert!(
+                shared_navigation_matches(
+                    &SharedClickOutcome::Navigation {
+                        url: Some(expected.into())
+                    },
+                    &before,
+                    &actual,
+                )
+                .unwrap(),
+                "browser-equivalent URLs must match: {expected} -> {}",
+                actual.2
+            );
+        }
+        assert!(
+            !shared_navigation_matches(
+                &SharedClickOutcome::Navigation {
+                    url: Some("https://site.test/story/".into())
+                },
+                &before,
+                &target,
+            )
+            .unwrap()
+        );
+        assert!(
+            shared_navigation_matches(
+                &SharedClickOutcome::Navigation {
+                    url: Some("/story/1".into())
+                },
+                &before,
+                &target,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_shared_click_outcome(&SharedClickOutcome::Navigation {
+                url: Some("/story/1".into())
+            })
+            .is_err()
+        );
+        for malformed in [
+            "https://example.test:bad",
+            "https://example.test:65536",
+            "https://example.test:",
+            "https://[::1",
+            "https://[:::]/",
+            "https://[gggg::1]/",
+            "http:///missing-host",
+        ] {
+            assert!(
+                validate_shared_click_outcome(&SharedClickOutcome::Navigation {
+                    url: Some(malformed.into())
+                })
+                .is_err(),
+                "malformed exact destination must be rejected before dispatch: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_tab_schema_requires_idempotency_key_only_for_open() {
+        let schema =
+            serde_json::to_value(rmcp::schemars::schema_for!(super::SharedTabArgs)).unwrap();
+        assert_eq!(
+            schema["allOf"][0]["if"]["properties"]["action"]["const"],
+            "open"
+        );
+        assert!(
+            schema["allOf"][0]["then"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|property| property == "idempotency_key")
+        );
     }
 
     #[test]
@@ -5521,6 +5769,9 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .strip_prefix("artifact_")
+                .unwrap()
+                .split('@')
+                .next()
                 .unwrap();
             let staged_file = std::env::temp_dir()
                 .join(format!("controlla-artifact-{artifact_id}"))
@@ -6000,6 +6251,47 @@ mod tests {
         assert_eq!(ax["nodes"][0]["nodeId"], "7");
         assert_eq!(ax["shared_frame_identity"]["loader_id"], "doc-1");
         assert!(serde_json::to_vec(&ax).unwrap().len() <= 8192);
+
+        let frame_ax = client.call_tool(
+            CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
+                "session_id":session_id,"chrome_tab_id":"123","frame_id":"child","max_bytes":1_000_000
+            }))),
+        );
+        let frame_ax_replies = async {
+            let tree = json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"},"childFrames":[{"frame":{"id":"child","loaderId":"child-doc","url":"https://picker.fixture.test/"}}]}});
+            for (method, result) in [
+                ("Page.getFrameTree", tree.clone()),
+                ("Page.getFrameTree", tree.clone()),
+                (
+                    "Accessibility.getFullAXTree",
+                    json!({"nodes":[{"backendDOMNodeId":41,"role":{"value":"button"},"name":{"value":"Select account"}}]}),
+                ),
+                ("Page.getFrameTree", tree.clone()),
+                ("Page.getFrameTree", tree),
+            ] {
+                let Ok(Some(Ok(message))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), extension.next()).await
+                else {
+                    break;
+                };
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (frame_ax, ()) = tokio::join!(frame_ax, frame_ax_replies);
+        let frame_ax = frame_ax.unwrap().structured_content.unwrap();
+        assert_eq!(frame_ax["items"][0]["backend_node_id"], 41);
+        assert_eq!(frame_ax["items"][0]["name"], "Select account");
+        assert_eq!(frame_ax["routing"], "root_frame_id");
+        assert_eq!(frame_ax["frame_loader_id"], "child-doc");
 
         let oversized_ax = client.call_tool(CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
             "session_id":session_id,"chrome_tab_id":"123","selector":"#selected","max_bytes":4096

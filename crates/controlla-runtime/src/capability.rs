@@ -230,6 +230,10 @@ pub struct DoctorReport {
     pub heartbeat_age_seconds: Option<u64>,
     pub live_round_trip: DiagnosticState,
     pub policy_revision: Option<u64>,
+    pub expected_mcp_surface: String,
+    pub requested_client: Option<String>,
+    pub loaded_client_tool_state: DiagnosticState,
+    pub client_tool_acknowledgement: String,
     pub errors: Vec<String>,
 }
 

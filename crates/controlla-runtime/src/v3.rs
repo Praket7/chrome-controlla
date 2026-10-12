@@ -81,7 +81,7 @@ impl TypingPolicy {
     pub fn new(mode: TypingMode, delay_ms: Option<u64>) -> Result<Self, &'static str> {
         let delay_ms = match mode {
             TypingMode::Block | TypingMode::FastKeys | TypingMode::Ime => 0,
-            TypingMode::HumanKeys => delay_ms.unwrap_or(18),
+            TypingMode::HumanKeys => delay_ms.unwrap_or(180),
         };
         if delay_ms > 250 {
             return Err("typing delay must be <= 250ms");
@@ -107,6 +107,13 @@ impl TypingPolicy {
         };
         Self::new(mode, None).expect("built-in typing policies are valid")
     }
+}
+
+pub fn human_typing_timeout_ms(char_count: usize, delay_ms: u64) -> u64 {
+    (char_count as u64)
+        .saturating_mul(delay_ms.saturating_add(50))
+        .saturating_add(10_000)
+        .clamp(30_000, 600_000)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

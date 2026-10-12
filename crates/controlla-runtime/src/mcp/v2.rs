@@ -12,9 +12,11 @@ const MAX_WORKFLOW_STEPS: usize = 20;
 #[derive(Clone, Default)]
 struct SemanticTabState {
     document_key: String,
+    document: Option<crate::semantic_state::SemanticDocumentKey>,
     next_ref: u32,
     key_to_short: BTreeMap<String, String>,
     short_to_legacy: BTreeMap<String, String>,
+    identities: BTreeMap<String, crate::reference_reacquire::SemanticIdentity>,
     items: BTreeMap<String, Value>,
     snapshot_id: String,
 }
@@ -62,6 +64,7 @@ struct BrowserSnapshotArgs {
     max_text_chars: Option<usize>,
     max_bytes: Option<usize>,
     href_hint: Option<String>,
+    frame_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -81,7 +84,10 @@ struct BrowserFindArgs {
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserClickOutcome {
-    Navigation { url: Option<String> },
+    Navigation {
+        #[schemars(description = "Optional exact absolute HTTP(S) destination. Omit to accept any observed document change; use verify url_starts_with for canonical redirects.")]
+        url: Option<String>,
+    },
     Focused,
     Visible { selector: String },
     Text { selector: String, text: String },
@@ -124,7 +130,7 @@ struct BrowserProbeArgs {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserPredicate {
     Text { reference: String, equals: String },
@@ -197,12 +203,23 @@ fn document_key(snapshot: &Value) -> String {
 }
 
 fn changed_fields(previous: &Value, current: &Value) -> bool {
-    ["role", "name", "raw_value", "href", "expanded", "selected", "disabled", "requires_trusted_events"]
+    ["role", "name", "raw_value", "href", "expanded", "selected", "disabled", "requires_trusted_events", "present", "rendered", "in_viewport", "pointer_events_none", "actionability", "editable_kind", "multiline"]
         .into_iter()
         .any(|field| previous.get(field) != current.get(field))
 }
 
 async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value, rmcp::ErrorData> {
+    if let Some(frame_id) = args.frame_id.as_deref() {
+        let Json(value) = app.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
+            session_id: args.session_id.clone(),
+            chrome_tab_id: args.chrome_tab_id.clone(),
+            selector: None,
+            frame_id: Some(frame_id.to_owned()),
+            max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000),
+            timeout_ms: Some(10_000),
+        })).await?;
+        return Ok(value);
+    }
     let legacy = app
         .legacy
         .shared_snapshot(Parameters(SharedSnapshotArgs {
@@ -235,10 +252,12 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
     if state.document_key != doc_key {
         *state = SemanticTabState {
             document_key: doc_key.clone(),
+            document: Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot)),
             next_ref: 1,
             ..Default::default()
         };
     }
+    state.document = Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot));
     if state.next_ref == 0 {
         state.next_ref = 1;
     }
@@ -262,6 +281,11 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             .to_owned();
         item["reference"] = json!(short);
         item["index"] = json!(index);
+        let identity = crate::reference_reacquire::SemanticIdentity::from_item(
+            &item,
+            state.document.as_ref().expect("snapshot document was set"),
+        );
+        state.identities.insert(short.clone(), identity);
         state.short_to_legacy.insert(short.clone(), legacy_ref);
         state.items.insert(short, item.clone());
         public_items.push(item);
@@ -294,19 +318,32 @@ async fn resolve_reference(app: &AppV2, session_id: &str, tab_id: &str, referenc
     if !reference.starts_with("@c") || reference[2..].parse::<u32>().is_err() {
         return Err(invalid("reference must be an exact @cN value returned by browser_snapshot/browser_find"));
     }
-    app.semantic
-        .lock()
-        .await
-        .get(&tab_key(session_id, tab_id))
-        .and_then(|state| state.short_to_legacy.get(reference))
-        .cloned()
-        .ok_or_else(|| invalid("reference is stale or unknown; take a fresh browser_snapshot"))
+    let mut semantic = app.semantic.lock().await;
+    let state = semantic.get_mut(&tab_key(session_id, tab_id))
+        .ok_or_else(|| invalid("reference is stale or unknown; take a fresh browser_snapshot"))?;
+    if let Some(legacy) = state.short_to_legacy.get(reference) {
+        return Ok(legacy.clone());
+    }
+    let expected = state.identities.get(reference)
+        .ok_or_else(|| invalid("reference is stale or unknown; take a fresh browser_snapshot"))?;
+    let current_document = state.document.as_ref()
+        .ok_or_else(|| invalid("semantic document identity is unavailable; take a fresh browser_snapshot"))?;
+    let items = state.items.values().cloned().collect::<Vec<_>>();
+    let candidate = crate::reference_reacquire::reacquire_reference(expected, current_document, &items)
+        .map_err(|error| invalid(format!("reference could not be rebound safely: {error}")))?;
+    let current = state.items.get(&candidate.reference)
+        .ok_or_else(|| invalid("reacquired candidate is no longer in the current snapshot"))?;
+    let index = current["index"].as_u64().ok_or_else(|| invalid("reacquired candidate omitted its index"))?;
+    let legacy = format!("{}:{index}", state.snapshot_id);
+    state.short_to_legacy.insert(reference.to_owned(), legacy.clone());
+    Ok(legacy)
 }
 
 async fn retained_mutation(
     app: &AppV2,
     args: &BrowserActArgs,
     reference: &str,
+    allow_password: bool,
     action: &str,
 ) -> Result<Value, rmcp::ErrorData> {
     let legacy_reference = resolve_reference(app, &args.session_id, &args.chrome_tab_id, reference).await?;
@@ -359,12 +396,15 @@ async fn retained_mutation(
     if !unrestricted && before != snapshot.identity {
         return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
     }
-    let function = if unrestricted {
-        r#"function(index,expected,value){const e=this.nodes[index];if(!e)return {ok:false,reason:'target_missing'};e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:true,value:e.value};}"#
+    if allow_password && action != "fill" {
+        return Err(invalid("allow_password is supported only for action=fill"));
+    }
+    let function = if action == "fill" && allow_password {
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement)||e.type!=='password'||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(r.width<=0||r.height<=0||r.left<0||r.top<0||r.right>innerWidth||r.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)!==e)return {ok:false,reason:'blocked'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value};}"#
     } else if action == "fill" {
-        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
     } else {
-        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLSelectElement)||e.matches(':disabled')||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(![...e.options].some(o=>o.value===value))return {ok:false,reason:'option_missing'};e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLSelectElement)||e.matches(':disabled')||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(![...e.options].some(o=>o.value===value))return {ok:false,reason:'option_missing'};e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
     };
     // Consume before dispatch so a lost response cannot permit duplicate mutation via the same reference.
     if !unrestricted {
@@ -445,6 +485,7 @@ async fn retained_mutation(
             max_text_chars: None,
             max_bytes: None,
             href_hint: None,
+            frame_id: None,
         }).await;
         if let Ok(snapshot) = fresh {
             result["snapshot"] = snapshot;
@@ -467,6 +508,7 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
             max_text_chars: None,
             max_bytes: None,
             href_hint: None,
+            frame_id: None,
         }).await?;
     }
     let mode = args.match_mode.as_deref().unwrap_or("all");
@@ -495,6 +537,7 @@ async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmc
         max_text_chars: Some(6000),
         max_bytes: Some(60_000),
         href_hint: None,
+        frame_id: None,
     }).await?;
     let state = app.semantic.lock().await;
     let state = state.get(&tab_key(&args.session_id, &args.chrome_tab_id)).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
@@ -537,6 +580,10 @@ fn substitute_reference(reference: &str, vars: &BTreeMap<String, String>) -> Res
     }
 }
 
+fn frame_click_receipt(response: Value) -> Value {
+    response.pointer("/result/value").or_else(|| response.get("result")).cloned().unwrap_or(response)
+}
+
 #[tool_router]
 impl AppV2 {
     #[tool(name = "browser_session", description = "Discover, pair, connect, list, or release explicitly selected Chrome targets. This is a compact alias over Controlla's existing authority-preserving session broker.")]
@@ -550,7 +597,7 @@ impl AppV2 {
         })).await
     }
 
-    #[tool(name = "browser_snapshot", description = "Return a compact visible-page snapshot for an explicitly paired Chrome tab. Actionable controls receive stable short refs such as @c1 for the current document, plus a changed-only delta from the previous snapshot. Refs still resolve to the broker's single-use retained DOM identities.")]
+    #[tool(name = "browser_snapshot", description = "Return a compact semantic snapshot for an explicitly paired Chrome tab. Controls report present/rendered/in_viewport separately; in_viewport is only a candidate, and mutations still require actionability checks. Completeness reports text, controls, frames, and limits. Set frame_id to request a bounded frame-aware accessibility snapshot for a child frame; returned @f refs carry frame identity.")]
     async fn browser_snapshot(&self, Parameters(args): Parameters<BrowserSnapshotArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         Ok(Json(snapshot_impl(self, &args).await?))
     }
@@ -565,6 +612,33 @@ impl AppV2 {
         let reference = args.reference.as_deref().ok_or_else(|| invalid("reference is required"))?;
         let result = match args.action.as_str() {
             "click" => {
+                if let Some(BrowserClickOutcome::Navigation { url: Some(url) }) = args.outcome.as_ref() {
+                    super::validate_shared_url(url)?;
+                }
+                if let Some(frame_ref) = reference.strip_prefix("@f:") {
+                    let mut parts = frame_ref.splitn(3, ':');
+                    let frame_id = parts.next().unwrap_or_default();
+                    let loader_id = parts.next().unwrap_or_default();
+                    let backend = parts.next().unwrap_or_default();
+                    let backend_node_id = backend.parse::<i64>().ok().filter(|id| *id > 0).ok_or_else(|| invalid("frame reference has an invalid backend node id"))?;
+                    if frame_id.is_empty() || frame_id.len() > 256 || loader_id.is_empty() || loader_id.len() > 256 || args.outcome.is_none() {
+                        return Err(invalid("frame click requires a valid frame identity and explicit outcome"));
+                    }
+                    let outcome = args.outcome.as_ref().ok_or_else(|| invalid("frame click requires an explicit outcome"))?;
+                    let shared = self.legacy.shared_sessions.lock().await.get(&args.session_id).cloned().ok_or_else(||invalid("unknown shared session_id"))?;
+                    let shared = shared.lock().await;
+                    if shared.handle.principal != self.legacy.principal.as_ref() { return Err(invalid("session is not owned by this server principal")); }
+                    let connection = shared.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+                    let response = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.frameClick", serde_json::json!({"frame_id":frame_id,"loader_id":loader_id,"backend_node_id":backend_node_id,"outcome":outcome,"timeout_ms":args.timeout_ms.unwrap_or(5000).clamp(250,10000)})).await;
+                    match response {
+                        Ok(response) => {
+                            let value = frame_click_receipt(response);
+                            let status = if value["verified"] == true { "verified" } else if value["dispatch_may_have_occurred"] == false { "not_dispatched" } else { "unknown" };
+                            json!({"status":status,"dispatch_acknowledged":value["dispatch_acknowledged"],"dispatch_may_have_occurred":value["dispatch_may_have_occurred"],"verified":value["verified"] == true,"reference":reference,"source_frame_id":frame_id,"requested_outcome":outcome,"reason":value["reason"],"dispatch":value})
+                        }
+                        Err(error) => json!({"status":"unknown","dispatch_acknowledged":null,"dispatch_may_have_occurred":true,"verified":false,"reference":reference,"source_frame_id":frame_id,"requested_outcome":outcome,"reason":format!("frame click delivery or readback became uncertain; inspect the frame before retrying: {error}")}),
+                    }
+                } else {
                 let legacy_reference = resolve_reference(self, &args.session_id, &args.chrome_tab_id, reference).await?;
                 let outcome = args.outcome.ok_or_else(|| invalid("click requires an explicit bounded outcome"))?;
                 let outcome: SharedClickOutcome = serde_json::from_value(serde_json::to_value(outcome).map_err(|e| invalid(e.to_string()))?)
@@ -577,8 +651,9 @@ impl AppV2 {
                     timeout_ms: args.timeout_ms,
                 })).await?;
                 value
+                }
             }
-            "fill" | "select" => retained_mutation(self, &args, reference, &args.action).await?,
+            "fill" | "select" => retained_mutation(self, &args, reference, false, &args.action).await?,
             _ => return Err(invalid("action must be click, fill, or select")),
         };
         Ok(Json(result))
@@ -586,7 +661,7 @@ impl AppV2 {
 
     #[tool(name = "browser_extract", description = "Run a bounded structured extraction from one explicitly paired Chrome tab while requiring the root frame, loader, and URL to remain stable across the read.")]
     async fn browser_extract(&self, Parameters(args): Parameters<BrowserExtractArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
-        self.legacy.shared_observe(Parameters(SharedObserveArgs {
+        let result = self.legacy.shared_observe(Parameters(SharedObserveArgs {
             session_id: args.session_id,
             chrome_tab_id: args.chrome_tab_id,
             spec: ObserveInput {
@@ -597,7 +672,14 @@ impl AppV2 {
                 max_bytes: args.max_bytes.unwrap_or(200_000).clamp(4096, 1_000_000),
                 cursor: None,
             },
-        })).await
+        })).await;
+        match result {
+            Ok(value) => Ok(Json(value.0)),
+            Err(error) => match selector_error_receipt(&error.message) {
+                Some(receipt) => Ok(Json(receipt)),
+                None => Err(error),
+            },
+        }
     }
 
     #[tool(name = "browser_probe", description = "Perform a targeted accessibility probe on one CSS-selected node in an explicitly paired Chrome tab. This is a scoped fallback, not a full-page screenshot loop.")]
@@ -605,7 +687,8 @@ impl AppV2 {
         self.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
             session_id: args.session_id,
             chrome_tab_id: args.chrome_tab_id,
-            selector: args.selector,
+            selector: Some(args.selector),
+            frame_id: None,
             max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 262_144),
             timeout_ms: args.timeout_ms,
         })).await
@@ -627,7 +710,7 @@ impl AppV2 {
             let receipt = match step {
                 BrowserWorkflowStep::Snapshot => snapshot_impl(self, &BrowserSnapshotArgs {
                     session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector: None,
-                    max_items: None, max_text_chars: None, max_bytes: None, href_hint: None,
+                    max_items: None, max_text_chars: None, max_bytes: None, href_hint: None, frame_id: None,
                 }).await?,
                 BrowserWorkflowStep::Find { query, role, save_as } => {
                     if save_as.is_empty() || save_as.len() > 64 || !save_as.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -649,14 +732,14 @@ impl AppV2 {
                     retained_mutation(self, &BrowserActArgs {
                         session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "fill".into(),
                         reference: Some(reference.clone()), expected_value: Some(expected_value), value: Some(value), outcome: None, timeout_ms: None,
-                    }, &reference, "fill").await?
+                    }, &reference, false, "fill").await?
                 }
                 BrowserWorkflowStep::Select { reference, expected_value, value } => {
                     let reference = substitute_reference(&reference, &vars)?;
                     retained_mutation(self, &BrowserActArgs {
                         session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), action: "select".into(),
                         reference: Some(reference.clone()), expected_value: Some(expected_value), value: Some(value), outcome: None, timeout_ms: None,
-                    }, &reference, "select").await?
+                    }, &reference, false, "select").await?
                 }
                 BrowserWorkflowStep::Click { reference, outcome } => {
                     let reference = substitute_reference(&reference, &vars)?;
@@ -745,9 +828,34 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+fn selector_error_receipt(message: &str) -> Option<Value> {
+    let (field, reason) = message.split_once("selector_error:")?.1.split_once(':')?;
+    if field.is_empty() || !matches!(reason, "invalid_selector" | "no_match" | "ambiguous_match" | "unsupported_target_type") {
+        return None;
+    }
+    Some(json!({"status":"not_dispatched","field":field,"reason_code":reason}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_selector_failures_are_typed_and_field_bound() {
+        let receipt = selector_error_receipt("browser response was invalid: selector_error:announcement:invalid_selector").unwrap();
+        assert_eq!(receipt["status"], "not_dispatched");
+        assert_eq!(receipt["field"], "announcement");
+        assert_eq!(receipt["reason_code"], "invalid_selector");
+        assert!(selector_error_receipt("selector_error:body:browser_crash").is_none());
+        assert!(selector_error_receipt("unrelated failure").is_none());
+    }
+
+    #[test]
+    fn frame_click_keeps_the_native_receipt_when_transport_has_unwrapped_it() {
+        let receipt = json!({"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"verified":true});
+        assert_eq!(frame_click_receipt(receipt.clone()), receipt);
+        assert_eq!(frame_click_receipt(json!({"result":{"value":receipt}})), receipt);
+    }
 
     #[test]
     fn page_order_survives_two_digit_reference_keys() {

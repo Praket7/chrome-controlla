@@ -25,7 +25,9 @@ pub enum TaskPrimitive {
     },
     Upload {
         artifact_handle: String,
-        selector: String,
+        selector: Option<String>,
+        trigger_reference: Option<String>,
+        acceptance: Option<Value>,
         account_marker: (String, String),
     },
     Download {
@@ -79,7 +81,9 @@ pub enum ExpandedStep {
     },
     Upload {
         artifact_handle: String,
-        selector: String,
+        selector: Option<String>,
+        trigger_reference: Option<String>,
+        acceptance: Option<Value>,
         account_marker: (String, String),
     },
     Download {
@@ -179,26 +183,42 @@ impl TaskPrimitive {
             Self::Upload {
                 artifact_handle,
                 selector,
+                trigger_reference,
+                acceptance,
                 account_marker,
             } => {
+                let exactly_one_target = selector.is_some() ^ trigger_reference.is_some();
+                let valid_selector = selector
+                    .as_ref()
+                    .is_none_or(|selector| !selector.is_empty() && selector.len() <= 512);
+                let valid_reference = trigger_reference
+                    .as_ref()
+                    .is_none_or(|reference| !reference.is_empty() && reference.len() <= 1024);
+                let valid_acceptance = acceptance.as_ref().is_none_or(|value| {
+                    serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= 8192)
+                });
                 if artifact_handle.is_empty()
                     || artifact_handle.len() > 256
                     || artifact_handle.contains('/')
                     || artifact_handle.contains('\\')
-                    || selector.is_empty()
-                    || selector.len() > 512
+                    || !exactly_one_target
+                    || !valid_selector
+                    || !valid_reference
+                    || !valid_acceptance
                     || account_marker.0.is_empty()
                     || account_marker.0.len() > 512
                     || account_marker.1.is_empty()
                     || account_marker.1.len() > 512
                 {
                     return Err(
-                        "upload requires an opaque artifact handle, bounded file selector, and account marker",
+                        "upload requires an opaque artifact handle, exactly one bounded file selector or trigger reference, and account marker",
                     );
                 }
                 vec![ExpandedStep::Upload {
                     artifact_handle: artifact_handle.clone(),
                     selector: selector.clone(),
+                    trigger_reference: trigger_reference.clone(),
+                    acceptance: acceptance.clone(),
                     account_marker: account_marker.clone(),
                 }]
             }

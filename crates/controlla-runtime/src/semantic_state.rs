@@ -187,14 +187,29 @@ pub fn stable_item_keys(items: &[Value], revision: &str) -> Vec<String> {
                 .pointer("/semantic_ancestor/id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let structure = item
+                .get("dom_path_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 field("source_frame"),
+                field("source_frame_revision"),
                 field("role"),
                 field("name"),
                 field("href"),
                 field("datetime"),
-                ancestor
+                ancestor,
+                structure,
+                field("editable_kind"),
+                item.get("multiline")
+                    .and_then(Value::as_bool)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                item.get("requires_trusted_events")
+                    .and_then(Value::as_bool)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>();
@@ -228,6 +243,14 @@ fn changed_fields(previous: &Value, current: &Value) -> bool {
         "expanded",
         "selected",
         "disabled",
+        "present",
+        "rendered",
+        "in_viewport",
+        "pointer_events_none",
+        "actionability",
+        "editable_kind",
+        "multiline",
+        "requires_trusted_events",
     ]
     .into_iter()
     .any(|field| previous.get(field) != current.get(field))
@@ -293,10 +316,10 @@ pub fn rank_candidates(
         let href_score = if href_match { 20 } else { 0 };
         let role_score = if role.is_some() { 10 } else { 0 };
         let hint_score = if href_hint.is_some() { 15 } else { 0 };
-        let visible_score = if item["visible"] == true { 5 } else { 0 };
-        let score = name_score + href_score + role_score + hint_score + visible_score;
+        let in_viewport_score = if item["in_viewport"] == true || item["visible"] == true { 5 } else { 0 };
+        let score = name_score + href_score + role_score + hint_score + in_viewport_score;
         item["score"] = json!(score);
-        item["score_components"] = json!({"name":name_score,"href":href_score,"role":role_score,"href_hint":hint_score,"visible":visible_score});
+        item["score_components"] = json!({"name":name_score,"href":href_score,"role":role_score,"href_hint":hint_score,"in_viewport":in_viewport_score});
         Some(item)
     }).collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
@@ -328,6 +351,10 @@ pub fn rank_candidates(
     ranked
 }
 
+pub fn workflow_find_needs_refresh(found: &Value) -> bool {
+    found["matches"].as_array().is_some_and(Vec::is_empty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +367,17 @@ mod tests {
             frame_revision: Some("7".into()),
             document_revision: Some("11".into()),
         }
+    }
+
+    #[test]
+    fn workflow_refreshes_only_after_an_empty_find_result() {
+        assert!(workflow_find_needs_refresh(&json!({"matches":[]})));
+        assert!(!workflow_find_needs_refresh(
+            &json!({"matches":[{"reference":"@c1"}]})
+        ));
+        assert!(!workflow_find_needs_refresh(
+            &json!({"error":"invalid_selector"})
+        ));
     }
 
     #[test]
@@ -430,6 +468,34 @@ mod tests {
         assert_ne!(refs[0], second.items[0]["reference"]);
         assert_ne!(refs[1], second.items[1]["reference"]);
         assert_ne!(refs[0], refs[1]);
+    }
+
+    #[test]
+    fn editor_refs_use_structure_and_survive_text_changes() {
+        let mut memory = SemanticMemory::default();
+        let editors = |refs: [&str; 2], values: [&str; 2]| {
+            vec![
+                json!({"reference":refs[0],"role":"textbox","name":"Editor","raw_value":values[0],"editable_kind":"rich_text","multiline":true,"dom_path_fingerprint":"div:0>div:0"}),
+                json!({"reference":refs[1],"role":"textbox","name":"Editor","raw_value":values[1],"editable_kind":"rich_text","multiline":true,"dom_path_fingerprint":"div:0>div:1"}),
+            ]
+        };
+        let first = memory
+            .ingest(
+                document("https://example.test/form"),
+                "s1",
+                editors(["a:0", "a:1"], ["", ""]),
+            )
+            .unwrap();
+        assert_ne!(first.items[0]["reference"], first.items[1]["reference"]);
+        let second = memory
+            .ingest(
+                document("https://example.test/form"),
+                "s2",
+                editors(["b:0", "b:1"], ["Draft one", "Draft two"]),
+            )
+            .unwrap();
+        assert_eq!(first.items[0]["reference"], second.items[0]["reference"]);
+        assert_eq!(first.items[1]["reference"], second.items[1]["reference"]);
     }
 
     #[test]

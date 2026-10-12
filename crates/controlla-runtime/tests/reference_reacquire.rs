@@ -5,8 +5,17 @@ use serde_json::json;
 
 #[test]
 fn lost_cdp_object_reacquires_with_high_confidence() {
-    let id = SemanticIdentity {
+    let doc = SemanticDocumentKey {
         frame_id: "f".into(),
+        loader_id: "l".into(),
+        url: "https://example.test".into(),
+        frame_revision: None,
+        document_revision: None,
+    };
+    let id = SemanticIdentity {
+        document: doc.clone(),
+        frame_id: "f".into(),
+        frame_revision: String::new(),
         backend_node_id: Some(123),
         role: "link".into(),
         name: "Go".into(),
@@ -15,15 +24,8 @@ fn lost_cdp_object_reacquires_with_high_confidence() {
         rect_bucket: None,
         ancestor_id: None,
     };
-    let doc = SemanticDocumentKey {
-        frame_id: "f".into(),
-        loader_id: "l".into(),
-        url: "https://example.test".into(),
-        frame_revision: None,
-        document_revision: None,
-    };
     let items = vec![
-        json!({"reference":"@c1","role":"link","name":"Go","href":"https://example.test/a","dom_path_fingerprint":"a:0","backend_node_id":123}),
+        json!({"reference":"@c1","source_frame":"f","role":"link","name":"Go","href":"https://example.test/a","dom_path_fingerprint":"a:0","backend_node_id":123}),
     ];
     let r = controlla_runtime::reference_reacquire::reacquire_reference(&id, &doc, &items).unwrap();
     assert_eq!(r.confidence, IdentityConfidence::High);
@@ -31,8 +33,17 @@ fn lost_cdp_object_reacquires_with_high_confidence() {
 
 #[test]
 fn reordered_duplicates_do_not_alias() {
-    let id = SemanticIdentity {
+    let doc = SemanticDocumentKey {
         frame_id: "f".into(),
+        loader_id: "l".into(),
+        url: "https://example.test".into(),
+        frame_revision: None,
+        document_revision: None,
+    };
+    let id = SemanticIdentity {
+        document: doc.clone(),
+        frame_id: "f".into(),
+        frame_revision: String::new(),
         backend_node_id: None,
         role: "link".into(),
         name: "Item".into(),
@@ -41,18 +52,43 @@ fn reordered_duplicates_do_not_alias() {
         rect_bucket: None,
         ancestor_id: None,
     };
-    let doc = SemanticDocumentKey {
-        frame_id: "f".into(),
-        loader_id: "l".into(),
-        url: "https://example.test".into(),
-        frame_revision: None,
-        document_revision: None,
-    };
     let items = vec![
-        json!({"reference":"@c1","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
-        json!({"reference":"@c2","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:0"}),
+        json!({"reference":"@c1","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
+        json!({"reference":"@c2","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:0"}),
     ];
     // High confidence still finds the correct fingerprint, not ordinal
     let r = controlla_runtime::reference_reacquire::reacquire_reference(&id, &doc, &items).unwrap();
     assert_eq!(r.reference, "@c2");
+}
+
+#[test]
+fn child_frame_navigation_invalidates_semantic_reacquisition() {
+    let doc = SemanticDocumentKey {
+        frame_id: "root".into(),
+        loader_id: "root-loader".into(),
+        url: "https://example.test".into(),
+        frame_revision: None,
+        document_revision: None,
+    };
+    let identity = SemanticIdentity {
+        document: doc.clone(),
+        frame_id: "main/iframe[1]".into(),
+        frame_revision: "1000".into(),
+        backend_node_id: None,
+        role: "link".into(),
+        name: "Continue".into(),
+        href: None,
+        dom_path_fingerprint: "a:0".into(),
+        rect_bucket: None,
+        ancestor_id: None,
+    };
+    let reloaded_frame = json!({"reference":"@c2","source_frame":"main/iframe[1]","source_frame_revision":"2000","role":"link","name":"Continue","href":null,"dom_path_fingerprint":"a:0"});
+    assert!(
+        controlla_runtime::reference_reacquire::reacquire_reference(
+            &identity,
+            &doc,
+            &[reloaded_frame]
+        )
+        .is_err()
+    );
 }

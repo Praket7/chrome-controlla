@@ -42,6 +42,16 @@ fn fast_keys_have_zero_intentional_delay_and_human_keys_are_bounded() {
     assert!(fast.revalidate_every <= 16);
     let human = TypingPolicy::new(TypingMode::HumanKeys, Some(24)).unwrap();
     assert_eq!(human.delay_ms, 24);
+    assert_eq!(
+        TypingPolicy::new(TypingMode::HumanKeys, None)
+            .unwrap()
+            .delay_ms,
+        180
+    );
+    assert_eq!(
+        controlla_runtime::v3::human_typing_timeout_ms(280, 180),
+        74_400
+    );
     assert!(TypingPolicy::new(TypingMode::HumanKeys, Some(251)).is_err());
     assert_eq!(
         TypingPolicy::choose("hello", false, false).mode,

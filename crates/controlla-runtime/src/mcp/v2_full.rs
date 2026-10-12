@@ -661,6 +661,7 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
             max_text_chars: None,
             max_bytes: None,
             href_hint: None,
+            frame_id: None,
         },
     )
     .await
@@ -1156,6 +1157,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         max_text_chars: None,
                         max_bytes: None,
                         href_hint: None,
+                        frame_id: None,
                     },
                 )
                 .await?
@@ -1169,6 +1171,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         action: "navigate".to_owned(),
                         chrome_tab_id: Some(args.chrome_tab_id.clone()),
                         url,
+                        idempotency_key: None,
                     }))
                     .await?;
                 app.core
@@ -1248,6 +1251,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         timeout_ms: None,
                     },
                     &reference,
+                    false,
                     "fill",
                 )
                 .await?
@@ -1311,6 +1315,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         timeout_ms: None,
                     },
                     &reference,
+                    false,
                     "select",
                 )
                 .await?
@@ -1439,6 +1444,7 @@ async fn current_skill_context(
             max_text_chars: Some(6_000),
             max_bytes: Some(100_000),
             href_hint: None,
+            frame_id: None,
         },
     )
     .await?;

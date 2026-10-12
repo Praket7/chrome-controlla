@@ -19,6 +19,7 @@ thiserror = "=2.0.20"
 rmcp = { version = "=3.5.1", features = ["transport-io", "transport-streamable-http-server", "macros"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 schemars = "=1.2.2"
+url = "=2.5.8"
 futures-util = "=0.3.34"
 tokio-tungstenite = "=0.28.0"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "futures"] }

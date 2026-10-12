@@ -60,7 +60,7 @@ fn fixture_server() -> (String, thread::JoinHandle<()>, Arc<AtomicBool>) {
                         "/linked" => ("200 OK", "<html><head><title>Linked story metadata</title></head><body><main><article><a href='/article-older.html'>Bills look ahead to the weekend</a></article><article><a href='/article-newest.html'>Bills latest: injury report before Sunday</a></article></main></body></html>".to_owned()),
                         "/listed" => ("200 OK", r#"<html><head><title>Listed story metadata</title><script type="application/ld+json">{"@graph":[{"@type":"NewsArticle","url":"/article-older.html","datePublished":"2026-10-09T16:30:00Z"},{"@type":"NewsArticle","url":"/article-newest.html","datePublished":"2026-10-10T12:00:00Z"}]}</script></head><body><main><article><a href='/article-older.html'>Bills look ahead to the weekend</a></article><article><a href='/article-newest.html'>Bills latest: injury report before Sunday</a></article></main></body></html>"#.to_owned()),
                         "/nested" => ("200 OK", "<html><body><main><div id='shadow'></div><div id='masked' data-masked></div><iframe src='/frame'></iframe><iframe sandbox='allow-scripts' srcdoc='<a href=/opaque>Unread</a>'></iframe></main><script>let r=document.getElementById('shadow').attachShadow({mode:'open'});r.innerHTML='<article data-id=shadow-card><a href=/article-newest.html>Shadow story</a><time datetime=2026-10-10T12:00:00Z>Today</time></article>';document.getElementById('masked').attachShadow({mode:'open'}).innerHTML='<a href=/secret>Secret story</a>'</script></body></html>".to_owned()),
-                        "/frame" => ("200 OK", "<html><body><article data-id=frame-card><a href=/article-older.html>Frame story</a></article></body></html>".to_owned()),
+                        "/frame" => ("200 OK", "<html><body><p>SAME_ORIGIN_FRAME_SENTINEL</p><article data-id=frame-card><a href=/article-older.html>Frame story</a></article></body></html>".to_owned()),
                         "/article-newest.html" => ("200 OK", include_str!("../../../bench/fixtures/espn_bills_latest_story/article-newest.html").to_owned()),
                         "/article-older.html" => ("200 OK", include_str!("../../../bench/fixtures/espn_bills_latest_story/article-older.html").to_owned()),
                         _ => ("404 Not Found", "not found".to_owned()),
@@ -159,6 +159,13 @@ async fn nested_snapshot_reports_read_and_unread_sources() {
         "{snapshot}"
     );
     assert_eq!(snapshot["truncation_reason"], "cross_origin_frames_unread");
+    assert!(
+        snapshot["text"]
+            .as_str()
+            .unwrap()
+            .contains("SAME_ORIGIN_FRAME_SENTINEL"),
+        "same-origin frame text omitted despite complete reachable frame scan: {snapshot}"
+    );
     assert_eq!(snapshot["first_party_complete"], false);
     let scoped = client
         .call_tool(call(

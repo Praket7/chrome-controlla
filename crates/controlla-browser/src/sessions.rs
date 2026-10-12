@@ -115,12 +115,66 @@ const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SESSION_ARTIFACT_COUNT: usize = 16;
 const MAX_SESSION_ARTIFACT_BYTES: usize = 50 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ArtifactHandle(String);
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactScope {
+    PrivateHeadlessSession,
+    LocalUnrestrictedSharedSession,
+}
+
+impl ArtifactScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrivateHeadlessSession => "private_headless_session",
+            Self::LocalUnrestrictedSharedSession => "local_unrestricted_shared_session",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactHandle {
+    opaque: String,
+    scope: ArtifactScope,
+}
+
+impl Serialize for ArtifactHandle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{}@{}", self.opaque, self.scope.as_str()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let (opaque, scope) = match value.split_once('@') {
+            Some((opaque, "private_headless_session")) => {
+                (opaque, ArtifactScope::PrivateHeadlessSession)
+            }
+            Some((opaque, "local_unrestricted_shared_session")) => {
+                (opaque, ArtifactScope::LocalUnrestrictedSharedSession)
+            }
+            Some(_) => return Err(serde::de::Error::custom("unknown artifact scope")),
+            None => (value.as_str(), ArtifactScope::PrivateHeadlessSession),
+        };
+        let id = opaque
+            .strip_prefix("artifact_")
+            .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| serde::de::Error::custom("invalid artifact handle"))?;
+        let _ = id;
+        Ok(Self {
+            opaque: opaque.to_owned(),
+            scope,
+        })
+    }
+}
 
 impl ArtifactHandle {
     pub fn opaque_id(&self) -> &str {
-        &self.0
+        &self.opaque
+    }
+
+    pub fn scope(&self) -> ArtifactScope {
+        self.scope
     }
 }
 
@@ -129,6 +183,7 @@ pub struct ArtifactMetadata {
     pub handle: ArtifactHandle,
     pub filename: String,
     pub size: usize,
+    pub scope: ArtifactScope,
 }
 
 #[derive(Debug)]
@@ -394,6 +449,21 @@ impl SessionRegistry {
         filename: &str,
         bytes: &[u8],
     ) -> Result<ArtifactMetadata, SessionError> {
+        self.put_artifact_bytes_scoped(
+            session,
+            filename,
+            bytes,
+            ArtifactScope::PrivateHeadlessSession,
+        )
+    }
+
+    pub fn put_artifact_bytes_scoped(
+        &mut self,
+        session: &SessionHandle,
+        filename: &str,
+        bytes: &[u8],
+        scope: ArtifactScope,
+    ) -> Result<ArtifactMetadata, SessionError> {
         self.validate_clipboard_session(session)?;
         if !valid_artifact_filename(filename) {
             return Err(SessionError::ArtifactInvalidFilename);
@@ -448,11 +518,15 @@ impl SessionRegistry {
                 let _ = std::fs::remove_dir(&directory);
                 return Err(SessionError::ArtifactIo);
             }
-            let handle = ArtifactHandle(format!("artifact_{id}"));
+            let handle = ArtifactHandle {
+                opaque: format!("artifact_{id}"),
+                scope,
+            };
             let metadata = ArtifactMetadata {
                 handle: handle.clone(),
                 filename: filename.to_owned(),
                 size: bytes.len(),
+                scope,
             };
             self.artifacts
                 .entry(session.id.clone())
@@ -1227,6 +1301,28 @@ mod tests {
             .put_artifact_bytes(&alice, "payload.txt", b"hello")
             .unwrap();
         assert_eq!(artifact.size, 5);
+        assert_eq!(artifact.scope, ArtifactScope::PrivateHeadlessSession);
+        let local = registry
+            .put_artifact_bytes_scoped(
+                &alice,
+                "shared.txt",
+                b"local",
+                ArtifactScope::LocalUnrestrictedSharedSession,
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(&local.handle).unwrap();
+        assert!(encoded.ends_with("@local_unrestricted_shared_session\""));
+        let round_trip: ArtifactHandle = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round_trip, local.handle);
+        let wrong_scope: ArtifactHandle = serde_json::from_str(&encoded.replace(
+            "local_unrestricted_shared_session",
+            "private_headless_session",
+        ))
+        .unwrap();
+        assert_eq!(
+            registry.artifact_metadata(&alice, &wrong_scope),
+            Err(SessionError::ArtifactNotFound)
+        );
         assert_eq!(
             registry
                 .read_artifact_bytes(&alice, &artifact.handle)
@@ -1267,7 +1363,7 @@ mod tests {
             registry.put_artifact_bytes(&alice, "large", &vec![0; MAX_ARTIFACT_BYTES + 1]),
             Err(SessionError::ArtifactTooLarge)
         );
-        for index in 0..(MAX_SESSION_ARTIFACT_COUNT - 1) {
+        for index in 0..(MAX_SESSION_ARTIFACT_COUNT - 2) {
             registry
                 .put_artifact_bytes(&alice, &format!("extra-{index}"), b"x")
                 .unwrap();

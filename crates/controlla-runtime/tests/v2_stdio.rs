@@ -62,6 +62,25 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         serde_json::to_value(&tool.input_schema).unwrap()
     };
     let browser = schema("browser");
+    let browser_description = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "browser")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap_or_default();
+    assert!(browser_description.contains("{\"kind\":\"research\""));
+    assert!(browser_description.contains("allow_password=true"));
+    assert!(
+        browser["properties"]["task"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("\"kind\":\"research\""))
+    );
+    assert!(
+        browser["properties"].get("file_path").is_some(),
+        "browser file staging exposes the local path fast path"
+    );
     for property in [
         "action",
         "mode",
@@ -75,6 +94,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "bytes",
         "artifact_handle",
         "client_id",
+        "idempotency_key",
         "steps",
     ] {
         assert!(
@@ -82,6 +102,22 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             "browser {property}"
         );
     }
+    assert!(
+        browser["properties"]["idempotency_key"]["description"]
+            .as_str()
+            .is_some_and(|value| value.contains("Required for action=open"))
+    );
+    assert_eq!(
+        browser["allOf"][0]["if"]["properties"]["action"]["const"], "open",
+        "schema makes the key conditional on open"
+    );
+    assert!(
+        browser["allOf"][0]["then"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|property| property == "idempotency_key")
+    );
     for task_kind in ["research", "form_draft", "upload", "download", "repeat"] {
         assert!(
             browser.to_string().contains(task_kind),
@@ -89,11 +125,35 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         );
     }
     let act = schema("act");
+    let snapshot_description = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "snapshot")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap_or_default();
+    let act_description = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "act")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap_or_default();
+    assert!(snapshot_description.contains("credential_input"));
+    assert!(snapshot_description.contains("raw_value=null"));
+    assert!(act_description.contains("allow_password=true"));
+    assert!(
+        act.to_string()
+            .contains("Optional exact absolute HTTP(S) destination")
+    );
     for property in [
         "action",
         "reference",
         "expected_value",
         "value",
+        "allow_password",
         "key",
         "typing_mode",
         "delay_ms",
@@ -103,7 +163,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     }
     let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
     for step in [
-        "snapshot", "find", "click", "fill", "type", "press", "extract", "verify",
+        "snapshot", "find", "click", "fill", "type", "press", "extract", "verify", "upload",
     ] {
         assert!(
             workflow_text.contains(step),
@@ -135,6 +195,24 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             .unwrap()
             .contains(&serde_json::json!("open"))
     );
+    let mut surface = tools
+        .tools
+        .iter()
+        .map(|tool| serde_json::to_value(tool).unwrap())
+        .collect::<Vec<_>>();
+    surface.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let expected_fingerprint = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(serde_json::to_vec(&surface).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(described["schema_sha256"], expected_fingerprint);
+    assert_eq!(
+        described["client_loaded_tool_state"],
+        "unverified_until_client_acknowledges_surface_fingerprint"
+    );
     assert!(
         !described["act_actions"]
             .as_array()
@@ -154,7 +232,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert!(
         invalid_cold_open
             .to_string()
-            .contains("URL must be HTTP(S)"),
+            .contains("absolute HTTP(S) URL without credentials"),
         "reject invalid navigation before pairing: {invalid_cold_open}"
     );
     let invalid_open_workflow = client
@@ -186,7 +264,19 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert_eq!(failed_workflow["status"], "failed");
     assert_eq!(failed_workflow["failed_step"], 0);
     assert_eq!(failed_workflow["receipts"][0]["status"], "failed");
-    let open = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/"});
+    let missing_open_key = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/"});
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("browser")
+                .with_arguments(missing_open_key.as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("retry-safe open requires a stable idempotency key");
+    assert!(
+        error.to_string().contains("requires idempotency_key"),
+        "{error}"
+    );
+    let open = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/","idempotency_key":"stdio-open-123456"});
     let error = client
         .call_tool(
             CallToolRequestParams::new("browser").with_arguments(open.as_object().unwrap().clone()),
@@ -199,7 +289,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             .contains("shared extension session has not been accepted"),
         "{error}"
     );
-    let background_open = serde_json::json!({"action":"open","mode":"background","session_id":session_id,"url":"https://example.test/"});
+    let background_open = serde_json::json!({"action":"open","mode":"background","session_id":session_id,"url":"https://example.test/","idempotency_key":"stdio-bg-open-123456"});
     let error = client
         .call_tool(
             CallToolRequestParams::new("browser")
@@ -325,6 +415,7 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
         .unwrap()
         .structured_content
         .unwrap();
+    assert!(registered["elapsed_ms"].as_u64().is_some(), "{registered}");
     let upload_handle = registered["artifact_handle"].as_str().unwrap();
     let uploaded = client
         .call_tool(call(
@@ -340,6 +431,7 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
     assert_eq!(uploaded["status"], "incomplete", "{uploaded}");
     assert_eq!(uploaded["receipts"][0]["status"], "selected", "{uploaded}");
     assert_eq!(uploaded["receipts"][0]["filename"], "upload.txt");
+    assert!(uploaded["elapsed_ms"].as_u64().is_some(), "{uploaded}");
     let released = client
         .call_tool(call(
             "browser",

@@ -87,6 +87,18 @@ fn main() {
     } else {
         None
     };
+    let doctor_client = if command == "doctor" && args.peek().is_some_and(|arg| arg == "--client") {
+        args.next();
+        let Some(client) = args.next() else {
+            invalid("doctor --client requires a client name");
+        };
+        if client != "codex" {
+            invalid("doctor --client currently supports codex");
+        }
+        Some(client)
+    } else {
+        None
+    };
     if args.next().is_some() {
         invalid("unexpected argument");
     }
@@ -119,7 +131,11 @@ fn main() {
                         .map(|home| PathBuf::from(home).join(".chrome-controlla"))
                 })
                 .unwrap_or_else(|| PathBuf::from(".chrome-controlla"));
-            let report = controlla_runtime::doctor::report(&state, env!("CARGO_PKG_VERSION"));
+            let report = controlla_runtime::doctor::report_for_client(
+                &state,
+                env!("CARGO_PKG_VERSION"),
+                doctor_client.as_deref(),
+            );
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         _ => unreachable!("validated command"),

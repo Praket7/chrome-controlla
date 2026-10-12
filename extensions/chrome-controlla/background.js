@@ -5,9 +5,11 @@ const RECONNECT_MAX_MS = 60000;
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
 const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
+const OPEN_RECEIPTS_KEY = "openReceipts";
+// shortcut: receipts never expire; storage exhaustion fails closed before navigation to preserve retry safety.
 const MAX_BATCH_ACTIONS = 64;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-  "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.setFileInputFiles", "Accessibility.getPartialAXTree"]);
+  "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
 let nativePort;
 let nativeReady = false;
 let nativeError;
@@ -36,6 +38,164 @@ let nativePortGeneration = 0;
 let nativeMutation = Promise.resolve();
 const pendingTabDetaches = new Map();
 const tabPairReservations = new Map();
+const fileChooserEvents = new Map();
+const fileChooserWaiters = new Map();
+const fileChooserOperations = new Map();
+let fileChooserEventSequence = 0;
+const frameSessions = new Map();
+const frameSessionWaiters = new Map();
+const openTabInflight = new Map();
+let openTabQueue = Promise.resolve();
+let activationEpoch = 0;
+let focusEpoch = 0;
+chrome.tabs.onActivated.addListener(() => { activationEpoch++; });
+chrome.windows.onFocusChanged.addListener(() => { focusEpoch++; });
+function recordFrameSession(tabId, frameId, sessionId) {
+  let frames = frameSessions.get(tabId);
+  if (!frames) { frames = new Map(); frameSessions.set(tabId, frames); }
+  frames.set(frameId, sessionId);
+  const waiter = frameSessionWaiters.get(`${tabId}:${frameId}`);
+  if (waiter) { clearTimeout(waiter.timer); frameSessionWaiters.delete(`${tabId}:${frameId}`); waiter.resolve(sessionId); }
+}
+function isExactHttpUrl(value) {
+  if (typeof value !== "string" || !value || value.length > 2048 || /\s/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && !!url.hostname && !url.username && !url.password;
+  } catch { return false; }
+}
+function waitForFrameSession(tabId, frameId, timeoutMs) {
+  const existing = frameSessions.get(tabId)?.get(frameId);
+  if (existing) return Promise.resolve(existing);
+  const key = `${tabId}:${frameId}`;
+  if (frameSessionWaiters.has(key)) return frameSessionWaiters.get(key).promise;
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  const waiter = { promise, resolve, timer: setTimeout(() => { frameSessionWaiters.delete(key); resolve(undefined); }, timeoutMs) };
+  frameSessionWaiters.set(key, waiter);
+  return promise;
+}
+function clearFrameSessions(tabId) {
+  frameSessions.delete(tabId);
+  for (const [key, waiter] of frameSessionWaiters) if (key.startsWith(`${tabId}:`)) { clearTimeout(waiter.timer); frameSessionWaiters.delete(key); waiter.resolve(undefined); }
+}
+
+function clearFileChooserState(tabId, error = "Target detached before the file chooser opened.") {
+  fileChooserEvents.delete(tabId);
+  const waiter = fileChooserWaiters.get(tabId);
+  if (waiter) { clearTimeout(waiter.timer); fileChooserWaiters.delete(tabId); waiter.reject(new Error(error)); }
+}
+function waitForFileChooser(tabId, documentId, timeoutMs, afterSequence = 0) {
+  const queued = fileChooserEvents.get(tabId) || [];
+  const index = queued.findIndex(event => event.root_document_id === documentId && event.sequence > afterSequence);
+  if (index >= 0) { const [event] = queued.splice(index, 1); return Promise.resolve(event); }
+  if (fileChooserWaiters.has(tabId)) return Promise.reject(new Error("A file chooser wait is already active for this tab."));
+  return new Promise((resolve, reject) => {
+    const waiter = { documentId, afterSequence, resolve, reject, timer: setTimeout(() => {
+      if (fileChooserWaiters.get(tabId) === waiter) fileChooserWaiters.delete(tabId);
+      reject(new Error("No file chooser opened before the bounded wait expired."));
+    }, timeoutMs) };
+    fileChooserWaiters.set(tabId, waiter);
+  });
+}
+async function frameActionablePoint(route, objectId) {
+  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function __controllaFrameActionable(){const e=this,r=e.getBoundingClientRect(),v=e.ownerDocument.defaultView;if(!e.isConnected||!r.width||!r.height||r.left<0||r.top<0||r.right>v.innerWidth||r.bottom>v.innerHeight)return false;for(let n=e;n;n=n.parentElement){const s=v.getComputedStyle(n);if(n.disabled||n.getAttribute('aria-disabled')==='true'||n.hasAttribute('inert')||n.hasAttribute('hidden')||s.display==='none'||s.visibility!=='visible'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0)return false}const x=r.left+r.width/2,y=r.top+r.height/2,root=e.getRootNode(),h=(root.elementFromPoint?.(x,y)||e.ownerDocument.elementFromPoint(x,y));return !!h&&(h===e||e.contains(h))?{x,y}:false}", returnByValue: true });
+  const point = result.result?.value;
+  if (!(point?.x >= 0) || !(point?.y >= 0)) throw new Error("Frame control is disabled, outside the viewport, or obscured.");
+  return point;
+}
+async function rootPointForFrame(tabId, frameId, objectId, x, y) {
+  const root = { tabId }, tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+  const path = (node, ancestors = []) => node?.frame?.id === frameId ? ancestors : (node?.childFrames || []).map(child => path(child, [...ancestors, child.frame.id])).find(Boolean);
+  const frames = path(tree.frameTree);
+  if (!frames?.length || frames.length > 8) throw new Error("Same-process frame ancestry is unavailable or too deep.");
+  let viewport = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+  viewport = viewport.result?.value;
+  for (const childFrameId of frames.reverse()) {
+    const owner = await chrome.debugger.sendCommand(root, "DOM.getFrameOwner", { frameId: childFrameId });
+    const box = await chrome.debugger.sendCommand(root, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId });
+    const q = box.model?.content;
+    if (!Array.isArray(q) || q.length !== 8 || !(viewport?.width > 0) || !(viewport?.height > 0)) throw new Error("Same-process frame geometry is unavailable.");
+    const u = x / viewport.width, v = y / viewport.height;
+    x = q[0] + u * (q[2] - q[0]) + v * (q[6] - q[0]);
+    y = q[1] + u * (q[3] - q[1]) + v * (q[7] - q[1]);
+    const parent = await chrome.debugger.sendCommand(root, "DOM.resolveNode", { backendNodeId: owner.backendNodeId });
+    if (!parent.object?.objectId) throw new Error("Same-process frame owner could not be resolved.");
+    const size = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId: parent.object.objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+    viewport = size.result?.value;
+  }
+  return { x, y };
+}
+function fileInputNodes(node, found = []) {
+  if (!node || typeof node !== "object") return found;
+  if (node.nodeName === "INPUT") {
+    const attributes = node.attributes || [];
+    for (let index = 0; index < attributes.length; index += 2) {
+      if (String(attributes[index]).toLowerCase() === "type" && String(attributes[index + 1]).toLowerCase() === "file" && Number.isSafeInteger(node.backendNodeId)) {
+        found.push(node.backendNodeId);
+        break;
+      }
+    }
+  }
+  for (const child of [...(node.children || []), ...(node.shadowRoots || []), ...(node.contentDocument ? [node.contentDocument] : [])]) fileInputNodes(child, found);
+  return found;
+}
+async function fileInputsInFrames(tabId, frameTree) {
+  const root = frameTree?.frame;
+  if (!root?.id || !root.loaderId) throw new Error("Main document frame identity is unavailable for file-input discovery.");
+  const frames = [];
+  const visit = node => { for (const child of node?.childFrames || []) { if (child.frame?.id && child.frame.loaderId) frames.push(child.frame); visit(child); } };
+  visit(frameTree);
+  if (frames.length > 128) throw new Error("Too many frames for bounded file-input discovery.");
+  await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+  try {
+    const sessions = await Promise.all(frames.map(async child => [child, frameSessions.get(tabId)?.get(child.id) || await waitForFrameSession(tabId, child.id, 400)]));
+    const routes = [{ frameId: root.id, loaderId: root.loaderId, target: { tabId } }, ...sessions.filter(([, sessionId]) => sessionId).map(([child, sessionId]) => ({ frameId: child.id, loaderId: child.loaderId, target: { tabId, sessionId } }))];
+    const inputs = [];
+    const documents = await Promise.all(routes.map(route => chrome.debugger.sendCommand(route.target, "DOM.getDocument", { depth: -1, pierce: true })));
+    for (let index = 0; index < routes.length; index++) {
+      const route = routes[index];
+      inputs.push(...fileInputNodes(documents[index].root).map(backendNodeId => ({ frame_id: route.frameId, frame_loader_id: route.loaderId, backend_node_id: backendNodeId })));
+      if (inputs.length > 256) throw new Error("Too many file inputs for bounded upload discovery.");
+    }
+    return inputs;
+  } finally {
+    await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+  }
+}
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (Number.isSafeInteger(source?.tabId)) {
+    const tabId = source.tabId;
+    captureUploadNetworkEvent(tabId, source, method, params || {});
+    if (method === "Target.attachedToTarget" && params?.targetInfo?.type === "iframe" && typeof params.sessionId === "string") {
+      recordFrameSession(tabId, params.targetInfo.targetId, params.sessionId);
+      void chrome.debugger.sendCommand({ tabId, sessionId: params.sessionId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] }).catch(() => {});
+    } else if (method === "Page.frameNavigated" && typeof source.sessionId === "string" && typeof params?.frame?.id === "string") {
+      recordFrameSession(tabId, params.frame.id, source.sessionId);
+    } else if (method === "Target.detachedFromTarget") {
+      const frames = frameSessions.get(tabId);
+      if (frames) for (const [frameId, sessionId] of frames) if (sessionId === params?.sessionId) frames.delete(frameId);
+    }
+  }
+  if (method !== "Page.fileChooserOpened" || !Number.isSafeInteger(source?.tabId)) return;
+  const tabId = source.tabId, documentId = pairedTabDocumentIds.get(tabId);
+  if (!documentId || !(nativeAttachedTabs.has(tabId) || manualAttachedTabs.has(tabId))) return;
+  const backendNodeId = params?.backendNodeId, frameId = params?.frameId;
+  if (!Number.isSafeInteger(backendNodeId) || typeof frameId !== "string") return;
+  const sequence = ++fileChooserEventSequence;
+  const operation = fileChooserOperations.get(tabId);
+  if (operation && (!operation.pressing || operation.frameId !== frameId)) operation.conflicted = true;
+  void chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {}).then(tree => {
+    const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
+    const frame = find(tree.frameTree);
+    if (!frame?.loaderId || pairedTabDocumentIds.get(tabId) !== documentId) return;
+    const event = { backend_node_id: backendNodeId, frame_id: frameId, frame_loader_id: frame.loaderId, mode: params?.mode, document_id: documentId, root_document_id: documentId, sequence };
+    const waiter = fileChooserWaiters.get(tabId);
+    if (waiter && waiter.documentId === documentId && sequence > waiter.afterSequence) { clearTimeout(waiter.timer); fileChooserWaiters.delete(tabId); waiter.resolve(event); return; }
+    const queued = fileChooserEvents.get(tabId) || [];
+    queued.push(event); if (queued.length > 2) queued.shift(); fileChooserEvents.set(tabId, queued);
+  }).catch(() => {});
+});
 
 function reservePairingTabs(tabIds) {
   if (tabIds.some(tabId => tabPairReservations.has(tabId))) throw new Error("A requested tab is already being paired.");
@@ -170,6 +330,55 @@ async function dispatchBatch(request, isAuthorized, respond, nativeRoute = false
   }
   respond({ type: "batch_result", id: request.id, result: { receipts, completed: actions.length, stopped_before: null, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt } });
 }
+function boundedUploadNetworkUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)(google\.com|googleapis\.com|googleusercontent\.com)$/.test(url.hostname)) return null;
+    return { host: url.hostname, path: url.pathname.replace(/[A-Za-z0-9_-]{24,}/g, "<redacted>").slice(0, 160) };
+  } catch { return null; }
+}
+function captureUploadNetworkEvent(tabId, source, method, params) {
+  const operation = fileChooserOperations.get(tabId);
+  if (!operation || operation.networkSessionId !== (source.sessionId || null) || !method.startsWith("Network.")) return;
+  let request;
+  if (method === "Network.requestWillBeSent") {
+    if (!(params.type === "XHR" || params.type === "Fetch")) return;
+    const url = boundedUploadNetworkUrl(params.request?.url);
+    if (!url || !params.request?.method) return;
+    request = { ...url, method: params.request.method, type: params.type };
+    operation.networkRequests.set(params.requestId, request);
+  } else if (method === "Network.responseReceived") {
+    request = operation.networkRequests.get(params.requestId);
+    if (!request || !(params.type === "XHR" || params.type === "Fetch")) return;
+    operation.networkEvents.push({ ...request, status: params.response?.status, status_text: params.response?.statusText, mime_type: params.response?.mimeType });
+  } else if (method === "Network.loadingFailed") {
+    request = operation.networkRequests.get(params.requestId);
+    if (!request) return;
+    operation.networkEvents.push({ ...request, error: params.errorText, blocked_reason: params.blockedReason, cors_error: params.corsErrorStatus?.corsError });
+  } else return;
+  if (operation.networkEvents.length > 24) operation.networkEvents.shift();
+  operation.networkChanged?.(operation.networkEvents.at(-1));
+}
+function waitForUploadNetwork(operation, maxWaitMs = 10000) {
+  return new Promise(resolve => {
+    const started = Date.now();
+    let quietTimer;
+    const finish = () => {
+      clearTimeout(maxTimer);
+      clearTimeout(quietTimer);
+      operation.networkChanged = undefined;
+      resolve(Date.now() - started);
+    };
+    const maxTimer = setTimeout(finish, maxWaitMs);
+    operation.networkChanged = event => {
+      if (event?.status != null || event?.error) return finish();
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(finish, 1200);
+    };
+    if (operation.networkEvents.some(event => event.status != null || event.error)) finish();
+    else quietTimer = setTimeout(finish, operation.networkRequests.size ? 1200 : 2500);
+  });
+}
 async function dispatchCommand(request, isAuthorized, respond, nativeMessage = false) {
   const tabId = Number(request.target_id); const startedAt = Date.now();
   if (nativeMessage && nativeUnrestricted && !nativeAttachedTabs.has(tabId)) { try { await attachUnrestrictedNativeTab(tabId); } catch (error) { respond({ type: "result", id: request.id, error: String(error) }); return; } }
@@ -185,15 +394,229 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId) { respond({ type: "result", id: request.id, error: "Target document identity changed; rediscover and pair again." }); return; }
     if (!frame?.documentId || frame.documentId !== expectedDocumentId) { await detachPairedTab(tabId); respond({ type: "result", id: request.id, error: "Target document identity changed; pair the tab again." }); return; }
     if (request.method === "Controlla.openTab") {
-      const url = validateNavigationUrl(request.params?.url); const native = nativeRoute; const tab = await chrome.tabs.create({ url: "about:blank", active: true }); let identity; let attachedIdentity;
-      try { attachedIdentity = await attachNewTab(tab.id, url, native, routeGeneration); identity = await nativePageIdentity(tab.id); }
-      catch (error) {
-        if (attachedIdentity && routeGeneration === (native ? nativeGeneration : manualGeneration) && pairedTabDocumentIds.get(tab.id) === attachedIdentity.document_id && (native ? nativeAttachedTabs : manualAttachedTabs).has(tab.id)) { pairedTabUrls.delete(tab.id); pairedTabDocumentIds.delete(tab.id); (native ? nativeAttachedTabs : manualAttachedTabs).delete(tab.id); await detachDebugger(tab.id); }
-        throw new Error("Tab " + tab.id + " remains open after the failed open; rediscover and pair it before use. " + String(error));
-      }
-      respond({ type: "result", id: request.id, result: { tab_id: String(tab.id), ...identity } }); return;
+      const url = validateNavigationUrl(request.params?.url); const native = nativeRoute;
+      const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration);
+      respond({ type: "result", id: request.id, result }); return;
     }
     if (request.method === "Controlla.navigate") { const url = validateNavigationUrl(request.params?.url); await navigatePairedTab(tabId, url, nativeRoute, routeGeneration); respond({ type: "result", id: request.id, result: { tab_id: String(tabId), ...(await nativePageIdentity(tabId)) } }); return; }
+    if (request.method === "Controlla.presentationState") {
+      const tab = await chrome.tabs.get(tabId);
+      const win = await chrome.windows.get(tab.windowId);
+      respond({ type: "result", id: request.id, result: { tab_active: !!tab.active, window_focused: !!win.focused, window_id: tab.windowId, activation_epoch: activationEpoch, focus_epoch: focusEpoch } }); return;
+    }
+    if (request.method === "Page.setInterceptFileChooserDialog" && request.params?.enabled === true) clearFileChooserState(tabId);
+    if (request.method === "Controlla.waitForFileChooser") {
+      const timeout = request.params?.timeout_ms;
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 15000) throw new Error("File chooser timeout_ms must be 1..15000.");
+      const event = await waitForFileChooser(tabId, expectedDocumentId, timeout);
+      if (!routeActive(nativeRoute, routeGeneration) || pairedTabDocumentIds.get(tabId) !== event.document_id) throw new Error("File chooser belongs to a stale tab document.");
+      respond({ type: "result", id: request.id, result: event }); return;
+    }
+    if (request.method === "Controlla.checkIdentityMarker") {
+      const { selector, expected } = request.params || {};
+      if (typeof selector !== "string" || !selector || selector.length > 512 || typeof expected !== "string" || !expected || expected.length > 512) throw new Error("Identity marker requires bounded selector and expected text.");
+      const direct = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: `(()=>{const norm=s=>String(s||'').replace(/\\s+/g,' ').trim(),visible=[];for(const e of document.querySelectorAll(${JSON.stringify(selector)})){if(!e.isConnected||e.getClientRects().length===0||e.getAttribute('aria-selected')==='true'||e.getAttribute('aria-checked')==='true'||e.closest('[role="menu"],[role="listbox"],[role="option"],[role="menuitem"],[role="dialog"],[aria-modal="true"]'))continue;let shown=true;for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||n.hasAttribute('hidden')||n.hasAttribute('inert')){shown=false;break}}if(shown)visible.push(e);if(visible.length===2)break}const e=visible[0];const labelled=(e?.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.innerText||'').join(' ').trim();const name=labelled||e?.getAttribute('aria-label')||e?.innerText||e?.getAttribute('alt')||Array.from(e?.labels||[]).map(label=>label.innerText).join(' ')||e?.getAttribute('title')||e?.getAttribute('content')||'';return visible.length===1&&norm(name)===norm(${JSON.stringify(expected)})})()`, returnByValue: true });
+      if (direct.result?.value === true) {
+        const currentFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
+        if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || currentFrame?.documentId !== expectedDocumentId) throw new Error("Identity marker document changed during the root DOM check.");
+        respond({ type: "result", id: request.id, result: { matches: true, match_count: 1, route: "root_dom" } }); return;
+      }
+      respond({ type: "result", id: request.id, result: { matches: false, match_count: 0, route: "none" } });
+      return;
+    }
+    if (request.method === "Controlla.fileInputSnapshot") {
+      const tree = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const inputs = await fileInputsInFrames(tabId, tree.frameTree);
+      const current = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || current.frameTree?.frame?.id !== tree.frameTree?.frame?.id || current.frameTree?.frame?.loaderId !== tree.frameTree?.frame?.loaderId) throw new Error("Upload target document changed during file-input baseline discovery.");
+      respond({ type: "result", id: request.id, result: { inputs, document_id: expectedDocumentId } }); return;
+    }
+    if (request.method === "Controlla.findFileInput") {
+      const baseline = request.params?.baseline;
+      if (!Array.isArray(baseline) || baseline.length > 256 || baseline.some(item => typeof item?.frame_id !== "string" || typeof item?.frame_loader_id !== "string" || !Number.isSafeInteger(item?.backend_node_id))) throw new Error("Lazy-input fallback requires a bounded pre-trigger file-input baseline.");
+      const tree = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const all = await fileInputsInFrames(tabId, tree.frameTree);
+      const existed = new Set(baseline.map(item => `${item.frame_id}:${item.frame_loader_id}:${item.backend_node_id}`));
+      const candidates = all.filter(item => !existed.has(`${item.frame_id}:${item.frame_loader_id}:${item.backend_node_id}`));
+      if (candidates.length === 0) throw new Error("No new file input appeared after the upload trigger.");
+      if (candidates.length !== 1) throw new Error("Multiple new file inputs appeared after the upload trigger; refusing ambiguous selection.");
+      const selected = candidates[0];
+      const current = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const currentFrame = (() => { const find = node => node?.frame?.id === selected.frame_id ? node.frame : (node?.childFrames || []).map(find).find(Boolean); return find(current.frameTree); })();
+      if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || current.frameTree?.frame?.id !== tree.frameTree?.frame?.id || current.frameTree?.frame?.loaderId !== tree.frameTree?.frame?.loaderId || currentFrame?.loaderId !== selected.frame_loader_id) throw new Error("Upload target document changed during lazy file-input discovery.");
+      respond({ type: "result", id: request.id, result: { ...selected, document_id: expectedDocumentId } }); return;
+    }
+    if (request.method === "Controlla.setFrameFileInputFiles") {
+      if (!nativeRoute || !nativeUnrestricted) throw new Error("File selection requires local unrestricted mode.");
+      const { frame_id: frameId, frame_loader_id: loaderId, backend_node_id: backendNodeId, file_path: filePath } = request.params || {};
+      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload target or local path is invalid.");
+      const readTree = () => chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
+      if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated after the chooser opened.");
+      const childSessionId = frameSessions.get(tabId)?.get(frameId);
+      const route = childSessionId ? { tabId, sessionId: childSessionId } : { tabId };
+      await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: [filePath], backendNodeId });
+      const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId });
+      const objectId = resolved.object?.objectId;
+      if (!objectId) throw new Error("Chooser input could not be resolved for file readback.");
+      const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
+      if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated during file selection.");
+      respond({ type: "result", id: request.id, result: { frame_id: frameId, frame_loader_id: loaderId, files: readback.result?.value } }); return;
+    }
+    if (request.method === "Controlla.frameSelectFile") {
+      if (!nativeRoute || !nativeUnrestricted) throw new Error("File selection requires local unrestricted mode.");
+      const { frame_id: frameId, frame_loader_id: loaderId, trigger_backend_node_id: triggerId, file_path: filePath } = request.params || {};
+      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(triggerId) || triggerId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload trigger or local path is invalid.");
+      const root = { tabId };
+      const readFrame = async () => {
+        const tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+        const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
+        return find(tree.frameTree);
+      };
+      if ((await readFrame())?.loaderId !== loaderId) throw new Error("Upload frame changed before selection.");
+      if (fileChooserOperations.has(tabId) || fileChooserWaiters.has(tabId)) throw new Error("Another file chooser operation is active for this tab.");
+      const operation = { frameId, pressing: false, conflicted: false, networkRequests: new Map(), networkEvents: [] };
+      fileChooserOperations.set(tabId, operation);
+      let route, interceptionEnabled = false, networkEnabled = false, pressAttempted = false, dispatched = false, selectionResult;
+      try {
+        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+        const sessionId = frameSessions.get(tabId)?.get(frameId) || await waitForFrameSession(tabId, frameId, 400);
+        route = sessionId ? { tabId, sessionId } : root;
+        operation.networkSessionId = sessionId || null;
+        await chrome.debugger.sendCommand(route, "Network.enable", {});
+        networkEnabled = true;
+        const ax = await chrome.debugger.sendCommand(route, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const trigger = ax.nodes?.find(node => node.backendDOMNodeId === triggerId);
+        if (!trigger || !["button", "link", "option", "menuitem"].includes(trigger.role?.value)) throw new Error("Frame upload trigger is stale or is not actionable.");
+        const resolvedTrigger = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: triggerId });
+        if (!resolvedTrigger.object?.objectId) throw new Error("Frame upload trigger could not be resolved.");
+        const localPoint = await frameActionablePoint(route, resolvedTrigger.object.objectId);
+        const box = await chrome.debugger.sendCommand(route, "DOM.getBoxModel", { backendNodeId: triggerId });
+        const quad = box.model?.content;
+        if (!Array.isArray(quad) || quad.length !== 8 || (await readFrame())?.loaderId !== loaderId) throw new Error("Frame upload trigger changed before dispatch.");
+        clearFileChooserState(tabId);
+        await chrome.debugger.sendCommand(route, "Page.enable", {});
+        await chrome.debugger.sendCommand(route, "Page.setInterceptFileChooserDialog", { enabled: true });
+        interceptionEnabled = true;
+        let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+        if (!sessionId) ({ x, y } = await rootPointForFrame(tabId, frameId, resolvedTrigger.object.objectId, localPoint.x, localPoint.y));
+        if ((await readFrame())?.loaderId !== loaderId) throw new Error("Upload frame changed before dispatch.");
+        if (operation.conflicted) throw new Error("Another file chooser opened before the upload trigger was pressed.");
+        // shortcut: CDP does not identify a chooser's initiating click; add causal page instrumentation if same-frame human interaction must be distinguished during dispatch.
+        operation.eventCursor = fileChooserEventSequence;
+        operation.pressing = true;
+        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+        pressAttempted = true;
+        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+        dispatched = true;
+        const chooser = await waitForFileChooser(tabId, expectedDocumentId, 4000, operation.eventCursor);
+        if (operation.conflicted || chooser.frame_id !== frameId || chooser.frame_loader_id !== loaderId || (await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("File chooser belongs to another frame, document, or overlapping operation.");
+        await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: [filePath], backendNodeId: chooser.backend_node_id });
+        const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: chooser.backend_node_id });
+        if (!resolved.object?.objectId) throw new Error("Chooser input could not be resolved for file readback.");
+        const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
+        if ((await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("Upload frame or root document changed during file selection.");
+        if (!Array.isArray(readback.result?.value) || readback.result.value.length !== 1 || !readback.result.value[0]?.name) throw new Error("File input did not retain one selected file for readback.");
+        selectionResult = { status: "selected", files: readback.result?.value, frame_id: frameId, frame_loader_id: loaderId, document_id: expectedDocumentId, dispatch_acknowledged: true };
+      } catch (error) {
+        selectionResult = { status: pressAttempted ? "unknown" : "not_dispatched", dispatch_acknowledged: dispatched, reason: String(error) };
+      } finally {
+        if (networkEnabled && selectionResult?.reason?.includes("File input did not retain")) {
+          selectionResult.network_observation_window_ms = await waitForUploadNetwork(operation);
+        }
+        if (networkEnabled) await chrome.debugger.sendCommand(route, "Network.disable", {}).catch(() => {});
+        if (selectionResult) selectionResult.network_events = operation.networkEvents;
+        if (fileChooserOperations.get(tabId) === operation) fileChooserOperations.delete(tabId);
+        if (interceptionEnabled) await chrome.debugger.sendCommand(route, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      }
+      respond({ type: "result", id: request.id, result: selectionResult });
+      return;
+    }
+    if (request.method === "Controlla.frameClick") {
+      const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
+      if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0) throw new Error("frame click requires bounded frame, loader, and backend node identities.");
+      const outcome = request.params?.outcome, timeoutMs = request.params?.timeout_ms;
+      if (!outcome || !["navigation", "focused", "visible", "text", "expanded", "selected"].includes(outcome.kind) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 250 || timeoutMs > 10000) throw new Error("frame click requires a supported postcondition and a 250..10000ms timeout.");
+      if (["visible", "text"].includes(outcome.kind) && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512) || outcome.kind === "text" && (typeof outcome.text !== "string" || outcome.text.length > 512) || outcome.kind === "navigation" && outcome.url != null && !isExactHttpUrl(outcome.url) || ["expanded", "selected"].includes(outcome.kind) && outcome.selector != null && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512)) throw new Error("frame click postcondition is invalid or exceeds its bound.");
+      const route = { tabId };
+      const frameLoader = async () => {
+        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
+        return visit(tree.frameTree);
+      };
+      const frameUrl = async () => {
+        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const visit = node => node?.frame?.id === frameId ? node.frame.url : (node?.childFrames || []).map(visit).find(Boolean);
+        return visit(tree.frameTree);
+      };
+      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      try {
+        if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
+        let sessionId = frameSessions.get(tabId)?.get(frameId);
+        if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
+        const child = sessionId ? { tabId, sessionId } : route;
+        const beforeUrl = await frameUrl();
+        const ax = await chrome.debugger.sendCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const node = ax.nodes?.find(item => item.backendDOMNodeId === backendNodeId);
+        if (!node || !["button", "link", "checkbox", "radio", "option", "menuitem", "tab", "switch"].includes(node.role?.value)) throw new Error("Frame control is stale or is not an actionable control.");
+        const box = await chrome.debugger.sendCommand(child, "DOM.getBoxModel", { backendNodeId });
+        const quad = box.model?.content;
+        if (!Array.isArray(quad) || quad.length !== 8 || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
+        const resolved = await chrome.debugger.sendCommand(child, "DOM.resolveNode", { backendNodeId });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw new Error("Frame click target could not be resolved for outcome verification.");
+        const localPoint = await frameActionablePoint(child, objectId);
+        let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+        if (!sessionId) ({ x, y } = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y));
+        if (await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
+        let pressAttempted = false;
+        try {
+          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+          pressAttempted = true;
+          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+        } catch (error) {
+          respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: false, dispatch_may_have_occurred: pressAttempted, verified: false, reason: String(error) } });
+          return;
+        }
+        const verifyOutcome = async () => {
+          if (outcome.kind === "navigation") {
+            const currentUrl = await frameUrl();
+            return outcome.url == null ? currentUrl !== beforeUrl : new URL(currentUrl).href === new URL(outcome.url).href;
+          }
+          const result = await chrome.debugger.sendCommand(child, "Runtime.callFunctionOn", {
+            objectId,
+            functionDeclaration: "function __controllaFrameOutcome(outcome){const e=this;const q=s=>s==null?e:document.querySelector(s);switch(outcome.kind){case 'focused':return document.activeElement===e||e.contains(document.activeElement);case 'visible':{const n=q(outcome.selector);if(!n)return false;const s=getComputedStyle(n);return n.isConnected&&n.getClientRects().length>0&&s.display!=='none'&&s.visibility==='visible'&&Number.parseFloat(s.opacity||'1')>0}case 'text':{const n=q(outcome.selector);return !!n&&n.isConnected&&(n.innerText||n.textContent||'').includes(outcome.text)}case 'expanded':{const n=q(outcome.selector);return !!n&&(n.getAttribute('aria-expanded')==='true'||n.open===true)}case 'selected':{const n=q(outcome.selector);return !!n&&(n.getAttribute('aria-selected')==='true'||n.getAttribute('aria-checked')==='true'||n.checked===true||n.selected===true)}default:return false}}",
+            arguments: [{ value: outcome }], returnByValue: true,
+          });
+          return result.result?.value === true;
+        };
+        const deadline = Date.now() + timeoutMs;
+        let verified = false;
+        do { verified = await verifyOutcome().catch(() => false); if (verified || Date.now() >= deadline) break; await new Promise(resolve => setTimeout(resolve, 50)); } while (Date.now() < deadline);
+        respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified, reason: verified ? undefined : "requested frame click outcome was not observed before its deadline" } });
+      } finally {
+        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      }
+      return;
+    }
+    if (request.method === "Controlla.frameAccessibility") {
+      const frameId = request.params?.frame_id;
+      if (typeof frameId !== "string" || !frameId || frameId.length > 256) throw new Error("frame_id must be a bounded nonempty string.");
+      const route = { tabId };
+      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      try {
+        const sessionId = await waitForFrameSession(tabId, frameId, 1500);
+        if (!sessionId) throw new Error("No attached OOPIF session matched the requested frame.");
+        const result = await chrome.debugger.sendCommand({ tabId, sessionId }, "Accessibility.getFullAXTree", {});
+        respond({ type: "result", id: request.id, result: { ...result, source_frame_id: frameId, routing: "oopif_child_session" } });
+      } finally {
+        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      }
+      return;
+    }
     if (!SHARED_COMMAND_METHODS.has(request.method)) throw new Error("Command is outside the shared observe/input allowlist.");
     traceSharedCommand("dispatch", request, tabId, startedAt); const result = await chrome.debugger.sendCommand({ tabId }, request.method, request.params || {}); traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result" }); respond({ type: "result", id: request.id, result });
   } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error) }); }
@@ -205,11 +628,92 @@ async function waitForTabComplete(tabId) {
   await new Promise((resolve, reject) => { const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); reject(new Error("Tab navigation timed out.")); }, 30000); const listener = (updatedId, info) => { if (updatedId !== tabId || info.status !== "complete") return; clearTimeout(timer); chrome.tabs.onUpdated.removeListener(listener); resolve(); }; chrome.tabs.onUpdated.addListener(listener); });
 }
 function routeActive(native, generation) { return native ? nativeGeneration === generation && !!nativePort : manualGeneration === generation && !!socket && socket.readyState === WebSocket.OPEN; }
-async function attachNewTab(tabId, url, native, generation) {
-  await chrome.tabs.update(tabId, { url }); await waitForTabComplete(tabId); if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
+async function attachNewTab(tabId, url, native, generation, navigate = true) {
+  if (navigate) await chrome.tabs.update(tabId, { url });
+  else if ((await chrome.tabs.get(tabId)).url !== url) throw new Error("Recovery tab no longer matches the requested destination.");
+  await waitForTabComplete(tabId); if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
   const navigationGeneration = tabNavigationGenerations.get(tabId) || 0; const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!routeActive(native, generation) || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); (native ? nativeAttachedTabs : manualAttachedTabs).add(tabId); return attachedIdentity;
+}
+async function returnExistingOpen(receipt, url, native, generation) {
+  if ((receipt.requested_url || receipt.url) !== url) throw new Error("Idempotency key is already bound to a different URL.");
+  const tabId = Number(receipt.tab_id);
+  const identity = await nativePageIdentity(tabId).catch(() => undefined);
+  if (!identity || identity.url !== receipt.url || identity.document_id !== receipt.document_id) throw new Error(`Open receipt ${receipt.tab_id} is stale; its tab changed or closed, so no replacement tab was opened.`);
+  const attached = native ? nativeAttachedTabs : manualAttachedTabs;
+  if (!attached.has(tabId)) {
+    await attachDebugger(tabId);
+    const after = await nativePageIdentity(tabId).catch(() => undefined);
+    if (!routeActive(native, generation) || after?.url !== receipt.url || after?.document_id !== receipt.document_id) { await detachDebugger(tabId); throw new Error(`Open receipt ${receipt.tab_id} changed while reconnecting; no replacement tab was opened.`); }
+    pairedTabUrls.set(tabId, after.url); pairedTabDocumentIds.set(tabId, after.document_id); attached.add(tabId);
+  }
+  return { tab_id: receipt.tab_id, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true };
+}
+async function createControllaTab(url, native, generation, tab, markerUrl, reused = false) {
+  tab ||= await chrome.tabs.create({ url: markerUrl, active: true });
+  let identity, attachedIdentity;
+  try {
+    const current = await chrome.tabs.get(tab.id);
+    attachedIdentity = await attachNewTab(tab.id, url, native, generation, current.url !== url);
+    identity = await nativePageIdentity(tab.id);
+  }
+  catch (error) {
+    if (attachedIdentity && generation === (native ? nativeGeneration : manualGeneration) && pairedTabDocumentIds.get(tab.id) === attachedIdentity.document_id && (native ? nativeAttachedTabs : manualAttachedTabs).has(tab.id)) { pairedTabUrls.delete(tab.id); pairedTabDocumentIds.delete(tab.id); (native ? nativeAttachedTabs : manualAttachedTabs).delete(tab.id); await detachDebugger(tab.id); }
+    const failure = new Error("Tab " + tab.id + " remains open after the failed open; rediscover and pair it before use. " + String(error));
+    failure.controllaOrphanTabId = String(tab.id);
+    throw failure;
+  }
+  return { tab_id: String(tab.id), ...identity, idempotent_reuse: reused, created_by_controlla: true };
+}
+async function openControllaTab(url, clientKey, native, generation) {
+  if (clientKey === undefined) throw new Error("idempotency_key is required so an open retry cannot create another tab.");
+  if (typeof clientKey !== "string" || clientKey.length < 8 || clientKey.length > 256 || /[\u0000-\u001f\u007f]/.test(clientKey)) throw new Error("idempotency_key must be 8..256 bounded printable characters.");
+  const pending = openTabInflight.get(clientKey);
+  if (pending) {
+    if (pending.url !== url) throw new Error("Idempotency key is already bound to a different URL.");
+    return pending.promise;
+  }
+  const operation = openTabQueue.then(async () => {
+    const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+    const receipts = saved[OPEN_RECEIPTS_KEY] || (await chrome.storage.session.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {};
+    const markerUrl = `${chrome.runtime.getURL("open-recovery.html")}#${encodeURIComponent(clientKey)}`;
+    let receipt = receipts[clientKey];
+    if (receipt?.status === "failed") throw new Error(`Open attempt left Controlla-created tab ${receipt.tab_id} for recovery; rediscover and pair that tab before retrying.`);
+    if (receipt?.status === "complete" || receipt?.document_id) {
+      const result = await returnExistingOpen(receipt, url, native, generation);
+      receipts[clientKey] = { ...receipt, status: "complete", requested_url: receipt.requested_url || url };
+      await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+      return result;
+    }
+    let tab;
+    if (receipt?.tab_id) tab = await chrome.tabs.get(Number(receipt.tab_id)).catch(() => undefined);
+    if (!tab) tab = (await chrome.tabs.query({})).find(candidate => candidate.url === markerUrl);
+    if (receipt?.status === "creating" && !tab) throw new Error("Open attempt was interrupted and its recovery tab is no longer available; no duplicate tab was opened.");
+    if (tab && receipt?.url !== undefined && receipt.url !== url) throw new Error("Idempotency key is already bound to a different URL.");
+    if (tab && ![markerUrl, url].includes(tab.url)) throw new Error("Open recovery tab changed before completion; no replacement tab was opened.");
+    const reused = !!receipt || !!tab;
+    if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active: true });
+    receipt = { status: "creating", tab_id: String(tab.id), url, requested_url: url, marker_url: markerUrl, created_ms: receipt?.created_ms || Date.now() };
+    receipts[clientKey] = receipt;
+    await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    let result;
+    try { result = await createControllaTab(url, native, generation, tab, markerUrl, reused); }
+    catch (error) {
+      if (error?.controllaOrphanTabId) {
+        receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, url, created_ms: Date.now() };
+        await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+      }
+      throw error;
+    }
+    receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, created_ms: receipt.created_ms };
+    await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    return result;
+  });
+  openTabQueue = operation.catch(() => {});
+  const inflight = { url, promise: operation };
+  openTabInflight.set(clientKey, inflight);
+  try { return await operation; } finally { if (openTabInflight.get(clientKey) === inflight) openTabInflight.delete(clientKey); }
 }
 async function attachUnrestrictedNativeTab(tabId) {
   if (!Number.isSafeInteger(tabId) || tabId < 0) throw new Error("Invalid Chrome tab ID.");
@@ -219,15 +723,16 @@ async function attachUnrestrictedNativeTab(tabId) {
   nativeAttachedTabs.add(tabId); pairedTabUrls.set(tabId, tab.url); pairedTabDocumentIds.set(tabId, frame.documentId);
 }
 async function navigatePairedTab(tabId, url, native, generation) {
+  clearFileChooserState(tabId, "Target navigated before the file chooser opened.");
   (native ? nativeAttachedTabs : manualAttachedTabs).delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); await detachDebugger(tabId); await chrome.tabs.update(tabId, { url }); await waitForTabComplete(tabId);
   if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
   const navigationGeneration = tabNavigationGenerations.get(tabId) || 0; const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!routeActive(native, generation) || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); (native ? nativeAttachedTabs : manualAttachedTabs).add(tabId);
 }
-async function detachPairedTab(tabId) { navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); manualAttachedTabs.delete(tabId); nativeAttachedTabs.delete(tabId); await detachDebugger(tabId); }
-async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
-async function detachNative(generation) { if (generation !== nativeGeneration) return; const toDetach = [...nativeAttachedTabs]; nativeAttachedTabs = new Set(); nativeUnrestricted = false; for (const tabId of toDetach) { navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
+async function detachPairedTab(tabId) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); manualAttachedTabs.delete(tabId); nativeAttachedTabs.delete(tabId); await detachDebugger(tabId); }
+async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
+async function detachNative(generation) { if (generation !== nativeGeneration) return; const toDetach = [...nativeAttachedTabs]; nativeAttachedTabs = new Set(); nativeUnrestricted = false; for (const tabId of toDetach) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   if (message?.type === "pair") { pair(message.endpoint, message.token, message.tabIds).then(() => respond({ ok: true })).catch(error => respond({ ok: false, error: String(error) })); return true; }
   if (message?.type === "status") respond({ connected: socket?.readyState === WebSocket.OPEN, attached: [...manualAttachedTabs] });
@@ -284,7 +789,7 @@ async function reattachAfterNavigation(tabId, native, generation, expectedUrl, e
   pairedTabUrls.set(tabId, identity.url); pairedTabDocumentIds.set(tabId, identity.document_id);
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") { tabNavigationGenerations.set(tabId, (tabNavigationGenerations.get(tabId) || 0) + 1); if (pairedTabDocumentIds.has(tabId)) navigatingTabs.add(tabId); }
+  if (changeInfo.status === "loading") { clearFileChooserState(tabId, "Target navigated before the file chooser opened."); tabNavigationGenerations.set(tabId, (tabNavigationGenerations.get(tabId) || 0) + 1); if (pairedTabDocumentIds.has(tabId)) navigatingTabs.add(tabId); }
   if (changeInfo.status === "complete" && !debuggerDetachedDuringNavigation.has(tabId)) navigatingTabs.delete(tabId);
   const pairedUrl = pairedTabUrls.get(tabId); if (pairedUrl === undefined || !changeInfo.url || changeInfo.url === "about:blank" || navigatingTabs.has(tabId)) return;
   const changed = (() => { try { const before = new URL(pairedUrl), after = new URL(changeInfo.url); return before.origin !== after.origin || before.pathname !== after.pathname || before.search !== after.search; } catch { return changeInfo.url !== pairedUrl; } })(); if (changed) void detachPairedTab(tabId);

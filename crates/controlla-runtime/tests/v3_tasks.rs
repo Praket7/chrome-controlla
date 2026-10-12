@@ -79,6 +79,64 @@ fn upload_does_not_accept_raw_filesystem_paths() {
 }
 
 #[test]
+fn upload_requires_one_bounded_target_and_acceptance_is_explicit() {
+    let selector = serde_json::from_value::<TaskPrimitive>(json!({
+        "kind":"upload","artifact_handle":"opaque-handle","selector":"input[type=file]",
+        "account_marker":["#account","school@example.test"]
+    }))
+    .unwrap();
+    assert!(matches!(
+        selector.expand().unwrap().as_slice(),
+        [ExpandedStep::Upload {
+            selector: Some(_),
+            trigger_reference: None,
+            ..
+        }]
+    ));
+    let trigger = serde_json::from_value::<TaskPrimitive>(json!({
+        "kind":"upload","artifact_handle":"opaque-handle","trigger_reference":"@c4",
+        "acceptance":{"kind":"text","reference":"@c5","equals":"attached"},
+        "account_marker":["#account","school@example.test"]
+    }))
+    .unwrap();
+    assert!(matches!(
+        trigger.expand().unwrap().as_slice(),
+        [ExpandedStep::Upload {
+            selector: None,
+            trigger_reference: Some(_),
+            acceptance: Some(_),
+            ..
+        }]
+    ));
+    let frame_trigger = serde_json::from_value::<TaskPrimitive>(json!({
+        "kind":"upload","artifact_handle":"opaque-handle",
+        "trigger_reference":"@f:32C95EE3B095097A0638B9FBD18DC854:952ABCB690EC70ABEA7A73F866B1F49D:5673",
+        "account_marker":["#account","school@example.test"]
+    })).unwrap();
+    assert!(
+        frame_trigger.expand().is_ok(),
+        "frame-bound Browse references must survive task validation"
+    );
+    for target in [
+        json!({}),
+        json!({"selector":"#file","trigger_reference":"@c1"}),
+        json!({"trigger_reference":""}),
+    ] {
+        let mut args = json!({"kind":"upload","artifact_handle":"opaque-handle","account_marker":["#account","school@example.test"]});
+        args.as_object_mut()
+            .unwrap()
+            .extend(target.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<TaskPrimitive>(args.clone()).is_ok());
+        assert!(
+            serde_json::from_value::<TaskPrimitive>(args)
+                .unwrap()
+                .expand()
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn form_draft_can_save_without_submitting() {
     let task = TaskPrimitive::FormDraft {
         fields: vec![FormField {

@@ -32,6 +32,10 @@ struct HealthReply {
 }
 
 pub fn report(state_dir: &Path, version: &str) -> DoctorReport {
+    report_for_client(state_dir, version, None)
+}
+
+pub fn report_for_client(state_dir: &Path, version: &str, client: Option<&str>) -> DoctorReport {
     let config_path = state_dir.join("runtime.json");
     let mut errors = Vec::new();
     let mut report = DoctorReport {
@@ -47,6 +51,13 @@ pub fn report(state_dir: &Path, version: &str) -> DoctorReport {
         heartbeat_age_seconds: None,
         live_round_trip: State::Unknown,
         policy_revision: None,
+        expected_mcp_surface: "v3-compact".to_owned(),
+        requested_client: client.map(str::to_owned),
+        loaded_client_tool_state: State::Unknown,
+        client_tool_acknowledgement: format!(
+            "unverified: server health does not prove {} loaded its tools; no client startup acknowledgement is available",
+            client.unwrap_or("the MCP client")
+        ),
         errors,
     };
 
