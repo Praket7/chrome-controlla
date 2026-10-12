@@ -237,8 +237,8 @@ impl RouteMemory {
         if metadata.len() > MAX_STORE_BYTES {
             return Err(RouteMemoryError::Capacity);
         }
-        let bytes = std::fs::read(&self.path)
-            .map_err(|error| RouteMemoryError::Io(error.to_string()))?;
+        let bytes =
+            std::fs::read(&self.path).map_err(|error| RouteMemoryError::Io(error.to_string()))?;
         let records = serde_json::from_slice::<BTreeMap<String, RouteRecord>>(&bytes)
             .map_err(|error| RouteMemoryError::Json(error.to_string()))?;
         if records.len() > MAX_ROUTES {
@@ -266,8 +266,7 @@ impl RouteMemory {
         let temp = self
             .path
             .with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&temp, bytes)
-            .map_err(|error| RouteMemoryError::Io(error.to_string()))?;
+        std::fs::write(&temp, bytes).map_err(|error| RouteMemoryError::Io(error.to_string()))?;
         if let Err(rename_error) = std::fs::rename(&temp, &self.path) {
             if self.path.exists() {
                 std::fs::remove_file(&self.path)
@@ -429,9 +428,16 @@ fn public_read_route(site_scope: &str, destination: &str) -> bool {
         .next()
         .unwrap_or("/")
         .to_ascii_lowercase();
-    !["/submit", "/delete", "/remove", "/purchase", "/checkout", "/logout"]
-        .iter()
-        .any(|suffix| path.ends_with(suffix))
+    ![
+        "/submit",
+        "/delete",
+        "/remove",
+        "/purchase",
+        "/checkout",
+        "/logout",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
 }
 
 fn http_origin(value: &str) -> Option<String> {
@@ -571,12 +577,7 @@ mod tests {
         let memory = memory();
         qualify(&memory);
         let record = memory
-            .record_runtime_verification(
-                "espn-bills",
-                Verification::Failed,
-                false,
-                true,
-            )
+            .record_runtime_verification("espn-bills", Verification::Failed, false, true)
             .unwrap();
         assert_eq!(record.status, RouteStatus::Quarantined);
         assert!(
