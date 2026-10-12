@@ -19,6 +19,7 @@ pub mod native_setup;
 pub mod page_tool_schema;
 pub mod process_lease;
 pub mod reference_reacquire;
+pub mod route_memory;
 pub mod runtime_observer;
 pub mod semantic_state;
 pub mod skill_runtime;
