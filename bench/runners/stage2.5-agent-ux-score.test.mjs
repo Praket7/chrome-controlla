@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { summarizeAgentUx } from './stage2.5-agent-ux-score.mjs';
 
-test('direct Bills fast path passes without setup discovery or detours', () => {
+test('direct Bills fast path passes as one compiled agent call plus release', () => {
   const result = summarizeAgentUx({
     task_id: 'espn-newest-bills-story',
     prompt_started_ms: 0,
@@ -12,10 +12,11 @@ test('direct Bills fast path passes without setup discovery or detours', () => {
     expected_first_destination: 'bills-specific-page',
     first_destination: 'bills-specific-page',
     events: [
-      { kind: 'browser_open', at_ms: 900 },
-      { kind: 'snapshot', at_ms: 1_550, targeted: true, model_visible_observation: true },
-      { kind: 'workflow', at_ms: 1_800, mutation: true },
-      { kind: 'verify', at_ms: 2_700 },
+      { kind: 'browser_open', at_ms: 900, agent_tool_call: true },
+      { kind: 'snapshot', at_ms: 1_550, targeted: true, model_visible_observation: false, agent_tool_call: false },
+      { kind: 'workflow', at_ms: 1_800, mutation: true, agent_tool_call: false },
+      { kind: 'verify', at_ms: 2_700, agent_tool_call: false },
+      { kind: 'browser_release', at_ms: 2_850, agent_tool_call: true },
     ],
   });
   assert.equal(result.pass, true);
@@ -23,6 +24,7 @@ test('direct Bills fast path passes without setup discovery or detours', () => {
   assert.equal(result.metrics.repo_reads, 0);
   assert.equal(result.metrics.broad_snapshots, 0);
   assert.equal(result.metrics.navigation_detours, 0);
+  assert.equal(result.metrics.agent_tool_calls, 2);
   assert.equal(result.metrics.orchestration_overhead_ms, 1_450);
 });
 
@@ -66,6 +68,7 @@ test('the observed three-minute source-reading route fails every relevant orches
     'navigation_detours',
     'duplicate_observations',
     'model_visible_observations_before_first_mutation',
+    'agent_tool_calls',
     'first_destination',
   ]) {
     assert.equal(failed.has(metric), true, `expected ${metric} to fail`);
@@ -84,6 +87,7 @@ test('schema recovery after an explicit mismatch can be given a recovery-only bu
       max_repo_reads: 0,
       max_documentation_reads: 0,
       max_describe_calls: 0,
+      max_agent_tool_calls: 4,
     },
     events: [
       { kind: 'browser_open', at_ms: 1_000 },
