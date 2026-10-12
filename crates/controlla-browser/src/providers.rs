@@ -14,10 +14,30 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
+
+fn fast_type_cdp_bound(params: &Value) -> u64 {
+    let Some(text) = params.get("text").and_then(Value::as_str) else {
+        return 1;
+    };
+    if text.is_empty() || text.len() > 16_384 || !text.is_ascii() {
+        return 1;
+    }
+    let chars = text.chars().count() as u64;
+    let newlines = text.bytes().filter(|byte| *byte == b'\n').count() as u64;
+    // Reserve the full guard/key sequence so an unknown partial result cannot exceed the CDP cap.
+    chars
+        .saturating_mul(6)
+        .saturating_add(1)
+        .saturating_sub(newlines.saturating_mul(2))
+}
+
+fn cdp_command_count_is_partial(method: &str, response_received: bool) -> bool {
+    method.starts_with("Controlla.") && (method != "Controlla.fastType" || !response_received)
+}
 #[cfg(all(test, unix))]
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::{
@@ -31,7 +51,18 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// consume the whole pairing window and starve the legitimate extension.
 const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHARED_MESSAGE_LIMIT: usize = 1_048_576;
+const SHARED_PROTOCOL_VERSION: u32 = 2;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+fn shared_protocol_version(value: Option<&Value>) -> Result<u32, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or(()),
+    }
+}
 
 /// Removes one pending-command entry when dropped unless disarmed. Guarantees
 /// cancellation-safe cleanup of the pending-reply map even when the awaiting
@@ -670,7 +701,22 @@ impl SharedExtensionProvider {
                 continue;
             }
             let extension_version = hello["extension_version"].as_str();
-            if extension_version != Some(env!("CARGO_PKG_VERSION")) {
+            let protocol_version = match shared_protocol_version(hello.get("protocol_version")) {
+                Ok(version) => version,
+                Err(()) => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return Err(ProviderError::Extension(
+                        "invalid shared bridge protocol version".into(),
+                    ));
+                }
+            };
+            if !matches!(protocol_version, 1 | SHARED_PROTOCOL_VERSION) {
+                let _ = socket.send(Message::Close(None)).await;
+                return Err(ProviderError::Extension(format!(
+                    "unsupported shared bridge protocol {protocol_version}"
+                )));
+            }
+            if protocol_version == 1 && extension_version != Some(env!("CARGO_PKG_VERSION")) {
                 let observed = extension_version.unwrap_or("unknown");
                 let _ = socket
                     .send(Message::Text(
@@ -687,7 +733,7 @@ impl SharedExtensionProvider {
             }
             if let Err(error) = socket
                 .send(Message::Text(
-                    json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
+                    json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION"),"protocol_version":protocol_version})
                         .to_string()
                         .into(),
                 ))
@@ -941,6 +987,15 @@ impl SharedExtensionSession {
         method: &str,
         params: Value,
     ) -> Result<Value, ProviderError> {
+        let started = Instant::now();
+        let cdp_budget_charge = if method == "Controlla.fastType" {
+            fast_type_cdp_bound(&params)
+        } else {
+            1
+        };
+        if method.starts_with("Controlla.") && method != "Controlla.fastType" {
+            crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+        }
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
@@ -953,29 +1008,94 @@ impl SharedExtensionSession {
             id,
             armed: true,
         };
-        let message = Message::Text(
-            json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params})
-                .to_string()
-                .into(),
-        );
+        let serialized = json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params}).to_string();
+        let request_bytes = serialized.len() as u64;
+        crate::scheduler::telemetry::admit_browser_commands(1)
+            .await
+            .map_err(|reason| ProviderError::Extension(reason.into()))?;
+        crate::scheduler::telemetry::admit_cdp_commands(cdp_budget_charge)
+            .await
+            .map_err(|reason| ProviderError::Extension(reason.into()))?;
+        let message = Message::Text(serialized.into());
         if let Err(error) = self.sink.lock().await.send(message).await {
+            crate::scheduler::telemetry::record_browser_command(
+                1,
+                0,
+                request_bytes,
+                0,
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            )
+            .await;
             return Err(ProviderError::Extension(error.to_string()));
         }
         let result = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
             Ok(Ok(Ok(value))) => value,
-            Ok(Ok(Err(error))) => return Err(ProviderError::Extension(error)),
+            Ok(Ok(Err(error))) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                if cdp_command_count_is_partial(method, false) {
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                }
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    1,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
+                return Err(ProviderError::Extension(error));
+            }
             Ok(Err(_)) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                if cdp_command_count_is_partial(method, false) {
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                }
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    1,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
                 return Err(ProviderError::Extension(
                     "extension response channel closed".into(),
                 ));
             }
             Err(_) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                if cdp_command_count_is_partial(method, false) {
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                }
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    1,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
                 return Err(ProviderError::Extension(
                     "extension command timed out".into(),
                 ));
             }
         };
         pending_guard.disarm();
+        crate::scheduler::telemetry::record_browser_command(
+            1,
+            if method == "Controlla.fastType" {
+                result
+                    .get("cdp_commands")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(cdp_budget_charge)
+            } else {
+                1
+            },
+            request_bytes.saturating_add(result.to_string().len() as u64),
+            0,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        )
+        .await;
         if let Some(error) = result.get("error") {
             return Err(ProviderError::Extension(error.to_string()));
         }
@@ -988,7 +1108,9 @@ impl SharedExtensionSession {
         actions: Vec<SharedBatchAction>,
         deadline_ms: u64,
     ) -> Result<Value, ProviderError> {
+        let started = Instant::now();
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        let action_count = actions.len() as u64;
         let wire_actions = actions
             .into_iter()
             .map(|action| json!({"method":action.method,"params":action.params,"stop_on_not_ok":action.stop_on_not_ok}))
@@ -1000,6 +1122,13 @@ impl SharedExtensionSession {
                 "batch request exceeds the shared-message limit".into(),
             ));
         }
+        let request_bytes = serialized.len() as u64;
+        crate::scheduler::telemetry::admit_browser_commands(action_count)
+            .await
+            .map_err(|reason| ProviderError::Extension(reason.into()))?;
+        crate::scheduler::telemetry::admit_cdp_commands(action_count)
+            .await
+            .map_err(|reason| ProviderError::Extension(reason.into()))?;
         let (sender, mut receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
         let pending_guard = PendingEntryGuard {
@@ -1014,23 +1143,72 @@ impl SharedExtensionSession {
             .send(Message::Text(serialized.into()))
             .await
         {
+            crate::scheduler::telemetry::record_browser_command(
+                1,
+                0,
+                request_bytes,
+                0,
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            )
+            .await;
             return Err(ProviderError::Extension(error.to_string()));
         }
         let response = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
             Ok(Ok(Ok(value))) => value,
-            Ok(Ok(Err(error))) => return Err(ProviderError::Extension(error)),
+            Ok(Ok(Err(error))) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    0,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
+                return Err(ProviderError::Extension(error));
+            }
             Ok(Err(_)) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    0,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
                 return Err(ProviderError::Extension(
                     "extension response channel closed".into(),
                 ));
             }
             Err(_) => {
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    0,
+                    request_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
                 return Err(ProviderError::Extension(
                     "extension batch timed out; delivery is unknown".into(),
                 ));
             }
         };
         pending_guard.disarm();
+        crate::scheduler::telemetry::record_browser_command(
+            1,
+            response
+                .get("result")
+                .and_then(|value| value.get("completed"))
+                .and_then(Value::as_u64)
+                .unwrap_or(action_count),
+            request_bytes.saturating_add(response.to_string().len() as u64),
+            0,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        )
+        .await;
         let mut result = response.get("result").cloned().unwrap_or(Value::Null);
         if let Some(error) = response.get("error").and_then(Value::as_str)
             && let Some(object) = result.as_object_mut()
@@ -1078,6 +1256,33 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_protocol_version_rejects_numeric_overflow_and_non_integer_values() {
+        assert_eq!(shared_protocol_version(None), Ok(1));
+        assert_eq!(shared_protocol_version(Some(&json!(2))), Ok(2));
+        assert!(shared_protocol_version(Some(&json!(4_294_967_298_u64))).is_err());
+        assert!(shared_protocol_version(Some(&json!(2.0))).is_err());
+    }
+
+    #[test]
+    fn fast_type_budget_reserves_full_cdp_work_even_if_delivery_becomes_unknown() {
+        assert_eq!(fast_type_cdp_bound(&json!({"text":"abcd"})), 25);
+        assert_eq!(fast_type_cdp_bound(&json!({"text":"a\nb"})), 17);
+        assert_eq!(
+            fast_type_cdp_bound(&json!({"text":"x".repeat(3_334)})),
+            20_005
+        );
+        assert_eq!(fast_type_cdp_bound(&json!({"text":"é"})), 1);
+    }
+
+    #[test]
+    fn custom_extension_cdp_counts_are_partial_when_unobservable() {
+        assert!(cdp_command_count_is_partial("Controlla.fastType", false));
+        assert!(!cdp_command_count_is_partial("Controlla.fastType", true));
+        assert!(cdp_command_count_is_partial("Controlla.frameClick", true));
+        assert!(!cdp_command_count_is_partial("Runtime.evaluate", false));
+    }
 
     #[tokio::test]
     async fn pending_entry_drop_cleans_up_after_mutex_contention() {
@@ -3576,6 +3781,53 @@ list.addEventListener('scroll',render);render();
                 .as_str()
                 .unwrap()
                 .contains("reload the matching unpacked extension")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_extension_protocol_v2_negotiates_across_package_versions() {
+        use crate::sessions::ProviderGrants;
+        use serde_json::json;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["17".to_owned()],
+                },
+                "alice",
+            )
+            .unwrap();
+        let mut provider = SharedExtensionProvider::bind(&mut registry, &session)
+            .await
+            .unwrap();
+        let pairing = provider.pairing().clone();
+        let (accepted, ready) = tokio::join!(provider.accept(&mut registry), async {
+            let (mut socket, _) = connect_async(&pairing.endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type":"hello", "token":pairing.token, "extension_version":"9.9.9",
+                        "protocol_version":2, "document_identity":true, "targets":["17"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                .unwrap()
+        });
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["protocol_version"], 2);
+        assert!(
+            accepted.is_ok(),
+            "protocol compatibility must be based on negotiated protocol, not package version"
         );
     }
 

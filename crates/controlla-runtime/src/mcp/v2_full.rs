@@ -662,6 +662,8 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
             max_bytes: None,
             href_hint: None,
             frame_id: None,
+            goal: None,
+            max_scan_nodes: None,
         },
     )
     .await
@@ -1158,6 +1160,8 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         max_bytes: None,
                         href_hint: None,
                         frame_id: None,
+                        goal: None,
+                        max_scan_nodes: None,
                     },
                 )
                 .await?
@@ -1172,6 +1176,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         chrome_tab_id: Some(args.chrome_tab_id.clone()),
                         url,
                         idempotency_key: None,
+                        wait_until: None,
                     }))
                     .await?;
                 app.core
@@ -1445,6 +1450,8 @@ async fn current_skill_context(
             max_bytes: Some(100_000),
             href_hint: None,
             frame_id: None,
+            goal: None,
+            max_scan_nodes: None,
         },
     )
     .await?;

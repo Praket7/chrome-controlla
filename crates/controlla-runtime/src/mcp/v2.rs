@@ -19,6 +19,7 @@ struct SemanticTabState {
     identities: BTreeMap<String, crate::reference_reacquire::SemanticIdentity>,
     items: BTreeMap<String, Value>,
     snapshot_id: String,
+    scope_complete: bool,
 }
 
 impl SemanticTabState {
@@ -65,6 +66,10 @@ struct BrowserSnapshotArgs {
     max_bytes: Option<usize>,
     href_hint: Option<String>,
     frame_id: Option<String>,
+    #[schemars(description = "Optional targeted search. A match is a bounded candidate, not proof that no better or duplicate candidate exists; inspect global_complete and scope_complete before claiming exhaustive coverage.")]
+    goal: Option<super::SnapshotGoal>,
+    #[schemars(description = "Optional node-visit ceiling for targeted snapshots (1..65536).")]
+    max_scan_nodes: Option<usize>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -81,7 +86,7 @@ struct BrowserFindArgs {
     href_hint: Option<String>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserClickOutcome {
     Navigation {
@@ -209,6 +214,7 @@ fn changed_fields(previous: &Value, current: &Value) -> bool {
 }
 
 async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value, rmcp::ErrorData> {
+    let started = std::time::Instant::now();
     if let Some(frame_id) = args.frame_id.as_deref() {
         let Json(value) = app.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
             session_id: args.session_id.clone(),
@@ -218,6 +224,12 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000),
             timeout_ms: Some(10_000),
         })).await?;
+        let bytes = serde_json::to_vec(&value).map_or(0, |encoded| encoded.len() as u64);
+        controlla_browser::scheduler::telemetry::record_observation(0, bytes).await;
+        controlla_browser::scheduler::telemetry::record_phase(
+            controlla_browser::scheduler::telemetry::OperationPhase::Snapshot,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        ).await;
         return Ok(value);
     }
     let legacy = app
@@ -230,6 +242,8 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             max_text_chars: args.max_text_chars.unwrap_or_else(snapshot_chars).min(6000),
             max_bytes: args.max_bytes.unwrap_or_else(snapshot_bytes).clamp(4096, 100_000),
             href_hint: args.href_hint.clone(),
+            goal: args.goal.clone(),
+            max_scan_nodes: args.max_scan_nodes,
         }))
         .await?;
     let Json(mut snapshot) = legacy;
@@ -246,6 +260,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let scope_complete = snapshot["scope_complete"] == true;
     let mut semantic = app.semantic.lock().await;
     let state = semantic.entry(key).or_default();
     let document_changed = !state.document_key.is_empty() && state.document_key != doc_key;
@@ -258,6 +273,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         };
     }
     state.document = Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot));
+    state.scope_complete = scope_complete;
     if state.next_ref == 0 {
         state.next_ref = 1;
     }
@@ -311,6 +327,15 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         "upsert": upsert,
         "removed": removed
     });
+    let bytes = serde_json::to_vec(&snapshot).map_or(0, |encoded| encoded.len() as u64);
+    controlla_browser::scheduler::telemetry::record_observation(
+        snapshot["scanned_nodes"].as_u64().unwrap_or(0),
+        bytes,
+    ).await;
+    controlla_browser::scheduler::telemetry::record_phase(
+        controlla_browser::scheduler::telemetry::OperationPhase::Snapshot,
+        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+    ).await;
     Ok(snapshot)
 }
 
@@ -346,6 +371,145 @@ async fn retained_mutation(
     allow_password: bool,
     action: &str,
 ) -> Result<Value, rmcp::ErrorData> {
+    let first = retained_mutation_once(app, args, reference, allow_password, action).await?;
+    if first["status"] != "not_dispatched" || first["readback"]["reason"] != "target_replaced" {
+        return Ok(first);
+    }
+
+    let (expected, ancestor) = {
+        let semantic = app.semantic.lock().await;
+        let Some(state) = semantic.get(&tab_key(&args.session_id, &args.chrome_tab_id)) else { return Ok(first); };
+        let Some(expected) = state.identities.get(reference).cloned() else { return Ok(first); };
+        let ancestor = state.items.get(reference).and_then(|item| {
+            Some(SnapshotSemanticAncestor {
+                tag: item.pointer("/semantic_ancestor/tag")?.as_str()?.to_owned(),
+                id: item.pointer("/semantic_ancestor/id")?.as_str()?.to_owned(),
+            })
+        });
+        (expected, ancestor)
+    };
+    if expected.name.is_empty() || expected.role.is_empty() {
+        let mut result = first;
+        result["reacquisition"] = json!({"status":"not_rebound","reason":"target identity lacks an exact role or name"});
+        return Ok(result);
+    }
+    let fresh = snapshot_impl(app, &BrowserSnapshotArgs {
+        session_id: args.session_id.clone(),
+        chrome_tab_id: args.chrome_tab_id.clone(),
+        selector: None,
+        max_items: Some(200),
+        max_text_chars: Some(0),
+        max_bytes: Some(100_000),
+        href_hint: None,
+        frame_id: None,
+        goal: Some(SnapshotGoal {
+            query: Some(expected.name.clone()),
+            roles: Some(vec![expected.role.clone()]),
+            href_hint: expected.href.clone(),
+            within: ancestor,
+            exhaustive: true,
+        }),
+        max_scan_nodes: Some(65_536),
+    }).await;
+    let fresh = match fresh {
+        Ok(snapshot) if snapshot["scope_complete"] == true => snapshot,
+        Ok(snapshot) => {
+            let mut result = first;
+            result["reacquisition"] = json!({"status":"not_rebound","reason":"targeted semantic scope was incomplete","scope_complete":snapshot["scope_complete"]});
+            return Ok(result);
+        }
+        Err(error) => {
+            let mut result = first;
+            result["reacquisition"] = json!({"status":"not_rebound","reason":error.to_string()});
+            return Ok(result);
+        }
+    };
+    let candidate = {
+        let semantic = app.semantic.lock().await;
+        let Some(state) = semantic.get(&tab_key(&args.session_id, &args.chrome_tab_id)) else { return Ok(first); };
+        let Some(document) = state.document.as_ref() else { return Ok(first); };
+        let items = state.items.values().cloned().collect::<Vec<_>>();
+        crate::reference_reacquire::reacquire_reference(&expected, document, &items)
+    };
+    let candidate = match candidate {
+        Ok(candidate) => candidate.reference,
+        Err(error) => {
+            let mut result = first;
+            result["reacquisition"] = json!({"status":"not_rebound","reason":error.to_string()});
+            return Ok(result);
+        }
+    };
+    let mut rebound = retained_mutation_once(app, args, &candidate, allow_password, action).await?;
+    rebound["reacquisition"] = json!({"status":"rebound","from":reference,"to":candidate,"semantic_revision":fresh["semantic_revision"]});
+    Ok(rebound)
+}
+
+async fn retained_click(
+    app: &AppV2,
+    args: &BrowserActArgs,
+    reference: &str,
+    outcome: BrowserClickOutcome,
+) -> Result<Value, rmcp::ErrorData> {
+    let first = retained_click_once(app, args, reference, &outcome).await?;
+    if !click_needs_reacquisition(&first) {
+        return Ok(first);
+    }
+    let expected = {
+        let semantic = app.semantic.lock().await;
+        semantic.get(&tab_key(&args.session_id, &args.chrome_tab_id))
+            .and_then(|state| state.identities.get(reference)).cloned()
+    };
+    let Some(expected) = expected.filter(|identity| !identity.name.is_empty() && !identity.role.is_empty()) else {
+        return Ok(first);
+    };
+    let fresh = snapshot_impl(app, &BrowserSnapshotArgs {
+        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(),
+        selector: None, max_items: Some(200), max_text_chars: Some(0), max_bytes: Some(100_000),
+        href_hint: None, frame_id: None,
+        goal: Some(SnapshotGoal { query: Some(expected.name.clone()), roles: Some(vec![expected.role.clone()]),
+            href_hint: expected.href.clone(), within: None, exhaustive: true }),
+        max_scan_nodes: Some(65_536),
+    }).await?;
+    if fresh["scope_complete"] != true { return Ok(first); }
+    let candidate = {
+        let semantic = app.semantic.lock().await;
+        let Some(state) = semantic.get(&tab_key(&args.session_id, &args.chrome_tab_id)) else { return Ok(first); };
+        let Some(document) = state.document.as_ref() else { return Ok(first); };
+        crate::reference_reacquire::reacquire_reference(&expected, document, &state.items.values().cloned().collect::<Vec<_>>())
+    };
+    let candidate = match candidate { Ok(candidate) => candidate.reference, Err(_) => return Ok(first) };
+    let mut rebound = retained_click_once(app, args, &candidate, &outcome).await?;
+    rebound["reacquisition"] = json!({"status":"rebound_after_not_dispatched","from":reference,"to":candidate,"semantic_revision":fresh["semantic_revision"]});
+    Ok(rebound)
+}
+
+fn click_needs_reacquisition(receipt: &Value) -> bool {
+    receipt["status"] == "not_dispatched" && receipt["reason_code"] == "changed_target"
+}
+
+async fn retained_click_once(
+    app: &AppV2,
+    args: &BrowserActArgs,
+    reference: &str,
+    outcome: &BrowserClickOutcome,
+) -> Result<Value, rmcp::ErrorData> {
+    let legacy_reference = resolve_reference(app, &args.session_id, &args.chrome_tab_id, reference).await?;
+    let shared_outcome: SharedClickOutcome = serde_json::from_value(serde_json::to_value(outcome).map_err(|e| invalid(e.to_string()))?)
+        .map_err(|e| invalid(e.to_string()))?;
+    let Json(value) = app.legacy.shared_click(Parameters(SharedClickArgs {
+        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(),
+        reference: legacy_reference, outcome: shared_outcome, timeout_ms: args.timeout_ms,
+    })).await?;
+    Ok(value)
+}
+
+async fn retained_mutation_once(
+    app: &AppV2,
+    args: &BrowserActArgs,
+    reference: &str,
+    allow_password: bool,
+    action: &str,
+) -> Result<Value, rmcp::ErrorData> {
     let legacy_reference = resolve_reference(app, &args.session_id, &args.chrome_tab_id, reference).await?;
     let expected = args.expected_value.clone().unwrap_or_default();
     let value = args.value.clone().unwrap_or_default();
@@ -374,7 +538,7 @@ async fn retained_mutation(
         .ok_or_else(|| invalid("invalid retained reference"))?;
     let index = index.parse::<usize>().map_err(|_| invalid("invalid retained reference index"))?;
     let unrestricted = crate::guard_reason::unrestricted_mode();
-    if index >= snapshot.count || (!unrestricted && (token != snapshot.token || snapshot.consumed)) {
+    if index >= snapshot.count || (!unrestricted && (token != snapshot.token || snapshot.consumed && !super::internal_workflow_snapshot_allowed(&snapshot.token))) {
         return Err(invalid("stale or consumed reference; take one fresh browser_snapshot"));
     }
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
@@ -400,9 +564,9 @@ async fn retained_mutation(
         return Err(invalid("allow_password is supported only for action=fill"));
     }
     let function = if action == "fill" && allow_password {
-        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement)||e.type!=='password'||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(r.width<=0||r.height<=0||r.left<0||r.top<0||r.right>innerWidth||r.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)!==e)return {ok:false,reason:'blocked'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value};}"#
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement)||e.type!=='password'||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(r.width<=0||r.height<=0||r.left<0||r.top<0||r.right>innerWidth||r.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)!==e)return {ok:false,reason:'blocked'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value,dispatched:true};}"#
     } else if action == "fill" {
-        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value,dispatched:true};}"#
     } else {
         r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLSelectElement)||e.matches(':disabled')||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(![...e.options].some(o=>o.value===value))return {ok:false,reason:'option_missing'};e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
     };
@@ -412,6 +576,7 @@ async fn retained_mutation(
             .ok_or_else(|| invalid("snapshot disappeared before dispatch"))?
             .consumed = true;
     }
+    let verification_started = std::time::Instant::now();
     let response = {
         let connection = shared
             .connection
@@ -439,6 +604,9 @@ async fn retained_mutation(
         Ok(Ok(response)) => match shared_value(&response) {
             Ok(value) if value["ok"] == true => {
                 json!({"status":"verified","dispatch_acknowledged":true,"action":action,"readback":value})
+            }
+            Ok(value) if value["dispatched"] == true => {
+                json!({"status":"unknown","dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"action":action,"reason":"fill readback changed after input/change dispatch; inspect state before retrying","readback":value})
             }
             Ok(value) => {
                 json!({"status":"not_dispatched","dispatch_acknowledged":true,"action":action,"reason":value["reason"],"readback":value})
@@ -475,21 +643,24 @@ async fn retained_mutation(
             "reason":"document changed after mutation; local readback cannot establish the final page state; inspect before retrying"
         });
     }
+    controlla_browser::scheduler::telemetry::record_phase(
+        controlla_browser::scheduler::telemetry::OperationPhase::Verification,
+        verification_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+    ).await;
     drop(shared);
+    if allow_password && result["status"] == "verified" {
+        result["readback"] = json!({"credential_filled":true,"ok":true});
+    }
     if result["status"] == "verified" {
-        let fresh = snapshot_impl(app, &BrowserSnapshotArgs {
-            session_id: args.session_id.clone(),
-            chrome_tab_id: args.chrome_tab_id.clone(),
-            selector: None,
-            max_items: None,
-            max_text_chars: None,
-            max_bytes: None,
-            href_hint: None,
-            frame_id: None,
-        }).await;
-        if let Ok(snapshot) = fresh {
-            result["snapshot"] = snapshot;
-        }
+        super::authorize_internal_workflow_snapshot(&snapshot.token);
+        result["delta"] = json!({
+            "reference": reference,
+            "before": if allow_password { Value::Null } else { json!(expected) },
+            "after": if allow_password { Value::Null } else { result["readback"].get("value").cloned().unwrap_or(json!(value)) },
+            "credential_filled": allow_password,
+            "document_changed": false,
+            "verified": true
+        });
     }
     Ok(result)
 }
@@ -509,6 +680,8 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
             max_bytes: None,
             href_hint: None,
             frame_id: None,
+            goal: None,
+            max_scan_nodes: None,
         }).await?;
     }
     let mode = args.match_mode.as_deref().unwrap_or("all");
@@ -521,14 +694,33 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
         Some(state.items.get(reference).and_then(|item| item.pointer("/semantic_ancestor/id")).and_then(Value::as_str).ok_or_else(|| invalid("within_reference must identify a stable semantic ancestor"))?)
     } else { None };
     let ranked = crate::semantic_state::rank_candidates(state.items.values().cloned(), &args.query, args.role.as_deref(), args.href_hint.as_deref(), ancestor_id, mode == "exact");
-    let ambiguous = mode == "best" && ranked.first().is_some_and(|item| item["confidence"] != "high");
+    let ambiguous = find_is_ambiguous(mode, state.scope_complete, &ranked);
     let limit = args.max_matches.or(args.limit).unwrap_or(10).clamp(1, 50);
     let matches = ranked.into_iter().take(if mode == "best" && !ambiguous { 1 } else { limit }).collect::<Vec<_>>();
     let count = matches.len();
-    Ok(json!({"matches":matches,"count":count,"ambiguous":ambiguous,"semantic_revision":state.snapshot_id}))
+    Ok(json!({"matches":matches,"count":count,"ambiguous":ambiguous,"scope_complete":state.scope_complete,"semantic_revision":state.snapshot_id}))
+}
+
+fn find_is_ambiguous(mode: &str, scope_complete: bool, ranked: &[Value]) -> bool {
+    match mode {
+        "best" => !scope_complete || ranked.first().is_some_and(|item| item["confidence"] != "high"),
+        "exact" => !scope_complete || ranked.len() > 1,
+        _ => false,
+    }
 }
 
 async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
+    let started = std::time::Instant::now();
+    let result = verify_impl_unmeasured(app, args).await;
+    controlla_browser::scheduler::telemetry::record_phase(
+        controlla_browser::scheduler::telemetry::OperationPhase::Verification,
+        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+    )
+    .await;
+    result
+}
+
+async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
     let snapshot = snapshot_impl(app, &BrowserSnapshotArgs {
         session_id: args.session_id.clone(),
         chrome_tab_id: args.chrome_tab_id.clone(),
@@ -538,6 +730,8 @@ async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmc
         max_bytes: Some(60_000),
         href_hint: None,
         frame_id: None,
+            goal: None,
+            max_scan_nodes: None,
     }).await?;
     let state = app.semantic.lock().await;
     let state = state.get(&tab_key(&args.session_id, &args.chrome_tab_id)).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
@@ -639,18 +833,8 @@ impl AppV2 {
                         Err(error) => json!({"status":"unknown","dispatch_acknowledged":null,"dispatch_may_have_occurred":true,"verified":false,"reference":reference,"source_frame_id":frame_id,"requested_outcome":outcome,"reason":format!("frame click delivery or readback became uncertain; inspect the frame before retrying: {error}")}),
                     }
                 } else {
-                let legacy_reference = resolve_reference(self, &args.session_id, &args.chrome_tab_id, reference).await?;
-                let outcome = args.outcome.ok_or_else(|| invalid("click requires an explicit bounded outcome"))?;
-                let outcome: SharedClickOutcome = serde_json::from_value(serde_json::to_value(outcome).map_err(|e| invalid(e.to_string()))?)
-                    .map_err(|e| invalid(e.to_string()))?;
-                let Json(value) = self.legacy.shared_click(Parameters(SharedClickArgs {
-                    session_id: args.session_id.clone(),
-                    chrome_tab_id: args.chrome_tab_id.clone(),
-                    reference: legacy_reference,
-                    outcome,
-                    timeout_ms: args.timeout_ms,
-                })).await?;
-                value
+                let outcome = args.outcome.clone().ok_or_else(|| invalid("click requires an explicit bounded outcome"))?;
+                retained_click(self, &args, reference, outcome).await?
                 }
             }
             "fill" | "select" => retained_mutation(self, &args, reference, false, &args.action).await?,
@@ -711,6 +895,8 @@ impl AppV2 {
                 BrowserWorkflowStep::Snapshot => snapshot_impl(self, &BrowserSnapshotArgs {
                     session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector: None,
                     max_items: None, max_text_chars: None, max_bytes: None, href_hint: None, frame_id: None,
+            goal: None,
+            max_scan_nodes: None,
                 }).await?,
                 BrowserWorkflowStep::Find { query, role, save_as } => {
                     if save_as.is_empty() || save_as.len() > 64 || !save_as.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -886,5 +1072,21 @@ mod tests {
         assert_eq!(substitute_reference("$email", &vars).unwrap(), "@c2");
         assert!(substitute_reference("$missing", &vars).is_err());
         assert_eq!(substitute_reference("@c1", &vars).unwrap(), "@c1");
+    }
+
+    #[test]
+    fn exact_find_does_not_claim_uniqueness_from_partial_scope_or_duplicates() {
+        let unique = vec![json!({"confidence":"high"})];
+        assert!(find_is_ambiguous("exact", false, &unique));
+        assert!(!find_is_ambiguous("exact", true, &unique));
+        assert!(find_is_ambiguous("exact", true, &[unique[0].clone(), unique[0].clone()]));
+        assert!(!find_is_ambiguous("all", false, &unique));
+    }
+
+    #[test]
+    fn click_reacquisition_only_follows_a_typed_pre_dispatch_target_change() {
+        assert!(click_needs_reacquisition(&json!({"status":"not_dispatched","reason_code":"changed_target"})));
+        assert!(!click_needs_reacquisition(&json!({"status":"unknown","reason_code":"changed_target"})));
+        assert!(!click_needs_reacquisition(&json!({"status":"not_dispatched","reason_code":"other"})));
     }
 }

@@ -17,6 +17,7 @@ const wallMs = Number(wall);
 const modelRounds = Number(rounds);
 process.stdout.write(JSON.stringify({
   adapter,
+  ...(payload.source_ref ? { source_ref: payload.source_ref } : {}),
   task_id: payload.task_id,
   mode: payload.mode,
   concurrency: payload.concurrency,

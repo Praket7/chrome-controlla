@@ -5,7 +5,7 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-const binaryDefault = '/ABS/PATH/TO/controlla';
+const binaryDefault = '/ABS/PATH/TO/controlla-v2';
 const stateDefault = '/ABS/PATH/TO/controlla-state';
 const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
 

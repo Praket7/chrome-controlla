@@ -15,6 +15,8 @@ rusqlite = { version = "=0.38.0", features = ["bundled"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 getrandom = "=0.3.4"
 thiserror = "=2.0.20"
+base64 = "=0.23.1"
+libc = "=0.2.190"
 
 rmcp = { version = "=3.5.1", features = ["transport-io", "transport-streamable-http-server", "macros"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
@@ -37,4 +39,3 @@ path = "src/main.rs"
 [[bin]]
 name = "controlla-v2"
 path = "src/bin/controlla-v2.rs"
-test = false

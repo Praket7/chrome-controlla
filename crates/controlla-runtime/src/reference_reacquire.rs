@@ -123,12 +123,6 @@ pub fn reacquire_reference(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let current_backend_node_id = item.get("backend_node_id").and_then(Value::as_i64);
-        if expected
-            .backend_node_id
-            .is_some_and(|expected_id| current_backend_node_id != Some(expected_id))
-        {
-            continue;
-        }
         // Score deterministically
         let mut score = 0;
         if role == expected.role {
@@ -148,7 +142,13 @@ pub fn reacquire_reference(
         if backend_id_matched {
             score += 50;
         }
+        let same_semantic_node = role == expected.role
+            && name == expected.name
+            && href == expected.href
+            && !fp.is_empty()
+            && fp == expected.dom_path_fingerprint;
         let is_high = (backend_id_matched && score >= 50)
+            || same_semantic_node
             || (expected.backend_node_id.is_none()
                 && score >= 40
                 && !fp.is_empty()
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_node_mismatch_cannot_be_reacquired_by_matching_semantics() {
+    fn replaced_backend_node_reacquires_only_on_exact_unique_semantic_identity() {
         let doc = SemanticDocumentKey {
             frame_id: "f".into(),
             loader_id: "l".into(),
@@ -254,8 +254,23 @@ mod tests {
             json!({"reference":"@c1","source_frame":"f","backend_node_id":456,
             "role":"link","name":"Latest story","href":"https://example.test/latest","dom_path_fingerprint":"a:0"}),
         ];
+        assert_eq!(
+            reacquire_reference(&expected, &doc, &current)
+                .unwrap()
+                .reference,
+            "@c1"
+        );
+        let ambiguous = [current[0].clone(), current[0].clone()];
         assert!(matches!(
-            reacquire_reference(&expected, &doc, &current),
+            reacquire_reference(&expected, &doc, &ambiguous),
+            Err(ReacquireError::Ambiguous)
+        ));
+        let changed_href = [
+            json!({"reference":"@c2","source_frame":"f","backend_node_id":456,
+            "role":"link","name":"Latest story","href":"https://example.test/other","dom_path_fingerprint":"a:0"}),
+        ];
+        assert!(matches!(
+            reacquire_reference(&expected, &doc, &changed_href),
             Err(ReacquireError::Ambiguous)
         ));
     }

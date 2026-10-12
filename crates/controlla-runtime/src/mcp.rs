@@ -144,6 +144,10 @@ struct SharedTabArgs {
         description = "Required only for action=open. Reuse the same key only when retrying the same logical open; choose a new key for a distinct tab."
     )]
     idempotency_key: Option<String>,
+    #[schemars(
+        description = "Optional readiness gate for action=open: document_committed attaches at the navigation commit; dom_content_loaded waits for the root document readiness event. Defaults to dom_content_loaded."
+    )]
+    wait_until: Option<String>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -382,6 +386,37 @@ struct SharedLiveSession {
     connection: Option<PageSessionTransport>,
     registry: Option<SessionRegistry>,
     handle: controlla_browser::sessions::SessionHandle,
+    native_pairing: Option<(String, String)>,
+}
+
+tokio::task_local! {
+    static INTERNAL_WORKFLOW_STATE: std::cell::RefCell<std::collections::HashSet<String>>;
+}
+
+#[allow(dead_code)] // Used by V3 workflow in the CLI binary.
+pub(crate) async fn with_internal_workflow_state<T>(
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    INTERNAL_WORKFLOW_STATE
+        .scope(
+            std::cell::RefCell::new(std::collections::HashSet::new()),
+            future,
+        )
+        .await
+}
+
+#[allow(dead_code)] // Used by V3 retained-mutation checks in the CLI binary.
+pub(crate) fn internal_workflow_snapshot_allowed(token: &str) -> bool {
+    INTERNAL_WORKFLOW_STATE
+        .try_with(|tokens| tokens.borrow().contains(token))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)] // Used by V2/V3 workflow success paths in the CLI binary.
+pub(crate) fn authorize_internal_workflow_snapshot(token: &str) {
+    let _ = INTERNAL_WORKFLOW_STATE.try_with(|tokens| {
+        tokens.borrow_mut().insert(token.to_owned());
+    });
 }
 
 /// The V2/V3 semantic layer uses the same guarded page protocol over either
@@ -433,6 +468,9 @@ impl PageSessionTransport {
                 .await
                 .map_err(|error| error.to_string()),
             Self::Dedicated(Some(browser)) => {
+                controlla_browser::scheduler::telemetry::admit_browser_commands(1)
+                    .await
+                    .map_err(str::to_owned)?;
                 registry
                     .authorize_direct_cdp(&handle.id)
                     .map_err(|error| format!("session authorization failed: {error:?}"))?;
@@ -448,7 +486,9 @@ impl PageSessionTransport {
                     .ok_or_else(|| {
                         "selected dedicated target is detached or no longer a page".to_owned()
                     })?;
-                browser
+                let request_bytes = method.len().saturating_add(params.to_string().len()) as u64;
+                let started = std::time::Instant::now();
+                let result = browser
                     .connection()
                     .target_command(
                         target_id,
@@ -457,8 +497,21 @@ impl PageSessionTransport {
                         method,
                         params,
                     )
-                    .await
-                    .map_err(|error| error.to_string())
+                    .await;
+                let response_bytes =
+                    result.as_ref().map_or(0, |value| value.to_string().len()) as u64;
+                controlla_browser::scheduler::telemetry::record_browser_command(
+                    1,
+                    1,
+                    request_bytes.saturating_add(response_bytes),
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
+                if result.is_err() {
+                    controlla_browser::scheduler::telemetry::record_unknown_delivery().await;
+                }
+                result.map_err(|error| error.to_string())
             }
             Self::Dedicated(None) => Err("dedicated browser session is shutting down".into()),
         }
@@ -659,6 +712,29 @@ struct SharedSnapshotArgs {
     #[serde(default = "snapshot_bytes")]
     max_bytes: usize,
     href_hint: Option<String>,
+    goal: Option<SnapshotGoal>,
+    max_scan_nodes: Option<usize>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SnapshotGoal {
+    query: Option<String>,
+    roles: Option<Vec<String>>,
+    href_hint: Option<String>,
+    #[serde(default)]
+    within: Option<SnapshotSemanticAncestor>,
+    #[serde(default)]
+    #[schemars(
+        description = "Search all reachable controls instead of stopping at the first exact match. Results remain bounded by max_scan_nodes and max_items."
+    )]
+    exhaustive: bool,
+}
+#[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SnapshotSemanticAncestor {
+    tag: String,
+    id: String,
 }
 fn snapshot_scope() -> String {
     "body".into()
@@ -709,12 +785,32 @@ struct SharedClickArgs {
 
 fn shared_value(response: &Value) -> Result<Value, String> {
     if response.get("exceptionDetails").is_some() {
-        return Err("page evaluation failed; take a fresh snapshot".into());
+        let details = response
+            .pointer("/exceptionDetails/text")
+            .and_then(Value::as_str)
+            .unwrap_or("page script exception");
+        return Err(format!(
+            "page evaluation failed: {}",
+            details.chars().take(256).collect::<String>()
+        ));
     }
-    response
-        .pointer("/result/value")
-        .cloned()
-        .ok_or_else(|| "page evaluation omitted value".into())
+    response.pointer("/result/value").cloned().ok_or_else(|| {
+        format!(
+            "page evaluation omitted value (remote type={}, subtype={}, response keys={})",
+            response
+                .pointer("/result/type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            response
+                .pointer("/result/subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("none"),
+            response
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default()
+        )
+    })
 }
 
 fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String)), String> {
@@ -737,7 +833,8 @@ fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String
         return Err("snapshot read batch returned unexpected or failed commands".into());
     }
     Ok((
-        shared_value(&receipts[0]["result"])?,
+        shared_value(&receipts[0]["result"])
+            .map_err(|error| format!("snapshot public getter failed: {error}"))?,
         frame_identity_from_tree(&receipts[1]["result"])?,
     ))
 }
@@ -749,7 +846,7 @@ async fn capture_shared_snapshot(
     if args.selector.is_empty()
         || args.selector.len() > 512
         || args.selector.chars().any(char::is_control)
-        || !(1..=200).contains(&args.max_items)
+        || !(1..=500).contains(&args.max_items)
         || args.max_text_chars > 6000
         || !(4096..=100000).contains(&args.max_bytes)
         || args.max_bytes < args.max_text_chars * 6 + 4096
@@ -757,7 +854,7 @@ async fn capture_shared_snapshot(
             hint.is_empty() || hint.len() > 512 || hint.chars().any(char::is_control)
         })
     {
-        return Err("snapshot limits: 1..200 items, 0..6000 text chars, 4096..100000 bytes; bytes must cover 6*text chars + 4096".into());
+        return Err("snapshot limits: 1..500 items, 0..6000 text chars, 4096..100000 bytes; bytes must cover 6*text chars + 4096".into());
     }
     let connection = shared
         .connection
@@ -783,9 +880,39 @@ async fn capture_shared_snapshot(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token,"href_hint":args.href_hint});
+    if args
+        .max_scan_nodes
+        .is_some_and(|limit| !(1..=65536).contains(&limit))
+        || args.goal.as_ref().is_some_and(|goal| {
+            goal.query
+                .as_ref()
+                .is_some_and(|query| query.trim().is_empty() || query.len() > 256)
+                || (goal.query.is_none() && goal.roles.is_none() && goal.href_hint.is_none())
+                || goal.roles.as_ref().is_some_and(|roles| {
+                    roles.is_empty() || roles.len() > 16 || roles.iter().any(|role| role.len() > 64)
+                })
+                || goal
+                    .href_hint
+                    .as_ref()
+                    .is_some_and(|hint| hint.is_empty() || hint.len() > 512)
+                || goal.within.as_ref().is_some_and(|scope| {
+                    scope.tag.is_empty()
+                        || scope.tag.len() > 32
+                        || !scope.tag.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                        })
+                        || scope.id.is_empty()
+                        || scope.id.len() > 256
+                })
+        })
+    {
+        return Err(
+            "targeted snapshot goal is invalid or exceeds its bounded search limits".into(),
+        );
+    }
+    let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token,"href_hint":args.href_hint,"goal":args.goal,"max_scan_nodes":args.max_scan_nodes});
     let expression = format!("({})({})", include_str!("shared_page/snapshot.js"), config);
-    let response = connection
+    let evaluation = connection
         .command(
             registry,
             &shared.handle,
@@ -795,7 +922,7 @@ async fn capture_shared_snapshot(
         )
         .await
         .map_err(|e| e.to_string())?;
-    let object_id = response
+    let object_id = evaluation
         .pointer("/result/objectId")
         .and_then(Value::as_str)
         .ok_or("snapshot failed to retain target identities")?
@@ -825,7 +952,10 @@ async fn capture_shared_snapshot(
             "Runtime.callFunctionOn",
             json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
         ).await?;
-        let value = shared_value(&response)?;
+        let value = match shared_value(&response) {
+            Ok(value) => value,
+            Err(error) => return Err(format!("snapshot public getter failed: {error}")),
+        };
         let after = shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await?;
         Ok((value, after))
     }}.await;
@@ -2198,19 +2328,13 @@ impl App {
                 let session_id = handle.id.clone();
                 let mut shared_sessions = self.shared_sessions.lock().await;
                 let host_registered = crate::native_setup::host_registered();
-                let native_busy = !shared_sessions.is_empty();
                 let unrestricted = crate::guard_reason::unrestricted_mode();
-                if native_busy && args.host_id.is_some() {
-                    return Err(invalid(
-                        "a shared session is active; release it before starting another native pairing",
-                    ));
-                }
                 if args.host_id.is_some() && !host_registered {
                     return Err(invalid(
                         "the native messaging host is not registered; register it before pairing",
                     ));
                 }
-                let native_snapshot = if !native_busy && host_registered {
+                let native_snapshot = if host_registered {
                     if args.host_id.is_some() || unrestricted {
                         Some(crate::native_setup::read_tabs().map_err(invalid)?)
                     } else {
@@ -2233,19 +2357,18 @@ impl App {
                 }
                 let native_bridge =
                     native_snapshot.is_some() && (args.host_id.is_some() || unrestricted);
+                let mut native_pairing = None;
                 if let Some(snapshot) = native_snapshot.filter(|_| native_bridge) {
                     let tabs = snapshot["tabs"]
                         .as_array()
                         .ok_or_else(|| invalid("native tab inventory is invalid"))?;
-                    if !unrestricted
-                        && target_ids.iter().any(|id| {
-                            !tabs.iter().any(|tab| {
-                                tab["id"]
-                                    .as_u64()
-                                    .is_some_and(|tab_id| tab_id.to_string() == *id)
-                            })
+                    if target_ids.iter().any(|id| {
+                        !tabs.iter().any(|tab| {
+                            tab["id"]
+                                .as_u64()
+                                .is_some_and(|tab_id| tab_id.to_string() == *id)
                         })
-                    {
+                    }) {
                         return Err(invalid(
                             "target_ids must be present in the fresh native tab inventory",
                         ));
@@ -2292,17 +2415,20 @@ impl App {
                             }
                         }
                     }
+                    let native_request_id =
+                        crate::native_setup::new_pairing_request_id().map_err(invalid)?;
                     crate::native_setup::write_pairing(
                         host_id,
                         &pairing.endpoint,
                         &pairing.token,
                         &target_ids,
-                        &session_id,
+                        &native_request_id,
                         &expected_urls,
                         &expected_document_ids,
                         unrestricted,
                     )
                     .map_err(invalid)?;
+                    native_pairing = Some((host_id.to_owned(), native_request_id));
                 }
                 shared_sessions.insert(
                     session_id.clone(),
@@ -2317,6 +2443,7 @@ impl App {
                         connection: None,
                         registry: None,
                         handle,
+                        native_pairing,
                     })),
                 );
                 drop(shared_sessions);
@@ -2326,11 +2453,11 @@ impl App {
                     "one_session_token":pairing.token,
                     "native_bridge":native_bridge,
                     "pairing_expires_in_seconds":300,
-                    "next":if native_bridge { "The native bridge is pairing the requested tab IDs. Call accept_shared to confirm; it returns accepted:false while waiting." } else if native_busy { "The native bridge handles one shared session at a time. For this additional session, use the extension popup with the returned endpoint and token, then call accept_shared." } else { "Native pairing is unavailable; use the popup's manual endpoint and token, then call accept_shared." },
+                    "next":if native_bridge { "The native bridge is pairing the requested tab IDs. Call accept_shared to confirm; it returns accepted:false while waiting." } else { "Native pairing is unavailable; use the popup's manual endpoint and token, then call accept_shared." },
                     "identity":"Chrome tab IDs are not Direct CDP target references"
                 })))
             }
-            "accept_shared" => {
+            "accept_shared" | "accept_shared_wait" => {
                 let id = args
                     .session_id
                     .as_deref()
@@ -2350,8 +2477,12 @@ impl App {
                     let task = shared.pairing.as_mut().ok_or_else(|| {
                         invalid("pairing ended; create a fresh pair_shared session")
                     })?;
-                    let outcome = match tokio::time::timeout(Duration::from_millis(100), task).await
-                    {
+                    let wait = if args.action == "accept_shared_wait" {
+                        Duration::from_secs(15)
+                    } else {
+                        Duration::from_millis(100)
+                    };
+                    let outcome = match tokio::time::timeout(wait, task).await {
                         Ok(outcome) => outcome,
                         Err(_) => {
                             return Ok(rmcp::handler::server::wrapper::Json(json!({
@@ -2442,6 +2573,13 @@ impl App {
                     matches!(connection, PageSessionTransport::Dedicated(_))
                 });
                 let handle = shared.handle.clone();
+                let pairing_cleanup_error =
+                    shared
+                        .native_pairing
+                        .take()
+                        .and_then(|(host_id, request_id)| {
+                            crate::native_setup::remove_pairing_request(&host_id, &request_id).err()
+                        });
                 let release_error = {
                     let SharedLiveSession {
                         connection,
@@ -2478,6 +2616,11 @@ impl App {
                 }
                 drop(shared);
                 self.shared_sessions.lock().await.remove(id);
+                if let Some(error) = pairing_cleanup_error {
+                    return Err(invalid(format!(
+                        "shared session released but pending pairing cleanup failed: {error}"
+                    )));
+                }
                 if let Some(error) = release_error {
                     return Err(invalid(format!(
                         "shared session retired after close failed: {error}"
@@ -2967,6 +3110,8 @@ impl App {
             max_text_chars: snapshot_chars(),
             max_bytes: snapshot_bytes(),
             href_hint: None,
+            goal: None,
+            max_scan_nodes: None,
         };
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -3315,7 +3460,7 @@ impl App {
         let expression = if args.action == "fill" {
             let value = serde_json::to_string(&args.value).map_err(|e| invalid(e.to_string()))?;
             format!(
-                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0];e.scrollIntoView({{block:'nearest'}});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value}};}})()"#
+                r#"(()=>{{let es;try{{es=[...document.querySelectorAll({selector})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(es.length!==1)return {{ok:false,reason:es.length?'ambiguous':'no_match'}};const e=es[0];e.scrollIntoView({{block:'nearest'}});const s=getComputedStyle(e),b=e.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2,h=document.elementFromPoint(x,y);if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted')||b.width<=0||b.height<=0||b.left<0||b.top<0||b.right>innerWidth||b.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||h!==e)return {{ok:false,reason:'blocked'}};if(e.value!=={expected})return {{ok:false,reason:'stale_value'}};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {{ok:false,reason:'blocked'}};setter.call(e,{value});e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{value}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:e.value==={value},value:e.value,dispatched:true}};}})()"#
             )
         } else if args.action == "type" {
             format!(
@@ -3367,21 +3512,27 @@ impl App {
                 Some("shared input deadline exceeded; effect may have occurred".into()),
             ),
         };
+        let dispatch_may_have_occurred =
+            args.action == "fill" && (preflight["dispatched"] == true || preflight["ok"] == true);
         let mut click_postcondition_error = None;
         if args.action != "type" && action_error.is_none() && preflight["ok"] != true {
             let detail = preflight["detail"]
                 .as_object()
                 .map(|d| serde_json::to_string(d).unwrap_or_default())
                 .unwrap_or_default();
-            action_error = Some(format!(
-                "shared input refused: {}{}",
-                preflight["reason"].as_str().unwrap_or("unverifiable"),
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({detail})")
-                }
-            ));
+            action_error = Some(if dispatch_may_have_occurred {
+                "shared fill readback changed after input/change dispatch; inspect state before retrying".into()
+            } else {
+                format!(
+                    "shared input refused: {}{}",
+                    preflight["reason"].as_str().unwrap_or("unverifiable"),
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({detail})")
+                    }
+                )
+            });
         }
         let observed_value;
         if args.action == "fill" {
@@ -3896,6 +4047,15 @@ impl App {
             after
         };
         if before != after {
+            if args.action == "fill" && dispatch_may_have_occurred {
+                return Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "status":"unknown","action":"fill","dispatch_acknowledged":true,
+                    "dispatch_may_have_occurred":true,
+                    "reason":"shared target changed after fill dispatch; inspect the new document before retrying",
+                    "identity_before":{"frame_id":before.0,"loader_id":before.1,"url":before.2},
+                    "identity_after":{"frame_id":after.0,"loader_id":after.1,"url":after.2}
+                })));
+            }
             if args.action == "click" && action_error.is_none() {
                 return Ok(rmcp::handler::server::wrapper::Json(json!({
                     "action":"click","dispatch_acknowledged":true,"navigation_observed":true,
@@ -3912,6 +4072,12 @@ impl App {
             return Err(invalid(error));
         }
         if let Some(error) = action_error {
+            if dispatch_may_have_occurred {
+                return Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "status":"unknown","action":"fill","dispatch_acknowledged":true,
+                    "dispatch_may_have_occurred":true,"reason":error
+                })));
+            }
             return Err(invalid(error));
         }
         Ok(rmcp::handler::server::wrapper::Json(json!({
@@ -3930,6 +4096,18 @@ impl App {
         validate_shared_url(&args.url)?;
         if args.action != "open" && args.action != "navigate" {
             return Err(invalid("shared_tab action must be open or navigate"));
+        }
+        if args
+            .wait_until
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "document_committed" | "dom_content_loaded"))
+        {
+            return Err(invalid(
+                "wait_until must be document_committed or dom_content_loaded",
+            ));
+        }
+        if args.action != "open" && args.wait_until.is_some() {
+            return Err(invalid("wait_until is supported only for action=open"));
         }
         if args.action == "open" && args.idempotency_key.as_deref().is_none_or(str::is_empty) {
             return Err(invalid(
@@ -3995,7 +4173,7 @@ impl App {
                 &shared.handle,
                 &source,
                 method,
-                json!({"url":args.url,"idempotency_key":args.idempotency_key}),
+                json!({"url":args.url,"idempotency_key":args.idempotency_key,"wait_until":args.wait_until.unwrap_or_else(|| "dom_content_loaded".into())}),
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
@@ -4767,6 +4945,19 @@ mod tests {
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn internal_workflow_reuse_is_scoped_to_its_successfully_consumed_generation() {
+        assert!(!super::internal_workflow_snapshot_allowed("external"));
+        super::with_internal_workflow_state(async {
+            assert!(!super::internal_workflow_snapshot_allowed("external"));
+            super::authorize_internal_workflow_snapshot("new");
+            assert!(super::internal_workflow_snapshot_allowed("new"));
+            assert!(!super::internal_workflow_snapshot_allowed("external"));
+        })
+        .await;
+        assert!(!super::internal_workflow_snapshot_allowed("new"));
+    }
 
     #[test]
     fn dedicated_batch_read_guard_accepts_only_explicit_true() {
@@ -6155,7 +6346,7 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 ready,
-                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
+                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION"),"protocol_version":1})
             );
             peer
         };
@@ -6424,7 +6615,7 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 ready,
-                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")})
+                json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION"),"protocol_version":1})
             );
             peer
         };
@@ -6489,7 +6680,7 @@ mod tests {
                                 json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
                                 json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
                                 json!({"result":{"type":"object","value":{"ok":true,"value":"new"}}}),
-                                json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener"}}}),
+                                json!({"result":{"type":"object","value":{"ok":false,"value":"changed by listener","dispatched":true}}}),
                                 json!({"result":{"type":"object","value":{"ok":false,"reason":"stale_value"}}}),
                                 json!({"result":{"type":"object","value":{"ok":false,"reason":"ambiguous"}}}),
                                 json!({"result":{"type":"object","value":{"ok":true,"x":12.0,"y":13.0,"postcondition_before_is_desired":false}}}),
@@ -6619,10 +6810,12 @@ mod tests {
         };
         let filled = fill("old").await.unwrap();
         assert_eq!(filled.structured_content.unwrap()["observed_value"], "new");
-        let changed_after_event = fill("old").await;
-        assert!(
-            changed_after_event.is_err() || changed_after_event.unwrap().is_error.unwrap_or(false)
+        let changed_after_event = fill("old").await.unwrap().structured_content.unwrap();
+        assert_eq!(
+            changed_after_event["status"], "unknown",
+            "a post-dispatch listener mutation must not be called not-dispatched: {changed_after_event}"
         );
+        assert_eq!(changed_after_event["dispatch_may_have_occurred"], true);
         let stale = fill("old").await;
         assert!(stale.is_err() || stale.unwrap().is_error.unwrap_or(false));
         let ambiguous = fill("old").await;
@@ -6980,8 +7173,20 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(waiting["accepted"], false);
-        // A sequential client must be able to finish the popup before calling accept_shared.
-        let mut socket = tokio::time::timeout(Duration::from_secs(1), async {
+        // One long wait can overlap extension hello and finish without polling accept_shared.
+        let id = pair["session_id"].as_str().unwrap().to_owned();
+        let wait = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.session(Parameters(SessionArgs {
+                action: "accept_shared_wait".into(),
+                provider: None,
+                session_id: Some(id.clone()),
+                target_ids: None,
+                host_id: None,
+            })),
+        );
+        let connect = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
             let (mut socket, _) = connect_async(pair["endpoint"].as_str().unwrap())
                 .await
                 .unwrap();
@@ -7000,19 +7205,13 @@ mod tests {
                 "ready"
             );
             socket
-        })
-        .await
-        .expect("pair_shared must listen without a concurrent accept_shared call");
-        let id = pair["session_id"].as_str().unwrap().to_owned();
-        let accepted = app
-            .session(Parameters(SessionArgs {
-                action: "accept_shared".into(),
-                provider: None,
-                session_id: Some(id.clone()),
-                target_ids: None,
-                host_id: None,
-            }))
+            })
             .await
+            .expect("extension hello should complete")
+        };
+        let (accepted, mut socket) = tokio::join!(wait, connect);
+        let accepted = accepted
+            .expect("single event-driven wait should complete")
             .unwrap()
             .0;
         assert_eq!(accepted["accepted"], true);
@@ -7032,7 +7231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_pairing_reports_an_active_session_instead_of_stale_inventory() {
+    async fn a_server_can_keep_multiple_shared_sessions_without_forcing_pair_release_first() {
         use super::{Parameters, SessionArgs};
 
         let app = App::default();
@@ -7048,35 +7247,33 @@ mod tests {
             .unwrap()
             .0;
 
-        let result = app
+        let second = app
             .session(Parameters(SessionArgs {
                 action: "pair_shared".into(),
                 provider: None,
                 session_id: None,
                 target_ids: Some(vec!["456".into()]),
-                host_id: Some("0123456789abcdef0123456789abcdef".into()),
+                host_id: None,
             }))
-            .await;
-        let error = match result {
-            Ok(_) => panic!("native pairing unexpectedly bypassed the active session"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .message
-                .contains("release it before starting another native pairing")
-        );
-        assert!(!error.message.contains("fresh tab inventory"));
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(first["session_id"], second["session_id"]);
 
-        app.session(Parameters(SessionArgs {
-            action: "release_shared".into(),
-            provider: None,
-            session_id: first["session_id"].as_str().map(str::to_owned),
-            target_ids: None,
-            host_id: None,
-        }))
-        .await
-        .unwrap();
+        for session in [&first, &second] {
+            let released = app
+                .session(Parameters(SessionArgs {
+                    action: "release_shared".into(),
+                    provider: None,
+                    session_id: session["session_id"].as_str().map(str::to_owned),
+                    target_ids: None,
+                    host_id: None,
+                }))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(released["released"], true);
+        }
     }
 
     #[tokio::test]

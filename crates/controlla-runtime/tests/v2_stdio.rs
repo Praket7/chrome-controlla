@@ -72,6 +72,12 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .unwrap_or_default();
     assert!(browser_description.contains("{\"kind\":\"research\""));
     assert!(browser_description.contains("allow_password=true"));
+    assert!(browser_description.contains("ready_when"));
+    assert!(
+        browser["properties"]["ready_when"]["anyOf"].is_array()
+            || browser["properties"]["ready_when"]["oneOf"].is_array(),
+        "ready_when exposes a tagged readiness policy"
+    );
     assert!(
         browser["properties"]["task"]["description"]
             .as_str()
@@ -89,9 +95,11 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         "target_ids",
         "chrome_tab_id",
         "url",
+        "ready_when",
         "task",
         "filename",
         "bytes",
+        "encoding",
         "artifact_handle",
         "client_id",
         "idempotency_key",
@@ -102,6 +110,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             "browser {property}"
         );
     }
+    assert!(schema("workflow")["properties"].get("program").is_some());
     assert!(
         browser["properties"]["idempotency_key"]["description"]
             .as_str()
@@ -162,6 +171,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         assert!(act["properties"].get(property).is_some(), "act {property}");
     }
     let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
+    assert!(schema("workflow")["properties"].get("program").is_some());
     for step in [
         "snapshot", "find", "click", "fill", "type", "press", "extract", "verify", "upload",
     ] {
@@ -400,9 +410,12 @@ async fn private_headless_download_returns_verified_artifact_bytes() {
         .unwrap()
         .structured_content
         .unwrap();
+    use base64::Engine as _;
     assert_eq!(
-        read["bytes"],
-        serde_json::json!([102, 105, 120, 116, 117, 114, 101])
+        base64::engine::general_purpose::STANDARD
+            .decode(read["bytes_base64"].as_str().unwrap())
+            .unwrap(),
+        b"fixture"
     );
     assert_eq!(read["sha256"], result["receipts"][0]["sha256"]);
     let registered = client

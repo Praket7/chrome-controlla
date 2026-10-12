@@ -59,13 +59,14 @@ function completeReport() {
     },
     comparisons: structuredBaselines.map(baselineId => ({
       baseline_adapter: baselineId,
-      paired_rows: phase11.tasks.flatMap(task => phase11.modes.flatMap(mode => phase11.concurrency.map(concurrency => ({
+      paired_rows: phase11.tasks.flatMap(task => phase11.modes.flatMap(mode => phase11.concurrency.flatMap(concurrency => Array.from({length: phase11.repetitions ?? 1}, (_, index) => ({
+        replicate: index + 1,
         task_id: task.id,
         mode,
         concurrency,
         candidate: result('controlla', task.id, mode, concurrency, 700, 2),
         baseline: result(baselineId, task.id, mode, concurrency, 1000, 4)
-      }))))
+      })))))
     }))
   };
 }
@@ -95,7 +96,7 @@ test('claim gate passes only complete independently verified structured competit
     await writeReport(missingRow);
     const incomplete = runClaimGate();
     assert.notEqual(incomplete.status, 0);
-    assert.match(`${incomplete.stderr}\n${incomplete.stdout}`, /complete 144-row task\/mode\/concurrency matrix/);
+    assert.match(`${incomplete.stderr}\n${incomplete.stdout}`, /complete 2640-row task\/mode\/concurrency\/replicate matrix/);
 
     const forgedVerification = structuredClone(good);
     forgedVerification.comparisons[0].paired_rows[0].candidate.verifier_evidence_hash = '';

@@ -33,7 +33,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -431,22 +431,60 @@ impl BrowserConnection {
         method: impl Into<String>,
         params: Value,
     ) -> Result<Value, BrowserError> {
+        let started = Instant::now();
         if self.cancellation.is_cancelled() {
             return Err(BrowserError::Closed);
         }
+        let method = method.into();
+        let payload_bytes = method
+            .len()
+            .saturating_add(serde_json::to_vec(&params).map_or(0, |bytes| bytes.len()))
+            as u64;
+        crate::scheduler::telemetry::admit_browser_commands(1)
+            .await
+            .map_err(|reason| BrowserError::Connection(reason.into()))?;
+        crate::scheduler::telemetry::admit_cdp_commands(1)
+            .await
+            .map_err(|reason| BrowserError::Connection(reason.into()))?;
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
         self.outgoing
             .send(OutgoingCommand {
                 id,
                 session_id,
-                method: method.into(),
+                method,
                 params,
                 response: response_tx,
             })
             .await
             .map_err(|_| BrowserError::Closed)?;
-        response_rx.await.map_err(|_| BrowserError::Cancelled)?
+        let result = match response_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                crate::scheduler::telemetry::record_browser_command(
+                    1,
+                    1,
+                    payload_bytes,
+                    0,
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                )
+                .await;
+                crate::scheduler::telemetry::record_unknown_delivery().await;
+                return Err(BrowserError::Cancelled);
+            }
+        };
+        crate::scheduler::telemetry::record_browser_command(
+            1,
+            1,
+            payload_bytes,
+            0,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        )
+        .await;
+        if matches!(&result, Err(BrowserError::Closed | BrowserError::Cancelled)) {
+            crate::scheduler::telemetry::record_unknown_delivery().await;
+        }
+        result
     }
 
     /// Create one target through this direct CDP provider and persist ownership

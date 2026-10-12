@@ -4,6 +4,7 @@
   "frozen_phase10_unchanged": true,
   "modes": ["cold_unknown","warm_known","warm_skill"],
   "concurrency": [1,2,4,8],
+  "repetitions": 10,
   "task_classes": [
     "forms","extraction","multitab","spa","visual_canvas","virtual_list","upload",
     "repeated_workflow","interference","stale_navigation","long_workflow","concurrent_tabs"
@@ -20,10 +21,22 @@
     {"id":"human-edit-race","class":"interference","fixture":"registration-form","requires_independent_verification":true},
     {"id":"stale-after-navigation","class":"stale_navigation","fixture":"spa-router","requires_independent_verification":true},
     {"id":"bounded-long-flow","class":"long_workflow","fixture":"workflow-suite","requires_independent_verification":true},
-    {"id":"eight-tab-pressure","class":"concurrent_tabs","fixture":"paired-tabs","requires_independent_verification":true}
+    {"id":"eight-tab-pressure","class":"concurrent_tabs","fixture":"paired-tabs","requires_independent_verification":true},
+    {"id":"slow-media-early-form","class":"forms","fixture":"registration-form","scenario":"form_ready_before_slow_media_completes","requires_independent_verification":true},
+    {"id":"50k-node-targeted-control","class":"extraction","fixture":"records-table","scenario":"50000_nodes_one_requested_control","requires_independent_verification":true},
+    {"id":"rich-editor-1000-char-fastkeys","class":"forms","fixture":"workflow-suite","scenario":"1000_character_rich_editor_fastkeys","requires_independent_verification":true},
+    {"id":"five-field-single-workflow","class":"repeated_workflow","fixture":"registration-form","scenario":"five_fields_one_workflow","requires_independent_verification":true},
+    {"id":"virtual-list-1000-rows","class":"virtual_list","fixture":"virtual-list","scenario":"1000_recycled_rows_stable_identity","requires_independent_verification":true},
+    {"id":"newest-ranking-50-candidates","class":"extraction","fixture":"records-table","scenario":"50_candidates_staged_freshness_frontier","requires_independent_verification":true},
+    {"id":"artifact-register-4mb","class":"upload","fixture":"file-input","scenario":"4_mib_artifact_transfer_digest_match","requires_independent_verification":true},
+    {"id":"artifact-register-10mb","class":"upload","fixture":"file-input","scenario":"10_mib_artifact_transfer_digest_match","requires_independent_verification":true},
+    {"id":"react-rerender-target","class":"interference","fixture":"registration-form","scenario":"same_document_unique_replacement_then_guarded_action","requires_independent_verification":true},
+    {"id":"on-demand-frame-escalation","class":"extraction","fixture":"workflow-suite","scenario":"root_snapshot_then_targeted_frame_read","requires_independent_verification":true}
   ],
   "adapters": [
     {"id":"controlla","track":"structured"},
+    {"id":"controlla-1","track":"structured","source_ref":"62e6407d0e75b83a1be8d69468476601a6e6da37"},
+    {"id":"controlla-2-pre-stage2","track":"structured","source_ref":"406b9d9794d6cb59dc75d22c7e6fe7a8554b1e67"},
     {"id":"playwright-mcp","track":"structured"},
     {"id":"chrome-devtools-mcp","track":"structured"},
     {"id":"agent-browser","track":"structured"},

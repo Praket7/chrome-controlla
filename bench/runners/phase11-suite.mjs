@@ -10,14 +10,16 @@ function commandEnvName(adapterId) {
   return `PHASE11_${adapterId.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_COMMAND_JSON`;
 }
 
-export async function structuredBaselineIds() {
+export async function structuredBaselineIds(candidateId = 'controlla') {
   const config = await loadPhase11Config();
   return config.adapters
-    .filter(adapter => adapter.track === 'structured' && adapter.id !== 'controlla')
+    .filter(adapter => adapter.track === 'structured' && adapter.id !== candidateId)
     .map(adapter => adapter.id);
 }
 
 export async function runFullSuite({
+  candidateId = 'controlla',
+  baselineIds,
   fixtureBaseUrl,
   commands,
   resetCommand,
@@ -25,22 +27,25 @@ export async function runFullSuite({
   environment,
   modes,
   concurrencyLevels,
+  repetitions,
   deadlineMs = 60_000,
   env = process.env,
 } = {}) {
-  const baselines = await structuredBaselineIds();
+  const baselines = baselineIds ?? await structuredBaselineIds(candidateId);
   const comparisons = [];
   for (const baselineId of baselines) {
     if (!commands?.[baselineId]) throw new Error(`missing command for structured baseline ${baselineId}`);
     const report = await runBenchmark({
       baselineId,
+      candidateId,
       fixtureBaseUrl,
-      commands: { controlla: commands.controlla, [baselineId]: commands[baselineId] },
+      commands: { [candidateId]: commands[candidateId], [baselineId]: commands[baselineId] },
       resetCommand,
       verifierCommand,
       environment,
       modes,
       concurrencyLevels,
+      repetitions,
       deadlineMs,
       env,
     });
@@ -49,7 +54,7 @@ export async function runFullSuite({
   return {
     schema_version: 2,
     track: 'phase11-realistic',
-    candidate_adapter: 'controlla',
+    candidate_adapter: candidateId,
     environment,
     comparisons,
   };
@@ -66,17 +71,21 @@ async function main() {
   const deadlineMs = Number(argValue('deadline-ms') ?? 60_000);
   const modes = argValue('modes')?.split(',').filter(Boolean);
   const concurrencyLevels = argValue('concurrency')?.split(',').filter(Boolean).map(Number);
+  const repetitions = argValue('repetitions') === undefined ? undefined : Number(argValue('repetitions'));
   const output = resolve(root, argValue('output') ?? 'bench/reports/phase11-results.json');
-  const baselines = await structuredBaselineIds();
+  const candidateId = process.env.PHASE11_CANDIDATE_ID ?? 'controlla';
+  const baselines = process.env.PHASE11_BASELINE_IDS
+    ? process.env.PHASE11_BASELINE_IDS.split(',').map(value => value.trim()).filter(Boolean)
+    : await structuredBaselineIds(candidateId);
   const commands = {
-    controlla: parseCommand(process.env[commandEnvName('controlla')], commandEnvName('controlla')),
+    [candidateId]: parseCommand(process.env[commandEnvName(candidateId)], commandEnvName(candidateId)),
   };
   for (const baselineId of baselines) {
     commands[baselineId] = parseCommand(process.env[commandEnvName(baselineId)], commandEnvName(baselineId));
   }
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
-  const report = await runFullSuite({ fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, deadlineMs });
+  const report = await runFullSuite({ candidateId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, repetitions, deadlineMs });
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
   const rows = report.comparisons.reduce((sum, comparison) => sum + comparison.paired_rows.length, 0);

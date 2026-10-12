@@ -66,14 +66,16 @@ function validateResultSide(side, expectedAdapter, taskId, mode, concurrency) {
 
 function validateCompleteMatrix(rows, baselineId) {
   const taskIds = phase11.tasks.map(task => task.id);
-  const expectedCount = taskIds.length * phase11.modes.length * phase11.concurrency.length;
-  assert.equal(rows.length, expectedCount, `${baselineId} claim evidence must cover the complete ${expectedCount}-row task/mode/concurrency matrix`);
+  const repetitions = phase11.repetitions ?? 1;
+  const expectedCount = taskIds.length * phase11.modes.length * phase11.concurrency.length * repetitions;
+  assert.equal(rows.length, expectedCount, `${baselineId} claim evidence must cover the complete ${expectedCount}-row task/mode/concurrency/replicate matrix`);
   const seen = new Set();
   for (const row of rows) {
     assert.ok(taskIds.includes(row.task_id), `unknown task_id ${row.task_id}`);
     assert.ok(phase11.modes.includes(row.mode), `unknown mode ${row.mode}`);
     assert.ok(phase11.concurrency.includes(row.concurrency), `unknown concurrency ${row.concurrency}`);
-    const key = `${row.task_id}\u001f${row.mode}\u001f${row.concurrency}`;
+    assert.ok(Number.isInteger(row.replicate) && row.replicate >= 1 && row.replicate <= repetitions, `invalid replicate ${row.replicate}`);
+    const key = `${row.task_id}\u001f${row.mode}\u001f${row.concurrency}\u001f${row.replicate}`;
     assert.ok(!seen.has(key), `duplicate Phase 11 row ${key}`);
     seen.add(key);
     validateResultSide(row.candidate, 'controlla', row.task_id, row.mode, row.concurrency);
@@ -82,8 +84,10 @@ function validateCompleteMatrix(rows, baselineId) {
   for (const taskId of taskIds) {
     for (const mode of phase11.modes) {
       for (const concurrency of phase11.concurrency) {
-        const key = `${taskId}\u001f${mode}\u001f${concurrency}`;
-        assert.ok(seen.has(key), `missing Phase 11 row ${key}`);
+        for (let replicate = 1; replicate <= repetitions; replicate++) {
+          const key = `${taskId}\u001f${mode}\u001f${concurrency}\u001f${replicate}`;
+          assert.ok(seen.has(key), `missing Phase 11 row ${key}`);
+        }
       }
     }
   }

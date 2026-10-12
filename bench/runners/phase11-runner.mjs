@@ -99,6 +99,7 @@ export function validateAdapterResult(result, contract, expected) {
   if (result.adapter !== expected.adapter || result.task_id !== expected.task_id || result.mode !== expected.mode || result.concurrency !== expected.concurrency) {
     throw new Error('adapter result identity does not match requested run');
   }
+  if (expected.source_ref && result.source_ref !== expected.source_ref) throw new Error(`adapter ${expected.adapter} did not execute pinned source_ref ${expected.source_ref}`);
   if (typeof result.success !== 'boolean' || typeof result.independently_verified_success !== 'boolean') {
     throw new Error('success fields must be booleans');
   }
@@ -126,7 +127,7 @@ async function independentlyVerify(verifierCommand, input, actingResult, timeout
 
 async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env }) {
   const fixtureUrl = new URL(task.fixture, fixtureBaseUrl).toString();
-  const input = { task_id: task.id, mode, concurrency, fixture_url: fixtureUrl, deadline_ms: deadlineMs };
+  const input = { task_id: task.id, scenario: task.scenario, mode, concurrency, fixture_url: fixtureUrl, deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
   let raw;
   try {
@@ -134,6 +135,7 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   } catch (error) {
     raw = {
       adapter: adapter.id, task_id: task.id, mode, concurrency, success: false, independently_verified_success: false,
+      ...(adapter.source_ref ? { source_ref: adapter.source_ref } : {}),
       wall_ms: deadlineMs, model_round_trips: 0, model_tokens: 0, mcp_calls: 0, browser_ops: 0,
       observation_bytes: 0, screenshot_bytes: 0, retries: 0, recovery_events: 0, cache_status: 'error',
       verification_ms: 0, cpu_ms: 0, peak_rss_bytes: 0, focus_disruptions: 0, clipboard_disruptions: 0,
@@ -141,7 +143,7 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
       runner_error: error.message,
     };
   }
-  validateAdapterResult(raw, contract, { adapter: adapter.id, task_id: task.id, mode, concurrency });
+  validateAdapterResult(raw, contract, { adapter: adapter.id, task_id: task.id, mode, concurrency, source_ref: adapter.source_ref });
   const verification = await independentlyVerify(verifierCommand, input, raw, deadlineMs, env);
   return {
     ...raw,
@@ -156,6 +158,7 @@ function assertEnvironment(environment) {
 }
 
 export async function runBenchmark({
+  candidateId = 'controlla',
   baselineId,
   fixtureBaseUrl,
   commands,
@@ -164,12 +167,13 @@ export async function runBenchmark({
   environment,
   modes,
   concurrencyLevels,
+  repetitions,
   deadlineMs = 60_000,
   env = process.env,
 } = {}) {
   const config = await loadPhase11Config();
   const contract = await loadAdapterContract();
-  const candidate = config.adapters.find(adapter => adapter.id === 'controlla');
+  const candidate = config.adapters.find(adapter => adapter.id === candidateId);
   const baseline = config.adapters.find(adapter => adapter.id === baselineId);
   if (!candidate || !baseline) throw new Error(`unknown baseline ${baselineId}`);
   if (baseline.track !== 'structured') throw new Error('release comparison requires a structured baseline; computer-use stays on the separate vision track');
@@ -177,16 +181,19 @@ export async function runBenchmark({
   assertEnvironment(environment);
   const selectedModes = modes ?? config.modes;
   const selectedConcurrency = concurrencyLevels ?? config.concurrency;
+  const selectedRepetitions = repetitions ?? config.repetitions ?? 1;
+  if (!Number.isInteger(selectedRepetitions) || selectedRepetitions < 1 || selectedRepetitions > 100) throw new Error('repetitions must be an integer from 1 to 100');
   for (const mode of selectedModes) if (!config.modes.includes(mode)) throw new Error(`unsupported mode ${mode}`);
   for (const value of selectedConcurrency) if (!config.concurrency.includes(value)) throw new Error(`unsupported concurrency ${value}`);
-  const candidateCommand = commands?.controlla;
+  const candidateCommand = commands?.[candidateId];
   const baselineCommand = commands?.[baselineId];
   if (!candidateCommand || !baselineCommand || !resetCommand || !verifierCommand) throw new Error('candidate, baseline, reset, and verifier commands are required');
 
   const pairedRows = [];
-  for (const task of config.tasks) {
-    for (const mode of selectedModes) {
-      for (const concurrency of selectedConcurrency) {
+  for (let replicate = 0; replicate < selectedRepetitions; replicate++) {
+    for (const task of config.tasks) {
+      for (const mode of selectedModes) {
+        for (const concurrency of selectedConcurrency) {
         const common = { task, mode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env };
         const candidateFirst = (pairedRows.length % 2) === 0;
         const runCandidate = () => runOne({ ...common, adapter: candidate, command: candidateCommand });
@@ -200,7 +207,8 @@ export async function runBenchmark({
           baselineResult = await runBaseline();
           candidateResult = await runCandidate();
         }
-        pairedRows.push({ task_id: task.id, mode, concurrency, candidate: candidateResult, baseline: baselineResult });
+        pairedRows.push({ replicate: replicate + 1, task_id: task.id, mode, concurrency, candidate: candidateResult, baseline: baselineResult });
+        }
       }
     }
   }
@@ -226,15 +234,16 @@ async function main() {
   const deadlineMs = Number(argValue('deadline-ms') ?? 60_000);
   const modes = argValue('modes')?.split(',').filter(Boolean);
   const concurrencyLevels = argValue('concurrency')?.split(',').filter(Boolean).map(Number);
+  const repetitions = argValue('repetitions') === undefined ? undefined : Number(argValue('repetitions'));
   const output = resolve(root, argValue('output') ?? 'bench/reports/phase11-results.json');
   if (!baselineId) throw new Error('--baseline=<structured-adapter-id> is required');
   const commands = {
-    controlla: parseCommand(process.env[commandEnvName('controlla')], commandEnvName('controlla')),
+    [argValue('candidate') ?? 'controlla']: parseCommand(process.env[commandEnvName(argValue('candidate') ?? 'controlla')], commandEnvName(argValue('candidate') ?? 'controlla')),
     [baselineId]: parseCommand(process.env[commandEnvName(baselineId)], commandEnvName(baselineId)),
   };
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
-  const report = await runBenchmark({ baselineId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, deadlineMs });
+  const report = await runBenchmark({ candidateId: argValue('candidate') ?? 'controlla', baselineId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, repetitions, deadlineMs });
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
   console.log(`wrote ${report.paired_rows.length} paired Phase 11 rows to ${output}`);

@@ -5,7 +5,8 @@ function(index, outcome, opts) {
   const fail = (reason, detail) => ({ok:false, reason, retry_class:RETRY[reason] || 'do_not_retry', detail:detail || {}});
   const round = n => Math.round(n);
   const rectOf = b => ({l:round(b.left), t:round(b.top), r:round(b.right), b:round(b.bottom)});
-  const e = this.nodes[index], saved = this.items[index];
+  let e = this.nodes[index];
+  const saved = this.items[index];
   const composedClosest = (node, selector) => {
     for (let n=node, depth=0; n && depth<16; n=n.parentElement || n.getRootNode()?.host, depth++) {
       if (n.matches?.(selector)) return n;
@@ -14,7 +15,17 @@ function(index, outcome, opts) {
   };
   const align = (opts && opts.scroll) || 'nearest';
   if (!e || !saved) return fail('stale_reference');
-  if (!e.isConnected) return fail('detached');
+  if (!e.isConnected) {
+    if (saved.source_frame !== 'main') return fail('detached');
+    const defaultRole = n => n.getAttribute('role') || ({A:'link',BUTTON:'button',INPUT:'input',TEXTAREA:'textbox',SELECT:'combobox',SUMMARY:'button'}[n.tagName] || 'control');
+    const candidates = Array.from(document.querySelectorAll('a[href],button,input,textarea,select,summary,[contenteditable]:not([contenteditable="false"]),[role]')).filter(n => {
+      if (n.tagName.toLowerCase() !== saved.tag || defaultRole(n) !== saved.role || this.name(n) !== saved.name || this.raw(n) !== saved.raw_value || (n.tagName === 'A' && n.href !== saved.href)) return false;
+      const ancestor = n.closest('article,li,[role="article"],[data-card],section');
+      return !saved.semantic_ancestor?.id || ancestor?.getAttribute('data-id') === saved.semantic_ancestor.id || ancestor?.id === saved.semantic_ancestor.id;
+    });
+    if (candidates.length !== 1) return fail('detached', {reacquire_candidates:candidates.length});
+    this.nodes[index] = e = candidates[0];
+  }
   const frame = e.ownerDocument === document ? null : e.ownerDocument.defaultView?.frameElement;
   if (e.ownerDocument !== document && (!frame || !frame.isConnected || frame.ownerDocument !== document)) return fail('document_changed');
   if (frame && e.tagName !== 'A') return fail('unsafe_page', {tag:e.tagName.toLowerCase()});

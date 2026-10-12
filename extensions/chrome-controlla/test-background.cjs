@@ -35,6 +35,11 @@ let tabsActivated;
 let windowFocusChanged;
 let navigationBefore;
 let navigationCommitted;
+let navigationDomContentLoaded;
+const committedListeners = new Set();
+const domContentLoadedListeners = new Set();
+let slowMediaNextNavigation = false;
+let delayedNextCommitMs = 0;
 let navigationError;
 let debuggerDetached;
 let debuggerEvent;
@@ -59,6 +64,10 @@ let fileReadbackEmpty = false;
 let childFrameUrl = "https://picker.example.test/";
 let navigateFrameOnClick = false;
 let networkEventsOnEnable = [];
+let fastTypeValue = "";
+let fastTypeFocused = true;
+let stealFocusAfterKeydown = false;
+let stealFocusAfterKeyup = false;
 const expectedUrls = ids => Object.fromEntries(ids.map(id => [id, `https://example.test/${id}`]));
 const expectedDocuments = ids => Object.fromEntries(ids.map(id => [id, `document-${id}`]));
 class FakeWebSocket {
@@ -107,7 +116,35 @@ const chrome = {
   tabs: {
     async query() { return tabList; },
     async create({ url }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete" }; tabList.push(tab); if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
-    async update(tabId, { url }) { const tab = tabList.find(tab => tab.id === tabId); if (!tab) throw new Error("missing tab"); tab.url = url; tab.status = "complete"; tabUrlOverrides.set(tabId, url); tabDocumentOverrides.set(tabId, `${tabDocumentOverrides.get(tabId) || `document-${tabId}`}-next`); return tab; },
+    async update(tabId, { url }) {
+      const tab = tabList.find(tab => tab.id === tabId);
+      if (!tab) throw new Error("missing tab");
+      const delayedCommit = delayedNextCommitMs;
+      delayedNextCommitMs = 0;
+      const priorUrl = tabUrlOverrides.get(tabId) || tab.url;
+      const priorDocumentId = tabDocumentOverrides.get(tabId) || `document-${tabId}`;
+      tab.url = url;
+      tab.status = delayedCommit ? "complete" : slowMediaNextNavigation ? "loading" : "complete";
+      const documentId = `${priorDocumentId}-next`;
+      if (delayedCommit) {
+        tabUrlOverrides.set(tabId, priorUrl);
+        setTimeout(() => {
+          tabUrlOverrides.set(tabId, url);
+          tabDocumentOverrides.set(tabId, documentId);
+          navigationCommitted?.({ tabId, frameId: 0, documentId, url });
+          navigationDomContentLoaded?.({ tabId, frameId: 0, documentId, url });
+        }, delayedCommit);
+        return tab;
+      }
+      tabUrlOverrides.set(tabId, url);
+      tabDocumentOverrides.set(tabId, documentId);
+      navigationCommitted?.({ tabId, frameId: 0, documentId, url });
+      if (slowMediaNextNavigation) {
+        slowMediaNextNavigation = false;
+        setTimeout(() => navigationDomContentLoaded?.({ tabId, frameId: 0, documentId, url }), 0);
+      } else navigationDomContentLoaded?.({ tabId, frameId: 0, documentId, url });
+      return tab;
+    },
     async get(tabId) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("No tab with id: " + tabId);
@@ -132,7 +169,8 @@ const chrome = {
         url: tabUrlOverrides.get(tabId) || tab.url };
     },
     onBeforeNavigate: { addListener(callback) { navigationBefore = callback; } },
-    onCommitted: { addListener(callback) { navigationCommitted = callback; } },
+    onCommitted: { addListener(callback) { committedListeners.add(callback); navigationCommitted = details => { for (const listener of [...committedListeners]) listener(details); }; }, removeListener(callback) { committedListeners.delete(callback); } },
+    onDOMContentLoaded: { addListener(callback) { domContentLoadedListeners.add(callback); navigationDomContentLoaded = details => { for (const listener of [...domContentLoadedListeners]) listener(details); }; }, removeListener(callback) { domContentLoadedListeners.delete(callback); } },
     onErrorOccurred: { addListener(callback) { navigationError = callback; } },
   },
   runtime: {
@@ -158,6 +196,19 @@ const chrome = {
     },
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
+      if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,expected,prepare,normalize,requireFocus)")) {
+        const [index, expected, prepare] = params.arguments.map(argument => argument.value);
+        if (prepare) fastTypeFocused = true;
+        return { result: { value: { ok: fastTypeFocused && fastTypeValue === expected, reason: fastTypeFocused ? "stale_value" : "focus_or_selection_changed", value: fastTypeValue, rich: false } } };
+      }
+      if (method === "Input.dispatchKeyEvent") {
+        if (params.type === "keyDown" && stealFocusAfterKeydown) { stealFocusAfterKeydown = false; fastTypeFocused = false; }
+        if (params.type === "keyUp" && stealFocusAfterKeyup) { stealFocusAfterKeyup = false; fastTypeFocused = false; }
+        if (params.type === "char") fastTypeValue += params.text;
+        if (params.type === "keyDown" && params.key === "Enter") fastTypeValue += "\n";
+        return {};
+      }
       if (method === "Network.enable" && networkEventsOnEnable.length) {
         const events = networkEventsOnEnable;
         networkEventsOnEnable = [];
@@ -218,7 +269,6 @@ const chrome = {
       afterCall?.(target, method, params);
       mockNow += advanceClockOnNextDebuggerCall;
       advanceClockOnNextDebuggerCall = 0;
-      if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration === "guard") return { result: { value: { ok: false } } };
       if (method === "Runtime.evaluate" && params?.awaitResult) {
         return new Promise(resolve => pendingCommands.push(resolve));
@@ -297,7 +347,39 @@ function message(payload) {
   assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", document_identity: true, batch_execution: true, batch_deadline: true }));
+  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
+  fastTypeValue = ""; fastTypeFocused = true;
+  native.hostMessage({ type: "command", id: "fast-type-program", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "Fast\nKeys", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const fastTypeReceipt = native.sent.find(message => message.id === "fast-type-program")?.result;
+  assert.equal(fastTypeReceipt.status, "verified", JSON.stringify(fastTypeReceipt));
+  assert.equal(fastTypeReceipt.readback, "Fast\nKeys");
+  assert.equal(fastTypeReceipt.completed_chars, 9);
+  assert.equal(fastTypeReceipt.key_events, 26);
+  fastTypeValue = ""; fastTypeFocused = true; stealFocusAfterKeydown = true;
+  const eventsBeforeFocusTheft = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "fast-type-focus-theft", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "x", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const focusTheftReceipt = native.sent.find(message => message.id === "fast-type-focus-theft")?.result;
+  assert.equal(focusTheftReceipt.status, "unknown");
+  assert.equal(focusTheftReceipt.completed_chars, 0);
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length - eventsBeforeFocusTheft, 1,
+    "focus movement after keyDown must stop before char and keyUp are sent to a new target");
+  fastTypeValue = ""; fastTypeFocused = true; stealFocusAfterKeyup = true;
+  const eventsBeforeKeyupFocusTheft = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "fast-type-keyup-focus-theft", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "ab", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const keyupFocusTheft = native.sent.find(message => message.id === "fast-type-keyup-focus-theft")?.result;
+  assert.equal(keyupFocusTheft.status, "unknown");
+  assert.equal(keyupFocusTheft.completed_chars, 1);
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length - eventsBeforeKeyupFocusTheft, 3,
+    "focus movement after keyUp must be detected before the next keyDown is dispatched");
+  fastTypeValue = ""; fastTypeFocused = true; rejectNextCommand = "Input.dispatchKeyEvent";
+  native.hostMessage({ type: "command", id: "fast-type-delivery-unknown", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "x", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const failedFastTypeReceipt = native.sent.find(message => message.id === "fast-type-delivery-unknown")?.result;
+  assert.equal(failedFastTypeReceipt.status, "unknown");
+  assert.equal(failedFastTypeReceipt.cdp_commands, 2, "unknown partial delivery reports the preflight and attempted key command");
   attachOopifOnNextAutoAttach = true;
   native.hostMessage({ type: "command", id: "oopif-ax", target_id: "41", method: "Controlla.frameAccessibility", params: { frame_id: "frame-oopif" } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -511,6 +593,13 @@ function message(payload) {
   assert.equal(navigated.result.tab_id, "503");
   assert.equal(navigated.result.url, "https://www.espn.com/nfl/");
   assert.equal(navigated.result.document_id, "document-503-next-next");
+  delayedNextCommitMs = 100;
+  native.hostMessage({ type: "command", id: "navigate-after-stale-ready", target_id: "503", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/team/" } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(native.sent.some(message => message.id === "navigate-after-stale-ready"), false,
+    "paired navigation must wait for the new document, even when the prior document is already DOM-ready");
+  await new Promise(resolve => setTimeout(resolve, 120));
+  assert.equal(native.sent.find(message => message.id === "navigate-after-stale-ready")?.result?.document_id, "document-503-next-next-next");
   native.hostMessage({ type: "command", id: "unsafe-url", target_id: "41", method: "Controlla.openTab", params: { url: "javascript:alert(1)" } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(native.sent.at(-1).error, /HTTP\(S\)/);
@@ -529,7 +618,12 @@ function message(payload) {
   assert.equal(debuggerCalls.at(-1).method, "DOM.getDocument");
   const successTrace = commandDiagnostics.splice(0).map(([, event]) => JSON.parse(JSON.stringify(event)));
   assert.deepEqual(successTrace.map(event => event.phase), ["dispatch", "settled", "reply"]);
-  assert.deepEqual(successTrace[1], {
+  assert.ok(Number.isSafeInteger(successTrace[1].requestBytes) && successTrace[1].requestBytes > 0);
+  assert.ok(Number.isSafeInteger(successTrace[1].responseBytes) && successTrace[1].responseBytes > 0);
+  const successSettlement = { ...successTrace[1] };
+  delete successSettlement.requestBytes;
+  delete successSettlement.responseBytes;
+  assert.deepEqual(successSettlement, {
     phase: "settled", commandId: "dom", targetId: 41, method: "DOM.getDocument",
     elapsedMs: successTrace[1].elapsedMs, outcome: "result"
   }, "debug diagnostics identify successful dispatch settlement without command parameters");
@@ -630,6 +724,23 @@ function message(payload) {
   native.hostMessage({ type: "release" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(detached.includes(41) && detached.includes(43), "release detaches only explicitly paired native targets");
+
+  native.hostMessage({ type: "pair", request_id: "codex-a", lease_id: "codex-a", tab_ids: [60], expected_urls: expectedUrls([60]), expected_document_ids: expectedDocuments([60]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  native.hostMessage({ type: "pair", request_id: "codex-b", lease_id: "codex-b", tab_ids: [61], expected_urls: expectedUrls([61]), expected_document_ids: expectedDocuments([61]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.find(message => message.request_id === "codex-a" && message.type === "paired")?.lease_id, "codex-a");
+  assert.equal(native.sent.find(message => message.request_id === "codex-b" && message.type === "paired")?.lease_id, "codex-b");
+  assert.equal(detached.includes(60), false, "a second Codex lease must preserve the first lease's tab");
+  native.hostMessage({ type: "release", lease_id: "codex-a" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(detached.includes(60), "releasing one Codex lease detaches only its tab");
+  assert.equal(detached.includes(61), false, "releasing one Codex lease preserves another client's tab");
+  native.hostMessage({ type: "command", lease_id: "codex-b", id: "codex-b-still-live", target_id: "61", method: "DOM.getDocument", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).id, "codex-b-still-live", "the remaining Codex lease remains usable");
+  native.hostMessage({ type: "release", lease_id: "codex-b" });
+  await new Promise(resolve => setTimeout(resolve, 0));
 
   native.disconnect();
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -824,6 +935,7 @@ function message(payload) {
   navigationBefore({ tabId: 67, frameId: 0, url: "https://example.test/67/story" });
   debuggerDetached({ tabId: 67 }, "target_closed");
   navigationCommitted({ tabId: 67, frameId: 0, documentId: "replacement-document-67", url: "https://example.test/67/story" });
+  navigationDomContentLoaded({ tabId: 67, frameId: 0, documentId: "replacement-document-67", url: "https://example.test/67/story" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(detached.filter(tabId => tabId === 67).length, priorNavigationDetachCount,
     "a committed navigation keeps the selected tab attached");
@@ -833,6 +945,24 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).id, "command-after-navigation");
   assert.equal(liveNative.sent.at(-1).error, undefined, "commands use the refreshed document identity");
+
+  liveNative.hostMessage({ type: "pair", request_id: "slow-media-reattach", tab_ids: [68], expected_urls: expectedUrls([68]), expected_document_ids: expectedDocuments([68]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const tab68 = tabList.find(tab => tab.id === 68);
+  tab68.status = "loading";
+  tabDocumentOverrides.set(68, "document-68-after-commit");
+  tabUrlOverrides.set(68, "https://example.test/68/story");
+  navigationBefore({ tabId: 68, frameId: 0, url: "https://example.test/68/story" });
+  debuggerDetached({ tabId: 68 }, "target_closed");
+  navigationCommitted({ tabId: 68, frameId: 0, documentId: "document-68-after-commit", url: "https://example.test/68/story" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(attached.filter(tabId => tabId === 68).length, 1, "reattach waits for DOMContentLoaded instead of the late complete event");
+  navigationDomContentLoaded({ tabId: 68, frameId: 0, documentId: "document-68-after-commit", url: "https://example.test/68/story" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(attached.filter(tabId => tabId === 68).length, 2, "paired tab is usable while late media keeps Chrome loading");
+  tab68.status = "complete";
+  tabDocumentOverrides.delete(68);
+  tabUrlOverrides.delete(68);
 
   liveNative.hostMessage({ type: "pair", request_id: "file-chooser", tab_ids: [66], unrestricted: true,
     expected_urls: expectedUrls([66]), expected_document_ids: expectedDocuments([66]) });
@@ -1004,6 +1134,7 @@ function message(payload) {
   navigationBefore({ tabId: 72, frameId: 0, url: "https://example.test/72/story" });
   navigationCommitted({ tabId: 72, frameId: 0, documentId: "replacement-document-72", url: "https://example.test/72/story" });
   debuggerDetached({ tabId: 72 }, "target_closed");
+  navigationDomContentLoaded({ tabId: 72, frameId: 0, documentId: "replacement-document-72", url: "https://example.test/72/story" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(!detached.includes(72), "a debugger detach delivered after commit preserves the selected pairing");
   assert.equal(attached.filter(tabId => tabId === 72).length, lateDetachAttachCount + 1,
@@ -1170,6 +1301,34 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(restartPort.sent.find(message => message.id === "open-conflict-b")?.error?.includes("different URL"),
     "an in-flight idempotency key cannot be reused with a different URL");
+
+  slowMediaNextNavigation = true;
+  restartPort.hostMessage({ type: "command", id: "open-before-slow-media", target_id: "41", method: "Controlla.openTab",
+    params: { url: "https://example.test/slow-media", idempotency_key: "client-fixture:slow-media-1234" } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const slowMediaOpen = restartPort.sent.find(message => message.id === "open-before-slow-media");
+  assert.ok(slowMediaOpen?.result, JSON.stringify(slowMediaOpen));
+  assert.equal(tabList.find(tab => String(tab.id) === slowMediaOpen.result.tab_id)?.status, "loading",
+    "open returns after DOMContentLoaded while late media is still loading");
+
+  slowMediaNextNavigation = true;
+  restartPort.hostMessage({ type: "command", id: "open-at-document-commit", target_id: "41", method: "Controlla.openTab",
+    params: { url: "https://example.test/committed", idempotency_key: "client-fixture:document-commit-1234", wait_until: "document_committed" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const committedOpen = restartPort.sent.find(message => message.id === "open-at-document-commit");
+  assert.ok(committedOpen?.result, JSON.stringify(committedOpen));
+  assert.equal(tabList.find(tab => String(tab.id) === committedOpen.result.tab_id)?.status, "loading",
+    "document_committed readiness attaches without waiting for DOMContentLoaded or late resources");
+
+  delayedNextCommitMs = 100;
+  restartPort.hostMessage({ type: "command", id: "open-after-stale-complete", target_id: "41", method: "Controlla.openTab",
+    params: { url: "https://example.test/delayed-commit", idempotency_key: "client-fixture:delayed-commit-1234" } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(restartPort.sent.some(message => message.id === "open-after-stale-complete"), false,
+    "a stale complete status from the prior document cannot satisfy navigation readiness");
+  await new Promise(resolve => setTimeout(resolve, 120));
+  assert.ok(restartPort.sent.find(message => message.id === "open-after-stale-complete")?.result,
+    "navigation resolves after the new document reaches DOMContentLoaded");
 
   console.log("Extension version handshake, pairing cleanup, chooser event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

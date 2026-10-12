@@ -22,6 +22,29 @@ pub fn pairing_path(host_id: &str) -> Result<PathBuf, String> {
     Ok(home()?.join(format!(".chrome-controlla/native-pairing-{host_id}.json")))
 }
 
+pub fn pairing_request_path(host_id: &str, request_id: &str) -> Result<PathBuf, String> {
+    if request_id.len() != 32 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid native pairing request ID".into());
+    }
+    let path = pairing_path(host_id)?;
+    Ok(path.with_file_name(format!("native-pairing-{host_id}-{request_id}.json")))
+}
+
+pub fn new_pairing_request_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| "cannot generate native pairing ID")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub fn remove_pairing_request(host_id: &str, request_id: &str) -> Result<(), String> {
+    let path = pairing_request_path(host_id, request_id)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub fn read_tabs() -> Result<serde_json::Value, String> {
     let path = home()?.join(".chrome-controlla/native-tabs.json");
     let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
@@ -87,7 +110,7 @@ pub fn write_pairing(
     expected_document_ids: &serde_json::Map<String, serde_json::Value>,
     unrestricted: bool,
 ) -> Result<(), String> {
-    let path = pairing_path(host_id)?;
+    let path = pairing_request_path(host_id, request_id)?;
     let dir = path.parent().ok_or("invalid pairing path")?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     #[cfg(unix)]

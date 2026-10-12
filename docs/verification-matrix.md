@@ -1,5 +1,16 @@
 # Verification matrix
 
+## Multi-session bridge and first-run setup — 2026-10-12
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Extension lease isolation | pass, fixture | Two selected tabs were paired under separate leases; releasing one detached only its own tab and the second lease continued to work. |
+| Native host multiplexing | pass, fixture | Separate request files are claimed independently; compatibility mode processes one request at a time until protocol-v2 capability is known. Native bridge single-session round trip also passes. |
+| MCP/provider compatibility | pass, fixture | One server can keep multiple shared sessions; protocol v2 accepts a version-mismatched extension while protocol v1 retains exact-version checks. |
+| Rust checks | pass, local | Browser crate 123 passed / 4 ignored; runtime crate tests, native bridge process/round trip, V3 fixtures, and warning-denied Clippy passed. |
+| Extension, setup docs, package | pass, local | Background harness, Codex config/client checks, Markdown links, package check, release build, and diff/format checks passed. |
+| Foreground Chrome concurrency | pending live pairing | Controlla 3 now reloads and discovers a fresh live tab inventory, but two simultaneous sessions on distinct tabs have not been live-tested. Same-tab leases intentionally conflict. |
+
 ## Local post-reload check — 2026-10-10
 
 | Check | Result | Evidence / limit |
@@ -746,3 +757,16 @@ The snapshot Chrome fixture additionally verifies that native `<input role="text
 | Full local gates | Stage 1 fixture script, workspace suite, Clippy `-D warnings`, docs/client/V3/dependency checks, release build | Passed on dirty tree based at `406b9d9`; workspace suite, Clippy, and release build rerun after canonical URL fix | No installed MCP client acknowledgement until reload |
 | Unknown mutation stops before later mutations; release preserves selected Chrome tabs | `workflow_stops_after_uncertain_or_undispatched_actions`; `test-background.cjs` release ownership assertions | Passed locally | App-level post persistence/idempotency is still not qualified; after `unknown`, callers must inspect before any retry |
 | Live foreground/background, Classroom acceptance/persistence, C1/C2-after metrics | Not run on rebuilt current revision | Open | Requires updated MCP and extension to be active, observed app results, and repeated matched samples |
+
+## Controlla 3 Stage 2 implementation and qualification — 2026-10-12
+
+| Gate | Result | Evidence / boundary |
+|---|---|---|
+| S2-01 through S2-16 implementation | Implemented; final Luna Medium review clean | Local source and regression coverage recorded in `.superpowers/sdd/CONTROLLA2_STAGE2_FIX_PLAN/progress.md`. Public single-tab VM parallel-read op remains omitted because the active shared-tab transport serializes commands. |
+| Rust workspace + isolated Chrome fixtures | Pass | `RUST_MIN_STACK=8388608 cargo test --locked --workspace`; six ignored `controlla-v2` real-Chrome headless regressions passed, including the oversized direct-act FastKeys pre-dispatch refusal. |
+| Clippy, extension protocol, docs, and provenance tests | Pass | `cargo clippy --locked --workspace --all-targets -- -D warnings`; extension background tests; 61-file Markdown-link check; 13 provenance digests and 22 retained tests. |
+| Phase 11 benchmark and release-claim contracts | Pass, claim disabled | 26 runner/contract tests and nine release-gate tests passed. Real paired adapter executions and results are absent, so no speed/superiority threshold is established. |
+| Documentation links and formatting | Pass | `npm run check:docs`, `cargo fmt --all -- --check`, and `git diff --check`. |
+| Native bridge reconnect and live tab discovery | Pass, live Chrome | Corrected native-host `allowed_origins` to the loaded Controlla 3 extension ID, reloaded the extension, and initialized the C3 stdio MCP. Native host ran from this checkout; discovery returned a fresh 57-tab inventory including the testing Classroom tab. No tab was paired or acted on; this does not verify Codex's loaded MCP schema or site workflows. |
+| Foreground live site workflows / Codex tool exposure after reload | Not run | Requires a Codex MCP reload and observed live task workflows. |
+| 30% fewer round trips, 25% lower median time, safety noninferiority | Not measured | Requires matched, independently verified Stage 2 and baseline runs through configured real adapters; fixtures are not evidence for these targets. |

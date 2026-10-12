@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract } from './phase11-runner.mjs';
+import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config } from './phase11-runner.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mock = resolve(here, 'mock-phase11-command.mjs');
@@ -59,12 +59,13 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     environment,
     modes: ['warm_skill'],
     concurrencyLevels: [1],
+    repetitions: 1,
     deadlineMs: 5000
   });
   assert.equal(report.schema_version, 1);
   assert.equal(report.candidate_adapter, 'controlla');
   assert.equal(report.baseline_adapter, 'playwright-mcp');
-  assert.equal(report.paired_rows.length, 12);
+  assert.equal(report.paired_rows.length, (await loadPhase11Config()).tasks.length);
   for (const row of report.paired_rows) {
     assert.equal(row.candidate.success, true);
     assert.equal(row.candidate.independently_verified_success, true);

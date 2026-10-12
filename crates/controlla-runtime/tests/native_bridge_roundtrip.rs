@@ -55,7 +55,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 let mut socket = accept_async(stream).await.map_err(|e| e.to_string())?;
                 let hello = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "hello timed out".to_owned())?.ok_or("provider socket closed before hello")?.map_err(|e| e.to_string())?;
                 let hello: Value = serde_json::from_str(hello.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true}) {
+                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"protocol_version":1,"batch_execution":true,"batch_deadline":true}) {
                     return Err(format!("unexpected provider hello: {hello}"));
                 }
                 socket.send(Message::Text(json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")}).to_string().into())).await.map_err(|e| e.to_string())?;
@@ -154,7 +154,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         };
         assert_eq!(
             pair,
-            json!({"type":"pair","request_id":"roundtrip-1","tab_ids":[42],"expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"unrestricted":false})
+            json!({"type":"pair","request_id":"roundtrip-1","lease_id":"roundtrip-1","tab_ids":[42],"expected_urls":{"42":"https://example.test/"},"expected_document_ids":{"42":"document-42"},"unrestricted":false})
         );
         write_native(
             &mut input,

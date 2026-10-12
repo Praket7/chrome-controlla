@@ -98,12 +98,18 @@ impl TypingPolicy {
     }
 
     pub fn choose(text: &str, requires_key_events: bool, composition_sensitive: bool) -> Self {
-        let mode = if composition_sensitive || !text.is_ascii() {
-            TypingMode::Ime
-        } else if requires_key_events {
-            TypingMode::FastKeys
-        } else {
-            TypingMode::Block
+        let mode = match controlla_browser::input_planner::plan(
+            text,
+            requires_key_events,
+            composition_sensitive,
+        )
+        .mode
+        {
+            controlla_browser::input_planner::InputMode::Ime => TypingMode::Ime,
+            controlla_browser::input_planner::InputMode::FastKeys => TypingMode::FastKeys,
+            controlla_browser::input_planner::InputMode::Block
+            | controlla_browser::input_planner::InputMode::AppAdapter => TypingMode::Block,
+            controlla_browser::input_planner::InputMode::HumanKeys => TypingMode::HumanKeys,
         };
         Self::new(mode, None).expect("built-in typing policies are valid")
     }
@@ -363,6 +369,7 @@ impl PageToolDescriptor {
 pub struct CommandBudget {
     pub max_model_round_trips: u32,
     pub max_browser_commands: u32,
+    pub max_cdp_commands: u32,
     pub max_wall_ms: u64,
 }
 
@@ -370,7 +377,8 @@ impl CommandBudget {
     pub const fn interactive_default() -> Self {
         Self {
             max_model_round_trips: 4,
-            max_browser_commands: 64,
+            max_browser_commands: 256,
+            max_cdp_commands: 20_000,
             max_wall_ms: 30_000,
         }
     }

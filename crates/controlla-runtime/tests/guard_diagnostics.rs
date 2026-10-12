@@ -53,6 +53,8 @@ const cases = {{
   obscured: {{html:'<button>Go</button>', mutate:()=>stage.insertAdjacentHTML('beforeend','<div role="dialog" style="position:fixed;inset:0;z-index:9999;background:#0008">SECRET-OVERLAY-TEXT</div>')}},
   obscured_protected: {{html:'<button>Go</button>', mutate:()=>stage.insertAdjacentHTML('beforeend','<div data-masked style="position:fixed;inset:0;z-index:9999">MASKED-SENTINEL</div>')}},
   detached: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').remove()}},
+  rerender_unique: {{html:'<button>Continue</button>', mutate:()=>{{const old=stage.querySelector('button');old.replaceWith(old.cloneNode(true));}}}},
+  rerender_ambiguous: {{html:'<button>Continue</button>', mutate:()=>{{const old=stage.querySelector('button');old.replaceWith(old.cloneNode(true),old.cloneNode(true));}}}},
   document_changed: {{html:'<button>Go</button>', mutate:()=>{{const d=document.implementation.createHTMLDocument('x');d.body.appendChild(stage.querySelector('button'));}}}},
 }};
 const results = {{}};
@@ -167,6 +169,16 @@ document.getElementById('out').textContent = JSON.stringify(results);
 fn every_guard_predicate_reports_its_own_reason_code() {
     let results = run_cases();
     assert_eq!(results["ok"]["ok"], true, "{}", results["ok"]);
+    assert_eq!(
+        results["rerender_unique"]["ok"], true,
+        "{}",
+        results["rerender_unique"]
+    );
+    assert_eq!(
+        results["rerender_ambiguous"]["reason"], "detached",
+        "{}",
+        results["rerender_ambiguous"]
+    );
     let expected = [
         ("unsafe_page", GuardReason::UnsafePage),
         ("stale_reference", GuardReason::StaleReference),

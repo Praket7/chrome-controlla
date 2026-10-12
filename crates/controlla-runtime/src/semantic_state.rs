@@ -352,7 +352,12 @@ pub fn rank_candidates(
 }
 
 pub fn workflow_find_needs_refresh(found: &Value) -> bool {
-    found["matches"].as_array().is_some_and(Vec::is_empty)
+    found["matches"].as_array().is_some_and(|matches| {
+        matches.is_empty()
+            || matches
+                .iter()
+                .any(|item| item["target_uniqueness"] == "unverified")
+    })
 }
 
 #[cfg(test)]
@@ -370,10 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn workflow_refreshes_only_after_an_empty_find_result() {
+    fn workflow_refreshes_empty_or_scope_incomplete_find_results() {
         assert!(workflow_find_needs_refresh(&json!({"matches":[]})));
+        assert!(workflow_find_needs_refresh(
+            &json!({"matches":[{"reference":"@c1","target_uniqueness":"unverified"}]})
+        ));
         assert!(!workflow_find_needs_refresh(
-            &json!({"matches":[{"reference":"@c1"}]})
+            &json!({"matches":[{"reference":"@c1","target_uniqueness":"scope_complete"}]})
         ));
         assert!(!workflow_find_needs_refresh(
             &json!({"error":"invalid_selector"})
@@ -559,6 +567,30 @@ mod tests {
         assert_eq!(chosen["selected"]["reference"], "@c1");
         assert_eq!(chosen["freshness_evidence"]["tie_count"], 2);
         assert_eq!(chosen["freshness_evidence"]["unique_latest"], false);
+
+        let fifty = (0..50)
+            .map(|index| {
+                let (month, day) = if index < 30 {
+                    (9, index + 1)
+                } else {
+                    (10, index - 29)
+                };
+                json!({
+                    "reference":format!("@c{index}"),
+                    "href":format!("/story/{index}"),
+                    "datetime":format!("2026-{month:02}-{day:02}T00:00:00Z"),
+                    "datetime_utc_ms":index as i64 * 86_400_000
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            choose_newest(&fifty, true).unwrap()["selected"]["reference"],
+            "@c49"
+        );
+        assert!(
+            choose_newest(&fifty, false).is_err(),
+            "partial collection cannot prove newest"
+        );
     }
 
     #[test]

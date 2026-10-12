@@ -14,7 +14,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "1ce6a1e636fe1e04c70c4b89aa8a20182758bcad26487b5dafbb166da8dac91f",
+      "destination_sha256": "ff7c7010c1aaf9d56472300ecb57a6d58f7291c30b5931797bb23933bf756b67",
       "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1\u2013A8 follow-up updates guarded-input regression fixture with the required stable DOM node token",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },

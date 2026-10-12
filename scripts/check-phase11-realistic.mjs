@@ -19,9 +19,21 @@ for (const task of config.tasks) {
   assert.ok(task.fixture);
 }
 const adapterIds = new Set(config.adapters.map(adapter => adapter.id));
-for (const id of ['controlla','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use','computer-use']) {
+for (const id of ['controlla','controlla-1','controlla-2-pre-stage2','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use','computer-use']) {
   assert.ok(adapterIds.has(id), `missing adapter ${id}`);
 }
+const requiredRegressionTasks = [
+  'slow-media-early-form','50k-node-targeted-control','rich-editor-1000-char-fastkeys',
+  'five-field-single-workflow','virtual-list-1000-rows','newest-ranking-50-candidates',
+  'artifact-register-4mb','artifact-register-10mb','react-rerender-target','on-demand-frame-escalation'
+];
+for (const id of requiredRegressionTasks) {
+  const task = config.tasks.find(candidate => candidate.id === id);
+  assert.ok(task, `missing Stage 2 regression ${id}`);
+  assert.ok(task.scenario, `Stage 2 regression ${id} needs an explicit scenario`);
+}
+assert.equal(config.adapters.find(adapter => adapter.id === 'controlla-1').source_ref, '62e6407d0e75b83a1be8d69468476601a6e6da37');
+assert.equal(config.adapters.find(adapter => adapter.id === 'controlla-2-pre-stage2').source_ref, '406b9d9794d6cb59dc75d22c7e6fe7a8554b1e67');
 assert.equal(config.adapters.find(adapter => adapter.id === 'computer-use').track, 'separate-vision');
 for (const metric of [
   'success','independently_verified_success','severe_wrong_target_events','authority_violations',
