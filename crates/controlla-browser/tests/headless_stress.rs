@@ -1,6 +1,6 @@
 use controlla_browser::{
     providers::DedicatedChromeProvider,
-    sessions::{ProviderGrants, SessionMode, SessionRegistry, SessionSpec},
+    sessions::{ProviderGrants, SessionMode, SessionRegistry, SessionSpec, StaleTarget},
 };
 use std::path::Path;
 
@@ -90,11 +90,13 @@ async fn repeated_headless_launch_evaluate_and_cleanup_never_reuses_profile_stat
                     .await
                 {
                     Ok(reference) => reference,
-                    Err(error) if error.to_string().contains("FrameChanged") => {
+                    Err(StaleTarget::FrameChanged) => {
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    Err(error) => panic!("headless run {run} failed to capture target: {error}"),
+                    Err(error) => {
+                        panic!("headless run {run} failed to capture target: {error:?}")
+                    }
                 };
                 match connection
                     .observe_accessibility(
