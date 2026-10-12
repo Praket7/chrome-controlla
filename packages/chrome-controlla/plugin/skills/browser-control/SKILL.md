@@ -68,7 +68,11 @@ Prefer one `workflow` to repeated `snapshot -> act -> snapshot` loops. Use a tar
 
 ## Verification
 
-If a mutation receipt already proves the requested postcondition, do not verify again. If it returns `unknown` or only `dispatched`, perform one fresh read-only verification and never replay the mutation. `not_dispatched` may be corrected according to its structured reason and retry guidance.
+If a mutation receipt already proves the requested postcondition, do not verify again. Never blind retry `unknown`. If a receipt returns `unknown` or only `dispatched`, perform one fresh read-only verification and never replay the mutation. `not_dispatched` may be corrected according to its structured reason and retry guidance.
+
+## Modes
+
+Stay in guarded mode for normal work. `local_unrestricted` is an explicit temporary compatibility mode only when the task truly requires it; load `references/advanced.md` before using it and return to guarded mode afterward.
 
 ## Cleanup
 
