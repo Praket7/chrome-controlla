@@ -110,7 +110,6 @@ async function main() {
   let tools = [];
   let schemas = new Map();
   let schemasStale = false;
-  let schemaGeneration = 0;
 
   async function refreshSchemas() {
     const nextTools = [];
@@ -123,7 +122,6 @@ async function main() {
     tools = nextTools;
     schemas = new Map(tools.map(tool => [tool.name, tool.inputSchema]));
     schemasStale = false;
-    schemaGeneration += 1;
   }
 
   lines.on('line', line => {
@@ -177,25 +175,52 @@ async function main() {
     if (request.method !== 'tools/call') { respond(null, { code: -32601, message: `unsupported client method: ${request.method}` }); return; }
     const { name, arguments: args } = request.params ?? {};
     let schema = schemas.get(name);
-    let issue = schema ? validate(schema, args ?? {}, schema) : `unknown tool: ${String(name)}`;
-    // Recover schema drift internally. This only pays a tools/list round trip after
-    // a mismatch; successful hot-path calls never perform agent-visible discovery.
-    if (!schema || issue) {
-      const generation = schemaGeneration;
+    if (!schema) {
+      // Unknown tools are the one local-validation case that may mean the server
+      // changed its advertised surface without a notification. Refresh once.
       try { await refreshSchemas(); }
       catch (error) { respond(null, { code: -32000, message: `Could not refresh Controlla schemas: ${error.message}` }); return; }
       schema = schemas.get(name);
-      issue = schema ? validate(schema, args ?? {}, schema) : `unknown tool: ${String(name)}`;
-      if (!issue && schemaGeneration > generation) process.stderr.write('Controlla schemas refreshed automatically after drift.\n');
     }
     if (!schema) { respond(null, { code: -32602, message: `unknown tool: ${String(name)}` }); return; }
+    const issue = validate(schema, args ?? {}, schema);
+    // A caller's locally invalid arguments are not evidence of schema drift.
+    // Return immediately rather than paying an unnecessary discovery round trip.
     if (issue) { respond(null, { code: -32602, message: `invalid arguments: ${issue}` }); return; }
+
+    const callTool = () => rpc('tools/call', { name, arguments: args ?? {} });
     try {
-      const result = await rpc('tools/call', { name, arguments: args ?? {} });
+      const result = await callTool();
       if (result.structuredContent !== undefined) delete result.content;
       respond(result, null);
     }
-    catch (error) { respond(null, { code: error.code ?? -32000, message: error.message, ...(error.data === undefined ? {} : { data: error.data }) }); }
+    catch (error) {
+      // JSON-RPC -32602 means the server rejected parameters before tool
+      // execution. Refresh only here, and retry only if the advertised schema
+      // actually changed and the original arguments validate under the new one.
+      // Never retry a timeout, application error, or unknown mutation outcome.
+      if (error.code === -32602) {
+        const previousSchema = JSON.stringify(schema);
+        try { await refreshSchemas(); }
+        catch (refreshError) { respond(null, { code: -32000, message: `Could not refresh Controlla schemas: ${refreshError.message}` }); return; }
+        const refreshed = schemas.get(name);
+        const changed = refreshed && JSON.stringify(refreshed) !== previousSchema;
+        const refreshedIssue = refreshed ? validate(refreshed, args ?? {}, refreshed) : `unknown tool: ${String(name)}`;
+        if (changed && !refreshedIssue) {
+          try {
+            const result = await callTool();
+            process.stderr.write('Controlla schema drift recovered automatically after a server invalid-params rejection.\n');
+            if (result.structuredContent !== undefined) delete result.content;
+            respond(result, null);
+            return;
+          } catch (retryError) {
+            respond(null, { code: retryError.code ?? -32000, message: retryError.message, ...(retryError.data === undefined ? {} : { data: retryError.data }) });
+            return;
+          }
+        }
+      }
+      respond(null, { code: error.code ?? -32000, message: error.message, ...(error.data === undefined ? {} : { data: error.data }) });
+    }
   }); };
   for (const line of queued) receive(line);
   process.stderr.write('Controlla client ready; schemas cached and drift refresh is automatic. Keep this process open for the task.\n');
