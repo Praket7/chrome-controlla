@@ -34,19 +34,27 @@ pub fn read_local_file(path: &str) -> Result<Vec<u8>, String> {
     if !path.is_absolute() {
         return Err("artifact file_path must be absolute".into());
     }
-    #[cfg(unix)]
-    let file = open_local_file_nofollow(path)?;
     #[cfg(not(unix))]
-    return Err(
-        "local artifact paths are unavailable on this platform; use bounded Base64 input".into(),
-    );
-    let metadata = file
-        .metadata()
-        .map_err(|_| "artifact file_path could not be opened".to_owned())?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
-        return Err("artifact file must be a regular file between 1 and 10485760 bytes".into());
+    {
+        let _ = path;
+        Err(
+            "local artifact paths are unavailable on this platform; use bounded Base64 input"
+                .into(),
+        )
     }
-    read_bounded(file)
+    #[cfg(unix)]
+    {
+        let file = open_local_file_nofollow(path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "artifact file_path could not be opened".to_owned())?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
+            return Err(
+                "artifact file must be a regular file between 1 and 10485760 bytes".into(),
+            );
+        }
+        read_bounded(file)
+    }
 }
 
 #[cfg(unix)]
