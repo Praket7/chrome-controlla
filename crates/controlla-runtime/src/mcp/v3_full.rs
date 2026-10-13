@@ -196,6 +196,27 @@ mod route_telemetry_tests {
     }
 
     #[test]
+    fn qualified_route_cannot_pass_when_internal_model_call_counters_are_missing() {
+        let mut route = json!({"tier":"qualified_skill"});
+        let result = json!({"status":"completed","receipts":[{"verified":true},{"verified":true}]});
+        attach_execution_actuals(&mut route, std::time::Instant::now(), &result);
+        assert_eq!(route["actual_cost"]["reported_internal_model_calls"], serde_json::Value::Null);
+        assert_eq!(route["model_budget"]["internal_calls_observed"], serde_json::Value::Null);
+        assert_eq!(route["model_budget"]["passed"], false);
+        assert_eq!(route["model_budget"]["status"], "inconclusive");
+    }
+
+    #[test]
+    fn authoritative_task_model_call_total_can_cover_omitted_step_counters() {
+        let mut route = json!({"tier":"qualified_skill"});
+        let result = json!({"status":"completed","internal_model_calls":0,"receipts":[{"verified":true}]});
+        attach_execution_actuals(&mut route, std::time::Instant::now(), &result);
+        assert_eq!(route["actual_cost"]["internal_model_call_count_source"], "task_aggregate");
+        assert_eq!(route["model_budget"]["internal_calls_observed"], 0);
+        assert_eq!(route["model_budget"]["passed"], true);
+    }
+
+    #[test]
     fn site_cost_cohorts_distinguish_site_warmth_from_a_qualified_route() {
         let mut seen_sites = std::collections::BTreeSet::new();
         let mut qualified_routes = std::collections::BTreeSet::new();
@@ -3449,7 +3470,14 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
     let receipts: &[Value] = result["receipts"].as_array().or_else(|| result["steps"].as_array()).map(Vec::as_slice).unwrap_or_default();
     let verified = !receipts.is_empty() && receipts.iter().all(|receipt| receipt["verified"] == true);
     let unknown = result["status"] == "unknown" || receipts.iter().any(|receipt| receipt["status"] == "unknown");
-    let internal_model_calls = receipts.iter().filter_map(|receipt| receipt["internal_model_calls"].as_u64()).sum::<u64>();
+    // Missing telemetry is unknown, never evidence of zero work. Prefer a
+    // server-owned aggregate when present; otherwise require every task receipt
+    // to contribute a count and reject overflow rather than wrapping/saturating.
+    let internal_model_calls = result["internal_model_calls"].as_u64().or_else(|| {
+        (!receipts.is_empty()).then(|| receipts.iter().try_fold(0u64, |total, receipt| {
+            total.checked_add(receipt["internal_model_calls"].as_u64()?)
+        }))?
+    });
     let tier = serde_json::from_value::<crate::capability_router::ExecutionTier>(route["tier"].clone()).ok();
     let internal_model_call_budget = tier.map(internal_model_call_budget).unwrap_or(1);
     let fallback_reason = ["skill_fallback_reason", "webmcp_fallback_reason", "speculative_fallback_reason", "profile_learning_fallback_reason"]
@@ -3460,6 +3488,7 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
         "logical_task_step_receipts":receipts.len(),
         "observation_bytes":result.pointer("/metrics/observation_bytes").and_then(Value::as_u64),
         "reported_internal_model_calls":internal_model_calls,
+        "internal_model_call_count_source":if result["internal_model_calls"].as_u64().is_some() {"task_aggregate"} else {"complete_step_receipts_or_unknown"},
         "external_model_calls":Value::Null,
         "external_model_cost_boundary":"caller model telemetry is outside the MCP process",
     });
@@ -3468,7 +3497,12 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
     route["model_budget"] = json!({
         "internal_calls_allowed":internal_model_call_budget,
         "internal_calls_observed":internal_model_calls,
-        "passed":internal_model_calls <= u64::from(internal_model_call_budget),
+        "passed":internal_model_calls.is_some_and(|calls| calls <= u64::from(internal_model_call_budget)),
+        "status":match internal_model_calls {
+            Some(calls) if calls <= u64::from(internal_model_call_budget) => "passed",
+            Some(_) => "failed",
+            None => "inconclusive",
+        },
         "caller_model_turns":Value::Null,
         "caller_model_visible_observations":Value::Null,
         "caller_model_telemetry_boundary":"external model turns and visible observations are not observable inside the MCP process; use a configured client adapter trace",
