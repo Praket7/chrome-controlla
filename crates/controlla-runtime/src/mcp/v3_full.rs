@@ -255,6 +255,13 @@ mod route_telemetry_tests {
         assert_eq!(receipt["execution_route"]["actual_cost"]["host_round_trips"], 4);
         assert_eq!(receipt["execution_route"]["actual_cost"]["cdp_measurement_partial"], true);
     }
+
+    #[test]
+    fn speculative_reads_are_disabled_while_another_task_is_active() {
+        assert!(super::speculative_route_allowed(0));
+        assert!(!super::speculative_route_allowed(1));
+        assert!(!super::speculative_route_allowed(8));
+    }
 }
 
 #[derive(Clone)]
@@ -273,8 +280,17 @@ struct AppV3 {
     capabilities: Arc<Mutex<crate::capability_registry::CapabilityRegistry>>,
     site_profiles: Arc<Mutex<crate::site_profiles::SiteProfileStore>>,
     execution_costs: Arc<std::sync::Mutex<crate::execution_cost_router::ExecutionCostRouter>>,
+    active_tasks: Arc<std::sync::atomic::AtomicUsize>,
     workflow_lease_owners: Arc<Mutex<std::collections::BTreeSet<String>>>,
     headless_chrome: Option<std::path::PathBuf>,
+}
+
+struct ActiveTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl AppV3 {
@@ -308,6 +324,7 @@ impl AppV3 {
             execution_costs: Arc::new(std::sync::Mutex::new(crate::execution_cost_router::ExecutionCostRouter::open(
                 super::super::state_directory().join("execution-costs-v1.json"),
             ))),
+            active_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             workflow_lease_owners: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             headless_chrome: std::env::var_os("COMPTROL_CHROME_EXECUTABLE")
                 .map(std::path::PathBuf::from),
@@ -4339,6 +4356,10 @@ fn route_candidates(signals: crate::capability_router::ExecutionCapabilities, re
     tiers
 }
 
+fn speculative_route_allowed(active_task_count_before_this_task: usize) -> bool {
+    active_task_count_before_this_task == 0
+}
+
 fn task_cost_context(task: &crate::v3_tasks::TaskPrimitive) -> Option<(String, String, String)> {
     let crate::v3_tasks::TaskPrimitive::Research { urls, .. } = task else { return None; };
     if urls.len() != 1 { return None; }
@@ -6997,6 +7018,9 @@ impl AppV3 {
         &self,
         Parameters(args): Parameters<V3TaskArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
+        let active_before = self.active_tasks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _active_task = ActiveTaskGuard(self.active_tasks.clone());
+        let allow_speculation = speculative_route_allowed(active_before);
         let budget = crate::v3::CommandBudget::interactive_default();
         let wall_limit = Duration::from_millis(budget.max_wall_ms);
         let session_id = args.session_id.clone();
@@ -7013,7 +7037,7 @@ impl AppV3 {
             budget.max_cdp_commands as u64,
             wall_limit,
             super::super::with_internal_workflow_state(async move {
-                match tokio::time::timeout(wall_limit, Box::pin(self.task_inner(args, task_owner.clone()))).await {
+                match tokio::time::timeout(wall_limit, Box::pin(self.task_inner(args, task_owner.clone(), allow_speculation))).await {
                     Ok(result) => result,
                     Err(_) => {
                         let target = lease_target_key(&session_id, &tab_id);
@@ -7051,6 +7075,7 @@ impl AppV3 {
         &self,
         mut args: V3TaskArgs,
         task_owner: String,
+        allow_speculation: bool,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         self.require_v3_session(&args.session_id).await?;
         let route_started = std::time::Instant::now();
@@ -7107,7 +7132,7 @@ impl AppV3 {
                                 } else { None }
                             } else { None }
                         } else { None };
-                        let profile_available = profile_route.is_some();
+                        let profile_available = profile_route.is_some() && allow_speculation;
                         let operation = match &args.task {
                             crate::v3_tasks::TaskPrimitive::Research { goal: Some(goal), .. } => crate::capability_registry::operation_from_goal(goal),
                             _ => None,
@@ -7154,6 +7179,8 @@ impl AppV3 {
                 "cohort":if task_cost_context(&args.task).is_some() {"origin_intent_warmth_size"} else {"unavailable"},
                 "historical_profile_selected":selected_by_history.is_some()},
             "visual_evidence_required":matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { goal: Some(goal), .. } if task_needs_visual_evidence(goal)),
+            "speculation_policy":{"read_only_only":true,"enabled":allow_speculation,
+                "reason":if allow_speculation {"no competing V3 task is active"} else {"speculative reads skipped under concurrent V3 task load"}},
             "intent_fingerprint":task_intent.clone(),
         });
         if let crate::v3_tasks::TaskPrimitive::Research { urls, tab_ids, .. } = &args.task {
