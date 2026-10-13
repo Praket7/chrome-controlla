@@ -41,7 +41,9 @@ function summaryFields(result) {
   const roots = contentValues(result);
   const metrics = collectValues(roots, value => value.metrics && typeof value.metrics === 'object').map(value => value.metrics);
   const cdp = metrics.map(item => item.browser?.cdp_commands ?? item.cdp_commands).find(Number.isSafeInteger);
-  const internal = metrics.map(item => item.internal_model_calls).find(Number.isSafeInteger);
+  const reportedInternal = collectValues(roots, value => Number.isSafeInteger(value.execution_route?.actual_cost?.reported_internal_model_calls))
+    .map(value => value.execution_route.actual_cost.reported_internal_model_calls).find(Number.isSafeInteger);
+  const internal = metrics.map(item => item.internal_model_calls).find(Number.isSafeInteger) ?? reportedInternal;
   const tier = collectValues(roots, value => value.execution_route?.selected || value.execution_route?.tier)
     .map(value => value.execution_route.selected ?? value.execution_route.tier).find(value => typeof value === 'string');
   const fallbacks = collectValues(roots, value => typeof value.fallback_reason === 'string').length;

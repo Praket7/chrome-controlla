@@ -67,6 +67,7 @@ test('unavailable browser-command telemetry stays null instead of becoming a fal
     assert.equal(exit, 0);
     const summary = summarizePromptTrace(await readPromptTrace(tracePath));
     assert.equal(summary.counters.browser_cdp_commands, null);
+    assert.equal(summary.counters.internal_model_calls, null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
