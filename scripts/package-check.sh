@@ -81,6 +81,14 @@ npm_cmd exec --prefix "$prefix" -- controlla --version | grep -F 'controlla 0.1.
 printf '%s\n' 'package-check: checking packaged ChatGPT plugin MCP startup and compact v3 tool discovery'
 plugin_request="$temp/plugin-request.jsonl"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$plugin_request"
+server_binary="$prefix/node_modules/chrome-controlla/bin/controlla-v2-core"
+if [ "$(node -p 'process.platform')" = win32 ]; then server_binary="$server_binary.exe"; fi
+printf '%s\n' 'package-check: checking packaged v3 server binary directly'
+direct_output=$(CONTROLLA_STATE_DIR="$temp/direct-state" "$node_bin" "$installed_client" --server "$server_binary" --server-arg mcp --timeout-ms 30000 < "$plugin_request")
+for tool in browser snapshot act workflow extract verify; do
+    printf '%s\n' "$direct_output" | grep -F "\"$tool\"" >/dev/null
+done
+printf '%s\n' 'package-check: checking packaged ChatGPT plugin proxy'
 plugin_output=$(CONTROLLA_STATE_DIR="$temp/plugin-state" "$node_bin" "$installed_client" --server "$node_bin" --server-arg "$plugin_launch" --timeout-ms 30000 < "$plugin_request")
 for tool in browser snapshot act workflow extract verify; do
     printf '%s\n' "$plugin_output" | grep -F "\"$tool\"" >/dev/null
