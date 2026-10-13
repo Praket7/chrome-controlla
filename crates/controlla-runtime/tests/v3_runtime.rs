@@ -5,7 +5,7 @@ use controlla_runtime::v3_runtime::{
     ReconnectDecision, TypingPlan, await_key_batch, compact_tool_surface_valid,
     execute_guarded_batch, result_within_budget,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 fn epoch() -> InteractionEpoch {
@@ -127,12 +127,36 @@ fn page_tool_program_uses_the_document_model_context_api_without_interpolation()
     let discovery = PageToolProgram::discovery();
     let invocation = PageToolProgram::invocation();
     assert!(discovery.contains("context.getTools()"));
+    assert!(discovery.contains("toolchange"));
+    assert!(discovery.contains("cache_hit"));
     assert!(invocation.contains("context.executeTool(tool,input"));
     assert!(invocation.contains("async function(name,input,expectedSchema,timeoutMs)"));
     assert!(invocation.contains("expectedSchema"));
     assert!(invocation.contains("{signal:controller.signal}"));
     assert!(invocation.contains("controller.abort()"));
     assert!(!invocation.contains("JSON.stringify(name)"));
+}
+
+#[tokio::test]
+async fn page_tool_discovery_cache_is_per_document_and_invalidates_on_toolchange() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let result = context.async_with(async |ctx| {
+        ctx.eval::<(), _>(r#"globalThis.calls=0;globalThis.document={modelContext:{getTools:async()=>{calls++;return [{name:'read',inputSchema:{type:'object'}}]},addEventListener:(name,callback)=>{document.modelContext.invalidate=callback}}};"#).unwrap();
+        let discover = format!("(async()=>JSON.stringify(await ({})()))()", PageToolProgram::discovery());
+        let first = ctx.eval::<rquickjs::Promise, _>(discover.clone()).unwrap().into_future::<String>().await.unwrap();
+        let second = ctx.eval::<rquickjs::Promise, _>(discover.clone()).unwrap().into_future::<String>().await.unwrap();
+        ctx.eval::<(), _>("document.modelContext.invalidate()") .unwrap();
+        let third = ctx.eval::<rquickjs::Promise, _>(discover).unwrap().into_future::<String>().await.unwrap();
+        Ok::<_, rquickjs::Error>((first, second, third, ctx.eval::<u32, _>("calls").unwrap()))
+    }).await.unwrap();
+    let first: Value = serde_json::from_str(&result.0).unwrap();
+    let second: Value = serde_json::from_str(&result.1).unwrap();
+    let third: Value = serde_json::from_str(&result.2).unwrap();
+    assert_eq!(first["cache_hit"], false);
+    assert_eq!(second["cache_hit"], true);
+    assert_eq!(third["cache_hit"], false);
+    assert_eq!(result.3, 2);
 }
 
 #[tokio::test]

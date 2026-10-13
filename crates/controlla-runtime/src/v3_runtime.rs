@@ -30,7 +30,7 @@ pub struct PageToolProgram;
 
 impl PageToolProgram {
     pub fn discovery() -> &'static str {
-        r#"async function(){const context=document.modelContext;if(!context||typeof context.getTools!=="function")return {available:false,tools:[]};const tools=await context.getTools();return {available:true,tools:Array.isArray(tools)?tools.slice(0,64).map(t=>({name:String(t.name||"").slice(0,128),description:String(t.description||"").slice(0,512),input_schema:t.inputSchema??{}})):[]};}"#
+        r#"async function(){const context=document.modelContext;if(!context||typeof context.getTools!=="function")return {available:false,tools:[]};const key=Symbol.for('controlla.webmcp.discovery.v1');let cache=globalThis[key];if(!(cache instanceof WeakMap)){cache=new WeakMap();try{if(globalThis[key]===undefined)Object.defineProperty(globalThis,key,{value:cache,configurable:false});else cache=null}catch{cache=null}}let state=cache?.get(context);if(cache&&!state){state={tools:null};cache.set(context,state);if(typeof context.addEventListener==='function')context.addEventListener('toolchange',()=>{state.tools=null})}if(state?.tools)return {available:true,tools:state.tools,cache_hit:true};const raw=await context.getTools();const tools=Array.isArray(raw)?raw.slice(0,64).map(t=>({name:String(t.name||'').slice(0,128),description:String(t.description||'').slice(0,512),input_schema:t.inputSchema??{}})):[];if(state)state.tools=tools;return {available:true,tools,cache_hit:false};}"#
     }
 
     pub fn invocation() -> &'static str {
