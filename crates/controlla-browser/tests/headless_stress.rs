@@ -113,7 +113,16 @@ async fn repeated_headless_launch_evaluate_and_cleanup_never_reuses_profile_stat
                     .await
                 {
                     Ok(observed) => break observed,
-                    Err(error) if error.to_string().contains("FrameChanged") => {
+                    Err(error)
+                        if error.to_string().contains("FrameChanged")
+                            || error
+                                .to_string()
+                                .contains("AX selector matched no DOM node") =>
+                    {
+                        // Chrome can commit the root frame before its first
+                        // document nodes are queryable. This is a read-only
+                        // readiness miss, so reacquire and retry within the
+                        // enclosing five-second startup bound.
                         tokio::task::yield_now().await;
                     }
                     Err(error) => panic!("headless run {run} observation failed: {error}"),
