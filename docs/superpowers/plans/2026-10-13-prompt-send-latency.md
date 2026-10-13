@@ -29,22 +29,22 @@
 
 ## Ordered tasks
 
-- [ ] P0-00: fix cross-platform `check:clients` failures from run 38437418756; reproduce locally, add regression coverage, and verify all other CI gates execute.
-- [ ] P0-01: add monotonic prompt-send-to-final-result spans and counters to client adapters, benchmark contracts, and versioned reports; include unavailable fields explicitly.
-- [ ] P0-02: extend existing `browser.goal` with typed task constraints/postconditions and one-call execution through route, observation, action, and verifier.
-- [ ] P0-03: enforce zero-model/zero-observation budgets for qualified tiers and bounded planning/observation budgets for novel tasks.
-- [ ] P0-04: keep just-in-time identity/actionability validation inside browser-side mutation batches using event-updated state.
-- [ ] P0-05: use bounded site/intent/tier/warmth/size measurements to select minimum expected wall-time subject to success and risk limits.
-- [ ] P0-06: piggyback strong structured readback and verification in the execution call wherever available.
-- [ ] P0-07: maintain a warm broker and event-updated target/document inventory; use singleflight on cold attach; report cold/warm strata separately.
-- [ ] P1-01: cache WebMCP metadata per document, invalidate on lifecycle changes, and revalidate the selected tool before execution.
-- [ ] P1-02: adapt observation richness from measured task and route utility while retaining deterministic filtering.
-- [ ] P1-03: consume bounded visual probes internally before returning control to the model.
-- [ ] P1-04: expand DAG parallel reads only when measured expected savings exceed setup/alignment costs.
-- [ ] P1-05: make speculative reads bounded, reversible, and load-aware.
-- [ ] P1-06: vary skill promotion/expiry thresholds by mutation risk and require data-flow grounded dependencies.
-- [ ] P1-07: preserve deterministic six-tool order/schema and compact evidence-handle receipts.
-- [ ] Gate: run all local checks, push, verify exact-head GitHub Actions green across OSes, then run the requested fresh Luna Medium plan review. Record unavailable live qualification separately.
+- [x] P0-00: reproduce and fix cross-platform `check:clients` failures; add contract regressions and run the downstream client/app/benchmark/release/V3 checks.
+- [x] P0-01: add monotonic prompt-handoff-to-final-result spans and counters to configured client adapters, benchmark contracts, and versioned reports; unavailable GUI/client measurements remain explicitly null.
+- [x] P0-02: use the existing six-tool `browser` task entry as the typed one-call capsule through routing, observation, action, and verification.
+- [x] P0-03: enforce qualified-route zero-model budgets and bounded novel-task planning/observation budgets in route receipts and execution paths.
+- [x] P0-04: keep just-in-time identity/actionability checks at browser mutation dispatch, with event-driven invalidation inside batches.
+- [x] P0-05: select routes from bounded, verified site/intent/tier/warmth/size latency cohorts; cohort warmth is scoped to the active browser session and qualified route.
+- [x] P0-06: piggyback structured readback and outcome verification in the execution call where the browser exposes sufficient evidence.
+- [x] P0-07: retain the warm broker, event-updated target/document inventory, and singleflight attach; distinguish live-session task warmth from external cold-browser startup.
+- [x] P1-01: cache WebMCP metadata per document, invalidate on lifecycle changes, and revalidate the selected tool before execution.
+- [x] P1-02: adapt observation richness from bounded measured task/route utility while retaining deterministic filtering.
+- [x] P1-03: consume bounded visual probes locally before returning control when structured evidence resolves the target.
+- [x] P1-04: expand DAG parallel reads only when measured expected savings exceed setup/alignment costs.
+- [x] P1-05: keep speculation read-only/reversible and disable it under competing task load.
+- [x] P1-06: vary skill qualification/expiry by risk and require typed input provenance; temporal ordering alone is not dependency evidence.
+- [x] P1-07: preserve deterministic six-tool order/schema and compact evidence-handle receipts.
+- [ ] Gate: run all local checks, verify exact-head GitHub Actions green across OSes, then obtain the requested fresh Luna Medium plan review. Record unavailable live qualification separately.
 
 ## Candidate implementation status — 2026-10-13
 
