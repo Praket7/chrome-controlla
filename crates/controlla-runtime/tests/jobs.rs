@@ -1033,10 +1033,24 @@ async fn persisted_job_deadline_marks_unsent_and_dispatched_effects_differently(
     );
 
     let started = journal
-        .admit_with_deadline("p", "s", "started-deadline", &json!({"effect":"read"}), 100)
+        .admit_with_deadline(
+            "p",
+            "s",
+            "started-deadline",
+            &json!({"effect":"read"}),
+            60_000,
+        )
         .unwrap();
     assert!(journal.start("p", "s", &started.operation.id).unwrap());
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    // Advance the durable deadline directly instead of sleeping. This keeps the
+    // dispatched/unsent distinction deterministic under loaded Windows CI.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE operations SET deadline_at_ms=1 WHERE id=?1",
+        [&started.operation.id],
+    )
+    .unwrap();
+    drop(db);
     let expired_started = journal
         .get("p", "s", &started.operation.id)
         .unwrap()

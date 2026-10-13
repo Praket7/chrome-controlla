@@ -39,7 +39,10 @@ function boundedAppend(current, chunk, label) {
   return next;
 }
 
-export async function invokeJsonCommand(argv, payload, timeoutMs, env = process.env) {
+export async function invokeJsonCommand(argv, payload, timeoutMs, env = process.env, instrumentation = undefined) {
+  const inputText = JSON.stringify(payload);
+  const startedAt = process.hrtime.bigint();
+  if (instrumentation) instrumentation.input_bytes = Buffer.byteLength(inputText);
   return await new Promise((resolvePromise, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       cwd: root,
@@ -74,6 +77,12 @@ export async function invokeJsonCommand(argv, payload, timeoutMs, env = process.
     child.on('error', error => finish(error));
     child.on('close', code => {
       if (settled) return;
+      if (instrumentation) {
+        const now = process.hrtime.bigint();
+        instrumentation.output_bytes = Buffer.byteLength(stdout);
+        instrumentation.tool_result_delivered_ns = now.toString();
+        instrumentation.command_elapsed_ms = Number(now - startedAt) / 1_000_000;
+      }
       if (code !== 0) return finish(new Error(`command exited ${code}: ${stderr.trim()}`));
       try {
         finish(null, JSON.parse(stdout));
@@ -81,7 +90,7 @@ export async function invokeJsonCommand(argv, payload, timeoutMs, env = process.
         finish(new Error(`command returned invalid JSON: ${error.message}; stderr=${stderr.trim()}`));
       }
     });
-    child.stdin.end(JSON.stringify(payload));
+    child.stdin.end(inputText);
   });
 }
 
@@ -129,9 +138,11 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   const fixtureUrl = task.url ? liveTaskUrl(task) : new URL(task.fixture, fixtureBaseUrl).toString();
   const input = { task_id: task.id, scenario: task.scenario, mode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
+  const promptSentNs = process.hrtime.bigint();
+  const invocationMetrics = {};
   let raw;
   try {
-    raw = await invokeJsonCommand(command, { kind: 'run', ...input, environment }, deadlineMs, env);
+    raw = await invokeJsonCommand(command, { kind: 'run', ...input, environment }, deadlineMs, env, invocationMetrics);
   } catch (error) {
     raw = {
       adapter: adapter.id, task_id: task.id, mode, concurrency, success: false, independently_verified_success: false,
@@ -145,8 +156,38 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   }
   validateAdapterResult(raw, contract, { adapter: adapter.id, task_id: task.id, mode, concurrency, source_ref: adapter.source_ref });
   const verification = await independentlyVerify(verifierCommand, input, raw, deadlineMs, env);
+  const verifiedOutcomeNs = process.hrtime.bigint();
+  const promptTrace = raw.prompt_trace && typeof raw.prompt_trace === 'object' ? raw.prompt_trace : {};
+  const reportedFinalMs = Number.isFinite(raw.prompt_to_final_ms) ? raw.prompt_to_final_ms : promptTrace.prompt_to_final_ms;
+  const traceCounters = promptTrace.counters && typeof promptTrace.counters === 'object' ? promptTrace.counters : {};
   return {
     ...raw,
+    prompt_to_verified_ms: Number(verifiedOutcomeNs - promptSentNs) / 1_000_000,
+    prompt_to_final_ms: Number.isFinite(reportedFinalMs) && reportedFinalMs >= 0 ? reportedFinalMs : null,
+    prompt_trace: {
+      prompt_sent: true,
+      first_tool_decision_ms: Number.isFinite(promptTrace.prompt_to_first_tool_decision_ms) ? promptTrace.prompt_to_first_tool_decision_ms : null,
+      controlla_received_ms: Number.isFinite(promptTrace.prompt_to_controlla_received_ms) ? promptTrace.prompt_to_controlla_received_ms : null,
+      first_browser_op_ms: Number.isFinite(promptTrace.prompt_to_first_browser_op_ms) ? promptTrace.prompt_to_first_browser_op_ms : null,
+      last_browser_op_ms: Number.isFinite(promptTrace.prompt_to_last_browser_op_ms) ? promptTrace.prompt_to_last_browser_op_ms : null,
+      tool_result_delivered_ms: Number.isFinite(promptTrace.prompt_to_tool_result_delivered_ms)
+        ? promptTrace.prompt_to_tool_result_delivered_ms
+        : Number.isFinite(invocationMetrics.command_elapsed_ms) ? invocationMetrics.command_elapsed_ms : null,
+      verified_outcome_ms: Number(verifiedOutcomeNs - promptSentNs) / 1_000_000,
+      final_answer_ms: Number.isFinite(reportedFinalMs) && reportedFinalMs >= 0 ? reportedFinalMs : null,
+      input_bytes: invocationMetrics.input_bytes ?? null,
+      output_bytes: invocationMetrics.output_bytes ?? null,
+      schema_bytes: Number.isSafeInteger(raw.schema_bytes) ? raw.schema_bytes : Number.isSafeInteger(traceCounters.schema_bytes) ? traceCounters.schema_bytes : null,
+      external_controlla_calls: Number.isSafeInteger(raw.external_controlla_calls) ? raw.external_controlla_calls : Number.isSafeInteger(traceCounters.external_controlla_calls) ? traceCounters.external_controlla_calls : raw.mcp_calls ?? null,
+      model_turns: Number.isSafeInteger(raw.model_turns) ? raw.model_turns : Number.isSafeInteger(traceCounters.model_turns) ? traceCounters.model_turns : raw.model_round_trips ?? null,
+      model_visible_observations: Number.isSafeInteger(raw.model_visible_observations) ? raw.model_visible_observations : Number.isSafeInteger(traceCounters.model_visible_observations) ? traceCounters.model_visible_observations : null,
+      internal_model_calls: Number.isSafeInteger(raw.internal_model_calls) ? raw.internal_model_calls : Number.isSafeInteger(traceCounters.internal_model_calls) ? traceCounters.internal_model_calls : null,
+      browser_cdp_commands: Number.isSafeInteger(raw.browser_cdp_commands) ? raw.browser_cdp_commands : Number.isSafeInteger(traceCounters.browser_cdp_commands) ? traceCounters.browser_cdp_commands : null,
+      cold_warm: mode,
+      execution_tier: typeof promptTrace.execution_tier === 'string' ? promptTrace.execution_tier : raw.execution_tier ?? null,
+      fallback_count: Number.isSafeInteger(raw.fallback_count) ? raw.fallback_count : raw.recovery_events ?? null,
+      trace_valid: promptTrace.trace_valid === true,
+    },
     independently_verified_success: Boolean(raw.success && verification.passed),
     verifier_evidence_hash: verification.evidence_hash,
   };
@@ -239,7 +280,7 @@ export async function runBenchmark({
     }
   }
   return {
-    schema_version: 1,
+    schema_version: 2,
     track: config.track,
     candidate_adapter: candidate.id,
     baseline_adapter: baseline.id,

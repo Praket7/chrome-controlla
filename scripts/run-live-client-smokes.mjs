@@ -116,10 +116,15 @@ export async function runLiveClientSmokes({
       if (!tasks || requiredTasks.some(task => typeof tasks[task] !== 'string' || !tasks[task].trim())) {
         throw new Error(`${id} host adapter is available, but CONTROLLA_CLIENT_HOST_TASKS_JSON must provide read_only, verified_mutation, and mode_specific prompts; no client evidence was written`);
       }
-      const hostConfig = await prepareClientHostConfig(id, clientAdapter, join(clientAdapter.state_dir, 'host-config'));
       for (const task of requiredTasks) {
+        const traceFile = join(clientAdapter.state_dir, 'prompt-traces', `${task}.jsonl`);
+        const traceId = `${runId}:${task}`;
+        const hostConfig = await prepareClientHostConfig(id, clientAdapter, join(clientAdapter.state_dir, 'host-config', task),
+          // A fresh MCP process does not imply a cold Chrome browser; measure its
+          // warmth only when the browser fixture can establish it.
+          { traceFile, traceId, coldWarm: 'unknown' });
         const run = await hostTaskRunner(id, { task, executable: hostAdapter.executable, workDir: clientAdapter.state_dir,
-          mcpConfig: { ...clientAdapter, ...hostConfig }, prompt: tasks[task], env });
+          mcpConfig: { ...clientAdapter, ...hostConfig }, prompt: tasks[task], env, traceFile, traceId, coldWarm: 'unknown' });
         if (run.status !== 'host_tool_invocation_observed' || !Array.isArray(run.tool_events) || run.tool_events.length === 0) {
           throw new Error(`${id} ${task} host task did not invoke a Controlla MCP tool; qualification evidence was not written`);
         }
@@ -130,7 +135,7 @@ export async function runLiveClientSmokes({
           && event.input?.action === 'open' && ['background', 'headless'].includes(event.input.mode))) {
           throw new Error(`${id} mode_specific host run did not request a supported background or headless browser mode`);
         }
-        hostTaskRuns.push({ task, ...run });
+        hostTaskRuns.push({ task, ...run, prompt_trace: run.prompt_trace ?? null });
       }
     } else if (hostAdapter.status === 'missing_dependency' || hostAdapter.status === 'interactive_only' || hostAdapter.status === 'manual_host_required') {
       if (!commands[adapterId]) throw new Error(`${id} client host is ${hostAdapter.status}: ${hostAdapter.reason}; provide an explicitly registered in-app driver; no qualification evidence was written`);
@@ -142,8 +147,8 @@ export async function runLiveClientSmokes({
       client_schema_contract: clientSchemaContract,
       host_task_runs: hostTaskRuns,
     }, 300_000, env);
-    const hostTaskBinding = hostTaskRuns.map(({ task, process_id, tool_events, stdout_sha256 }) => ({ task, process_id, tool_events, stdout_sha256 }));
-    const matchesHostTaskBinding = value => Array.isArray(value) && JSON.stringify(value.map(({ task, process_id, tool_events, stdout_sha256 }) => ({ task, process_id, tool_events, stdout_sha256 }))) === JSON.stringify(hostTaskBinding);
+    const hostTaskBinding = hostTaskRuns.map(({ task, process_id, tool_events, stdout_sha256, prompt_trace }) => ({ task, process_id, tool_events, stdout_sha256, prompt_trace }));
+    const matchesHostTaskBinding = value => Array.isArray(value) && JSON.stringify(value.map(({ task, process_id, tool_events, stdout_sha256, prompt_trace }) => ({ task, process_id, tool_events, stdout_sha256, prompt_trace: prompt_trace ?? null }))) === JSON.stringify(hostTaskBinding);
     if (!matchesHostTaskBinding(rawResult.host_task_runs)) {
       throw new Error(`${id} evidence driver did not return the exact observed host-task process IDs, tool calls, and output hashes; no qualification result was written`);
     }
@@ -163,7 +168,8 @@ export async function runLiveClientSmokes({
     results.push({ client: id, status: 'verified', live: true, verified_capabilities: verified.verified_capabilities,
       evidence_path: result.evidence_path, evidence_hash: digest, client_version: result.client_version,
       integration_config_sha256: clientAdapter.config_sha256,
-      controlla_version: result.controlla_version });
+      controlla_version: result.controlla_version,
+      prompt_traces: hostTaskRuns.map(({ task, prompt_trace }) => ({ task, trace: prompt_trace })) });
   }
 
   await mkdir(dirname(outputPath), { recursive: true });

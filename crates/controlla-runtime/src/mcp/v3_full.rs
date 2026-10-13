@@ -179,6 +179,18 @@ mod route_telemetry_tests {
         assert!(route["actual_cost"]["external_model_calls"].is_null());
         assert_eq!(route["verification"], "passed");
         assert_eq!(route["fallback_reason"], "structural drift");
+        assert_eq!(route["model_budget"]["internal_calls_allowed"], 0);
+        assert_eq!(route["model_budget"]["passed"], true);
+    }
+
+    #[test]
+    fn qualified_route_fails_its_zero_model_contract_if_any_step_reports_a_model_call() {
+        let mut route = json!({"tier":"qualified_skill"});
+        let result = json!({"status":"completed","receipts":[{"verified":true,"internal_model_calls":1}]});
+        attach_execution_actuals(&mut route, std::time::Instant::now(), &result);
+        assert_eq!(route["model_budget"]["internal_calls_allowed"], 0);
+        assert_eq!(route["model_budget"]["internal_calls_observed"], 1);
+        assert_eq!(route["model_budget"]["passed"], false);
     }
 
     #[test]
@@ -251,6 +263,8 @@ struct AppV3 {
     skills: Arc<crate::skill_runtime::SkillRuntime>,
     leases: Arc<Mutex<crate::v3::LeaseTable>>,
     browser_modes: Arc<Mutex<std::collections::BTreeMap<String, crate::v3::BrowserMode>>>,
+    cold_open_cache: Arc<Mutex<std::collections::BTreeMap<String, (String, crate::v3::BrowserMode)>>>,
+    cold_open_singleflight: Arc<Mutex<()>>,
     evidence: Arc<Mutex<std::collections::BTreeMap<String, crate::visual_probe::EvidenceTrail>>>,
     evidence_scopes: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
     evidence_store: Arc<crate::evidence_store::PersistentEvidenceStore>,
@@ -258,6 +272,7 @@ struct AppV3 {
     skill_traces: Option<Arc<crate::skill_induction::SkillTraceStore>>,
     capabilities: Arc<Mutex<crate::capability_registry::CapabilityRegistry>>,
     site_profiles: Arc<Mutex<crate::site_profiles::SiteProfileStore>>,
+    execution_costs: Arc<std::sync::Mutex<crate::execution_cost_router::ExecutionCostRouter>>,
     workflow_lease_owners: Arc<Mutex<std::collections::BTreeSet<String>>>,
     headless_chrome: Option<std::path::PathBuf>,
 }
@@ -271,6 +286,8 @@ impl AppV3 {
             )),
             leases: Arc::new(Mutex::new(crate::v3::LeaseTable::default())),
             browser_modes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            cold_open_cache: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            cold_open_singleflight: Arc::new(Mutex::new(())),
             evidence: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             evidence_scopes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             evidence_store: Arc::new(crate::evidence_store::PersistentEvidenceStore::new(
@@ -288,6 +305,9 @@ impl AppV3 {
             site_profiles: Arc::new(Mutex::new(crate::site_profiles::SiteProfileStore::open(
                 super::super::state_directory().join("site-profiles-v1.json"),
             ).unwrap_or_default())),
+            execution_costs: Arc::new(std::sync::Mutex::new(crate::execution_cost_router::ExecutionCostRouter::open(
+                super::super::state_directory().join("execution-costs-v1.json"),
+            ))),
             workflow_lease_owners: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             headless_chrome: std::env::var_os("COMPTROL_CHROME_EXECUTABLE")
                 .map(std::path::PathBuf::from),
@@ -430,11 +450,22 @@ impl AppV3 {
             host_id: None,
         })).await;
         self.browser_modes.lock().await.remove(session_id);
+        self.cold_open_cache.lock().await.retain(|_, (cached_session, _)| cached_session != session_id);
     }
 
     async fn cold_open_session(&self, args: &V3BrowserArgs, mode: crate::v3::BrowserMode) -> Result<String, rmcp::ErrorData> {
         if !crate::native_setup::host_registered() {
             return Err(invalid("native Chrome bridge is not registered"));
+        }
+        let client = args.client_id.as_deref().unwrap_or("local-stdio");
+        let idempotency_key = args.idempotency_key.as_deref().ok_or_else(|| invalid("browser action=open requires idempotency_key"))?;
+        let cache_key = format!("{client}:{}", idempotency_key);
+        let _singleflight = self.cold_open_singleflight.lock().await;
+        let cached_open = self.cold_open_cache.lock().await.get(&cache_key).cloned();
+        if let Some((session_id, cached_mode)) = cached_open {
+            if cached_mode != mode { return Err(invalid("idempotency_key was already used with a different browser mode")); }
+            if self.browser_modes.lock().await.get(&session_id) == Some(&mode) { return Ok(session_id); }
+            self.cold_open_cache.lock().await.remove(&cache_key);
         }
         let discovery_started = std::time::Instant::now();
         let mut host_id = args.host_id.clone();
@@ -502,7 +533,12 @@ impl AppV3 {
             ready_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         ).await;
         match accepted {
-            Ok(Json(value)) if value["accepted"] == true => Ok(session_id),
+            Ok(Json(value)) if value["accepted"] == true => {
+                let mut cache = self.cold_open_cache.lock().await;
+                if cache.len() >= 128 { if let Some(oldest) = cache.keys().next().cloned() { cache.remove(&oldest); } }
+                cache.insert(cache_key, (session_id.clone(), mode));
+                Ok(session_id)
+            }
             Ok(_) => {
                 self.release_cold_session(&session_id).await;
                 Err(invalid("native Chrome pairing timed out; inspect bridge status"))
@@ -1347,7 +1383,7 @@ fn browser_click_outcome_for_observed_target(
     }
 }
 
-const FILL_FORM_STEP: &str = r#"function(index,expected,value,select){const e=this.nodes[index],saved=this.items[index];if(!e||!saved||!e.isConnected)return {ok:false,reason:'detached'};if(this.raw(e)!==saved.raw_value||this.name(e)!==saved.name)return {ok:false,reason:'changed_target'};if(select?!(e instanceof HTMLSelectElement):!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||!select&&['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||''))return {ok:false,reason:'unsupported_control'};const trusted=e.closest('[data-requires-trusted]'),visible=(()=>{for(let n=e;n;n=n.parentElement||n.getRootNode()?.host){const s=getComputedStyle(n),r=n.getBoundingClientRect();if(n.hidden||n.inert||s.display==='none'||s.visibility==='hidden'||Number.parseFloat(s.opacity||'1')<=0||r.width<=0||r.height<=0)return false}return true})();if(!visible)return {ok:false,reason:'not_visible'};if(e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||trusted)return {ok:false,reason:'guard_rejected'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(select){const option=Array.from(e.options).find(option=>option.value===value&&!option.disabled);if(!option)return {ok:false,reason:'option_not_found'};e.value=value}else{const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value)}e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:select?null:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,reason:e.value===value?null:'readback_mismatch'}}"#;
+const FILL_FORM_STEP: &str = r#"function(index,expected,value,select,expectedSemanticRevision){const epoch=window[Symbol.for('controlla.interactionEpoch.v1')];if(!epoch||epoch.semantic!==expectedSemanticRevision)return {ok:false,reason:'interaction_epoch_changed'};const e=this.nodes[index],saved=this.items[index];if(!e||!saved||!e.isConnected)return {ok:false,reason:'detached'};if(this.raw(e)!==saved.raw_value||this.name(e)!==saved.name)return {ok:false,reason:'changed_target'};if(select?!(e instanceof HTMLSelectElement):!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||!select&&['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||''))return {ok:false,reason:'unsupported_control'};const trusted=e.closest('[data-requires-trusted]'),visible=(()=>{for(let n=e;n;n=n.parentElement||n.getRootNode()?.host){const s=getComputedStyle(n),r=n.getBoundingClientRect();if(n.hidden||n.inert||s.display==='none'||s.visibility==='hidden'||Number.parseFloat(s.opacity||'1')<=0||r.width<=0||r.height<=0)return false}return true})();if(!visible)return {ok:false,reason:'not_visible'};if(e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||trusted)return {ok:false,reason:'guard_rejected'};if(e.value!==expected)return {ok:false,reason:'stale_value'};if(select){const option=Array.from(e.options).find(option=>option.value===value&&!option.disabled);if(!option)return {ok:false,reason:'option_not_found'};e.value=value}else{const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value)}e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:select?null:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,reason:e.value===value?null:'readback_mismatch'}}"#;
 
 fn fill_form_known_pre_dispatch_failure(receipt: &Value) -> bool {
     let Some(result) = receipt
@@ -1362,6 +1398,7 @@ fn fill_form_known_pre_dispatch_failure(receipt: &Value) -> bool {
             Some(
                 "detached"
                     | "changed_target"
+                    | "interaction_epoch_changed"
                     | "unsupported_control"
                     | "not_visible"
                     | "guard_rejected"
@@ -1404,7 +1441,7 @@ async fn workflow_fill_form(
         }
         actions.push(controlla_browser::providers::SharedBatchAction {
             method: "Runtime.callFunctionOn".into(),
-            params: json!({"objectId":snapshot.object_id,"functionDeclaration":FILL_FORM_STEP,"arguments":[{"value":index},{"value":field.expected_value},{"value":field.value},{"value":field.select}],"returnByValue":true}),
+            params: json!({"objectId":snapshot.object_id,"functionDeclaration":FILL_FORM_STEP,"arguments":[{"value":index},{"value":field.expected_value},{"value":field.value},{"value":field.select},{"value":snapshot.interaction_epoch["semantic_revision"]}],"returnByValue":true}),
             stop_on_not_ok: true,
         });
     }
@@ -3310,6 +3347,8 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
     let verified = !receipts.is_empty() && receipts.iter().all(|receipt| receipt["verified"] == true);
     let unknown = result["status"] == "unknown" || receipts.iter().any(|receipt| receipt["status"] == "unknown");
     let internal_model_calls = receipts.iter().filter_map(|receipt| receipt["internal_model_calls"].as_u64()).sum::<u64>();
+    let tier = serde_json::from_value::<crate::capability_router::ExecutionTier>(route["tier"].clone()).ok();
+    let internal_model_call_budget = tier.map(internal_model_call_budget).unwrap_or(1);
     let fallback_reason = ["skill_fallback_reason", "webmcp_fallback_reason", "speculative_fallback_reason", "profile_learning_fallback_reason"]
         .iter().find_map(|key| route.get(*key).and_then(Value::as_str).map(str::to_owned));
     route["actual_cost"] = json!({
@@ -3323,6 +3362,25 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
     });
     route["verification"] = json!(if verified || matches!(result["status"].as_str(), Some("completed" | "verified" | "passed")) {"passed"} else if unknown {"inconclusive"} else {result["status"].as_str().unwrap_or("incomplete")});
     route["fallback_reason"] = fallback_reason.map(Value::String).unwrap_or(Value::Null);
+    route["model_budget"] = json!({
+        "internal_calls_allowed":internal_model_call_budget,
+        "internal_calls_observed":internal_model_calls,
+        "passed":internal_model_calls <= u64::from(internal_model_call_budget),
+        "caller_model_turns":"measured_by_prompt_send_trace_proxy",
+        "caller_model_visible_observations":"measured_by_prompt_send_trace_proxy",
+    });
+}
+
+fn internal_model_call_budget(tier: crate::capability_router::ExecutionTier) -> u32 {
+    match tier {
+        crate::capability_router::ExecutionTier::QualifiedSkill
+        | crate::capability_router::ExecutionTier::WebMcpOrSiteTool
+        | crate::capability_router::ExecutionTier::SpeculativeRead
+        | crate::capability_router::ExecutionTier::SemanticProgram => 0,
+        crate::capability_router::ExecutionTier::SemanticPlanner
+        | crate::capability_router::ExecutionTier::TargetedVisual
+        | crate::capability_router::ExecutionTier::FullVisionFallback => 1,
+    }
 }
 
 fn page_tool_route_receipt(
@@ -4202,6 +4260,10 @@ fn page_tool_snapshot_fresh(consumed: bool, identity_matches: bool) -> bool {
     !consumed && identity_matches
 }
 
+fn should_discover_page_tool(action: &str, cached_candidate: bool) -> bool {
+    action == "page_tools" || !cached_candidate
+}
+
 fn page_tool_unavailable(reason: &str) -> Value {
     json!({"status":"not_dispatched","action":"page_tool","fallback":"semantic_ui","reason":reason})
 }
@@ -4258,6 +4320,28 @@ fn task_route_signals(
         semantic_confidence: 0.0,
         targeted_visual: visual_required,
     }
+}
+
+fn route_candidates(signals: crate::capability_router::ExecutionCapabilities, read_only: bool) -> Vec<crate::capability_router::ExecutionTier> {
+    use crate::capability_router::ExecutionTier as Tier;
+    let mut tiers = Vec::new();
+    if read_only && signals.qualified_skill { tiers.push(Tier::QualifiedSkill); }
+    if signals.site_tool { tiers.push(Tier::WebMcpOrSiteTool); }
+    if read_only && signals.speculative_read { tiers.push(Tier::SpeculativeRead); }
+    if signals.semantic_program { tiers.push(Tier::SemanticProgram); }
+    if signals.semantic_confidence >= 0.8 { tiers.push(Tier::SemanticPlanner); }
+    if signals.targeted_visual { tiers.push(Tier::TargetedVisual); }
+    if tiers.is_empty() { tiers.push(Tier::FullVisionFallback); }
+    tiers
+}
+
+fn task_cost_context(task: &crate::v3_tasks::TaskPrimitive) -> Option<(String, String, String)> {
+    let crate::v3_tasks::TaskPrimitive::Research { urls, .. } = task else { return None; };
+    if urls.len() != 1 { return None; }
+    let origin = site_scope_from_url(&urls[0])?;
+    let intent = task.intent_fingerprint();
+    let size = match task.expand().ok()?.len() { 0..=3 => "small", 4..=8 => "medium", _ => "large" }.to_owned();
+    Some((origin, intent, size))
 }
 
 fn task_needs_visual_evidence(goal: &str) -> bool {
@@ -4421,14 +4505,17 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
         let cached = if args.action == "page_tool" {
             app.capabilities.lock().await.resolve_webmcp_candidate(name.expect("validated"), &site_scope).cloned()
         } else { None };
-        // Discovery is deliberately fresh even when the registry has a
-        // candidate: otherwise a cached descriptor could only compare against
-        // itself and schema drift would be invisible.
-        let discovery = Some(tokio::time::timeout(Duration::from_millis(timeout_ms), connection.command(
+        // A cached candidate skips the redundant preflight catalog call. The
+        // invocation program still re-reads the live catalog and compares the
+        // selected tool's schema immediately before dispatch. Listing tools or
+        // an uncached selection performs full discovery here.
+        let discovery = if should_discover_page_tool(&args.action, cached.is_some()) {
+            Some(tokio::time::timeout(Duration::from_millis(timeout_ms), connection.command(
                 shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.evaluate",
                 json!({"expression":format!("({})()", crate::v3_runtime::PageToolProgram::discovery()),"awaitPromise":true,"returnByValue":true}),
             )).await.map_err(|_| invalid("page-tool discovery timed out"))?
-                .map_err(|error| invalid(error.to_string()))?);
+                .map_err(|error| invalid(error.to_string()))?)
+        } else { None };
         (before, cached, discovery)
     };
     let discovered = discovery.as_ref().map(super::super::shared_value).transpose().map_err(invalid)?;
@@ -4476,7 +4563,7 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
             "requested page tool is not available",
         ));
     };
-    if cached_capability.is_some() {
+    if cached_capability.is_some() && discovered_tools.is_some() {
         let live_schema = discovered_tools.into_iter().flatten()
             .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
             .and_then(|tool| tool.get("input_schema"));
@@ -6561,21 +6648,40 @@ impl AppV3 {
         }
         let dag=crate::workflow_dag::compile(planned).map_err(invalid)?;
         let mut receipts=std::collections::BTreeMap::<String,Value>::new();
+        let mut parallel_read_layers = 0usize;
+        let mut serial_layers = 0usize;
         for layer in dag.layers {
-            let futures=layer.into_iter().map(|planned| {
-                let node=node_map.get(&planned.id).expect("compiled DAG node identity").clone();
-                let base_session=args.session_id.clone(); let client_id=args.client_id.clone();
-                async move {
-                    let node_args=V3WorkflowArgs{session_id:base_session,chrome_tab_id:node.target_id,steps:node.steps,program:None,client_id,dag:None};
-                    let result=self.workflow_inner(node_args).await?;
-                    Ok::<_,rmcp::ErrorData>((node.id,result.0))
+            let estimates = layer.iter().map(|planned| {
+                node_map.get(&planned.id).map(|node| (node.steps.len() as u64).saturating_mul(100)).unwrap_or_default()
+            }).collect::<Vec<_>>();
+            let parallel = layer.iter().all(|node| node.effect == crate::workflow_dag::DagEffect::ReadOnly)
+                && crate::workflow_dag::parallel_wave_is_worthwhile(&estimates, crate::workflow_dag::DEFAULT_PARALLEL_SETUP_COST_MS);
+            if parallel {
+                parallel_read_layers += 1;
+                let futures=layer.into_iter().map(|planned| {
+                    let node=node_map.get(&planned.id).expect("compiled DAG node identity").clone();
+                    let base_session=args.session_id.clone(); let client_id=args.client_id.clone();
+                    async move {
+                        let node_args=V3WorkflowArgs{session_id:base_session,chrome_tab_id:node.target_id,steps:node.steps,program:None,client_id,dag:None};
+                        let result=Box::pin(self.workflow_inner(node_args)).await?;
+                        Ok::<_,rmcp::ErrorData>((node.id,result.0))
+                    }
+                });
+                for result in futures_util::future::join_all(futures).await { let (id,receipt)=result?; receipts.insert(id,receipt); }
+            } else {
+                serial_layers += 1;
+                for planned in layer {
+                    let node=node_map.get(&planned.id).expect("compiled DAG node identity").clone();
+                    let node_args=V3WorkflowArgs{session_id:args.session_id.clone(),chrome_tab_id:node.target_id,steps:node.steps,program:None,client_id:args.client_id.clone(),dag:None};
+                    let result=Box::pin(self.workflow_inner(node_args)).await?;
+                    receipts.insert(node.id,result.0);
                 }
-            });
-            for result in futures_util::future::join_all(futures).await { let (id,receipt)=result?; receipts.insert(id,receipt); }
+            }
             if receipts.values().any(|receipt|matches!(receipt["status"].as_str(),Some("failed"|"unknown"|"not_dispatched"|"completed_unverified"))) {
                 let targets = node_map.iter().map(|(id, node)| (id.clone(), node.target_id.clone())).collect();
                 let merged_evidence = crate::workflow_dag::merge_branch_evidence(&receipts, &targets);
                 return Ok(Json(json!({"status":"stopped_after_unverified_node","nodes":receipts,
+                    "schedule":{"policy":"estimated_savings_over_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers},
                     "merged_evidence":{"provenance":"per_node_untrusted_page_receipts","items":merged_evidence},
                     "page_content_is_untrusted":true})));
             }
@@ -6585,7 +6691,9 @@ impl AppV3 {
         // untrusted page facts to independently verified evidence.
         let targets = node_map.iter().map(|(id, node)| (id.clone(), node.target_id.clone())).collect();
         let merged_evidence = crate::workflow_dag::merge_branch_evidence(&receipts, &targets);
-        Ok(Json(json!({"status":"completed","nodes":receipts,"merged_evidence":{"provenance":"per_node_untrusted_page_receipts","items":merged_evidence},"page_content_is_untrusted":true})))
+        Ok(Json(json!({"status":"completed","nodes":receipts,
+            "schedule":{"policy":"estimated_savings_over_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers},
+            "merged_evidence":{"provenance":"per_node_untrusted_page_receipts","items":merged_evidence},"page_content_is_untrusted":true})))
     }
 
     async fn workflow_inner(&self, mut args: V3WorkflowArgs) -> Result<Json<Value>, rmcp::ErrorData> {
@@ -6889,6 +6997,9 @@ impl AppV3 {
         let wall_limit = Duration::from_millis(budget.max_wall_ms);
         let session_id = args.session_id.clone();
         let tab_id = args.chrome_tab_id.clone();
+        let cost_context = task_cost_context(&args.task);
+        let cost_router = self.execution_costs.clone();
+        let task_started = std::time::Instant::now();
         let sequence = NEXT_WORKFLOW_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let task_owner = format!("task:{session_id}:{tab_id}:{}:{sequence}", now_ms());
         let tracked_task_owner = task_owner.clone();
@@ -6910,6 +7021,25 @@ impl AppV3 {
             }),
         )).await;
         self.workflow_lease_owners.lock().await.remove(&tracked_task_owner);
+        if let (Some((origin, intent, task_size)), Ok(receipt)) = (cost_context, result.as_ref()) {
+            let value = &receipt.0;
+            let tier = serde_json::from_value::<crate::capability_router::ExecutionTier>(value.pointer("/execution_route/tier").cloned().unwrap_or(Value::Null)).ok();
+            let verified = value["execution_route"]["verification"] == "passed"
+                && matches!(value["status"].as_str(), Some("completed" | "verified" | "passed"))
+                && value["receipts"].as_array().is_some_and(|receipts| !receipts.is_empty()
+                    && receipts.iter().all(|step| step["verified"] == true));
+            if let Some(tier) = tier {
+                let elapsed_ms = task_started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64;
+                tokio::task::spawn_blocking(move || {
+                    let context = crate::execution_cost_router::RouteCostContext {
+                        origin: &origin, intent: &intent, warmth: "unknown", task_size: &task_size,
+                    };
+                    if let Ok(mut router) = cost_router.lock() {
+                        let _ = router.record(&context, tier, elapsed_ms, verified, verified);
+                    }
+                });
+            }
+        }
         result
     }
 
@@ -6985,22 +7115,40 @@ impl AppV3 {
                     } else { (false, false, false, None) }
                 } else { (false, false, false, None) }
             } else { (false, false, false, None) };
-        let execution_route = crate::capability_router::route_execution(
-            task_route_signals(
-                &args.task,
-                steps.len(),
-                qualified_skill_available,
-                site_tool_available,
-                speculative_read_available,
-            ),
-            matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { .. }),
+        let read_only_task = matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { .. });
+        let signals = task_route_signals(
+            &args.task,
+            steps.len(),
+            qualified_skill_available,
+            site_tool_available,
+            speculative_read_available,
         );
+        let mut execution_route = crate::capability_router::route_execution(signals, read_only_task);
+        let available_routes = route_candidates(signals, read_only_task);
+        let selected_by_history = if let Some((origin, intent, size)) = task_cost_context(&args.task) {
+            let context = crate::execution_cost_router::RouteCostContext {
+                origin: &origin, intent: &intent, warmth: "unknown", task_size: &size,
+            };
+            self.execution_costs.lock().ok().and_then(|router| router.select(&context, &available_routes))
+        } else { None };
+        if let Some(tier) = selected_by_history {
+            execution_route.selected = tier;
+            execution_route.reason = "historical verified p95 latency selected the lowest-cost qualified route for this exact cohort";
+            execution_route.predicted_model_calls = if matches!(tier,
+                crate::capability_router::ExecutionTier::QualifiedSkill
+                    | crate::capability_router::ExecutionTier::WebMcpOrSiteTool
+                    | crate::capability_router::ExecutionTier::SpeculativeRead
+                    | crate::capability_router::ExecutionTier::SemanticProgram) { 0 } else { 1 };
+        }
         let mut route_receipt = json!({
             "tier":execution_route.selected,
             "reason":execution_route.reason,
             "predicted_model_calls":execution_route.predicted_model_calls,
             "predicted_cost":{"model_calls":execution_route.predicted_model_calls,
                 "browser_operations":steps.len(),"logical_task_steps":steps.len(),"external_model_tokens":null},
+            "cost_policy":{"kind":if selected_by_history.is_some() {"qualified_empirical_p95"} else {"static_qualified_priority"},
+                "cohort":if task_cost_context(&args.task).is_some() {"origin_intent_warmth_size"} else {"unavailable"},
+                "historical_profile_selected":selected_by_history.is_some()},
             "visual_evidence_required":matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { goal: Some(goal), .. } if task_needs_visual_evidence(goal)),
             "intent_fingerprint":task_intent.clone(),
         });
@@ -7729,7 +7877,7 @@ pub(super) async fn run() -> Result<(), String> {
 mod v3_batch_delivery_tests {
     use super::{
         AppV3, BrowserClickOutcome, BrowserPredicate, V3WorkflowStep, V3WorkflowOp, SHARED_TRIGGER_UPLOAD_DEADLINE, can_parallelize_research, research_document_matches, reject_research_extract, run_bounded_parallel, with_lease_release, cdp_character_events, normalize_key_text, fast_key_batch_failure, lease_target_key,
-        page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, task_receipt,
+        page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, should_discover_page_tool, task_receipt,
         typing_policy, validate_workflow_steps, workflow_find_reference, workflow_should_stop,
         workflow_should_stop_before_next, workflow_should_verify_next,
         compact_workflow_receipt, shared_extension_value, shared_file_input_baseline, upload_acceptance_transition, upload_input_selection_confirmed, upload_picker_consumed_input, upload_selection_reason_code, upload_trigger_may_have_dispatched,
@@ -8742,6 +8890,13 @@ mod v3_batch_delivery_tests {
         assert!(page_tool_snapshot_fresh(false, true));
         assert!(!page_tool_snapshot_fresh(true, true));
         assert!(!page_tool_snapshot_fresh(false, false));
+    }
+
+    #[test]
+    fn cached_page_tool_skips_duplicate_catalog_read_but_keeps_final_live_revalidation() {
+        assert!(!should_discover_page_tool("page_tool", true));
+        assert!(should_discover_page_tool("page_tool", false));
+        assert!(should_discover_page_tool("page_tools", true));
     }
 
     #[test]

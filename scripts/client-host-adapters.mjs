@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { recordPromptTraceEvent, readPromptTrace, summarizePromptTrace } from './prompt-send-trace.mjs';
 
 const HOSTS = Object.freeze({
   codex: { executable: 'codex', kind: 'cli', support: 'non_interactive' },
@@ -34,9 +36,15 @@ export async function resolveClientHostAdapter(clientId, { env = process.env } =
   return { client: clientId, kind: host.kind, status: 'ready', qualification_status: 'not_run', executable };
 }
 
-export async function prepareClientHostConfig(clientId, launch, directory) {
+export async function prepareClientHostConfig(clientId, launch, directory, traceOptions = undefined) {
   await mkdir(directory, { recursive: true });
-  const server = { command: launch.command, args: launch.args, env: launch.env };
+  const server = traceOptions?.traceFile ? {
+    command: process.execPath,
+    args: [fileURLToPath(new URL('./mcp-stdio-trace-proxy.mjs', import.meta.url)), launch.command, ...launch.args],
+    env: { ...launch.env, CONTROLLA_PROMPT_TRACE_FILE: traceOptions.traceFile,
+      CONTROLLA_PROMPT_TRACE_ID: traceOptions.traceId,
+      CONTROLLA_PROMPT_COLD_WARM: traceOptions.coldWarm ?? 'unknown' },
+  } : { command: launch.command, args: launch.args, env: launch.env };
   if (clientId === 'codex') return { command: server.command, args: server.args, env: server.env };
   if (clientId === 'opencode') {
     const configDir = resolve(directory);
@@ -80,12 +88,63 @@ function collectToolEvents(value, events = []) {
   return events;
 }
 
-export async function runClientHostTask(clientId, { executable, workDir, mcpConfig, prompt, env = process.env, timeoutMs = 120_000, spawnProcess = spawn } = {}) {
+function collectToolEventsFromHost(events) {
+  return events.filter(event => /chrome-controlla[._-](act|browser|extract|snapshot|verify|workflow)|mcp__chrome-controlla__(act|browser|extract|snapshot|verify|workflow)/.test(event.name));
+}
+
+export async function runClientHostTask(clientId, { executable, workDir, mcpConfig, prompt, env = process.env, timeoutMs = 120_000, spawnProcess = spawn,
+  traceFile, traceId = 'unbound', coldWarm = 'unknown' } = {}) {
   const invocation = buildClientHostInvocation(clientId, { executable, workDir, mcpConfig, prompt });
   return new Promise((resolveTask, rejectTask) => {
+    let traceWrites = Promise.resolve();
+    let lineBuffer = '';
+    const hostEvents = [];
+    const queueTrace = (event, fields = {}) => {
+      if (!traceFile) return;
+      const happenedAt = process.hrtime.bigint();
+      traceWrites = traceWrites.then(() => recordPromptTraceEvent(traceFile, traceId, event, fields, happenedAt));
+    };
+    let firstToolDecisionRecorded = false;
+    let finalAnswerRecorded = false;
+    const consumeLine = line => {
+      if (!line.trim()) return;
+      let value;
+      try { value = JSON.parse(line); } catch { return; }
+      const parsed = collectToolEvents(value);
+      hostEvents.push(...parsed);
+      if (parsed.length && !firstToolDecisionRecorded) {
+        firstToolDecisionRecorded = true;
+        queueTrace('first_tool_decision', { external_tool_calls: parsed.length });
+      }
+      const type = String(value.type ?? value.event ?? '').toLowerCase();
+      const nestedType = String(value.item?.type ?? value.message?.type ?? '').toLowerCase();
+      if (/turn[._ -]?completed|turn[._ -]?complete/.test(type)) queueTrace('model_turn');
+      if (/tool_result|mcp_tool_result|tool_output/.test(`${type} ${nestedType}`)) queueTrace('model_visible_observation');
+      if (!finalAnswerRecorded && ((/item[._ -]?completed/.test(type) && /agent_message|assistant_message/.test(nestedType))
+        || /assistant_final|final_answer|turn[._ -]?result/.test(type))) {
+        finalAnswerRecorded = true;
+        queueTrace('final_answer');
+      }
+      if (clientId === 'claude-code' && type === 'result') {
+        finalAnswerRecorded = true;
+        queueTrace('final_answer');
+      }
+    };
     const child = spawnProcess(invocation.command, invocation.args, { cwd: workDir, env: { ...env, ...invocation.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    // The prompt is delivered as a process argument; timestamp immediately after
+    // process creation, before consuming any host output or MCP events.
+    queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm });
     const stdout = []; const stderr = []; let stdoutBytes = 0; let stderrBytes = 0;
-    child.stdout.on('data', chunk => { if (stdoutBytes < 4_000_000) { const bounded = Buffer.from(chunk).subarray(0, 4_000_000 - stdoutBytes); stdout.push(bounded); stdoutBytes += bounded.length; } });
+    child.stdout.on('data', chunk => {
+      const bounded = Buffer.from(chunk).subarray(0, Math.max(0, 4_000_000 - stdoutBytes));
+      if (bounded.length) { stdout.push(bounded); stdoutBytes += bounded.length; }
+      lineBuffer += bounded.toString('utf8');
+      let newline;
+      while ((newline = lineBuffer.indexOf('\n')) >= 0) {
+        consumeLine(lineBuffer.slice(0, newline).replace(/\r$/, ''));
+        lineBuffer = lineBuffer.slice(newline + 1);
+      }
+    });
     child.stderr.on('data', chunk => { if (stderrBytes < 64_000) { const bounded = Buffer.from(chunk).subarray(0, 64_000 - stderrBytes); stderr.push(bounded); stderrBytes += bounded.length; } });
     const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
     child.once('error', error => { clearTimeout(timer); rejectTask(error); });
@@ -93,14 +152,16 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
       clearTimeout(timer);
       const output = Buffer.concat(stdout).toString('utf8');
       const errorOutput = Buffer.concat(stderr).toString('utf8').slice(0, 64_000);
-      if (code !== 0) { rejectTask(new Error(`${clientId} host exited with code ${code}${errorOutput ? `: ${errorOutput}` : ''}`)); return; }
-      const events = [];
-      for (const line of output.split(/\r?\n/)) {
-        try { collectToolEvents(JSON.parse(line), events); } catch { /* formatted or non-JSON lines are retained in the digest only */ }
-      }
-      const controllaEvents = events.filter(event => /chrome-controlla[._-](act|browser|extract|snapshot|verify|workflow)|mcp__chrome-controlla__(act|browser|extract|snapshot|verify|workflow)/.test(event.name));
-      resolveTask({ client: clientId, status: controllaEvents.length ? 'host_tool_invocation_observed' : 'no_host_tool_invocation_observed', qualification_status: 'not_run', process_id: child.pid,
-        tool_events: controllaEvents, stdout_sha256: createHash('sha256').update(output).digest('hex'), stderr: errorOutput, exit_code: code });
+      consumeLine(lineBuffer);
+      void (async () => {
+        await traceWrites;
+        if (code !== 0) throw new Error(`${clientId} host exited with code ${code}${errorOutput ? `: ${errorOutput}` : ''}`);
+        const controllaEvents = collectToolEventsFromHost(hostEvents);
+        const promptTrace = traceFile ? summarizePromptTrace(await readPromptTrace(traceFile)) : null;
+        resolveTask({ client: clientId, status: controllaEvents.length ? 'host_tool_invocation_observed' : 'no_host_tool_invocation_observed', qualification_status: 'not_run', process_id: child.pid,
+          tool_events: controllaEvents, stdout_sha256: createHash('sha256').update(output).digest('hex'), stderr: errorOutput, exit_code: code,
+          prompt_trace: promptTrace });
+      })().catch(rejectTask);
     });
   });
 }

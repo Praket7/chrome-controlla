@@ -328,7 +328,13 @@ mod tests {
             .record_training_example("registration", "train-2", "input-2")
             .unwrap();
         runtime
-            .record_validation_example("registration", "validate-1", "input-3")
+            .record_training_example("registration", "train-3", "input-3")
+            .unwrap();
+        runtime
+            .record_validation_example("registration", "validate-1", "input-4")
+            .unwrap();
+        runtime
+            .record_validation_example("registration", "validate-2", "input-5")
             .unwrap();
         runtime
             .qualify("registration", Verification::Passed, 100, 1000)

@@ -69,7 +69,7 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     repetitions: 1,
     deadlineMs: 5000
   });
-  assert.equal(report.schema_version, 1);
+  assert.equal(report.schema_version, 2);
   assert.equal(report.candidate_adapter, 'controlla');
   assert.equal(report.baseline_adapter, 'playwright-mcp');
   assert.equal(report.paired_rows.length, (await loadPhase11Config()).tasks.length);
@@ -78,6 +78,9 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     assert.equal(row.candidate.independently_verified_success, true);
     assert.equal(row.baseline.independently_verified_success, true);
     assert.equal(row.candidate.wall_ms, 80);
+    assert.equal(typeof row.candidate.prompt_to_verified_ms, 'number');
+    assert.equal(row.candidate.prompt_trace.prompt_sent, true);
+    assert.equal(row.candidate.prompt_trace.tool_result_delivered_ms !== null, true);
     assert.equal(row.baseline.wall_ms, 120);
     assert.match(row.candidate.verifier_evidence_hash, /^mock-/);
     assert.equal(row.candidate.severe_wrong_target_events, 0);

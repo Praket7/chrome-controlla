@@ -6,6 +6,8 @@ use std::collections::{BTreeSet, VecDeque};
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
 pub const OUTCOME_WINDOW: usize = 20;
 pub const MINIMUM_PASS_PERCENT: usize = 60;
+const MAX_REVERSIBLE_SKILL_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_CONSEQUENTIAL_SKILL_TTL_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +51,41 @@ impl SkillDefinition {
                 .all(|guard| !guard.is_empty() && guard.len() <= 256)
             && !self.structural_signatures.is_empty()
     }
+
+    /// Infer risk from the executable workflow itself; caller labels and prose
+    /// cannot downgrade a consequential action.
+    fn risk_tier(&self) -> SkillRisk {
+        let encoded = self.workflow.to_string().to_ascii_lowercase();
+        if [
+            "submit",
+            "purchase",
+            "checkout",
+            "delete",
+            "send",
+            "transfer",
+            "publish",
+            "account_change",
+        ]
+        .iter()
+        .any(|token| encoded.contains(token))
+        {
+            SkillRisk::Consequential
+        } else if ["fill", "type", "save", "click", "upload", "form"]
+            .iter()
+            .any(|token| encoded.contains(token))
+        {
+            SkillRisk::ReversibleMutation
+        } else {
+            SkillRisk::ReadOnly
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkillRisk {
+    ReadOnly,
+    ReversibleMutation,
+    Consequential,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -152,12 +189,21 @@ impl SkillRecord {
                 .iter()
                 .any(|validation| validation != training)
         });
-        let varied_inputs = self.training_input_signatures.len() >= 2
+        let (minimum_training, minimum_validation, max_ttl) = match self.definition.risk_tier() {
+            SkillRisk::ReadOnly => (2, 1, MAX_REVERSIBLE_SKILL_TTL_MS),
+            SkillRisk::ReversibleMutation => (3, 2, MAX_REVERSIBLE_SKILL_TTL_MS),
+            SkillRisk::Consequential => (4, 3, MAX_CONSEQUENTIAL_SKILL_TTL_MS),
+        };
+        let varied_inputs = self.training_input_signatures.len() >= minimum_training
+            && self.validation_input_signatures.len() >= minimum_validation
             && self
                 .validation_input_signatures
                 .iter()
                 .any(|signature| !self.training_input_signatures.contains(signature));
-        if !distinct_runs || !varied_inputs {
+        if !distinct_runs
+            || !varied_inputs
+            || expires_at_ms.saturating_sub(qualified_at_ms) > max_ttl
+        {
             return Err(SkillError::MissingQualificationRuns);
         }
         if runtime_verification != Verification::Passed {
@@ -250,12 +296,14 @@ mod tests {
         let mut record = SkillRecord::candidate(definition()).unwrap();
         record.record_training_example("run-a", "input-a");
         record.record_training_example("run-c", "input-c");
+        record.record_training_example("run-d", "input-d");
         record.record_validation_example("run-a", "input-a");
         assert_eq!(
             record.qualify(Verification::Passed, 100, 200),
             Err(SkillError::MissingQualificationRuns)
         );
         record.record_validation_example("run-b", "input-b");
+        record.record_validation_example("run-e", "input-e");
         assert_eq!(
             record.qualify(Verification::Inconclusive, 100, 200),
             Err(SkillError::RuntimeVerification)
@@ -264,6 +312,34 @@ mod tests {
         assert!(record.replay_allowed(150));
         assert!(!record.replay_allowed(200));
         assert_eq!(record.status, SkillStatus::Expired);
+    }
+
+    #[test]
+    fn consequential_workflows_require_stronger_evidence_and_short_expiry() {
+        let mut definition = definition();
+        definition.workflow = json!({"steps":["fill","submit"]});
+        let mut record = SkillRecord::candidate(definition).unwrap();
+        for (run, input) in [("a", "i1"), ("b", "i2"), ("c", "i3"), ("d", "i4")] {
+            record.record_training_example(run, input);
+        }
+        for (run, input) in [("e", "i5"), ("f", "i6"), ("g", "i7")] {
+            record.record_validation_example(run, input);
+        }
+        assert_eq!(
+            record.qualify(
+                Verification::Passed,
+                100,
+                100 + MAX_CONSEQUENTIAL_SKILL_TTL_MS + 1
+            ),
+            Err(SkillError::MissingQualificationRuns)
+        );
+        record
+            .qualify(
+                Verification::Passed,
+                100,
+                100 + MAX_CONSEQUENTIAL_SKILL_TTL_MS,
+            )
+            .unwrap();
     }
 
     #[test]

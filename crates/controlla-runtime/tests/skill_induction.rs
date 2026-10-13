@@ -217,7 +217,13 @@ fn structured_traces_persist_and_runtime_induction_stays_a_candidate() {
         .record_training_example(&record.definition.skill_id, "train-b", "input-b")
         .unwrap();
     runtime
-        .record_validation_example(&record.definition.skill_id, "validation-c", "input-c")
+        .record_training_example(&record.definition.skill_id, "train-c", "input-c")
+        .unwrap();
+    runtime
+        .record_validation_example(&record.definition.skill_id, "validation-c", "input-d")
+        .unwrap();
+    runtime
+        .record_validation_example(&record.definition.skill_id, "validation-d", "input-e")
         .unwrap();
     runtime
         .qualify(

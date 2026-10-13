@@ -9,6 +9,7 @@ pub mod capability_router;
 pub mod capcut_recipe;
 pub mod doctor;
 pub mod evidence_store;
+pub mod execution_cost_router;
 pub mod execution_journal;
 pub mod guard_reason;
 pub mod http_auth;

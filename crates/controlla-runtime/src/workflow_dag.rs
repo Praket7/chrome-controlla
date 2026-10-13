@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_DAG_NODES: usize = 64;
+pub const DEFAULT_PARALLEL_SETUP_COST_MS: u64 = 300;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DagEffect {
@@ -21,6 +22,20 @@ pub struct DagNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledDag {
     pub layers: Vec<Vec<DagNode>>,
+}
+
+/// Run a read wave concurrently only when estimated saved execution time beats
+/// the attach/alignment overhead. Small waves remain serial by design.
+pub fn parallel_wave_is_worthwhile(estimated_node_ms: &[u64], setup_cost_ms: u64) -> bool {
+    if estimated_node_ms.len() < 4 || estimated_node_ms.iter().any(|duration| *duration == 0) {
+        return false;
+    }
+    let serial = estimated_node_ms
+        .iter()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    let parallel = estimated_node_ms.iter().copied().max().unwrap_or_default();
+    serial.saturating_sub(parallel) > setup_cost_ms
 }
 
 pub fn compile(nodes: Vec<DagNode>) -> Result<CompiledDag, &'static str> {
@@ -240,6 +255,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+    }
+
+    #[test]
+    fn parallel_wave_grows_only_when_predicted_savings_exceed_setup_cost() {
+        assert!(!parallel_wave_is_worthwhile(&[200, 200, 200], 100));
+        assert!(!parallel_wave_is_worthwhile(&[100, 100, 100, 100], 300));
+        assert!(parallel_wave_is_worthwhile(&[300, 300, 300, 300], 300));
+        assert!(!parallel_wave_is_worthwhile(&[0, 300, 300, 300], 100));
     }
     #[test]
     fn cycles_are_rejected_and_mutations_to_same_target_are_separated() {

@@ -4,17 +4,21 @@ import { analyzePaired, effectiveSuccess, evaluateClaimGate } from './phase11-an
 
 const winningRows = Array.from({ length: 24 }, (_, index) => ({
   task_id: `task-${index}`,
-  candidate: {
-    success: true,
-    wall_ms: 700,
+    candidate: {
+      success: true,
+      wall_ms: 700,
+      prompt_to_verified_ms: 800,
+      prompt_to_final_ms: 900,
     model_round_trips: 2,
     severe_wrong_target_events: 0,
     authority_violations: 0,
     silent_stale_mutations: 0,
   },
   baseline: {
-    success: true,
-    wall_ms: 1000,
+      success: true,
+      wall_ms: 1000,
+      prompt_to_verified_ms: 1200,
+      prompt_to_final_ms: 1400,
     model_round_trips: 4,
     severe_wrong_target_events: 0,
     authority_violations: 0,
@@ -28,6 +32,44 @@ test('phase11 gates allow only a paired safety-clean measured win', () => {
   assert.equal(gate.eligible, true);
   assert.ok(report.model_round_trip_reduction >= 0.30);
   assert.ok(report.median_wall_time_reduction >= 0.25);
+  assert.ok(report.prompt_to_verified_median_reduction >= 0.25);
+  assert.ok(report.prompt_to_verified_p95_reduction >= 0.25);
+  assert.ok(report.prompt_to_final_median_reduction >= 0.25);
+  assert.ok(report.prompt_to_final_p95_reduction >= 0.25);
+});
+
+test('prompt-to-final p95 regression blocks the claim gate', () => {
+  const rows = structuredClone(winningRows);
+  rows.forEach((row, index) => {
+    row.candidate.prompt_to_final_ms = index < 2 ? 5000 : 700;
+    row.baseline.prompt_to_final_ms = 1000;
+  });
+  const report = analyzePaired(rows, { iterations: 500, seed: 12 });
+  assert.ok(report.prompt_to_final_median_reduction >= 0.25);
+  assert.ok(report.prompt_to_final_p95_reduction < 0);
+  assert.equal(evaluateClaimGate(report).checks.prompt_to_final_p95, false);
+});
+
+test('prompt-to-verified release gate rejects p95 regressions even when median improves', () => {
+  const rows = structuredClone(winningRows);
+  rows.forEach((row, index) => {
+    row.candidate.prompt_to_verified_ms = index < 2 ? 5000 : 700;
+    row.baseline.prompt_to_verified_ms = 1000;
+  });
+  const report = analyzePaired(rows, { iterations: 1000, seed: 8 });
+  assert.ok(report.prompt_to_verified_median_reduction >= 0.25);
+  assert.ok(report.prompt_to_verified_p95_reduction < 0);
+  const gate = evaluateClaimGate(report);
+  assert.equal(gate.eligible, false);
+  assert.equal(gate.checks.prompt_to_verified_p95, false);
+});
+
+test('missing prompt-to-verified evidence cannot qualify a release claim', () => {
+  const rows = structuredClone(winningRows);
+  for (const row of rows) delete row.candidate.prompt_to_verified_ms;
+  const gate = evaluateClaimGate(analyzePaired(rows, { iterations: 100, seed: 10 }));
+  assert.equal(gate.eligible, false);
+  assert.equal(gate.checks.prompt_to_verified_evidence, false);
 });
 
 test('one severe wrong-target event blocks the superiority gate', () => {

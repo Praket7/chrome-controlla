@@ -19,6 +19,29 @@ function result(adapter, taskId, mode, concurrency, wallMs, modelRoundTrips) {
     independently_verified_success: true,
     verifier_evidence_hash: `evidence-${adapter}-${taskId}-${mode}-${concurrency}`,
     wall_ms: wallMs,
+    prompt_to_verified_ms: wallMs + 30,
+    prompt_to_final_ms: wallMs + 60,
+    prompt_trace: {
+      prompt_sent: true,
+      first_tool_decision_ms: 5,
+      controlla_received_ms: 10,
+      first_browser_op_ms: 15,
+      last_browser_op_ms: 20,
+      tool_result_delivered_ms: wallMs,
+      verified_outcome_ms: wallMs + 30,
+      final_answer_ms: wallMs + 60,
+      input_bytes: 200,
+      output_bytes: 400,
+      schema_bytes: 500,
+      external_controlla_calls: 1,
+      model_turns: modelRoundTrips,
+      model_visible_observations: 1,
+      internal_model_calls: 0,
+      browser_cdp_commands: 20,
+      cold_warm: mode,
+      execution_tier: 'semantic_program',
+      fallback_count: 0,
+    },
     model_round_trips: modelRoundTrips,
     model_tokens: modelRoundTrips * 100,
     mcp_calls: 2,
@@ -104,6 +127,13 @@ test('claim gate passes only complete independently verified structured competit
     const forged = runClaimGate();
     assert.notEqual(forged.status, 0);
     assert.match(`${forged.stderr}\n${forged.stdout}`, /independent verifier evidence hash/);
+
+    const missingTrace = structuredClone(good);
+    delete missingTrace.comparisons[0].paired_rows[0].candidate.prompt_trace.model_turns;
+    await writeReport(missingTrace);
+    const missingTraceResult = runClaimGate();
+    assert.notEqual(missingTraceResult.status, 0);
+    assert.match(`${missingTraceResult.stderr}\n${missingTraceResult.stdout}`, /prompt_trace\.model_turns/);
   } finally {
     await rm(reportPath, { force: true });
   }

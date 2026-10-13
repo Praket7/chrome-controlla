@@ -53,6 +53,19 @@ function validateResultSide(side, expectedAdapter, taskId, mode, concurrency) {
   assert.ok(!(side.independently_verified_success && !side.success), 'independent success cannot be true when acting success is false');
   assert.equal(typeof side.verifier_evidence_hash, 'string');
   assert.ok(side.verifier_evidence_hash.length >= 8, 'claim evidence requires an independent verifier evidence hash');
+  for (const metric of ['prompt_to_verified_ms', 'prompt_to_final_ms']) {
+    assert.equal(typeof side[metric], 'number', `missing numeric ${expectedAdapter}.${metric}`);
+    assert.ok(Number.isFinite(side[metric]) && side[metric] >= 0, `invalid ${expectedAdapter}.${metric}`);
+  }
+  assert.ok(side.prompt_trace && side.prompt_trace.prompt_sent === true, `missing prompt-send trace for ${expectedAdapter}`);
+  for (const span of ['first_tool_decision_ms','controlla_received_ms','first_browser_op_ms','last_browser_op_ms','tool_result_delivered_ms','verified_outcome_ms','final_answer_ms']) {
+    assert.equal(typeof side.prompt_trace[span], 'number', `missing ${expectedAdapter} prompt_trace.${span}`);
+    assert.ok(Number.isFinite(side.prompt_trace[span]) && side.prompt_trace[span] >= 0, `invalid ${expectedAdapter} prompt_trace.${span}`);
+  }
+  for (const counter of ['input_bytes','output_bytes','schema_bytes','external_controlla_calls','model_turns','model_visible_observations','internal_model_calls','browser_cdp_commands','fallback_count']) {
+    assert.equal(typeof side.prompt_trace[counter], 'number', `missing ${expectedAdapter} prompt_trace.${counter}`);
+    assert.ok(Number.isSafeInteger(side.prompt_trace[counter]) && side.prompt_trace[counter] >= 0, `invalid ${expectedAdapter} prompt_trace.${counter}`);
+  }
   for (const metric of [
     'wall_ms','model_round_trips','model_tokens','mcp_calls','browser_ops','observation_bytes','screenshot_bytes',
     'retries','recovery_events','verification_ms','cpu_ms','peak_rss_bytes','focus_disruptions','clipboard_disruptions',
@@ -93,7 +106,7 @@ function validateCompleteMatrix(rows, baselineId) {
   }
 }
 
-assert.equal(results.schema_version, 2, 'broad superiority claims require full-suite Phase 11 schema_version 2 evidence');
+assert.equal(results.schema_version, 2, 'broad superiority claims require full-suite Phase 11 schema_version 2 prompt-to-outcome evidence');
 assert.equal(results.track, 'phase11-realistic');
 assert.equal(results.candidate_adapter, 'controlla');
 requireEnvironment(results.environment);

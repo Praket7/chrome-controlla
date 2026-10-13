@@ -14,11 +14,23 @@
     "peak_rss_bytes","focus_disruptions","clipboard_disruptions","human_interventions",
     "severe_wrong_target_events","authority_violations","silent_stale_mutations"
   ],
+  "runner_enriched_output": [
+    "prompt_to_verified_ms","prompt_to_final_ms","prompt_trace"
+  ],
+  "prompt_trace_fields": [
+    "prompt_sent","first_tool_decision_ms","controlla_received_ms","first_browser_op_ms",
+    "last_browser_op_ms","tool_result_delivered_ms","verified_outcome_ms","final_answer_ms",
+    "input_bytes","output_bytes","schema_bytes","external_controlla_calls","model_turns",
+    "model_visible_observations","internal_model_calls","browser_cdp_commands","cold_warm",
+    "execution_tier","fallback_count"
+  ],
   "rules": [
     "same Chrome version viewport reset model prompt budget and task deadline across structured adapters",
     "failed runs retain elapsed or capped wall time and are not removed from latency analysis",
     "computer-use is reported as a separate vision track",
     "adapters may report unsupported but may not silently replace a requested task with an easier one",
-    "all mutating tasks use an independent verifier outside the acting adapter"
+    "all mutating tasks use an independent verifier outside the acting adapter",
+    "runner report schema version 2 adds monotonic prompt-to-verified and prompt-to-final timing; unavailable client-side spans/counters remain null until a real client trace reports them",
+    "performance claims require prompt-to-verified and prompt-to-final evidence, complete traces, and p50/p95 non-regression"
   ]
 }
