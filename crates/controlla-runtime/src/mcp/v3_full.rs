@@ -47,7 +47,7 @@ fn attach_operation_costs(receipt: &mut Value, metrics: &controlla_browser::sche
 
 #[cfg(test)]
 mod route_telemetry_tests {
-    use super::{attach_execution_actuals, attach_operation_costs, browser_tool_result, finalize_visual_requirement, page_tool_route_receipt, task_parallel_research_allowed, task_route_signals, task_trace_steps, verify_visual_region_change};
+    use super::{attach_execution_actuals, attach_operation_costs, browser_tool_result, finalize_visual_requirement, observe_site_warmth, page_tool_route_receipt, task_cost_context, task_parallel_research_allowed, task_route_signals, task_trace_steps, verify_visual_region_change};
     use serde_json::json;
 
     #[test]
@@ -181,6 +181,8 @@ mod route_telemetry_tests {
         assert_eq!(route["fallback_reason"], "structural drift");
         assert_eq!(route["model_budget"]["internal_calls_allowed"], 0);
         assert_eq!(route["model_budget"]["passed"], true);
+        assert!(route["model_budget"]["caller_model_turns"].is_null());
+        assert!(route["model_budget"]["caller_model_visible_observations"].is_null());
     }
 
     #[test]
@@ -191,6 +193,32 @@ mod route_telemetry_tests {
         assert_eq!(route["model_budget"]["internal_calls_allowed"], 0);
         assert_eq!(route["model_budget"]["internal_calls_observed"], 1);
         assert_eq!(route["model_budget"]["passed"], false);
+    }
+
+    #[test]
+    fn site_cost_cohorts_measure_cold_then_warm_observations() {
+        let mut seen = std::collections::BTreeSet::new();
+        assert_eq!(observe_site_warmth(&mut seen, "https://example.test"), "cold");
+        assert_eq!(observe_site_warmth(&mut seen, "https://example.test"), "warm");
+    }
+
+    #[test]
+    fn cost_cohorts_cover_active_page_tasks_but_never_mix_cross_site_research() {
+        let task = crate::v3_tasks::TaskPrimitive::Repeat {
+            references: vec!["@c1".into()],
+            action: crate::v3_tasks::RepeatAction::VerifyVisible,
+            click_outcome: None,
+        };
+        let context = task_cost_context(&task, Some("https://example.test/page")).unwrap();
+        assert!(context.0.starts_with("origin-sha256:"));
+        assert_eq!(context.2, "small");
+        let multi_site = crate::v3_tasks::TaskPrimitive::Research {
+            urls: vec!["https://a.test".into(), "https://b.test".into()],
+            selector: None,
+            goal: None,
+            tab_ids: None,
+        };
+        assert!(task_cost_context(&multi_site, None).is_none());
     }
 
     #[test]
@@ -280,6 +308,8 @@ struct AppV3 {
     capabilities: Arc<Mutex<crate::capability_registry::CapabilityRegistry>>,
     site_profiles: Arc<Mutex<crate::site_profiles::SiteProfileStore>>,
     execution_costs: Arc<std::sync::Mutex<crate::execution_cost_router::ExecutionCostRouter>>,
+    cost_seen_sites: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    dag_costs: Arc<Mutex<crate::workflow_dag::DagCostHistory>>,
     active_tasks: Arc<std::sync::atomic::AtomicUsize>,
     workflow_lease_owners: Arc<Mutex<std::collections::BTreeSet<String>>>,
     headless_chrome: Option<std::path::PathBuf>,
@@ -323,6 +353,10 @@ impl AppV3 {
             ).unwrap_or_default())),
             execution_costs: Arc::new(std::sync::Mutex::new(crate::execution_cost_router::ExecutionCostRouter::open(
                 super::super::state_directory().join("execution-costs-v1.json"),
+            ))),
+            cost_seen_sites: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            dag_costs: Arc::new(Mutex::new(crate::workflow_dag::DagCostHistory::open(
+                super::super::state_directory().join("dag-costs-v1.json"),
             ))),
             active_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             workflow_lease_owners: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
@@ -1729,6 +1763,10 @@ fn workflow_step_name(step: &V3WorkflowStep) -> &'static str {
         V3WorkflowStep::PageTool { .. } => "page_tool",
         V3WorkflowStep::Verify { .. } => "verify",
     }
+}
+
+fn dag_node_signature(steps: &[V3WorkflowStep]) -> String {
+    steps.iter().map(workflow_step_name).collect::<Vec<_>>().join(",")
 }
 
 fn virtual_item_identity(item: &Value, fields: &[String]) -> Option<String> {
@@ -3360,7 +3398,23 @@ fn task_trace_steps(task: &crate::v3_tasks::TaskPrimitive, receipts: &[Value]) -
     let Ok(encoded) = serde_json::to_vec(&workflow) else { return Vec::new(); };
     use sha2::Digest;
     let fingerprint = format!("verified-template:{}", sha2::Sha256::digest(encoded).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-    vec![crate::skill_induction::TraceStep { fingerprint, action: workflow }]
+    let dataflow_evidence = match task {
+        crate::v3_tasks::TaskPrimitive::FormDraft { fields, save_without_submit, .. } => {
+            let mut evidence = fields.iter().enumerate()
+                .map(|(slot, _)| format!("input_binding:field_slot:{slot}"))
+                .collect::<std::collections::BTreeSet<_>>();
+            if *save_without_submit {
+                evidence.extend((0..fields.len()).map(|slot| format!("dependency:save_draft_after_fill_slot:{slot}")));
+            }
+            evidence
+        }
+        crate::v3_tasks::TaskPrimitive::Mutation { steps } =>
+            steps.iter().enumerate().map(|(index, _)| format!("caller_declared_sequence:mutation_step:{index}")).collect(),
+        crate::v3_tasks::TaskPrimitive::Repeat { references, .. } =>
+            references.iter().enumerate().map(|(index, _)| format!("independent_input_target:repeat:{index}")).collect(),
+        _ => return Vec::new(),
+    };
+    vec![crate::skill_induction::TraceStep { fingerprint, action: workflow, dataflow_evidence }]
 }
 
 fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, result: &Value) {
@@ -3387,8 +3441,9 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
         "internal_calls_allowed":internal_model_call_budget,
         "internal_calls_observed":internal_model_calls,
         "passed":internal_model_calls <= u64::from(internal_model_call_budget),
-        "caller_model_turns":"measured_by_prompt_send_trace_proxy",
-        "caller_model_visible_observations":"measured_by_prompt_send_trace_proxy",
+        "caller_model_turns":Value::Null,
+        "caller_model_visible_observations":Value::Null,
+        "caller_model_telemetry_boundary":"external model turns and visible observations are not observable inside the MCP process; use a configured client adapter trace",
     });
 }
 
@@ -4360,13 +4415,22 @@ fn speculative_route_allowed(active_task_count_before_this_task: usize) -> bool 
     active_task_count_before_this_task == 0
 }
 
-fn task_cost_context(task: &crate::v3_tasks::TaskPrimitive) -> Option<(String, String, String)> {
-    let crate::v3_tasks::TaskPrimitive::Research { urls, .. } = task else { return None; };
-    if urls.len() != 1 { return None; }
-    let origin = site_scope_from_url(&urls[0])?;
+fn task_cost_context(task: &crate::v3_tasks::TaskPrimitive, current_url: Option<&str>) -> Option<(String, String, String)> {
+    let site = match task {
+        crate::v3_tasks::TaskPrimitive::Research { urls, .. } if urls.len() == 1 => site_scope_from_url(&urls[0])?,
+        crate::v3_tasks::TaskPrimitive::Research { .. } => return None,
+        crate::v3_tasks::TaskPrimitive::Download { .. } => return None,
+        _ => site_scope_from_url(current_url?)?,
+    };
+    use sha2::Digest;
+    let origin = format!("origin-sha256:{}", sha2::Sha256::digest(site.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
     let intent = task.intent_fingerprint();
     let size = match task.expand().ok()?.len() { 0..=3 => "small", 4..=8 => "medium", _ => "large" }.to_owned();
     Some((origin, intent, size))
+}
+
+fn observe_site_warmth(seen: &mut std::collections::BTreeSet<String>, origin: &str) -> &'static str {
+    if seen.insert(origin.to_owned()) { "cold" } else { "warm" }
 }
 
 fn task_needs_visual_evidence(goal: &str) -> bool {
@@ -6676,29 +6740,49 @@ impl AppV3 {
         let mut parallel_read_layers = 0usize;
         let mut serial_layers = 0usize;
         for layer in dag.layers {
-            let estimates = layer.iter().map(|planned| {
-                node_map.get(&planned.id).map(|node| (node.steps.len() as u64).saturating_mul(100)).unwrap_or_default()
-            }).collect::<Vec<_>>();
+            let signatures = layer.iter().filter_map(|planned| node_map.get(&planned.id).map(|node| dag_node_signature(&node.steps))).collect::<Vec<_>>();
+            let estimates = self.dag_costs.lock().await.estimate_wave(&signatures);
             let parallel = layer.iter().all(|node| node.effect == crate::workflow_dag::DagEffect::ReadOnly)
-                && crate::workflow_dag::parallel_wave_is_worthwhile(&estimates, crate::workflow_dag::DEFAULT_PARALLEL_SETUP_COST_MS);
+                && estimates.as_ref().is_some_and(|(times, setup)| crate::workflow_dag::parallel_wave_is_worthwhile(times, *setup));
             if parallel {
                 parallel_read_layers += 1;
+                let wave_started = std::time::Instant::now();
                 let futures=layer.into_iter().map(|planned| {
                     let node=node_map.get(&planned.id).expect("compiled DAG node identity").clone();
                     let base_session=args.session_id.clone(); let client_id=args.client_id.clone();
+                    let signature = dag_node_signature(&node.steps);
                     async move {
+                        let node_started = std::time::Instant::now();
                         let node_args=V3WorkflowArgs{session_id:base_session,chrome_tab_id:node.target_id,steps:node.steps,program:None,client_id,dag:None};
                         let result=Box::pin(self.workflow_inner(node_args)).await?;
-                        Ok::<_,rmcp::ErrorData>((node.id,result.0))
+                        Ok::<_,rmcp::ErrorData>((node.id,signature,result.0,node_started.elapsed().as_millis().max(1) as u64))
                     }
                 });
-                for result in futures_util::future::join_all(futures).await { let (id,receipt)=result?; receipts.insert(id,receipt); }
+                let mut durations = Vec::new();
+                for result in futures_util::future::join_all(futures).await {
+                    let (id,signature,receipt,elapsed_ms)=result?;
+                    let verified = receipt["status"] == "completed" && receipt["receipts"].as_array().is_some_and(|steps| !steps.is_empty() && steps.iter().all(|step| step["verified"] == true));
+                    self.dag_costs.lock().await.record_node(signature, elapsed_ms, verified);
+                    durations.push(elapsed_ms);
+                    receipts.insert(id,receipt);
+                }
+                let max_node_ms = durations.iter().copied().max().unwrap_or_default();
+                let overhead_ms = (wave_started.elapsed().as_millis() as u64).saturating_sub(max_node_ms).max(1);
+                self.dag_costs.lock().await.record_setup(durations.len(), overhead_ms);
             } else {
                 serial_layers += 1;
                 for planned in layer {
+                    let effect = planned.effect;
                     let node=node_map.get(&planned.id).expect("compiled DAG node identity").clone();
+                    let signature = dag_node_signature(&node.steps);
+                    let node_started = std::time::Instant::now();
                     let node_args=V3WorkflowArgs{session_id:args.session_id.clone(),chrome_tab_id:node.target_id,steps:node.steps,program:None,client_id:args.client_id.clone(),dag:None};
                     let result=Box::pin(self.workflow_inner(node_args)).await?;
+                    let elapsed_ms = node_started.elapsed().as_millis().max(1) as u64;
+                    let verified = result.0["status"] == "completed" && result.0["receipts"].as_array().is_some_and(|steps| !steps.is_empty() && steps.iter().all(|step| step["verified"] == true));
+                    if effect == crate::workflow_dag::DagEffect::ReadOnly {
+                        self.dag_costs.lock().await.record_node(signature, elapsed_ms, verified);
+                    }
                     receipts.insert(node.id,result.0);
                 }
             }
@@ -6706,7 +6790,7 @@ impl AppV3 {
                 let targets = node_map.iter().map(|(id, node)| (id.clone(), node.target_id.clone())).collect();
                 let merged_evidence = crate::workflow_dag::merge_branch_evidence(&receipts, &targets);
                 return Ok(Json(json!({"status":"stopped_after_unverified_node","nodes":receipts,
-                    "schedule":{"policy":"estimated_savings_over_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers},
+                    "schedule":{"policy":"measured_p95_savings_over_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers,"cold_profiles_run_serially":true},
                     "merged_evidence":{"provenance":"per_node_untrusted_page_receipts","items":merged_evidence},
                     "page_content_is_untrusted":true})));
             }
@@ -6717,7 +6801,7 @@ impl AppV3 {
         let targets = node_map.iter().map(|(id, node)| (id.clone(), node.target_id.clone())).collect();
         let merged_evidence = crate::workflow_dag::merge_branch_evidence(&receipts, &targets);
         Ok(Json(json!({"status":"completed","nodes":receipts,
-            "schedule":{"policy":"estimated_savings_over_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers},
+            "schedule":{"policy":"measured_p95_savings_over_measured_setup_cost","parallel_read_layers":parallel_read_layers,"serial_layers":serial_layers,"cold_profiles_run_serially":true},
             "merged_evidence":{"provenance":"per_node_untrusted_page_receipts","items":merged_evidence},"page_content_is_untrusted":true})))
     }
 
@@ -7025,7 +7109,6 @@ impl AppV3 {
         let wall_limit = Duration::from_millis(budget.max_wall_ms);
         let session_id = args.session_id.clone();
         let tab_id = args.chrome_tab_id.clone();
-        let cost_context = task_cost_context(&args.task);
         let cost_router = self.execution_costs.clone();
         let task_started = std::time::Instant::now();
         let sequence = NEXT_WORKFLOW_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7049,8 +7132,12 @@ impl AppV3 {
             }),
         )).await;
         self.workflow_lease_owners.lock().await.remove(&tracked_task_owner);
-        if let (Some((origin, intent, task_size)), Ok(receipt)) = (cost_context, result.as_ref()) {
+        if let (Some(cohort), Ok(receipt)) = (result.as_ref().ok().and_then(|receipt| receipt.0.pointer("/execution_route/cost_cohort")), result.as_ref()) {
             let value = &receipt.0;
+            let origin = cohort["origin_key"].as_str().unwrap_or_default().to_owned();
+            let intent = cohort["intent"].as_str().unwrap_or_default().to_owned();
+            let warmth = cohort["warmth"].as_str().unwrap_or("unknown").to_owned();
+            let task_size = cohort["task_size"].as_str().unwrap_or_default().to_owned();
             let tier = serde_json::from_value::<crate::capability_router::ExecutionTier>(value.pointer("/execution_route/tier").cloned().unwrap_or(Value::Null)).ok();
             let verified = value["execution_route"]["verification"] == "passed"
                 && matches!(value["status"].as_str(), Some("completed" | "verified" | "passed"))
@@ -7060,7 +7147,7 @@ impl AppV3 {
                 let elapsed_ms = task_started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64;
                 tokio::task::spawn_blocking(move || {
                     let context = crate::execution_cost_router::RouteCostContext {
-                        origin: &origin, intent: &intent, warmth: "unknown", task_size: &task_size,
+                        origin: &origin, intent: &intent, warmth: &warmth, task_size: &task_size,
                     };
                     if let Ok(mut router) = cost_router.lock() {
                         let _ = router.record(&context, tier, elapsed_ms, verified, verified);
@@ -7084,12 +7171,14 @@ impl AppV3 {
         let task_intent = args.task.intent_fingerprint();
         let evidence_intent = args.task.evidence_fingerprint();
         let profile_intent = research_profile_intent(&args.task);
+        let mut current_page_url = None;
         if !matches!(
             &args.task,
             crate::v3_tasks::TaskPrimitive::Research { .. }
                 | crate::v3_tasks::TaskPrimitive::Download { .. }
         ) {
             let url = self.readiness_url(&args.session_id, &args.chrome_tab_id).await?;
+            current_page_url = Some(url.clone());
             bind_evidence_scope(self, &args.session_id, &args.chrome_tab_id, &url, &evidence_intent).await;
             if let Some(scope) = evidence_scope_for_url(&url, &evidence_intent) {
                 let previous = self.evidence_store.recent(&scope, 16);
@@ -7099,6 +7188,13 @@ impl AppV3 {
                 }
             }
         }
+        // Measure all single-site task routes against the active document that
+        // was already observed for execution. Cross-site research stays out of
+        // the router so unlike sites can never share a learned cohort.
+        let cost_context = task_cost_context(&args.task, current_page_url.as_deref());
+        let cost_warmth = if let Some((origin, _, _)) = cost_context.as_ref() {
+            observe_site_warmth(&mut *self.cost_seen_sites.lock().await, origin)
+        } else { "unknown" };
         let (qualified_skill_available, speculative_read_available, site_tool_available, routed_profile) =
             if let crate::v3_tasks::TaskPrimitive::Research { urls, .. } = &args.task {
                 if urls.len() == 1 {
@@ -7154,9 +7250,9 @@ impl AppV3 {
         );
         let mut execution_route = crate::capability_router::route_execution(signals, read_only_task);
         let available_routes = route_candidates(signals, read_only_task);
-        let selected_by_history = if let Some((origin, intent, size)) = task_cost_context(&args.task) {
+        let selected_by_history = if let Some((origin, intent, size)) = cost_context.as_ref() {
             let context = crate::execution_cost_router::RouteCostContext {
-                origin: &origin, intent: &intent, warmth: "unknown", task_size: &size,
+                origin, intent, warmth: cost_warmth, task_size: size,
             };
             self.execution_costs.lock().ok().and_then(|router| router.select(&context, &available_routes))
         } else { None };
@@ -7176,13 +7272,16 @@ impl AppV3 {
             "predicted_cost":{"model_calls":execution_route.predicted_model_calls,
                 "browser_operations":steps.len(),"logical_task_steps":steps.len(),"external_model_tokens":null},
             "cost_policy":{"kind":if selected_by_history.is_some() {"qualified_empirical_p95"} else {"static_qualified_priority"},
-                "cohort":if task_cost_context(&args.task).is_some() {"origin_intent_warmth_size"} else {"unavailable"},
+                "cohort":if cost_context.is_some() {"origin_intent_warmth_size"} else {"unavailable"},
                 "historical_profile_selected":selected_by_history.is_some()},
             "visual_evidence_required":matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { goal: Some(goal), .. } if task_needs_visual_evidence(goal)),
             "speculation_policy":{"read_only_only":true,"enabled":allow_speculation,
                 "reason":if allow_speculation {"no competing V3 task is active"} else {"speculative reads skipped under concurrent V3 task load"}},
             "intent_fingerprint":task_intent.clone(),
         });
+        if let Some((origin, intent, size)) = cost_context.as_ref() {
+            route_receipt["cost_cohort"] = json!({"origin_key":origin,"intent":intent,"warmth":cost_warmth,"task_size":size});
+        }
         if let crate::v3_tasks::TaskPrimitive::Research { urls, tab_ids, .. } = &args.task {
             let tab_ids = tab_ids.clone().unwrap_or_else(|| vec![args.chrome_tab_id.clone()]);
             let mut history = Vec::new();

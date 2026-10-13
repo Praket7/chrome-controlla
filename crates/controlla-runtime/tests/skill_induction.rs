@@ -18,6 +18,12 @@ fn success(id: &str, input: &str) -> SkillTrace {
         steps: vec![TraceStep {
             fingerprint: "verified-template:form_fill_save:2".into(),
             action: json!({"kind":"form_fill_save","fields":[{"slot":0},{"slot":1}],"confirmation":{"selector":"#draft-status","text":"Draft saved"}}),
+            dataflow_evidence: BTreeSet::from([
+                "input_binding:field_slot:0".into(),
+                "input_binding:field_slot:1".into(),
+                "dependency:save_draft_after_fill_slot:0".into(),
+                "dependency:save_draft_after_fill_slot:1".into(),
+            ]),
         }],
         failure: None,
     }
@@ -72,6 +78,23 @@ fn generic_receipt_summaries_cannot_become_unexecutable_skill_candidates() {
     for trace in &mut traces {
         trace.steps[0].action =
             json!({"kind":"fill","target_count":1,"verified":true,"route":"semantic"});
+    }
+    traces.push(SkillTrace::failure(
+        "f1",
+        "https://example.test",
+        "draft-form",
+        "form:v1",
+        FailureClass::ReadFailure,
+        "save_control_missing",
+    ));
+    assert!(induce_candidate(&SkillEvidenceSet { traces }).is_none());
+}
+
+#[test]
+fn induction_refuses_recipes_without_typed_task_dataflow_provenance() {
+    let mut traces = vec![success("r1", "a"), success("r2", "b"), success("r3", "c")];
+    for trace in &mut traces {
+        trace.steps[0].dataflow_evidence.clear();
     }
     traces.push(SkillTrace::failure(
         "f1",

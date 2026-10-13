@@ -5,6 +5,130 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_DAG_NODES: usize = 64;
 pub const DEFAULT_PARALLEL_SETUP_COST_MS: u64 = 300;
+
+/// Learns read-node and wave-alignment costs from verified executions. Until
+/// each node and the wave setup have enough evidence, the scheduler stays
+/// serial instead of guessing that concurrency is free.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DagCostHistory {
+    nodes: BTreeMap<String, Vec<u64>>,
+    setups: BTreeMap<usize, Vec<u64>>,
+    #[serde(skip)]
+    path: Option<std::path::PathBuf>,
+}
+
+impl DagCostHistory {
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let mut history = match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() <= 512 * 1024 => {
+                serde_json::from_slice(&bytes).unwrap_or_default()
+            }
+            _ => Self::default(),
+        };
+        history.path = Some(path);
+        history
+    }
+
+    pub fn estimate_wave(&self, signatures: &[String]) -> Option<(Vec<u64>, u64)> {
+        if signatures.len() < 2 {
+            return None;
+        }
+        let node_estimates = signatures
+            .iter()
+            .map(|signature| recent_p95(self.nodes.get(signature)?))
+            .collect::<Option<Vec<_>>>()?;
+        // Until measured parallel alignment samples exist, use the conservative
+        // fixed startup estimate. Verified parallel runs replace it with the
+        // observed p95 for this wave width.
+        let setup = self
+            .setups
+            .get(&signatures.len())
+            .and_then(|samples| recent_p95(samples))
+            .unwrap_or(DEFAULT_PARALLEL_SETUP_COST_MS);
+        Some((node_estimates, setup))
+    }
+
+    pub fn record_node(&mut self, signature: String, elapsed_ms: u64, verified: bool) {
+        if !verified || elapsed_ms == 0 || signature.is_empty() || signature.len() > 256 {
+            return;
+        }
+        let key = signature.clone();
+        push_sample(&mut self.nodes, signature, elapsed_ms, 512);
+        if self
+            .nodes
+            .get(&key)
+            .is_some_and(|samples| samples.len() % 8 == 0)
+        {
+            self.persist();
+        }
+    }
+
+    pub fn record_setup(&mut self, width: usize, elapsed_ms: u64) {
+        if !(2..=MAX_DAG_NODES).contains(&width) || elapsed_ms == 0 {
+            return;
+        }
+        let samples = self.setups.entry(width).or_default();
+        samples.push(elapsed_ms);
+        if samples.len() > 32 {
+            samples.remove(0);
+        }
+        if samples.len().is_multiple_of(8) {
+            self.persist();
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec(self) else {
+            return;
+        };
+        if bytes.len() > 512 * 1024 {
+            return;
+        }
+        let temp = path.with_extension("json.tmp");
+        if std::fs::write(&temp, bytes).is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+}
+
+fn push_sample<K: Ord + Clone>(
+    map: &mut BTreeMap<K, Vec<u64>>,
+    key: K,
+    value: u64,
+    max_profiles: usize,
+) {
+    if !map.contains_key(&key)
+        && map.len() >= max_profiles
+        && let Some(oldest) = map.keys().next().cloned()
+    {
+        map.remove(&oldest);
+    }
+    let samples = map.entry(key).or_default();
+    samples.push(value);
+    if samples.len() > 32 {
+        samples.remove(0);
+    }
+}
+
+fn recent_p95(samples: &[u64]) -> Option<u64> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let mut recent = samples.iter().rev().take(16).copied().collect::<Vec<_>>();
+    recent.sort_unstable();
+    Some(recent[recent.len() - 1])
+}
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DagEffect {
@@ -328,5 +452,35 @@ mod tests {
             result.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn dag_cost_history_requires_verified_node_and_alignment_samples() {
+        let mut history = DagCostHistory::default();
+        let keys = vec![
+            "read:extract".to_owned(),
+            "read:snapshot".to_owned(),
+            "read:find".to_owned(),
+            "read:verify".to_owned(),
+        ];
+        assert!(history.estimate_wave(&keys).is_none());
+        for _ in 0..3 {
+            history.record_node(keys[0].clone(), 900, true);
+            history.record_node(keys[1].clone(), 800, true);
+            history.record_node(keys[2].clone(), 700, true);
+            history.record_node(keys[3].clone(), 600, true);
+            history.record_setup(4, 100);
+        }
+        history.record_node("read:unverified".into(), 1, false);
+        assert_eq!(
+            history.estimate_wave(&keys),
+            Some((vec![900, 800, 700, 600], 100))
+        );
+        assert!(
+            history
+                .estimate_wave(&[keys[0].clone(), "read:unverified".into()])
+                .is_none()
+        );
+        assert!(parallel_wave_is_worthwhile(&[900, 800, 700, 600], 100));
     }
 }

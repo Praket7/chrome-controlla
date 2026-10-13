@@ -46,6 +46,7 @@ fn reset_semantic_document(state: &mut SemanticTabState, doc_key: &str, snapshot
 struct AppV2 {
     legacy: App,
     semantic: Arc<Mutex<BTreeMap<String, SemanticTabState>>>,
+    observation_history: Arc<std::sync::Mutex<crate::observation_router::ObservationHistory>>,
 }
 
 impl AppV2 {
@@ -53,6 +54,9 @@ impl AppV2 {
         Self {
             legacy,
             semantic: Arc::default(),
+            observation_history: Arc::new(std::sync::Mutex::new(crate::observation_router::ObservationHistory::open(
+                super::state_directory().join("observation-costs-v1.json"),
+            ))),
         }
     }
 }
@@ -362,7 +366,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .get(&tab_key(&args.session_id, &args.chrome_tab_id))
         .map(|state| semantic_ambiguity(state.items.values()))
         .unwrap_or(0.0);
-    let decision = crate::observation_router::choose_observation(crate::observation_router::ObservationRequest {
+    let request = crate::observation_router::ObservationRequest {
         task_class: observation_task_class(args.goal.as_ref().and_then(|goal| goal.query.as_deref())),
         model_profile: args.goal.as_ref().and_then(|goal| goal.model_profile).map(|profile| match profile {
             super::ObservationModelProfile::RichContext => crate::observation_router::ModelProfile::RichContext,
@@ -375,7 +379,10 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         rich_context: args.max_text_chars.is_some_and(|limit| limit > 2_000),
         frame_id: args.frame_id.is_some(),
         scoped_selector: args.selector.is_some(),
-    });
+    };
+    let decision = app.observation_history.lock().map(|history|
+        crate::observation_router::choose_observation_with_history(request, &history)
+    ).unwrap_or_else(|_| crate::observation_router::choose_observation(request));
     if let Some(frame_id) = args.frame_id.as_deref() {
         let Json(mut value) = app.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
             session_id: args.session_id.clone(),
@@ -386,6 +393,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             timeout_ms: Some(10_000),
         })).await?;
         let bytes = attach_observation_metadata(&mut value, decision);
+        record_observation_feedback(app, request, decision, started, &value, bytes);
         controlla_browser::scheduler::telemetry::record_observation(0, bytes).await;
         controlla_browser::scheduler::telemetry::record_phase(
             controlla_browser::scheduler::telemetry::OperationPhase::Snapshot,
@@ -519,6 +527,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         snapshot["page_content_is_untrusted"] = json!(true);
     }
     let bytes = attach_observation_metadata(&mut snapshot, decision);
+    record_observation_feedback(app, request, decision, started, &snapshot, bytes);
     controlla_browser::scheduler::telemetry::record_observation(
         snapshot["scanned_nodes"].as_u64().unwrap_or(0),
         bytes,
@@ -528,6 +537,23 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
     ).await;
     Ok(snapshot)
+}
+
+fn record_observation_feedback(
+    app: &AppV2,
+    request: crate::observation_router::ObservationRequest,
+    decision: crate::observation_router::ObservationDecision,
+    started: std::time::Instant,
+    value: &Value,
+    bytes: u64,
+) {
+    let has_evidence = value["items"].as_array().is_some_and(|items| !items.is_empty())
+        || value["nodes"].as_array().is_some_and(|nodes| !nodes.is_empty())
+        || value["global_complete"] == true;
+    let explicitly_failed = matches!(value["status"].as_str(), Some("failed" | "unknown" | "incomplete"));
+    if let Ok(mut history) = app.observation_history.lock() {
+        history.record(request, decision, started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64, bytes, has_evidence && !explicitly_failed);
+    }
 }
 
 fn semantic_ambiguity<'a>(items: impl Iterator<Item = &'a Value>) -> f32 {

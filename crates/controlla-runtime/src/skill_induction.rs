@@ -21,6 +21,10 @@ const MAX_STORED_TRACES: usize = 512;
 pub struct TraceStep {
     pub fingerprint: String,
     pub action: Value,
+    /// Explicit dependency/input provenance from the typed task contract.
+    /// Empty provenance is retained for old journals but never induces replay.
+    #[serde(default)]
+    pub dataflow_evidence: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -190,6 +194,11 @@ fn valid_trace(trace: &SkillTrace) -> bool {
         && trace.steps.iter().all(|step| {
             !step.fingerprint.is_empty()
                 && step.fingerprint.len() <= 256
+                && step.dataflow_evidence.len() <= MAX_STEPS
+                && step
+                    .dataflow_evidence
+                    .iter()
+                    .all(|item| !item.is_empty() && item.len() <= 256)
                 && serde_json::to_vec(&step.action).is_ok_and(|bytes| bytes.len() <= 4096)
         })
         && trace
@@ -268,9 +277,14 @@ pub fn induce_candidate(evidence: &SkillEvidenceSet) -> Option<SkillCandidate> {
         .collect::<BTreeSet<_>>();
     if successes.len() < MIN_SUCCESS_TRACES
         || failures.is_empty()
-        || successes
-            .iter()
-            .any(|trace| trace.steps.is_empty() || trace.steps.len() > MAX_STEPS)
+        || successes.iter().any(|trace| {
+            trace.steps.is_empty()
+                || trace.steps.len() > MAX_STEPS
+                || trace
+                    .steps
+                    .iter()
+                    .any(|step| step.dataflow_evidence.is_empty())
+        })
     {
         return None;
     }
@@ -368,7 +382,9 @@ fn ordered_common_steps<'a>(first: &'a SkillTrace, rest: &[&SkillTrace]) -> Vec<
         let mut positions = Vec::with_capacity(rest.len());
         for (index, trace) in rest.iter().enumerate() {
             let Some(position) = trace.steps[cursors[index]..].iter().position(|candidate| {
-                candidate.fingerprint == step.fingerprint && candidate.action == step.action
+                candidate.fingerprint == step.fingerprint
+                    && candidate.action == step.action
+                    && candidate.dataflow_evidence == step.dataflow_evidence
             }) else {
                 break;
             };
