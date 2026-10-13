@@ -69,7 +69,9 @@ const action=id=>({jsonrpc:'2.0',id,method:'tools/call',params:{name:'act',argum
 
 test('timeout reports unknown and never repeats an action', {timeout:5000}, async t=>{
   const count=path.join(dir,'dispatches');
-  const result=await fixture(t,'timeout',`require('node:fs').appendFileSync(${JSON.stringify(count)},'1');`,[action(1)],100);
+  // Give Windows CI time to start the fixture and dispatch the call; the timeout
+  // under test begins before the remote reply, not during host process startup.
+  const result=await fixture(t,'timeout',`require('node:fs').appendFileSync(${JSON.stringify(count)},'1');`,[action(1)],2000);
   assert.equal(result.code,0);assert.match(result.rows[0].error.message,/outcome unknown/);assert.equal(fs.readFileSync(count,'utf8'),'1');
 });
 test('tool errors remain tool errors and duplicated content is removed', {timeout:5000}, async t=>{
