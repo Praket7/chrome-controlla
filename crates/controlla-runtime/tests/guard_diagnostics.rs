@@ -378,7 +378,7 @@ fn snapshot_surfaces_password_target_without_reading_its_value() {
         .unwrap()
         .iter()
         .find(|item| item["credential_input"] == true)
-        .expect("visible password field has a snapshot reference");
+        .unwrap_or_else(|| panic!("visible password field has a snapshot reference: {editors}"));
     assert_eq!(password["name"], "Password");
     assert_eq!(password["raw_value"], serde_json::Value::Null);
     assert_eq!(password["editable_kind"], serde_json::Value::Null);

@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
 pub const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||(e.hasAttribute('data-requires-trusted')&&!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(t)))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
+const SHARED_CLICK_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Why a click was refused before any input was dispatched.
 enum ClickRefusal {
     /// Typed guard failure; already shaped as the compact `not_dispatched` result.
@@ -144,6 +145,10 @@ struct SharedTabArgs {
         description = "Required only for action=open. Reuse the same key only when retrying the same logical open; choose a new key for a distinct tab."
     )]
     idempotency_key: Option<String>,
+    #[schemars(
+        description = "Whether a new tab becomes active. Defaults to true; set false to keep it in the background."
+    )]
+    active: Option<bool>,
     #[schemars(
         description = "Optional readiness gate for action=open: document_committed attaches at the navigation commit; dom_content_loaded waits for the root document readiness event. Defaults to dom_content_loaded."
     )]
@@ -694,6 +699,7 @@ struct SharedPageSnapshot {
     token: String,
     object_id: String,
     identity: (String, String, String),
+    interaction_epoch: Value,
     count: usize,
     consumed: bool,
 }
@@ -729,6 +735,16 @@ struct SnapshotGoal {
         description = "Search all reachable controls instead of stopping at the first exact match. Results remain bounded by max_scan_nodes and max_items."
     )]
     exhaustive: bool,
+    #[serde(default)]
+    model_profile: Option<ObservationModelProfile>,
+    #[serde(default)]
+    needs_layout: bool,
+}
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationModelProfile {
+    CompactContext,
+    RichContext,
 }
 #[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -755,6 +771,12 @@ enum SharedClickOutcome {
     Navigation {
         #[schemars(
             description = "Optional exact absolute HTTP(S) destination. Omit to accept any observed document change; use a separate URL prefix verification for canonical redirects."
+        )]
+        url: Option<String>,
+    },
+    NewTab {
+        #[schemars(
+            description = "Exact absolute HTTP(S) URL expected in the new tab. The runtime verifies attribution only when Chrome reports this source tab as opener; a matching URL alone cannot prove causality, so rel=noopener or missing opener identity remains unverified."
         )]
         url: Option<String>,
     },
@@ -964,17 +986,25 @@ async fn capture_shared_snapshot(
         if before != after {
             return Err("document changed during snapshot; discard and read once again".into());
         }
+        let interaction_epoch = value
+            .get("interaction_epoch")
+            .cloned()
+            .ok_or_else(|| "snapshot omitted interaction epoch".to_owned())?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| "snapshot result is not an object".to_owned())?
+            .remove("interaction_epoch");
         value["snapshot_id"] = json!(token);
         value["chrome_tab_id"] = json!(args.chrome_tab_id);
         value["document"] = json!({"frame_id":before.0,"loader_id":before.1,"url":before.2});
         if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > args.max_bytes {
             return Err("snapshot exceeded byte budget; reduce text/items".into());
         }
-        Ok(value)
+        Ok((value, interaction_epoch))
     }
     .await;
     match result {
-        Ok(value) => {
+        Ok((value, interaction_epoch)) => {
             let count = value["items"]
                 .as_array()
                 .ok_or("snapshot omitted items")?
@@ -985,6 +1015,7 @@ async fn capture_shared_snapshot(
                     token,
                     object_id,
                     identity: before,
+                    interaction_epoch,
                     count,
                     consumed: false,
                 },
@@ -1013,12 +1044,26 @@ async fn evaluate_shared_outcome(
     index: usize,
     outcome: &SharedClickOutcome,
     identity: &(String, String, String),
+    since_ms: u64,
 ) -> Result<bool, String> {
     if matches!(outcome, SharedClickOutcome::Navigation { .. }) {
         return shared_navigation_matches(outcome, &snapshot.identity, identity);
     }
     let connection = shared.connection.as_ref().ok_or("session not accepted")?;
     let registry = shared.registry().map_err(|e| e.to_string())?;
+    if let SharedClickOutcome::NewTab { url } = outcome {
+        let response = connection
+            .command(
+                registry,
+                &shared.handle,
+                tab,
+                "Controlla.newTabs",
+                json!({"since_ms":since_ms,"url":url}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(shared_new_tab_matches(&response, url.as_deref()));
+    }
     let function = include_str!("shared_page/outcome.js");
     let response=if identity==&snapshot.identity {
         connection.command(registry,&shared.handle,tab,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":function,"arguments":[{"value":outcome},{"value":index}],"returnByValue":true})).await
@@ -1027,6 +1072,23 @@ async fn evaluate_shared_outcome(
         connection.command(registry,&shared.handle,tab,"Runtime.evaluate",json!({"expression":expression,"returnByValue":true})).await
     }.map_err(|e|e.to_string())?;
     Ok(shared_value(&response)? == true)
+}
+
+fn shared_new_tab_matches(response: &Value, expected_url: Option<&str>) -> bool {
+    response["tabs"].as_array().is_some_and(|tabs| {
+        tabs.iter()
+            .filter(|candidate| {
+                candidate["tab_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+                    && candidate["url"].as_str().is_some_and(|url| {
+                        candidate["opener_match"] == true
+                            && expected_url.is_none_or(|expected| url == expected)
+                    })
+            })
+            .count()
+            == 1
+    })
 }
 
 fn shared_navigation_matches(
@@ -1050,10 +1112,19 @@ fn shared_navigation_matches(
 }
 
 fn validate_shared_click_outcome(outcome: &SharedClickOutcome) -> Result<(), rmcp::ErrorData> {
-    if let SharedClickOutcome::Navigation { url: Some(url) } = outcome {
-        validate_shared_url(url)?;
+    match outcome {
+        SharedClickOutcome::Navigation { url: Some(url) }
+        | SharedClickOutcome::NewTab { url: Some(url) } => validate_shared_url(url)?,
+        _ => {}
     }
     Ok(())
+}
+
+fn click_mouse_events(x: f64, y: f64) -> [Value; 2] {
+    [
+        json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
+        json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
+    ]
 }
 
 #[derive(Clone)]
@@ -1878,6 +1949,27 @@ async fn shared_frame_identity(
     frame_identity_from_tree(&response)
 }
 
+async fn shared_interaction_epoch(
+    connection: &PageSessionTransport,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    object_id: &str,
+) -> Result<Value, String> {
+    let response = connection.command(
+        registry,
+        handle,
+        tab_id,
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": r#"function(){const s=window[Symbol.for('controlla.interactionEpoch.v1')];if(!s)return null;const a=document.activeElement;const focus=a?JSON.stringify([a.tagName,a.id||'',a.getAttribute('name')||'',a.getAttribute('role')||'',a.getAttribute('aria-label')||'']):'';let selection='';if(a&&typeof a.selectionStart==='number')selection=JSON.stringify([a.selectionStart,a.selectionEnd,a.selectionDirection||'none']);else{const x=window.getSelection?.();if(x)selection=JSON.stringify([x.anchorNode?.nodeType,x.anchorOffset,x.focusNode?.nodeType,x.focusOffset,x.isCollapsed])}const viewport=JSON.stringify([innerWidth,innerHeight,scrollX,scrollY,visualViewport?.width,visualViewport?.height,visualViewport?.offsetLeft,visualViewport?.offsetTop,visualViewport?.scale]);return {semantic_revision:s.semantic,focus,selection,viewport}}"#,
+            "returnByValue": true
+        }),
+    ).await?;
+    shared_value(&response)
+}
+
 fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String), String> {
     let frame = response
         .get("frameTree")
@@ -1896,6 +1988,60 @@ fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String)
         .ok_or_else(|| "Page.getFrameTree omitted root frame URL".to_owned())?;
     let fragment = frame["urlFragment"].as_str().unwrap_or("");
     Ok((id.to_owned(), loader.to_owned(), format!("{url}{fragment}")))
+}
+
+/// Bind the existing single-use snapshot token and live root-frame identity to the
+/// interaction-epoch contract. Element hit-test/readback guards still validate the
+/// target-specific and viewport dimensions immediately before input dispatch.
+fn shared_epoch_matches(
+    snapshot: &SharedPageSnapshot,
+    target_id: &str,
+    current: &(String, String, String),
+    current_interaction: &Value,
+    use_case: crate::v3::EpochUse,
+) -> bool {
+    if !snapshot.interaction_epoch.is_object() || !current_interaction.is_object() {
+        return false;
+    }
+    use sha2::Digest as _;
+    let revision = |bytes: &[u8]| {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .take(8)
+            .fold(0u64, |n, b| (n << 8) | u64::from(*b))
+    };
+    let make = |identity: &(String, String, String), interaction: &Value| {
+        let focus = interaction
+            .get("focus")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let selection = interaction
+            .get("selection")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let viewport = interaction
+            .get("viewport")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        crate::v3::InteractionEpoch {
+            browser_generation: 1,
+            target_id: target_id.to_owned(),
+            target_revision: revision(target_id.as_bytes()).to_string(),
+            frame_id: identity.0.clone(),
+            loader_id: identity.1.clone(),
+            document_id: format!("{}:{}", identity.1, revision(identity.2.as_bytes())),
+            focused_backend_node_id: (!focus.is_empty()).then(|| revision(focus.as_bytes()) as i64),
+            selection_fingerprint: Some(selection.to_owned()),
+            semantic_revision: interaction
+                .get("semantic_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                .to_string(),
+            viewport_revision: revision(viewport.as_bytes()),
+        }
+    };
+    make(&snapshot.identity, &snapshot.interaction_epoch)
+        .compatible_with(&make(current, current_interaction), use_case)
 }
 
 fn find_cdp_frame(response: &Value, frame_id: &str) -> Option<(String, String)> {
@@ -2894,9 +3040,9 @@ impl App {
         {
             return Err(invalid("outcome selector/text/URL exceeds bounds"));
         }
-        let timeout = args.timeout_ms.unwrap_or(10000);
-        if !(1000..=30000).contains(&timeout) {
-            return Err(invalid("timeout_ms must be 1000..30000"));
+        let timeout = args.timeout_ms.unwrap_or(3000);
+        if !(1000..=10000).contains(&timeout) {
+            return Err(invalid("timeout_ms must be 1000..10000"));
         }
         let shared = self
             .shared_sessions
@@ -2936,7 +3082,23 @@ impl App {
             let identity =
                 shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
                     .await?;
-            if !unrestricted && identity != snapshot.identity {
+            let interaction = shared_interaction_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+            )
+            .await?;
+            if !unrestricted
+                && !shared_epoch_matches(
+                    &snapshot,
+                    &args.chrome_tab_id,
+                    &identity,
+                    &interaction,
+                    crate::v3::EpochUse::PointerMutation,
+                )
+            {
                 return Err(ClickRefusal::Guard(crate::guard_reason::refusal(
                     &json!({"ok":false,"reason":"document_changed"}),
                 )));
@@ -2948,6 +3110,7 @@ impl App {
                 return Err(ClickRefusal::Guard(crate::guard_reason::refusal(&value)));
             }
             if !unrestricted
+                && !matches!(&args.outcome, SharedClickOutcome::NewTab { .. })
                 && evaluate_shared_outcome(
                     &shared,
                     &args.chrome_tab_id,
@@ -2955,6 +3118,7 @@ impl App {
                     index,
                     &args.outcome,
                     &identity,
+                    0,
                 )
                 .await?
             {
@@ -3005,12 +3169,27 @@ impl App {
             return Ok(rmcp::handler::server::wrapper::Json(refusal));
         }
         if !unrestricted {
-            let fresh = tokio::time::timeout_at(
-                deadline,
-                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
-            )
+            let fresh = tokio::time::timeout_at(deadline, async {
+                let identity = shared_frame_identity(
+                    connection,
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                )
+                .await?;
+                let interaction = shared_interaction_epoch(
+                    connection,
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    &snapshot.object_id,
+                )
+                .await?;
+                Ok::<_, String>((identity, interaction))
+            })
             .await;
-            if !matches!(fresh, Ok(Ok(ref identity)) if identity == &snapshot.identity) {
+            if !matches!(fresh, Ok(Ok((ref identity, ref interaction))) if shared_epoch_matches(&snapshot, &args.chrome_tab_id, identity, interaction, crate::v3::EpochUse::PointerMutation))
+            {
                 return Ok(rmcp::handler::server::wrapper::Json(
                     json!({"status":"not_dispatched","reason":"document changed before dispatch; take one fresh snapshot","dispatch_acknowledged":false}),
                 ));
@@ -3020,22 +3199,12 @@ impl App {
             checked["x"].as_f64().ok_or_else(|| invalid("missing x"))?,
             checked["y"].as_f64().ok_or_else(|| invalid("missing y"))?,
         );
-        let moved = tokio::time::timeout_at(
-            deadline,
-            connection.command(
-                registry,
-                &shared.handle,
-                &args.chrome_tab_id,
-                "Input.dispatchMouseEvent",
-                json!({"type":"mouseMoved","button":"none","x":x,"y":y}),
-            ),
-        )
-        .await;
-        if !matches!(moved, Ok(Ok(_))) {
-            return Ok(rmcp::handler::server::wrapper::Json(json!({
-                "status":"not_dispatched","reason":"pointer move failed before click","dispatch_acknowledged":false
-            })));
-        }
+        let [press_event, release_event] = click_mouse_events(x, y);
+        let click_started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
         let press = tokio::time::timeout_at(
             deadline,
             connection.command(
@@ -3043,7 +3212,7 @@ impl App {
                 &shared.handle,
                 &args.chrome_tab_id,
                 "Input.dispatchMouseEvent",
-                json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
+                press_event,
             ),
         )
         .await;
@@ -3055,7 +3224,7 @@ impl App {
                 &shared.handle,
                 &args.chrome_tab_id,
                 "Input.dispatchMouseEvent",
-                json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
+                release_event,
             ),
         )
         .await;
@@ -3070,6 +3239,19 @@ impl App {
                     &args.chrome_tab_id,
                 )
                 .await?;
+                if matches!(&args.outcome, SharedClickOutcome::Navigation { .. }) {
+                    let verified = evaluate_shared_outcome(
+                        &shared,
+                        &args.chrome_tab_id,
+                        &snapshot,
+                        index,
+                        &args.outcome,
+                        &identity,
+                        click_started_ms,
+                    )
+                    .await?;
+                    return Ok::<_, String>((identity, verified));
+                }
                 let observed = evaluate_shared_outcome(
                     &shared,
                     &args.chrome_tab_id,
@@ -3077,6 +3259,7 @@ impl App {
                     index,
                     &args.outcome,
                     &identity,
+                    click_started_ms,
                 )
                 .await?;
                 let after = shared_frame_identity(
@@ -3090,12 +3273,14 @@ impl App {
                 Ok::<_, String>((identity, verified))
             };
             if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
-                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity});
+                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity,"new_tab_observed":matches!(&args.outcome, SharedClickOutcome::NewTab { .. })});
                 break;
             }
-            let _ =
-                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(100)))
-                    .await;
+            let _ = tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(SHARED_CLICK_VERIFY_POLL_INTERVAL),
+            )
+            .await;
         }
         if result["status"] == "unknown" && !acknowledged {
             result["reason"] = json!(
@@ -4087,7 +4272,7 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open an active Chrome tab or navigate an explicitly paired tab through the native Controlla extension session. `open` requires a stable idempotency_key; reuse it only for the same logical open retry. A different key creates a distinct tab. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
+        description = "Open a Chrome tab in the foreground by default or leave it in the background with active=false, or navigate an explicitly paired tab through the native Controlla extension session. `open` requires a stable idempotency_key; reuse it only for the same logical open retry with the same activation mode. A different key creates a distinct tab. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
     )]
     async fn shared_tab(
         &self,
@@ -4108,6 +4293,9 @@ impl App {
         }
         if args.action != "open" && args.wait_until.is_some() {
             return Err(invalid("wait_until is supported only for action=open"));
+        }
+        if args.action != "open" && args.active.is_some() {
+            return Err(invalid("active is supported only for action=open"));
         }
         if args.action == "open" && args.idempotency_key.as_deref().is_none_or(str::is_empty) {
             return Err(invalid(
@@ -4173,7 +4361,7 @@ impl App {
                 &shared.handle,
                 &source,
                 method,
-                json!({"url":args.url,"idempotency_key":args.idempotency_key,"wait_until":args.wait_until.unwrap_or_else(|| "dom_content_loaded".into())}),
+                json!({"url":args.url,"idempotency_key":args.idempotency_key,"active":args.active.unwrap_or(true),"wait_until":args.wait_until.unwrap_or_else(|| "dom_content_loaded".into())}),
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
@@ -4938,6 +5126,7 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
+        SharedPageSnapshot, click_mouse_events, shared_epoch_matches,
         shared_typing_minimum_duration, validate_loopback_ws,
     };
     use rmcp::{
@@ -4945,6 +5134,17 @@ mod tests {
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn semantic_click_dispatches_at_verified_point_without_a_separate_pointer_move() {
+        let events = click_mouse_events(12.0, 34.0);
+        assert_eq!(events[0]["type"], "mousePressed");
+        assert_eq!(events[0]["x"], 12.0);
+        assert_eq!(events[0]["y"], 34.0);
+        assert_eq!(events[1]["type"], "mouseReleased");
+        assert_eq!(events[1]["x"], 12.0);
+        assert_eq!(events[1]["y"], 34.0);
+    }
 
     #[tokio::test]
     async fn internal_workflow_reuse_is_scoped_to_its_successfully_consumed_generation() {
@@ -4992,6 +5192,11 @@ mod tests {
             "new-loader".into(),
             "https://site.test/story/1".into(),
         );
+        let spa_route = (
+            "frame".into(),
+            "old-loader".into(),
+            "https://site.test/story/1".into(),
+        );
         assert!(
             shared_navigation_matches(
                 &SharedClickOutcome::Navigation { url: None },
@@ -4999,6 +5204,15 @@ mod tests {
                 &target,
             )
             .unwrap()
+        );
+        assert!(
+            shared_navigation_matches(
+                &SharedClickOutcome::Navigation { url: None },
+                &before,
+                &spa_route,
+            )
+            .unwrap(),
+            "same-document SPA URL changes count as navigation"
         );
         assert!(
             !shared_navigation_matches(
@@ -5083,6 +5297,43 @@ mod tests {
     }
 
     #[test]
+    fn new_tab_outcome_requires_a_recent_child_tab_and_optional_exact_url() {
+        use super::shared_new_tab_matches;
+        let response =
+            json!({"tabs":[{"tab_id":"900","url":"https://site.test/story","opener_match":true}]});
+        assert!(shared_new_tab_matches(&response, None));
+        assert!(shared_new_tab_matches(
+            &response,
+            Some("https://site.test/story")
+        ));
+        assert!(!shared_new_tab_matches(
+            &response,
+            Some("https://site.test/other")
+        ));
+        assert!(!shared_new_tab_matches(&json!({"tabs":[]}), None));
+        assert!(!shared_new_tab_matches(
+            &json!({"tabs":[{"tab_id":"1","url":"https://site.test/story","opener_match":false}]}),
+            None
+        ));
+        assert!(!shared_new_tab_matches(
+            &json!({"tabs":[{"tab_id":"1","url":"https://site.test/story","opener_match":false}]}),
+            Some("https://site.test/story")
+        ));
+        assert!(!shared_new_tab_matches(
+            &json!({"tabs":[{"tab_id":"1","url":"https://site.test/story"}]}),
+            Some("https://site.test/story")
+        ));
+        assert!(!shared_new_tab_matches(
+            &json!({"tabs":[{"tab_id":"1","url":"https://site.test/a"},{"tab_id":"2","url":"https://site.test/b"}]}),
+            None
+        ));
+        assert!(!shared_new_tab_matches(
+            &json!({"tabs":[{"url":"https://site.test/story"}]}),
+            None
+        ));
+    }
+
+    #[test]
     fn shared_tab_schema_requires_idempotency_key_only_for_open() {
         let schema =
             serde_json::to_value(rmcp::schemars::schema_for!(super::SharedTabArgs)).unwrap();
@@ -5097,6 +5348,87 @@ mod tests {
                 .iter()
                 .any(|property| property == "idempotency_key")
         );
+        assert!(
+            schema["properties"]["active"]["type"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kind| kind == "boolean")
+        );
+    }
+
+    #[test]
+    fn interaction_epoch_guard_binds_click_to_snapshot_and_document_identity() {
+        let interaction = json!({"semantic_revision":4,"focus":"body","selection":"collapsed:0","viewport":"800x600@0,0"});
+        let snapshot = SharedPageSnapshot {
+            token: "snapshot-7".into(),
+            object_id: "obj".into(),
+            identity: (
+                "frame".into(),
+                "loader".into(),
+                "https://example.test/a".into(),
+            ),
+            interaction_epoch: interaction.clone(),
+            count: 1,
+            consumed: false,
+        };
+        assert!(shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &interaction,
+            crate::v3::EpochUse::PointerMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &(
+                "other-frame".into(),
+                "loader".into(),
+                "https://example.test/a".into()
+            ),
+            &interaction,
+            crate::v3::EpochUse::PointerMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &(
+                "frame".into(),
+                "new-loader".into(),
+                "https://example.test/a".into()
+            ),
+            &interaction,
+            crate::v3::EpochUse::TextMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":5,"focus":"body","selection":"collapsed:0","viewport":"800x600@0,0"}),
+            crate::v3::EpochUse::PointerMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":4,"focus":"input#search","selection":"collapsed:0","viewport":"800x600@0,0"}),
+            crate::v3::EpochUse::TextMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":4,"focus":"body","selection":"range:1-4","viewport":"800x600@0,0"}),
+            crate::v3::EpochUse::TextMutation
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":4,"focus":"body","selection":"collapsed:0","viewport":"900x600@0,0"}),
+            crate::v3::EpochUse::PointerMutation
+        ));
     }
 
     #[test]

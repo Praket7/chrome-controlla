@@ -35,12 +35,23 @@ export async function loadClientQualification() {
     'chatgpt-desktop': { serverId: Object.keys(chatgpt.mcpServers)[0], command: [chatgpt.mcpServers['chrome-controlla'].command, ...chatgpt.mcpServers['chrome-controlla'].args], surface: 'packaged-local-plugin' },
     'generic-mcp': { serverId: Object.keys(generic.mcpServers)[0], command: [generic.mcpServers['chrome-controlla'].command, ...generic.mcpServers['chrome-controlla'].args], surface: generic.mcpServers['chrome-controlla'].env.CONTROLLA_AGENT_SURFACE },
   };
-  return { matrix, adapters };
+  const integrationConfigs = {
+    freebuff: 'integrations/freebuff/chrome-controlla.mcp.json',
+    opencode: 'integrations/opencode/opencode.json.example',
+    'claude-code': 'integrations/claude-code/mcp.json.example',
+    codex: 'integrations/codex/config.toml.example',
+    'chatgpt-desktop': 'packages/chrome-controlla/plugin/mcp.json',
+    'generic-mcp': 'integrations/generic/mcp.json.example',
+  };
+  return { matrix, adapters, integrationConfigs };
 }
 
-export function validateClientQualification(matrix, adapters) {
+export function validateClientQualification(matrix, adapters, integrationConfigs) {
   assert.equal(matrix.schema, 'controlla-client-qualification-v3');
   assert.deepEqual(matrix.requiredCapabilities, required, 'required capability evidence dimensions must remain complete and ordered');
+  assert.equal(matrix.smokeAdapterContract.protocol, 'one_json_request_one_json_result');
+  assert.equal(matrix.smokeAdapterContract.commandsEnvironment, 'CONTROLLA_CLIENT_SMOKE_COMMANDS_JSON');
+  assert.equal(matrix.smokeAdapterContract.generatedEvidenceMayQualifyRealClient, false);
   for (const name of ['freebuff', 'opencode', 'claude-code', 'codex', 'chatgpt-desktop', 'generic-mcp']) {
     const entry = matrix.clients[name];
     const adapter = adapters[name];
@@ -49,13 +60,15 @@ export function validateClientQualification(matrix, adapters) {
     assert.ok(['stdio-mcp', 'packaged-local-plugin'].includes(entry.contract));
     assert.equal(entry.contractStatus, 'verified');
     assert.equal(entry.liveSmokeStatus, 'unverified');
+    assert.equal(entry.smokeAdapter, name, `${name} must map to its named executable smoke adapter`);
     assert.equal(adapter.serverId, entry.serverId, `${name} adapter server id does not match the qualification row`);
-    assert.deepEqual(adapter.command, entry.command, `${name} adapter command does not match the qualification row`);
+    assert.equal(entry.integrationConfig, integrationConfigs?.[name], `${name} qualification row must bind to its actual checked-in integration config`);
+    assert.equal(entry.adapterKind, name === 'chatgpt-desktop' ? 'packaged_local_plugin' : 'stdio_mcp');
     assert.equal(adapter.surface, entry.surface, `${name} adapter does not select the required capability surface`);
     assert.deepEqual(entry.requiredEvidenceCategories, required, `${name} is missing required capability evidence categories`);
     if (name === 'codex') {
       assert.equal(adapter.generatedServerId, entry.serverId, 'generated Codex command server id does not match');
-      assert.deepEqual(adapter.generatedCommand, entry.command, 'generated Codex command does not match');
+      assert.deepEqual(adapter.generatedCommand, adapter.command, 'generated Codex command does not match the checked-in Codex MCP config');
     }
   }
   assert.equal(matrix.qualificationPolicy.generatedEvidenceMaySupportBestClaim, false);
@@ -65,6 +78,6 @@ export function validateClientQualification(matrix, adapters) {
 
 if (process.argv[1] && new URL(`file://${process.argv[1]}`).href === import.meta.url) {
   const loaded = await loadClientQualification();
-  validateClientQualification(loaded.matrix, loaded.adapters);
+  validateClientQualification(loaded.matrix, loaded.adapters, loaded.integrationConfigs);
   console.log('V3 client qualification matrix is bound to adapter configs and remains fail-closed.');
 }

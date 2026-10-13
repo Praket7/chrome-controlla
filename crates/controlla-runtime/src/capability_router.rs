@@ -10,10 +10,93 @@ pub struct RouteAvailability {
     pub strict_input: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RouteDecision {
     pub selected: RouteClass,
     pub attempted: Vec<RouteClass>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTier {
+    QualifiedSkill,
+    WebMcpOrSiteTool,
+    SpeculativeRead,
+    SemanticProgram,
+    SemanticPlanner,
+    TargetedVisual,
+    FullVisionFallback,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutionCapabilities {
+    pub qualified_skill: bool,
+    pub site_tool: bool,
+    pub speculative_read: bool,
+    pub semantic_program: bool,
+    pub semantic_confidence: f32,
+    pub targeted_visual: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutionRouteDecision {
+    pub selected: ExecutionTier,
+    pub reason: &'static str,
+    pub predicted_model_calls: u8,
+}
+
+pub fn route_execution(
+    capabilities: ExecutionCapabilities,
+    read_only: bool,
+) -> ExecutionRouteDecision {
+    let (selected, reason, predicted_model_calls) = if read_only && capabilities.qualified_skill {
+        (
+            ExecutionTier::QualifiedSkill,
+            "qualified workflow preconditions are available",
+            0,
+        )
+    } else if capabilities.site_tool {
+        (
+            ExecutionTier::WebMcpOrSiteTool,
+            "a runtime-qualified site tool is available",
+            0,
+        )
+    } else if read_only && capabilities.speculative_read {
+        (
+            ExecutionTier::SpeculativeRead,
+            "verified read-only site profile is available",
+            0,
+        )
+    } else if capabilities.semantic_program {
+        (
+            ExecutionTier::SemanticProgram,
+            "a deterministic semantic program is available",
+            0,
+        )
+    } else if capabilities.semantic_confidence >= 0.8 {
+        (
+            ExecutionTier::SemanticPlanner,
+            "semantic target confidence meets the routing threshold",
+            1,
+        )
+    } else if capabilities.targeted_visual {
+        (
+            ExecutionTier::TargetedVisual,
+            "semantic confidence is low and a bounded visual probe is available",
+            1,
+        )
+    } else {
+        (
+            ExecutionTier::FullVisionFallback,
+            "no cheaper qualified route is available",
+            1,
+        )
+    };
+    ExecutionRouteDecision {
+        selected,
+        reason,
+        predicted_model_calls,
+    }
 }
 
 pub fn select_route(availability: RouteAvailability) -> Option<RouteDecision> {

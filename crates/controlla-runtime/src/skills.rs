@@ -16,7 +16,7 @@ pub enum SkillStatus {
     Expired,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 pub struct SkillDefinition {
     pub skill_id: String,
     pub schema_version: u32,
@@ -26,6 +26,8 @@ pub struct SkillDefinition {
     pub preconditions: Vec<String>,
     pub workflow: Value,
     pub postconditions: Vec<String>,
+    #[serde(default)]
+    pub failure_guards: Vec<String>,
     pub structural_signatures: Vec<String>,
     pub version: u32,
 }
@@ -40,6 +42,11 @@ impl SkillDefinition {
             && !self.workflow.is_null()
             && !self.preconditions.is_empty()
             && !self.postconditions.is_empty()
+            && self.failure_guards.len() <= 64
+            && self
+                .failure_guards
+                .iter()
+                .all(|guard| !guard.is_empty() && guard.len() <= 256)
             && !self.structural_signatures.is_empty()
     }
 }
@@ -50,6 +57,10 @@ pub struct SkillRecord {
     pub status: SkillStatus,
     pub training_run_ids: BTreeSet<String>,
     pub validation_run_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub training_input_signatures: BTreeSet<String>,
+    #[serde(default)]
+    pub validation_input_signatures: BTreeSet<String>,
     pub recent_outcomes: VecDeque<bool>,
     pub qualified_at_ms: Option<u64>,
     pub expires_at_ms: Option<u64>,
@@ -78,6 +89,8 @@ impl SkillRecord {
             status: SkillStatus::Candidate,
             training_run_ids: BTreeSet::new(),
             validation_run_ids: BTreeSet::new(),
+            training_input_signatures: BTreeSet::new(),
+            validation_input_signatures: BTreeSet::new(),
             recent_outcomes: VecDeque::with_capacity(OUTCOME_WINDOW),
             qualified_at_ms: None,
             expires_at_ms: None,
@@ -99,6 +112,32 @@ impl SkillRecord {
         }
     }
 
+    pub fn record_training_example(
+        &mut self,
+        run_id: impl Into<String>,
+        input_signature: impl Into<String>,
+    ) {
+        let run_id = run_id.into();
+        let signature = input_signature.into();
+        if !run_id.trim().is_empty() && valid_input_signature(&signature) {
+            self.training_run_ids.insert(run_id);
+            self.training_input_signatures.insert(signature);
+        }
+    }
+
+    pub fn record_validation_example(
+        &mut self,
+        run_id: impl Into<String>,
+        input_signature: impl Into<String>,
+    ) {
+        let run_id = run_id.into();
+        let signature = input_signature.into();
+        if !run_id.trim().is_empty() && valid_input_signature(&signature) {
+            self.validation_run_ids.insert(run_id);
+            self.validation_input_signatures.insert(signature);
+        }
+    }
+
     pub fn qualify(
         &mut self,
         runtime_verification: Verification,
@@ -108,12 +147,17 @@ impl SkillRecord {
         if expires_at_ms <= qualified_at_ms {
             return Err(SkillError::InvalidExpiry);
         }
-        let distinct = self.training_run_ids.iter().any(|training| {
+        let distinct_runs = self.training_run_ids.iter().any(|training| {
             self.validation_run_ids
                 .iter()
                 .any(|validation| validation != training)
         });
-        if !distinct {
+        let varied_inputs = self.training_input_signatures.len() >= 2
+            && self
+                .validation_input_signatures
+                .iter()
+                .any(|signature| !self.training_input_signatures.contains(signature));
+        if !distinct_runs || !varied_inputs {
             return Err(SkillError::MissingQualificationRuns);
         }
         if runtime_verification != Verification::Passed {
@@ -176,6 +220,10 @@ impl SkillRecord {
     }
 }
 
+fn valid_input_signature(signature: &str) -> bool {
+    !signature.trim().is_empty() && signature.len() <= 256
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +239,7 @@ mod tests {
             preconditions: vec!["signed_in".into()],
             workflow: json!({"steps":["find","fill","verify"]}),
             postconditions: vec!["email_matches".into()],
+            failure_guards: Vec::new(),
             structural_signatures: vec!["form:registration:v1".into()],
             version: 1,
         }
@@ -199,13 +248,14 @@ mod tests {
     #[test]
     fn qualification_requires_distinct_training_validation_and_runtime_proof() {
         let mut record = SkillRecord::candidate(definition()).unwrap();
-        record.record_training_success("run-a");
-        record.record_validation_success("run-a");
+        record.record_training_example("run-a", "input-a");
+        record.record_training_example("run-c", "input-c");
+        record.record_validation_example("run-a", "input-a");
         assert_eq!(
             record.qualify(Verification::Passed, 100, 200),
             Err(SkillError::MissingQualificationRuns)
         );
-        record.record_validation_success("run-b");
+        record.record_validation_example("run-b", "input-b");
         assert_eq!(
             record.qualify(Verification::Inconclusive, 100, 200),
             Err(SkillError::RuntimeVerification)

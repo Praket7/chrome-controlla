@@ -24,7 +24,7 @@ Default execution policy:
 
 For newest/latest content, the preferred shape is **direct destination -> one targeted candidate read -> choose by observed publication evidence -> click -> verify**. Avoid homepage navigation, repeated general snapshots, source-code inspection, and manual schema discovery. If exact timestamps are unavailable, report the actual freshness evidence used rather than inventing precision.
 
-A normal browser task should have zero repository reads, zero schema/describe calls, zero MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known or can be safely routed. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
+A normal browser task should have zero repository reads, zero schema/describe calls, zero model-visible MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known or can be safely routed. Guarded cold open performs its fresh target inventory internally as part of `browser action=open`; do not call discovery separately unless intentionally selecting a particular existing tab. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
 
 Successful speculative routes become reusable only after independent page-identity verification. Persisted route/skill memory must be bounded, origin-scoped, expiring, and quarantined on structural drift or repeated verification failure. Failed, ambiguous, credential-bearing, or sensitive routes must not be learned or replayed.
 

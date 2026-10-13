@@ -1,0 +1,110 @@
+import { access, mkdir, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { delimiter, join, resolve } from 'node:path';
+
+const HOSTS = Object.freeze({
+  codex: { executable: 'codex', kind: 'cli', support: 'non_interactive' },
+  opencode: { executable: 'opencode', kind: 'cli', support: 'non_interactive' },
+  'claude-code': { executable: 'claude', kind: 'cli', support: 'non_interactive' },
+  freebuff: { executable: 'freebuff', kind: 'cli', support: 'interactive_only' },
+  'chatgpt-desktop': { executable: null, kind: 'desktop', support: 'desktop_only' },
+  'generic-mcp': { executable: null, kind: 'protocol', support: 'stdio_protocol' },
+});
+
+async function findExecutable(name, env) {
+  for (const directory of (env.PATH ?? '').split(delimiter)) {
+    const candidate = join(directory, name);
+    try { await access(candidate, constants.X_OK); return candidate; } catch { /* continue */ }
+  }
+  return null;
+}
+
+export async function resolveClientHostAdapter(clientId, { env = process.env } = {}) {
+  const host = HOSTS[clientId];
+  if (!host) throw new Error(`no client host adapter is registered for ${clientId}`);
+  if (host.kind === 'protocol') return { client: clientId, kind: host.kind, status: 'protocol_only', qualification_status: 'not_run', reason: 'Generic MCP has no model-client host; run the stdio contract adapter.' };
+  if (host.kind === 'desktop') return { client: clientId, kind: host.kind, status: 'manual_host_required', qualification_status: 'not_run', reason: 'ChatGPT Desktop exposes no supported isolated non-interactive host runner; desktop launch and in-app evidence are required.' };
+  const override = env[`CONTROLLA_${clientId.toUpperCase().replaceAll('-', '_')}_BIN`];
+  const executable = override ? resolve(override) : await findExecutable(host.executable, env);
+  if (!executable) return { client: clientId, kind: host.kind, status: 'missing_dependency', qualification_status: 'not_run', executable: host.executable, reason: `Required client executable '${host.executable}' was not found on PATH or in its CONTROLLA_*_BIN override.` };
+  try { await access(executable, constants.X_OK); } catch { return { client: clientId, kind: host.kind, status: 'missing_dependency', qualification_status: 'not_run', executable, reason: `Configured client executable is missing or not executable: ${executable}` }; }
+  if (host.support === 'interactive_only') return { client: clientId, kind: host.kind, status: 'interactive_only', qualification_status: 'not_run', executable, reason: 'Freebuff currently exposes no non-interactive prompt command; its app must provide the client-side smoke driver.' };
+  return { client: clientId, kind: host.kind, status: 'ready', qualification_status: 'not_run', executable };
+}
+
+export async function prepareClientHostConfig(clientId, launch, directory) {
+  await mkdir(directory, { recursive: true });
+  const server = { command: launch.command, args: launch.args, env: launch.env };
+  if (clientId === 'codex') return { command: server.command, args: server.args, env: server.env };
+  if (clientId === 'opencode') {
+    const configDir = resolve(directory);
+    await writeFile(join(configDir, 'opencode.json'), `${JSON.stringify({ '$schema': 'https://opencode.ai/config.json', mcp: { 'chrome-controlla': { type: 'local', command: [server.command, ...server.args], enabled: true, environment: server.env } }, permission: { edit: 'deny', bash: 'deny' } }, null, 2)}\n`, { flag: 'wx' });
+    return { configDir };
+  }
+  if (clientId === 'claude-code') {
+    const configPath = join(resolve(directory), 'claude-mcp.json');
+    await writeFile(configPath, `${JSON.stringify({ mcpServers: { 'chrome-controlla': { command: server.command, args: server.args, env: server.env } } }, null, 2)}\n`, { flag: 'wx' });
+    return { configPath };
+  }
+  throw new Error(`${clientId} does not support an isolated CLI host config`);
+}
+
+export function buildClientHostInvocation(clientId, { executable, workDir, mcpConfig, prompt }) {
+  if (!HOSTS[clientId] || typeof executable !== 'string' || typeof workDir !== 'string' || typeof prompt !== 'string') {
+    throw new Error(`invalid host invocation context for ${clientId}`);
+  }
+  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${JSON.stringify(mcpConfig.env)}`, prompt] };
+  if (clientId === 'opencode') return { command: executable, args: ['run', '--format', 'json', '--dir', workDir, prompt], env: { OPENCODE_CONFIG_DIR: mcpConfig.configDir } };
+  if (clientId === 'claude-code') return { command: executable, args: ['-p', '--output-format', 'json', '--strict-mcp-config', '--mcp-config', mcpConfig.configPath, '--max-turns', '8', prompt] };
+  throw new Error(`${clientId} has no supported non-interactive host invocation`);
+}
+
+function collectToolEvents(value, events = []) {
+  if (Array.isArray(value)) { for (const item of value) collectToolEvents(item, events); return events; }
+  if (!value || typeof value !== 'object') return events;
+  const name = value.tool_name ?? value.toolName ?? value.tool ?? value.name;
+  const type = String(value.type ?? value.event ?? '').toLowerCase();
+  if (typeof name === 'string' && (type.includes('tool') || name.includes('chrome-controlla'))) {
+    const input = value.arguments ?? value.input ?? value.tool_input ?? value.params?.arguments;
+    let boundedInput;
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      const safe = {};
+      for (const key of ['action', 'mode', 'provider']) if (typeof input[key] === 'string') safe[key] = input[key].slice(0, 80);
+      if (Object.keys(safe).length) boundedInput = safe;
+    }
+    events.push({ name, type, id: value.id ?? value.call_id ?? null, ...(boundedInput === undefined ? {} : { input: boundedInput }) });
+  }
+  for (const [key, child] of Object.entries(value)) if (!['tool_input', 'arguments', 'input', 'params'].includes(key)) collectToolEvents(child, events);
+  return events;
+}
+
+export async function runClientHostTask(clientId, { executable, workDir, mcpConfig, prompt, env = process.env, timeoutMs = 120_000, spawnProcess = spawn } = {}) {
+  const invocation = buildClientHostInvocation(clientId, { executable, workDir, mcpConfig, prompt });
+  return new Promise((resolveTask, rejectTask) => {
+    const child = spawnProcess(invocation.command, invocation.args, { cwd: workDir, env: { ...env, ...invocation.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout = []; const stderr = []; let stdoutBytes = 0; let stderrBytes = 0;
+    child.stdout.on('data', chunk => { if (stdoutBytes < 4_000_000) { const bounded = Buffer.from(chunk).subarray(0, 4_000_000 - stdoutBytes); stdout.push(bounded); stdoutBytes += bounded.length; } });
+    child.stderr.on('data', chunk => { if (stderrBytes < 64_000) { const bounded = Buffer.from(chunk).subarray(0, 64_000 - stderrBytes); stderr.push(bounded); stderrBytes += bounded.length; } });
+    const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
+    child.once('error', error => { clearTimeout(timer); rejectTask(error); });
+    child.once('close', code => {
+      clearTimeout(timer);
+      const output = Buffer.concat(stdout).toString('utf8');
+      const errorOutput = Buffer.concat(stderr).toString('utf8').slice(0, 64_000);
+      if (code !== 0) { rejectTask(new Error(`${clientId} host exited with code ${code}${errorOutput ? `: ${errorOutput}` : ''}`)); return; }
+      const events = [];
+      for (const line of output.split(/\r?\n/)) {
+        try { collectToolEvents(JSON.parse(line), events); } catch { /* formatted or non-JSON lines are retained in the digest only */ }
+      }
+      const controllaEvents = events.filter(event => /chrome-controlla[._-](act|browser|extract|snapshot|verify|workflow)|mcp__chrome-controlla__(act|browser|extract|snapshot|verify|workflow)/.test(event.name));
+      resolveTask({ client: clientId, status: controllaEvents.length ? 'host_tool_invocation_observed' : 'no_host_tool_invocation_observed', qualification_status: 'not_run', process_id: child.pid,
+        tool_events: controllaEvents, stdout_sha256: createHash('sha256').update(output).digest('hex'), stderr: errorOutput, exit_code: code });
+    });
+  });
+}
+
+export function registeredClientHostAdapters() {
+  return Object.fromEntries(Object.entries(HOSTS).map(([id, host]) => [id, { ...host }]));
+}

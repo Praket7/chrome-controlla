@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "track": "phase11-live-sites",
+  "purpose": "Live-site action/perception qualification. Matrix membership is not evidence that a site or adapter passed.",
+  "frozen_phase10_unchanged": true,
+  "modes": ["cold_unknown", "warm_known", "warm_skill"],
+  "concurrency": [1],
+  "repetitions": 1,
+  "default_baseline_ids": ["controlla-1"],
+  "qualification_status": "unqualified",
+  "global_guards": [
+    "Use public demo or read-only pages only; never submit, purchase, publish, or mutate a real account.",
+    "Each adapter must independently bind a live rubric to the current page before acting.",
+    "If a page is unavailable, changed, blocked, or presents consent/auth prompts, report unsupported and preserve the failure.",
+    "No live-site result qualifies itself; a separate verifier must read the outcome."
+  ],
+  "task_classes": [
+    "nested_dropdown", "multi_select_checkbox", "searchable_combobox", "date_picker_range", "time_picker",
+    "slider", "tree_select", "rich_editor", "file_upload", "hover_popover", "virtualized_infinite_list",
+    "tabs_carousel_collapse", "drag_drop", "canvas_chart_reading", "cross_origin_iframe_oopif", "spa_rerender",
+    "cross_site_multitab", "background_nonactivation", "user_interference"
+  ],
+  "tasks": [
+    {"id":"live-nested-menu","class":"nested_dropdown","url":"https://www.w3.org/WAI/ARIA/apg/patterns/menubar/examples/menubar-navigation/","allowed_hosts":["www.w3.org"],"site_mode":"read_only_navigation","action_points":["open nested menu","choose an exact child link"],"perception_points":["identify expanded menu state"],"independent_verifier":"fresh_url_and_expanded_state","requires_independent_verification":true},
+    {"id":"live-multiselect-checkbox","class":"multi_select_checkbox","url":"https://demoqa.com/checkbox","allowed_hosts":["demoqa.com"],"site_mode":"local_demo_state_only","action_points":["expand a tree branch","select two distinct checkboxes"],"perception_points":["distinguish checked state from labels"],"independent_verifier":"fresh_checked_attributes_and_selected_labels","requires_independent_verification":true},
+    {"id":"live-searchable-combobox","class":"searchable_combobox","url":"https://www.w3.org/WAI/ARIA/apg/patterns/combobox/examples/combobox-autocomplete-list/","allowed_hosts":["www.w3.org"],"site_mode":"local_demo_state_only","action_points":["type bounded query","select exact suggestion"],"perception_points":["identify active suggestion and expanded state"],"independent_verifier":"fresh_value_and_selected_option","requires_independent_verification":true},
+    {"id":"live-date-range","class":"date_picker_range","url":"https://mui.com/x/react-date-pickers/date-range-picker/","allowed_hosts":["mui.com"],"site_mode":"local_demo_state_only","action_points":["set start and end dates"],"perception_points":["read month grid and disabled dates"],"independent_verifier":"fresh_input_values_and_calendar_selection","requires_independent_verification":true},
+    {"id":"live-time-picker","class":"time_picker","url":"https://mui.com/x/react-date-pickers/time-picker/","allowed_hosts":["mui.com"],"site_mode":"local_demo_state_only","action_points":["set a bounded time"],"perception_points":["read clock meridiem and selected value"],"independent_verifier":"fresh_input_value","requires_independent_verification":true},
+    {"id":"live-range-slider","class":"slider","url":"https://demoqa.com/slider","allowed_hosts":["demoqa.com"],"site_mode":"local_demo_state_only","action_points":["set slider to target range"],"perception_points":["read thumb position and displayed value"],"independent_verifier":"fresh_value_and_aria_value","requires_independent_verification":true},
+    {"id":"live-tree-select","class":"tree_select","url":"https://demoqa.com/select-menu","allowed_hosts":["demoqa.com"],"site_mode":"local_demo_state_only","action_points":["expand nested selection","choose leaf option"],"perception_points":["disambiguate same-label options by ancestry"],"independent_verifier":"fresh_selected_option_and_tree_path","requires_independent_verification":true},
+    {"id":"live-rich-editor","class":"rich_editor","url":"https://www.tiny.cloud/docs/tinymce/latest/full-featured-demo/","allowed_hosts":["www.tiny.cloud"],"site_mode":"local_demo_state_only","action_points":["edit a bounded text block","preserve paragraph boundaries"],"perception_points":["read resulting formatted text"],"independent_verifier":"fresh_editor_dom_readback","requires_independent_verification":true},
+    {"id":"live-file-upload","class":"file_upload","url":"https://the-internet.herokuapp.com/upload","allowed_hosts":["the-internet.herokuapp.com"],"site_mode":"public_test_fixture_only","action_points":["choose supplied harmless fixture file","upload to demo endpoint"],"perception_points":["read accepted filename"],"independent_verifier":"fresh_upload_result_page_and_filename","requires_independent_verification":true},
+    {"id":"live-hover-popover","class":"hover_popover","url":"https://the-internet.herokuapp.com/hovers","allowed_hosts":["the-internet.herokuapp.com"],"site_mode":"read_only","action_points":["hover exact image target"],"perception_points":["read revealed user label and link"],"independent_verifier":"fresh_hover_text_and_href","requires_independent_verification":true},
+    {"id":"live-infinite-list","class":"virtualized_infinite_list","url":"https://the-internet.herokuapp.com/infinite_scroll","allowed_hosts":["the-internet.herokuapp.com"],"site_mode":"read_only","action_points":["scroll within bounded page budget","identify terminal or partial state"],"perception_points":["distinguish new content from repeated content"],"independent_verifier":"fresh_unique_content_and_scroll_state","requires_independent_verification":true},
+    {"id":"live-tabs-collapse","class":"tabs_carousel_collapse","url":"https://getbootstrap.com/docs/5.3/components/accordion/","allowed_hosts":["getbootstrap.com"],"site_mode":"read_only_navigation","action_points":["open target accordion panel"],"perception_points":["read expanded/collapsed state and panel content"],"independent_verifier":"fresh_aria_expanded_and_panel_visibility","requires_independent_verification":true},
+    {"id":"live-drag-drop","class":"drag_drop","url":"https://the-internet.herokuapp.com/drag_and_drop","allowed_hosts":["the-internet.herokuapp.com"],"site_mode":"local_demo_state_only","action_points":["drag source into named target"],"perception_points":["read exact post-drop labels"],"independent_verifier":"fresh_container_membership_and_text","requires_independent_verification":true},
+    {"id":"live-canvas-chart","class":"canvas_chart_reading","url":"https://www.chartjs.org/docs/latest/samples/","allowed_hosts":["www.chartjs.org"],"site_mode":"read_only","action_points":["locate chart and targeted data point"],"perception_points":["report trend and exact visible values with evidence"],"independent_verifier":"independent_visual_region_and_data_crosscheck","requires_independent_verification":true},
+    {"id":"live-cross-origin-frame","class":"cross_origin_iframe_oopif","url":"https://the-internet.herokuapp.com/iframe","allowed_hosts":["the-internet.herokuapp.com"],"site_mode":"read_only_or_local_demo_state_only","action_points":["locate frame origin","read or edit only explicitly named frame content"],"perception_points":["distinguish root and frame documents"],"independent_verifier":"fresh_frame_origin_and_document_identity","requires_independent_verification":true},
+    {"id":"live-spa-rerender","class":"spa_rerender","url":"https://react.dev/learn","allowed_hosts":["react.dev"],"site_mode":"read_only_navigation","action_points":["navigate to a linked section","survive client-side route/rerender"],"perception_points":["verify route and new content"],"independent_verifier":"fresh_url_loader_and_content_identity","requires_independent_verification":true},
+    {"id":"live-cross-site-multitab","class":"cross_site_multitab","url":"https://www.wikipedia.org/","allowed_hosts":["www.wikipedia.org"],"site_urls":["https://www.wikipedia.org/","https://developer.mozilla.org/"],"site_allowlists":[["www.wikipedia.org"],["developer.mozilla.org"]],"site_mode":"read_only","action_points":["read two distinct sites in parallel","retain source attribution"],"perception_points":["resolve conflicting or missing facts"],"independent_verifier":"fresh_url_and_source_bound_fact_checks","requires_independent_verification":true},
+    {"id":"live-background-nonactivation","class":"background_nonactivation","url":"https://www.w3.org/","allowed_hosts":["www.w3.org"],"site_mode":"read_only","action_points":["open a new browser tab in background"],"perception_points":["confirm source tab remains active"],"independent_verifier":"browser_active_tab_id_before_and_after","requires_independent_verification":true},
+    {"id":"live-user-interference","class":"user_interference","url":"https://www.w3.org/","allowed_hosts":["www.w3.org"],"site_mode":"controlled_profile_required","action_points":["detect user focus or document change during a paused workflow","stop before stale mutation"],"perception_points":["distinguish user intervention from agent action"],"independent_verifier":"browser_focus_epoch_and_document_identity","requires_independent_verification":true}
+  ],
+  "adapters": [
+    {"id":"controlla","track":"structured"},
+    {"id":"controlla-1","track":"structured","source_ref":"62e6407d0e75b83a1be8d69468476601a6e6da37"},
+    {"id":"playwright-mcp","track":"structured"},
+    {"id":"chrome-devtools-mcp","track":"structured"},
+    {"id":"agent-browser","track":"structured"},
+    {"id":"stagehand","track":"structured"},
+    {"id":"browser-use","track":"structured"}
+  ],
+  "required_environment": ["browser_version", "model", "prompt_hash", "token_budget", "machine", "run_mode", "verifier_version"],
+  "required_metrics": ["success", "independently_verified_success", "wall_ms", "model_round_trips", "model_tokens", "browser_ops", "observation_bytes", "screenshot_bytes", "focus_disruptions", "human_interventions", "authority_violations", "silent_stale_mutations"],
+  "claim_policy": {"unqualified_matrix_is_not_a_result":true,"fixture_or_synthetic_evidence_cannot_qualify_live_site":true,"public_performance_claim_requires_all_environment_fields":true,"mutation_or_upload_requires_disposable_demo_site_and_independent_verifier":true}
+}

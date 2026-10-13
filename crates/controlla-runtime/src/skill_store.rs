@@ -144,6 +144,7 @@ mod tests {
             preconditions: vec!["ready".into()],
             workflow: json!({"steps":[]}),
             postconditions: vec!["done".into()],
+            failure_guards: Vec::new(),
             structural_signatures: vec!["sig".into()],
             version: 1,
         })

@@ -1,8 +1,10 @@
 pub use controlla_runtime::{
-    apps, artifacts, browser_workflow, cache, canva, capability, capability_router, capcut_recipe,
-    doctor, guard_reason, http_auth, http_server, jobs, metrics, native_host, native_setup,
-    reference_reacquire, runtime_observer, semantic_state, skill_runtime, skill_store, skills,
-    slides_deck, v3, v3_runtime, v3_tasks, verifier, workflow, workflow_vm,
+    apps, artifacts, browser_workflow, cache, canva, capability, capability_registry,
+    capability_router, capcut_recipe, doctor, evidence_store, guard_reason, http_auth, http_server,
+    jobs, metrics, native_host, native_setup, observation_router, page_action_memory,
+    reference_reacquire, relevance, runtime_observer, semantic_state, site_profiles,
+    skill_induction, skill_runtime, skill_store, skills, slides_deck, v3, v3_runtime, v3_tasks,
+    verifier, visual_probe, widget_adapters, workflow, workflow_dag, workflow_vm,
 };
 
 #[allow(dead_code, clippy::unnecessary_sort_by)]

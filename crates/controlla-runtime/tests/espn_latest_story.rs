@@ -230,8 +230,12 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
         .unwrap();
     let session = launch["session_id"].as_str().unwrap();
     let tab = launch["target_ids"][0].as_str().unwrap();
+    let snapshot = client.call_tool(call("snapshot", serde_json::json!({"session_id":session,"chrome_tab_id":tab,"max_items":20,"max_text_chars":0}))).await.unwrap().structured_content.unwrap();
+    assert_eq!(
+        snapshot["scope_complete"], true,
+        "fixture story candidates need a complete freshness scope: {snapshot}"
+    );
     let workflow = client.call_tool(call("workflow", serde_json::json!({"session_id":session,"chrome_tab_id":tab,"steps":[
-        {"kind":"snapshot","href_hint":"/article-"},
         {"kind":"find_all","role":"link","href_hint":"/article-","max_matches":10,"save_as":"stories"},
         {"kind":"choose","from":"stories","key":"datetime","save_as":"story"},
         {"kind":"click","reference":"$story","outcome":{"kind":"navigation"}},
@@ -254,7 +258,7 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
     let _ = server.join();
     let _ = std::fs::remove_dir_all(state);
     let workflow_steps = result["steps"].as_u64().unwrap_or(0);
-    serde_json::json!({"result":result,"mcp_calls":3,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
+    serde_json::json!({"result":result,"mcp_calls":4,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
 }
 
 #[cfg(target_os = "macos")]
@@ -264,12 +268,12 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
     let _serial = TEST_LOCK.lock().unwrap();
     let result = run_latest_story(false, false, false).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
-    assert_eq!(result["result"]["steps"], 5, "workflow step budget");
+    assert_eq!(result["result"]["steps"], 4, "workflow step budget");
     assert!(result["result"]["elapsed_ms"].is_number());
-    assert_eq!(result["result"]["step_ms"].as_array().unwrap().len(), 5);
-    assert_eq!(result["result"]["receipts"][0]["item_count"], 2);
+    assert_eq!(result["result"]["step_ms"].as_array().unwrap().len(), 4);
+    assert_eq!(result["result"]["receipts"][0]["count"], 2);
     assert!(
-        result["result"]["receipts"][2]["selected"]["href"]
+        result["result"]["receipts"][1]["selected"]["href"]
             .as_str()
             .unwrap()
             .ends_with("/article-newest.html"),
@@ -292,7 +296,7 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
 async fn espn_latest_story_recovers_from_safe_obstruction_without_model_retry() {
     let _serial = TEST_LOCK.lock().unwrap();
     let result = run_latest_story(true, false, false).await;
-    let click = &result["result"]["receipts"][3];
+    let click = &result["result"]["receipts"][2];
     assert!(
         click["status"] == "verified"
             || (click["status"] == "not_dispatched"
@@ -312,16 +316,16 @@ async fn linked_article_metadata_resolves_same_origin_story_dates() {
     let result = run_latest_story(false, true, false).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(
-        result["result"]["receipts"][2]["selected"]["freshness_source"],
+        result["result"]["receipts"][1]["selected"]["freshness_source"],
         "linked_article_metadata"
     );
     assert!(
-        result["result"]["receipts"][2]["selected"]["href"]
+        result["result"]["receipts"][1]["selected"]["href"]
             .as_str()
             .unwrap()
             .ends_with("/article-newest.html")
     );
-    assert_eq!(result["result"]["receipts"][4]["status"], "passed");
+    assert_eq!(result["result"]["receipts"][3]["status"], "passed");
 }
 
 #[cfg(target_os = "macos")]
@@ -332,8 +336,8 @@ async fn listing_json_ld_avoids_linked_page_reads() {
     let result = run_latest_story(false, false, true).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(
-        result["result"]["receipts"][2]["selected"]["freshness_source"],
+        result["result"]["receipts"][1]["selected"]["freshness_source"],
         "listing_json_ld"
     );
-    assert_eq!(result["result"]["receipts"][4]["status"], "passed");
+    assert_eq!(result["result"]["receipts"][3]["status"], "passed");
 }

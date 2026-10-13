@@ -32,6 +32,7 @@ const failAttach = new Set();
 let tabsUpdated;
 let tabsReplaced;
 let tabsActivated;
+let tabsCreated;
 let windowFocusChanged;
 let navigationBefore;
 let navigationCommitted;
@@ -115,7 +116,7 @@ const chrome = {
   },
   tabs: {
     async query() { return tabList; },
-    async create({ url }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete" }; tabList.push(tab); if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
+    async create({ url, active = true }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
     async update(tabId, { url }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
@@ -153,6 +154,7 @@ const chrome = {
     onUpdated: { addListener(callback) { tabsUpdated = callback; }, removeListener() {} },
     onReplaced: { addListener(callback) { tabsReplaced = callback; } },
     onActivated: { addListener(callback) { tabsActivated = callback; } },
+    onCreated: { addListener(callback) { tabsCreated = callback; } },
   },
   windows: { async get() { return { focused: false }; }, onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } } },
   webNavigation: {
@@ -377,6 +379,20 @@ function message(payload) {
   fastTypeValue = ""; fastTypeFocused = true; rejectNextCommand = "Input.dispatchKeyEvent";
   native.hostMessage({ type: "command", id: "fast-type-delivery-unknown", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "x", normalize_paragraphs: false } });
   await new Promise(resolve => setTimeout(resolve, 0));
+  const clickStartedAt = 0;
+  tabList.find(tab => tab.id === 41).windowId = 7;
+  const popupTab = { id: 900, windowId: 7, openerTabId: 41, url: "https://example.test/story", status: "complete" };
+  const unrelatedSameWindowTab = { id: 902, windowId: 7, url: "https://example.test/story", status: "complete" };
+  const unrelatedTab = { id: 901, windowId: 8, url: "https://example.test/unrelated", status: "complete" };
+  tabList.push(popupTab, unrelatedSameWindowTab, unrelatedTab); tabsCreated(popupTab); tabsCreated(unrelatedSameWindowTab); tabsCreated(unrelatedTab);
+  native.hostMessage({ type: "command", id: "verify-click-new-tab", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt, url: "https://example.test/story" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(native.sent.find(message => message.id === "verify-click-new-tab")?.result?.tabs)),
+    [{ tab_id: "900", url: "https://example.test/story", opener_match: true }], "only Chrome's opener relationship attributes a tab to the click, excluding same-URL tabs opened independently");
+  native.hostMessage({ type: "command", id: "verify-click-new-tab-no-url", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(native.sent.find(message => message.id === "verify-click-new-tab-no-url")?.result?.tabs)),
+    [{ tab_id: "900", url: "https://example.test/story", opener_match: true }], "without a selected href, only Chrome's opener relationship is used");
   const failedFastTypeReceipt = native.sent.find(message => message.id === "fast-type-delivery-unknown")?.result;
   assert.equal(failedFastTypeReceipt.status, "unknown");
   assert.equal(failedFastTypeReceipt.cdp_commands, 2, "unknown partial delivery reports the preflight and attempted key command");
@@ -466,6 +482,7 @@ function message(payload) {
   const firstOpen = native.sent.at(-1).result;
   assert.ok(firstOpen, JSON.stringify(native.sent.at(-1)));
   assert.equal(firstOpen.idempotent_reuse, false);
+  assert.equal(tabList.find(tab => tab.id === Number(firstOpen.tab_id)).active, true, "open defaults to a foreground tab");
   const countAfterFirstOpen = tabList.filter(tab => tab.url === "https://example.test/idempotent").length;
   native.hostMessage({ ...openRequest, id: "open-retry" });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -1329,6 +1346,22 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 120));
   assert.ok(restartPort.sent.find(message => message.id === "open-after-stale-complete")?.result,
     "navigation resolves after the new document reaches DOMContentLoaded");
+
+  const backgroundKey = "client-fixture:background-1234";
+  const backgroundParams = { url: "https://example.test/background", idempotency_key: backgroundKey, active: false };
+  restartPort.hostMessage({ ...openRequest, id: "open-background", params: backgroundParams });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const backgroundOpen = restartPort.sent.at(-1).result;
+  assert.ok(backgroundOpen, JSON.stringify(restartPort.sent.at(-1)));
+  assert.equal(tabList.find(tab => tab.id === Number(backgroundOpen.tab_id)).active, false, "active:false opens in the background");
+  restartPort.hostMessage({ ...openRequest, id: "open-background-retry", params: backgroundParams });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(restartPort.sent.at(-1).result.tab_id, backgroundOpen.tab_id, "background retries reuse the original tab");
+  assert.equal(tabList.find(tab => tab.id === Number(backgroundOpen.tab_id)).active, false, "a background retry keeps the tab inactive");
+  restartPort.hostMessage({ ...openRequest, id: "open-background-mode-mismatch", params: { ...backgroundParams, active: true } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(restartPort.sent.at(-1).error, /activation mode/i, "one idempotency key cannot change activation mode");
+  assert.equal(tabList.filter(tab => tab.url === backgroundParams.url).length, 1, "a conflicting retry cannot create a second tab");
 
   console.log("Extension version handshake, pairing cleanup, chooser event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

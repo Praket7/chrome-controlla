@@ -7,8 +7,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const MAX_STDIO_BYTES = 1024 * 1024;
 
-export async function loadPhase11Config() {
-  return JSON.parse(await readFile(resolve(root, 'bench/tasks/phase11-realistic.json'), 'utf8'));
+export async function loadPhase11Config(configPath = 'bench/tasks/phase11-realistic.json') {
+  return JSON.parse(await readFile(resolve(root, configPath), 'utf8'));
 }
 
 export async function loadAdapterContract() {
@@ -126,8 +126,8 @@ async function independentlyVerify(verifierCommand, input, actingResult, timeout
 }
 
 async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env }) {
-  const fixtureUrl = new URL(task.fixture, fixtureBaseUrl).toString();
-  const input = { task_id: task.id, scenario: task.scenario, mode, concurrency, fixture_url: fixtureUrl, deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
+  const fixtureUrl = task.url ? liveTaskUrl(task) : new URL(task.fixture, fixtureBaseUrl).toString();
+  const input = { task_id: task.id, scenario: task.scenario, mode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
   let raw;
   try {
@@ -152,8 +152,32 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   };
 }
 
-function assertEnvironment(environment) {
-  const required = ['chrome_version','viewport','model','prompt_hash','token_budget','fixture_revision','machine_profile'];
+export function liveTaskUrl(task) {
+  if (typeof task.url !== 'string' || !Array.isArray(task.allowed_hosts)) throw new Error(`live task ${task.id} must declare a URL and exact allowed_hosts`);
+  const url = new URL(task.url);
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash || !task.allowed_hosts.includes(url.hostname)) {
+    throw new Error(`live task ${task.id} URL must be credential-free HTTPS on an exact allowlisted host`);
+  }
+  return url.toString();
+}
+
+function validateLiveTaskUrls(task) {
+  liveTaskUrl(task);
+  if (task.site_urls === undefined) return;
+  if (!Array.isArray(task.site_urls) || !Array.isArray(task.site_allowlists) || task.site_urls.length !== task.site_allowlists.length || task.site_urls.length === 0 || task.site_urls.length > 8) {
+    throw new Error(`live task ${task.id} site_urls must have a matching bounded site_allowlists array`);
+  }
+  for (const [index, raw] of task.site_urls.entries()) {
+    const url = new URL(raw);
+    const hosts = task.site_allowlists[index];
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash || !Array.isArray(hosts) || hosts.length !== 1 || hosts[0] !== url.hostname) {
+      throw new Error(`live task ${task.id} site_urls must be credential-free HTTPS on exact per-site host allowlists`);
+    }
+  }
+}
+
+function assertEnvironment(environment, config) {
+  const required = config.required_environment ?? ['chrome_version','viewport','model','prompt_hash','token_budget','fixture_revision','machine_profile'];
   for (const field of required) if (!(field in environment)) throw new Error(`environment missing ${field}`);
 }
 
@@ -170,15 +194,17 @@ export async function runBenchmark({
   repetitions,
   deadlineMs = 60_000,
   env = process.env,
+  configPath = 'bench/tasks/phase11-realistic.json',
 } = {}) {
-  const config = await loadPhase11Config();
+  const config = await loadPhase11Config(configPath);
   const contract = await loadAdapterContract();
   const candidate = config.adapters.find(adapter => adapter.id === candidateId);
   const baseline = config.adapters.find(adapter => adapter.id === baselineId);
   if (!candidate || !baseline) throw new Error(`unknown baseline ${baselineId}`);
   if (baseline.track !== 'structured') throw new Error('release comparison requires a structured baseline; computer-use stays on the separate vision track');
-  if (!fixtureBaseUrl) throw new Error('fixtureBaseUrl is required');
-  assertEnvironment(environment);
+  if (!fixtureBaseUrl && config.tasks.some(task => !task.url)) throw new Error('fixtureBaseUrl is required for fixture tasks');
+  for (const task of config.tasks) if (task.url) validateLiveTaskUrls(task);
+  assertEnvironment(environment, config);
   const selectedModes = modes ?? config.modes;
   const selectedConcurrency = concurrencyLevels ?? config.concurrency;
   const selectedRepetitions = repetitions ?? config.repetitions ?? 1;
@@ -230,12 +256,14 @@ function argValue(name) {
 async function main() {
   const baselineId = argValue('baseline');
   const fixtureBaseUrl = process.env.PHASE11_FIXTURE_BASE_URL;
+  const configPath = argValue('task-set') ?? process.env.PHASE11_TASK_SET ?? 'bench/tasks/phase11-realistic.json';
   const environment = JSON.parse(process.env.PHASE11_ENVIRONMENT_JSON ?? '{}');
   const deadlineMs = Number(argValue('deadline-ms') ?? 60_000);
   const modes = argValue('modes')?.split(',').filter(Boolean);
   const concurrencyLevels = argValue('concurrency')?.split(',').filter(Boolean).map(Number);
   const repetitions = argValue('repetitions') === undefined ? undefined : Number(argValue('repetitions'));
-  const output = resolve(root, argValue('output') ?? 'bench/reports/phase11-results.json');
+  const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
+  const output = resolve(root, argValue('output') ?? `bench/reports/phase11-${baselineId}-${stamp}.json`);
   if (!baselineId) throw new Error('--baseline=<structured-adapter-id> is required');
   const commands = {
     [argValue('candidate') ?? 'controlla']: parseCommand(process.env[commandEnvName(argValue('candidate') ?? 'controlla')], commandEnvName(argValue('candidate') ?? 'controlla')),
@@ -243,7 +271,7 @@ async function main() {
   };
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
-  const report = await runBenchmark({ candidateId: argValue('candidate') ?? 'controlla', baselineId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, repetitions, deadlineMs });
+  const report = await runBenchmark({ candidateId: argValue('candidate') ?? 'controlla', baselineId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, repetitions, deadlineMs, configPath });
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
   console.log(`wrote ${report.paired_rows.length} paired Phase 11 rows to ${output}`);

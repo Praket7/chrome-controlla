@@ -185,6 +185,7 @@ pub struct TargetLease {
 #[derive(Clone, Debug, Default)]
 pub struct LeaseTable {
     leases: BTreeMap<TargetKey, TargetLease>,
+    reentrant_depth: BTreeMap<TargetKey, usize>,
 }
 
 impl LeaseTable {
@@ -204,21 +205,66 @@ impl LeaseTable {
             acquired_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(250, 120_000)),
         };
-        self.leases.insert(target, lease.clone());
+        self.leases.insert(target.clone(), lease.clone());
+        self.reentrant_depth.insert(target, 1);
         Ok(lease)
     }
 
+    pub fn acquire_nested(
+        &mut self,
+        target: TargetKey,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<TargetLease, TargetLease> {
+        self.expire(now_ms);
+        let Some(existing) = self.leases.get(&target).cloned() else {
+            return self.acquire(target, owner, now_ms, ttl_ms);
+        };
+        if existing.owner != owner {
+            return Err(existing);
+        }
+        let Some(renewed) = self.renew(&target, owner, now_ms, ttl_ms) else {
+            return Err(existing);
+        };
+        *self.reentrant_depth.entry(target).or_default() += 1;
+        Ok(renewed)
+    }
+
+    /// Renew a live lease only for its current owner. Expired leases cannot be
+    /// resurrected; callers must stop the workflow if this returns `None`.
+    pub fn renew(
+        &mut self,
+        target: &TargetKey,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Option<TargetLease> {
+        self.expire(now_ms);
+        let lease = self.leases.get_mut(target)?;
+        if lease.owner != owner {
+            return None;
+        }
+        lease.expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(250, 120_000));
+        Some(lease.clone())
+    }
+
     pub fn release(&mut self, target: &TargetKey, owner: &str) -> bool {
-        if self
+        if !self
             .leases
             .get(target)
             .is_some_and(|lease| lease.owner == owner)
         {
-            self.leases.remove(target);
-            true
-        } else {
-            false
+            return false;
         }
+        let depth = self.reentrant_depth.entry(target.clone()).or_default();
+        if *depth > 1 {
+            *depth -= 1;
+        } else {
+            self.reentrant_depth.remove(target);
+            self.leases.remove(target);
+        }
+        true
     }
 
     pub fn owner(&mut self, target: &TargetKey, now_ms: u64) -> Option<String> {
@@ -228,6 +274,8 @@ impl LeaseTable {
 
     pub fn expire(&mut self, now_ms: u64) {
         self.leases.retain(|_, lease| lease.expires_at_ms > now_ms);
+        self.reentrant_depth
+            .retain(|target, _| self.leases.contains_key(target));
     }
 }
 

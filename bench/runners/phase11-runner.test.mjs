@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config } from './phase11-runner.mjs';
+import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config, liveTaskUrl } from './phase11-runner.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mock = resolve(here, 'mock-phase11-command.mjs');
@@ -29,6 +29,13 @@ test('parseCommand rejects shell strings and accepts argv JSON', () => {
   assert.deepEqual(parseCommand('["node","adapter.mjs"]', 'TEST'), ['node', 'adapter.mjs']);
   assert.throws(() => parseCommand('node adapter.mjs', 'TEST'), /valid JSON/);
   assert.throws(() => parseCommand('[]', 'TEST'), /non-empty JSON array/);
+});
+
+test('live site URLs require HTTPS and exact host allowlists', () => {
+  assert.equal(liveTaskUrl({ id:'safe', url:'https://demo.example.test/path', allowed_hosts:['demo.example.test'] }), 'https://demo.example.test/path');
+  assert.throws(() => liveTaskUrl({ id:'host-drift', url:'https://evil.example.test/path', allowed_hosts:['demo.example.test'] }), /exact allowlisted host/);
+  assert.throws(() => liveTaskUrl({ id:'credentials', url:'https://user:pass@demo.example.test/path', allowed_hosts:['demo.example.test'] }), /credential-free HTTPS/);
+  assert.throws(() => liveTaskUrl({ id:'http', url:'http://demo.example.test/path', allowed_hosts:['demo.example.test'] }), /credential-free HTTPS/);
 });
 
 test('validateAdapterResult rejects identity drift', async () => {

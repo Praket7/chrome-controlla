@@ -1,5 +1,13 @@
 # Blockers and external dependencies
 
+## Stage 3 S3-01–S3-16 status — 2026-10-13
+
+Code and wiring are implemented through all 16 planned Stage 3 items. The remaining release blockers are qualification inputs/evidence rather than missing runner paths: the 19-task real-site matrix has no measured runs; client-specific smoke commands and local client credentials/configuration have not been supplied; paired competitor runs, controlled-profile interference/background checks, and public performance claims remain unqualified. The new runners fail with explicit missing-adapter/dependency errors and do not mark these gates complete from fixtures. External model-call/token telemetry is not visible to the MCP process and is reported as unavailable; a claiming client adapter must measure it.
+
+## Stage 3 S3-01–S3-10 code boundary — 2026-10-13
+
+S3-01 through S3-10 are implemented and wired at code level. Qualified mutation templates, task-level runtime-classified WebMCP reads, exact-site/structure skill and profile routing, and guarded widget adapters are part of the V3 task path. Empirical acceptance remains open: no mixed-task non-inferiority benchmark, three-site DAG qualification, broad CAP-style live widget matrix, or external-client run was performed in this pass. `site-profiles-v1.json` is operator-provisioned and each entry must be qualified against the site's schema/structure; it is disabled on invalid/unreadable state. Unsupported widget structures return a guarded fallback. Do not claim real-site accuracy, zero-action completion rates, latency wins, or broad speed superiority from unit/fixture evidence.
+
 ## Speed claim boundary — 2026-10-10
 
 - The shared snapshot saves one host exchange in a batch-capable extension fixture, but measured wall-clock gains on the installed extension and other sites remain open. Cross-origin frame content, dynamically changing lists, and rich editors still need representative live qualification.
@@ -11,12 +19,15 @@
 
 ## V3 release blockers — 2026-10-09
 
+- 2026-10-12 headless Keychain popup fix: Controlla-owned headless Chrome now uses Chromium's macOS mock-keychain switch. The switch is absent from headed/shared runs; launch test and the headless smoke passed. No Keychain credential reset or normal Chrome profile change is needed. Reload/rebuild is still required before the installed MCP uses the source change.
+- Stage 3 implementation paths are present and locally tested, but the plan's empirical gates remain open: mixed observation benchmark, live canvas/widget qualification, three-site concurrency, real-site speculative profile, and client-level qualification. Remaining code boundaries are tracked per S3 item in `verification-matrix.md`; do not interpret local fixtures as live acceptance.
+
 - The v3 implementation plan is partial. Browser-mode parity, full near-page workflow batching, real 1,000-character typing/event qualification, live user-interference and multi-client races, and crash/reconnect stress still need real-browser evidence.
-- WebMCP descriptor and schema checks exist, but selected-tab discovery and invocation are not integrated. Keep the route fail-closed and do not claim WebMCP automation support.
+- WebMCP discovery and invocation are integrated for the selected tab. Registered read-only task routes now resolve by runtime-owned operation and exact origin, always rediscover the live schema, and refuse drift before dispatch; the task falls back to semantic extraction. Explicit page-tool calls retain their guarded consequential behavior.
 - Freebuff, OpenCode, Claude Code, Codex, ChatGPT Desktop, and generic MCP config contracts are checked. Real end-to-end client smokes remain unverified except for the separately recorded narrow OpenCode guide call; that does not qualify a v3 workflow.
 - Upload/download and authenticated persistence have browser/file-selection fixtures only; app acceptance and saved state remain unqualified.
 - No controlled real competitor results are available. The release gate must continue to reject broad “best” claims.
-- Multi-step workflows lease each mutation step but do not hold an exclusive transaction lease across the full workflow; cross-client changes between steps must continue to fail through revision-bound references. No live concurrent-agent qualification is claimed.
+- Guarded multi-step mutation tasks hold a bounded target lease; lower-level workflow nodes retain target-scoped guards. The epoch dimensions unavailable from the provider are covered only by target/document identity and semantic guards. No live concurrent-agent qualification is claimed.
 - The lease table is process-local. The current v3 shared-tab route uses one local Chrome namespace; coordination across separate server processes or multiple Chrome instances is not qualified.
 
 ## Source-audit repair follow-up — 2026-10-08
@@ -151,3 +162,10 @@ The old MCP binary rejected the Classroom upload before file selection because t
 ## Controlla 3 Stage 2 implementation boundary — 2026-10-12
 
 Stage 2 source implementation and local fixtures are complete for S2-01 through S2-16. The final Luna review found a standalone `act` route that bypassed command/time budgets; it is now wrapped in the shared 30-second/256-browser/20,000-CDP limit with typed pre-dispatch FastKeys refusal and a real-Chrome regression. A fresh Luna Medium final review found no actionable remaining implementation issues. The best-Chrome release claim remains disabled. The plan's matched 30% round-trip reduction, 25% median-latency reduction, noninferior success/safety, and competitor comparisons are not measured because this environment has no configured Phase 11 adapter, reset, fixture, and independent-verifier commands. On 2026-10-12, the loaded Controlla 3 extension ID was corrected in the native-host manifest and live MCP discovery returned a fresh inventory. Foreground live-site workflows and Codex's loaded MCP tool surface remain unverified. The one-tab workflow omits public parallel reads until the shared transport can safely multiplex commands.
+# Stage 3 remaining acceptance gates — 2026-10-12
+
+- The latest Rust V3 source has been rebuilt; direct stdio initialize and `tools/list` verified the exact six-tool surface and open idempotency field. The Codex-owned MCP process still needs restart before live behavior can be checked against this binary.
+- No real-client smoke adapters or credentials are configured, so live-client compatibility remains unverified.
+- The Phase 11 command/fixture/reset/independent-verifier adapters are not configured; real-site CAP coverage, paired C1/C2 performance/safety evidence, and any broad speed claim remain unverified.
+- At that historical checkpoint, the SDD ledger still marked code paths partial. The current 2026-10-13 source closes the requested S3-01–S3-10 code/wiring scope; performance, broad live-site, and external-client qualification remain separate open gates.
+- 2026-10-13 reloaded ESPN/Bills background run: one bounded workflow selected the unique newest of five same-origin story links from linked publication timestamps, but click returned `unknown`; read-only URL verification showed the source page unchanged and tab inventory showed no child tab. No click retry was sent. The rebuilt source now records anchor `target`/`rel` and routes observed `_blank` links to exact-href new-tab verification; this fixture/release check does not prove ESPN live click success, and the Codex MCP needs restart before that check can run.

@@ -239,12 +239,14 @@ enum ShutdownPhase {
     ProcessCleanup,
 }
 
-/// Receipt from a shutdown attempt. If cleanup cannot be safely completed,
-/// `recovery` retains the live browser process and private profile for retry.
+/// Receipt from a shutdown attempt. `forced_termination` is true only when a
+/// provider-owned headless process ignored `Browser.close` after all pages closed.
+/// If cleanup cannot be safely completed, `recovery` retains it for retry.
 pub struct ShutdownOutcome {
     pub receipt: crate::sessions::CleanupReceipt,
     pub recovery: Option<DedicatedBrowserSession>,
     pub cleanup_error: Option<String>,
+    pub forced_termination: bool,
 }
 
 impl DedicatedBrowserSession {
@@ -286,6 +288,7 @@ impl DedicatedBrowserSession {
                         cleanup_error: Some(
                             "session resources remain; browser process preserved".into(),
                         ),
+                        forced_termination: false,
                     };
                 }
                 self.shutdown_phase = ShutdownPhase::ProcessCleanup;
@@ -298,6 +301,7 @@ impl DedicatedBrowserSession {
                     cleanup_error: Some(
                         "preserved session resources prevent browser shutdown".into(),
                     ),
+                    forced_termination: false,
                 };
             }
             ShutdownPhase::ProcessCleanup => self.last_receipt.clone().unwrap_or_default(),
@@ -309,6 +313,7 @@ impl DedicatedBrowserSession {
                 cleanup_error: Some(
                     "headed Chrome is preserved; whole-window shutdown is disabled".into(),
                 ),
+                forced_termination: false,
             };
         }
         let target_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -326,6 +331,7 @@ impl DedicatedBrowserSession {
                         cleanup_error: Some(format!(
                             "cannot verify remaining page targets: {error}"
                         )),
+                        forced_termination: false,
                     };
                 }
             };
@@ -334,6 +340,7 @@ impl DedicatedBrowserSession {
                     receipt,
                     recovery: Some(self),
                     cleanup_error: Some("Target.getTargets returned no targetInfos array".into()),
+                    forced_termination: false,
                 };
             };
             let live_pages = target_infos
@@ -356,22 +363,28 @@ impl DedicatedBrowserSession {
                     cleanup_error: Some(format!(
                         "live page targets remain; Chrome process and profile preserved: {live_pages:?}"
                     )),
+                    forced_termination: false,
                 };
             }
             sleep(Duration::from_millis(50)).await;
         }
-        if let Err(error) = self.process.graceful_stop(&self.connection).await {
-            return ShutdownOutcome {
-                receipt,
-                recovery: Some(self),
-                cleanup_error: Some(error.to_string()),
-            };
-        }
+        let forced_termination = match self.process.graceful_stop(&self.connection).await {
+            Ok(forced) => forced,
+            Err(error) => {
+                return ShutdownOutcome {
+                    receipt,
+                    recovery: Some(self),
+                    cleanup_error: Some(error.to_string()),
+                    forced_termination: false,
+                };
+            }
+        };
         self.manager.evict(&self.endpoint).await;
         ShutdownOutcome {
             receipt,
             recovery: None,
             cleanup_error: None,
+            forced_termination,
         }
     }
 }
@@ -438,7 +451,10 @@ impl ChromeProcess {
         let _ = std::fs::remove_dir_all(&self.profile_directory);
     }
 
-    async fn graceful_stop(&mut self, connection: &BrowserConnection) -> Result<(), ProviderError> {
+    async fn graceful_stop(
+        &mut self,
+        connection: &BrowserConnection,
+    ) -> Result<bool, ProviderError> {
         if self.child.is_some() && !self.close_requested {
             connection
                 .command(None, "Browser.close", Value::Null)
@@ -452,13 +468,15 @@ impl ChromeProcess {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ProviderError::ShutdownTimeout);
+                // This child owns a private disposable profile and no pages remain.
+                self.stop();
+                return Ok(true);
             }
             sleep(Duration::from_millis(50)).await;
         }
         match std::fs::remove_dir_all(&self.profile_directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(ProviderError::Io(error)),
         }
     }
@@ -513,6 +531,8 @@ fn chrome_command(executable: &Path, profile_directory: &Path, mode: SessionMode
         .stderr(Stdio::inherit());
     if mode == SessionMode::Headless {
         command.arg("--headless=new");
+        #[cfg(target_os = "macos")]
+        command.arg("--use-mock-keychain");
     }
     command
 }
@@ -1341,6 +1361,11 @@ mod tests {
         assert!(headed.iter().any(|arg| arg == "--no-startup-window"));
         let headless = chrome_command(Path::new("/opt/chrome"), &profile, SessionMode::Headless);
         assert!(headless.get_args().any(|arg| arg == "--headless=new"));
+        #[cfg(target_os = "macos")]
+        assert!(headless.get_args().any(|arg| arg == "--use-mock-keychain"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!headless.get_args().any(|arg| arg == "--use-mock-keychain"));
+        assert!(!headed.iter().any(|arg| arg == "--use-mock-keychain"));
     }
 
     #[cfg(unix)]

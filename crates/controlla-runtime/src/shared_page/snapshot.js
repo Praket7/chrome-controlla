@@ -1,4 +1,36 @@
 function(q) {
+  const epochKey = Symbol.for('controlla.interactionEpoch.v1');
+  if (!window[epochKey]) {
+    const state = {semantic: 0};
+    Object.defineProperty(window, epochKey, {value: state, configurable: false});
+    new MutationObserver(() => { state.semantic++; }).observe(document, {
+      subtree: true, childList: true, attributes: true, characterData: true
+    });
+  }
+  const epochState = window[epochKey];
+  const interactionEpoch = () => {
+    const active = document.activeElement;
+    const focus = active ? JSON.stringify([
+      active.tagName, active.id || '', active.getAttribute('name') || '',
+      active.getAttribute('role') || '', active.getAttribute('aria-label') || ''
+    ]) : '';
+    let selection = '';
+    if (active && typeof active.selectionStart === 'number') {
+      selection = JSON.stringify([active.selectionStart, active.selectionEnd, active.selectionDirection || 'none']);
+    } else {
+      const current = window.getSelection?.();
+      if (current) selection = JSON.stringify([
+        current.anchorNode?.nodeType, current.anchorOffset,
+        current.focusNode?.nodeType, current.focusOffset, current.isCollapsed
+      ]);
+    }
+    const viewport = JSON.stringify([
+      innerWidth, innerHeight, scrollX, scrollY,
+      visualViewport?.width, visualViewport?.height,
+      visualViewport?.offsetLeft, visualViewport?.offsetTop, visualViewport?.scale
+    ]);
+    return {semantic_revision: epochState.semantic, focus, selection, viewport};
+  };
   const roots = document.querySelectorAll(q.selector);
   if (roots.length !== 1) throw Error('snapshot scope must match exactly one element');
   let root = roots[0];
@@ -132,7 +164,8 @@ function(q) {
       const freshnessUpperBound = dateOnly ? Date.UTC(Number(dateOnly[1]), Number(dateOnly[2])-1, Number(dateOnly[3])+1, 12)-1 : null;
       const exactInstant = typeof datetime === 'string' && /T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/.test(datetime);
       const rich = richEditor(e), editable = rich || e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(e.type);
-      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),role:e.getAttribute('role') || (rich ? 'textbox' : ({A:'link',BUTTON:'button',INPUT:'input',TEXTAREA:'textbox',SELECT:'combobox',SUMMARY:'button'}[e.tagName] || 'control')),name:label,text:label,raw_value:value,...state,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',href:e.tagName === 'A' ? e.href : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind};
+      const feedbackRegion = e.closest('[role="alert"],[role="status"],[role="log"],[aria-live]') !== null;
+      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),role:e.getAttribute('role') || (rich ? 'textbox' : ({A:'link',BUTTON:'button',INPUT:'input',TEXTAREA:'textbox',SELECT:'combobox',SUMMARY:'button'}[e.tagName] || 'control')),name:label,text:label,raw_value:value,...state,feedback_region:feedbackRegion,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',hover_reveals:e.getAttribute('data-hover-reveals')==='true'||e.hasAttribute('data-hover-reveals'),draggable:e.draggable===true||e.getAttribute('data-draggable')==='true',drop_target:e.getAttribute('data-drop-target')==='true'||e.getAttribute('aria-dropeffect')==='move',widget_kind:e.getAttribute('data-widget-kind'),href:e.tagName === 'A' ? e.href : null,target:e.tagName === 'A' ? e.getAttribute('target') : null,rel:e.tagName === 'A' ? e.getAttribute('rel') : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),bounds:scope.frame==='main'?{x:b.left+e.ownerDocument.defaultView.scrollX,y:b.top+e.ownerDocument.defaultView.scrollY,width:b.width,height:b.height}:null,source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind};
       let queryScore = 0;
       if (q.goal) {
         const normalize = text => text.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ').trim();
@@ -240,5 +273,5 @@ function(q) {
   const scope_complete = q.goal ? !truncated && !early_stopped && frames_complete : q.href_hint ? first_party_complete : complete;
   const target_uniqueness = scope_complete ? 'scope_complete' : 'unverified';
   for (const item of items) item.target_uniqueness = target_uniqueness;
-  return {nodes,items,raw,name,presentation,visible:e=>presentation(e).rendered,public:{url:location.href,title:document.title,ready_state:document.readyState,items,text:text.slice(0,q.max_text_chars),text_requested,text_truncated,truncated:!complete,complete,global_complete:complete,completeness:{controls:controls_complete?'complete':'partial',text:text_complete?'complete':'partial',frames:frames_complete?'complete':'partial'},incomplete_reasons,goal_satisfied,goal_score:goal_satisfied?goal_score:null,scope_complete,coverage,coverage_scope:q.goal?'ranked_target':q.href_hint ? 'matching_first_party_links' : 'all_reachable_controls',first_party_complete,scanned_nodes:Math.min(scanned,maxScanNodes),scanned_text_nodes:textScanned,search_budget_exhausted:truncation_reason==='scanned_nodes_exceeded',omitted_by_limit,omitted_oversized,shadow_roots_seen,iframes_seen,same_origin_frames_read,same_origin_frames_pending,blank_frames_seen,cross_origin_frames_unread,truncation_reason:truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : same_origin_frames_pending ? 'same_origin_frames_pending' : null),total_candidates:items.length+omitted_by_limit}};
+  return {nodes,items,raw,name,presentation,visible:e=>presentation(e).rendered,public:{interaction_epoch:interactionEpoch(),url:location.href,title:document.title,ready_state:document.readyState,items,text:text.slice(0,q.max_text_chars),text_requested,text_truncated,truncated:!complete,complete,global_complete:complete,completeness:{controls:controls_complete?'complete':'partial',text:text_complete?'complete':'partial',frames:frames_complete?'complete':'partial'},incomplete_reasons,goal_satisfied,goal_score:goal_satisfied?goal_score:null,scope_complete,coverage,coverage_scope:q.goal?'ranked_target':q.href_hint ? 'matching_first_party_links' : 'all_reachable_controls',first_party_complete,scanned_nodes:Math.min(scanned,maxScanNodes),scanned_text_nodes:textScanned,search_budget_exhausted:truncation_reason==='scanned_nodes_exceeded',omitted_by_limit,omitted_oversized,shadow_roots_seen,iframes_seen,same_origin_frames_read,same_origin_frames_pending,blank_frames_seen,cross_origin_frames_unread,truncation_reason:truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : same_origin_frames_pending ? 'same_origin_frames_pending' : null),total_candidates:items.length+omitted_by_limit}};
 }

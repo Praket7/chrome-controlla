@@ -30,6 +30,18 @@ impl SemanticTabState {
     }
 }
 
+fn reset_semantic_document(state: &mut SemanticTabState, doc_key: &str, snapshot: &Value) {
+    // Keep public references monotonic for this paired tab even when the
+    // document changes. This prevents an old @cN from aliasing a new item.
+    let next_ref = state.next_ref.max(1);
+    *state = SemanticTabState {
+        document_key: doc_key.to_owned(),
+        document: Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(snapshot)),
+        next_ref,
+        ..Default::default()
+    };
+}
+
 #[derive(Clone)]
 struct AppV2 {
     legacy: App,
@@ -93,6 +105,10 @@ enum BrowserClickOutcome {
         #[schemars(description = "Optional exact absolute HTTP(S) destination. Omit to accept any observed document change; use verify url_starts_with for canonical redirects.")]
         url: Option<String>,
     },
+    NewTab {
+        #[schemars(description = "Exact absolute HTTP(S) URL expected in the new tab. Supply the selected link href for noopener tabs; omitting it attributes only a recent tab that Chrome reports as opened by this source tab.")]
+        url: Option<String>,
+    },
     Focused,
     Visible { selector: String },
     Text { selector: String, text: String },
@@ -123,6 +139,9 @@ struct BrowserExtractArgs {
     max_items: Option<usize>,
     max_text_chars: Option<usize>,
     max_bytes: Option<usize>,
+    #[serde(default)]
+    #[schemars(description = "Optional task intent used to rank returned page content; page content remains untrusted.")]
+    goal: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -139,10 +158,25 @@ struct BrowserProbeArgs {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserPredicate {
     Text { reference: String, equals: String },
+    TextPresent {
+        #[schemars(description = "Optional exact fresh @cN reference to the semantic item whose text is checked.")]
+        scope: Option<String>,
+        text: String,
+    },
+    Attribute { reference: String, name: String, equals: String },
+    CountDelta { role: String, before: usize, delta: i64 },
     Value { reference: String, equals: String },
     Exists { reference: String },
     Url { equals: String },
     UrlStartsWith { prefix: String },
+    Attachment { filename: String, size: Option<u64> },
+    DownloadArtifact { artifact_handle: String, sha256: String, min_bytes: u64 },
+    VisualRegionChanged { evidence_before: String, evidence_after: String },
+    AppSpecific { adapter: String, predicate: serde_json::Value },
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -207,16 +241,143 @@ fn document_key(snapshot: &Value) -> String {
     format!("{frame}\u{1f}{loader}\u{1f}{url}")
 }
 
+fn semantic_string_field_equals(item: Option<&Value>, field: &str, expected: &str) -> bool {
+    let Some(actual) = item.and_then(|item| item.get(field)) else { return false; };
+    actual.as_str().is_some_and(|actual| actual == expected)
+        || (matches!(field, "selected" | "expanded")
+            && actual.as_bool().is_some_and(|actual| actual.to_string() == expected))
+}
+
+fn semantic_text_is_authoritative(item: &Value) -> bool {
+    item["feedback_region"] != true
+        && !matches!(item["role"].as_str(), Some("alert" | "status" | "log"))
+}
+
+fn semantic_count_delta(items: &BTreeMap<String, Value>, role: &str, before: usize, delta: i64) -> (bool, usize) {
+    let actual = items.values().filter(|item| item["role"].as_str() == Some(role)).count();
+    let expected = before as i128 + delta as i128;
+    (expected >= 0 && expected <= usize::MAX as i128 && actual as i128 == expected, actual)
+}
+
 fn changed_fields(previous: &Value, current: &Value) -> bool {
     ["role", "name", "raw_value", "href", "expanded", "selected", "disabled", "requires_trusted_events", "present", "rendered", "in_viewport", "pointer_events_none", "actionability", "editable_kind", "multiline"]
         .into_iter()
         .any(|field| previous.get(field) != current.get(field))
 }
 
+pub(super) fn update_observation_bytes(value: &mut Value) -> u64 {
+    if value.get("observation").is_none() { return 0; }
+    let mut bytes = 0;
+    for _ in 0..3 {
+        bytes = serde_json::to_vec(value).map_or(0, |encoded| encoded.len() as u64);
+        if value["observation"]["bytes"] == json!(bytes) { break; }
+        value["observation"]["bytes"] = json!(bytes);
+    }
+    bytes
+}
+
+fn attach_observation_metadata(value: &mut Value, decision: crate::observation_router::ObservationDecision) -> u64 {
+    value["observation"] = json!({"mode":decision.mode,"reason":decision.reason,"bytes":0});
+    update_observation_bytes(value)
+}
+
+fn query_needs_layout(query: &str) -> bool {
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    ["layout", "chart", "graph", "map", "canvas", "diagram", "overlap", "position"]
+        .iter()
+        .any(|term| terms.contains(*term))
+}
+
+fn observation_task_class(query: Option<&str>) -> crate::observation_router::TaskClass {
+    let words = query.unwrap_or_default().split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase).collect::<std::collections::BTreeSet<_>>();
+    if ["dashboard", "filter", "sort", "chart", "table"].iter().any(|word| words.contains(*word)) {
+        crate::observation_router::TaskClass::FilterSortDashboard
+    } else if ["fill", "submit", "save", "delete", "send", "purchase", "edit"].iter().any(|word| words.contains(*word)) {
+        crate::observation_router::TaskClass::Mutation
+    } else if query.is_some() {
+        crate::observation_router::TaskClass::Research
+    } else {
+        crate::observation_router::TaskClass::General
+    }
+}
+
+fn scoped_html_expression(selector: &str, max_chars: usize) -> String {
+    format!(
+        r#"(()=>{{let root;try{{const matches=[...document.querySelectorAll({selector})];if(matches.length!==1)return {{ok:false,reason:matches.length===0?'no_match':'ambiguous',count:matches.length}};root=matches[0].cloneNode(true)}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}}root.querySelectorAll('script,style,noscript,iframe,object,embed,svg,input,textarea,select,button').forEach(node=>node.remove());for(const node of [root,...root.querySelectorAll('*')]){{for(const attr of [...node.attributes]){{if(!['id','class','role','aria-label','aria-expanded','aria-selected','aria-controls','data-state'].includes(attr.name))node.removeAttribute(attr.name)}}}}return {{ok:true,html:root.outerHTML.slice(0,{max_chars}),truncated:root.outerHTML.length>{max_chars}}}}})()"#,
+        selector = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+        max_chars = max_chars.clamp(1, 32_768),
+    )
+}
+
+async fn scoped_html_view(
+    app: &AppV2,
+    session_id: &str,
+    tab_id: &str,
+    selector: &str,
+    max_bytes: usize,
+) -> Result<Value, rmcp::ErrorData> {
+    if selector.trim().is_empty() || selector.len() > 2048 || selector.contains('\0') {
+        return Err(invalid("scoped HTML requires one bounded CSS selector"));
+    }
+    let shared = app.legacy.shared_sessions.lock().await
+        .get(session_id).cloned().ok_or_else(|| invalid("unknown shared session_id"))?;
+    let shared = shared.lock().await;
+    if shared.handle.principal != app.legacy.principal.as_ref() {
+        return Err(invalid("session is not owned by this server principal"));
+    }
+    let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+    let registry = shared.registry()?;
+    let before = super::shared_frame_identity(connection, registry, &shared.handle, tab_id).await.map_err(invalid)?;
+    let expression = scoped_html_expression(selector, max_bytes.min(32_768));
+    let response = connection.command(registry, &shared.handle, tab_id, "Runtime.evaluate", serde_json::json!({"expression":expression,"returnByValue":true})).await.map_err(|error| invalid(error.to_string()))?;
+    let mut result = super::shared_value(&response).map_err(invalid)?;
+    let after = super::shared_frame_identity(connection, registry, &shared.handle, tab_id).await.map_err(invalid)?;
+    if before != after { return Err(invalid("document changed during scoped HTML observation")); }
+    if result["ok"] != true { return Err(invalid(format!("scoped HTML unavailable: {}", result["reason"].as_str().unwrap_or("unknown")))); }
+    let html = result["html"].as_str().unwrap_or_default().to_owned();
+    let limit = max_bytes.clamp(4096, 32_768);
+    let mut bounded = String::new();
+    for character in html.chars() {
+        if bounded.len() + character.len_utf8() > limit { break; }
+        bounded.push(character);
+    }
+    result["html"] = json!(bounded);
+    result["truncated"] = json!(result["truncated"] == true || bounded.len() < html.len());
+    result["document"] = json!({"frame_id":before.0,"loader_id":before.1,"url":before.2});
+    result["page_content_is_untrusted"] = json!(true);
+    Ok(result)
+}
+
 async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value, rmcp::ErrorData> {
     let started = std::time::Instant::now();
+    // Reuse the last observed candidate set to choose the next snapshot's
+    // detail level. This avoids taking a second snapshot just to estimate
+    // ambiguity, while still allowing a compact first read to trigger a rich
+    // follow-up when it exposed several indistinguishable controls.
+    let prior_ambiguity = app.semantic.lock().await
+        .get(&tab_key(&args.session_id, &args.chrome_tab_id))
+        .map(|state| semantic_ambiguity(state.items.values()))
+        .unwrap_or(0.0);
+    let decision = crate::observation_router::choose_observation(crate::observation_router::ObservationRequest {
+        task_class: observation_task_class(args.goal.as_ref().and_then(|goal| goal.query.as_deref())),
+        model_profile: args.goal.as_ref().and_then(|goal| goal.model_profile).map(|profile| match profile {
+            super::ObservationModelProfile::RichContext => crate::observation_router::ModelProfile::RichContext,
+            super::ObservationModelProfile::CompactContext => crate::observation_router::ModelProfile::CompactContext,
+        }).or_else(|| args.max_text_chars.map(|limit| if limit > 2_000 { crate::observation_router::ModelProfile::RichContext } else { crate::observation_router::ModelProfile::CompactContext })),
+        exhaustive: args.goal.as_ref().is_some_and(|goal| goal.exhaustive),
+        needs_layout: args.goal.as_ref().is_some_and(|goal| goal.needs_layout)
+            || args.goal.as_ref().and_then(|goal| goal.query.as_deref()).is_some_and(query_needs_layout),
+        ambiguity: prior_ambiguity,
+        rich_context: args.max_text_chars.is_some_and(|limit| limit > 2_000),
+        frame_id: args.frame_id.is_some(),
+        scoped_selector: args.selector.is_some(),
+    });
     if let Some(frame_id) = args.frame_id.as_deref() {
-        let Json(value) = app.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
+        let Json(mut value) = app.legacy.shared_accessibility(Parameters(SharedAccessibilityArgs {
             session_id: args.session_id.clone(),
             chrome_tab_id: args.chrome_tab_id.clone(),
             selector: None,
@@ -224,7 +385,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000),
             timeout_ms: Some(10_000),
         })).await?;
-        let bytes = serde_json::to_vec(&value).map_or(0, |encoded| encoded.len() as u64);
+        let bytes = attach_observation_metadata(&mut value, decision);
         controlla_browser::scheduler::telemetry::record_observation(0, bytes).await;
         controlla_browser::scheduler::telemetry::record_phase(
             controlla_browser::scheduler::telemetry::OperationPhase::Snapshot,
@@ -239,7 +400,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             chrome_tab_id: args.chrome_tab_id.clone(),
             selector: args.selector.clone().unwrap_or_else(snapshot_scope),
             max_items: args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200),
-            max_text_chars: args.max_text_chars.unwrap_or_else(snapshot_chars).min(6000),
+            max_text_chars: args.max_text_chars.unwrap_or_else(|| if decision.mode == crate::observation_router::ObservationMode::SemanticRich { 6_000 } else { snapshot_chars() }).min(6000),
             max_bytes: args.max_bytes.unwrap_or_else(snapshot_bytes).clamp(4096, 100_000),
             href_hint: args.href_hint.clone(),
             goal: args.goal.clone(),
@@ -252,6 +413,8 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let intent_query = args.goal.as_ref().and_then(|goal| goal.query.as_deref());
+    let items = crate::relevance::filter_items(&items, intent_query, args.max_items.unwrap_or(200));
     let item_keys = crate::semantic_state::stable_item_keys(&items, snapshot["snapshot_id"].as_str().unwrap_or_default());
     let key = tab_key(&args.session_id, &args.chrome_tab_id);
     let doc_key = document_key(&snapshot);
@@ -265,12 +428,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
     let state = semantic.entry(key).or_default();
     let document_changed = !state.document_key.is_empty() && state.document_key != doc_key;
     if state.document_key != doc_key {
-        *state = SemanticTabState {
-            document_key: doc_key.clone(),
-            document: Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot)),
-            next_ref: 1,
-            ..Default::default()
-        };
+        reset_semantic_document(state, &doc_key, &snapshot);
     }
     state.document = Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot));
     state.scope_complete = scope_complete;
@@ -297,6 +455,13 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             .to_owned();
         item["reference"] = json!(short);
         item["index"] = json!(index);
+        if let Some(adapter) = crate::widget_adapters::resolve_widget(&item) {
+            item["widget_adapter"] = json!({
+                "kind": adapter.kind,
+                "postcondition": adapter.live_postcondition,
+                "fallback": adapter.fallback
+            });
+        }
         let identity = crate::reference_reacquire::SemanticIdentity::from_item(
             &item,
             state.document.as_ref().expect("snapshot document was set"),
@@ -327,7 +492,33 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         "upsert": upsert,
         "removed": removed
     });
-    let bytes = serde_json::to_vec(&snapshot).map_or(0, |encoded| encoded.len() as u64);
+    drop(semantic);
+    if decision.mode == crate::observation_router::ObservationMode::HtmlScoped {
+        if let Some(selector) = args.selector.as_deref() {
+            snapshot["scoped_html"] = scoped_html_view(
+                app, &args.session_id, &args.chrome_tab_id, selector,
+                args.max_bytes.unwrap_or(32_768).min(32_768),
+            ).await?;
+        }
+        snapshot["page_content_is_untrusted"] = json!(true);
+    } else if decision.mode == crate::observation_router::ObservationMode::VisualTargeted {
+        if let Some(selector) = args.selector.as_deref() {
+            let visual = full::visual_probe(app, full::FullProbeArgs {
+                session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(),
+                reference: None, selector: Some(selector.to_owned()), region: None,
+                max_bytes: Some(args.max_bytes.unwrap_or(262_144).min(262_144)), timeout_ms: Some(10_000),
+            }).await?;
+            if visual["visual_ref"]["frame_id"] == snapshot["document"]["frame_id"]
+                && visual["visual_ref"]["loader_id"] == snapshot["document"]["loader_id"]
+            {
+                snapshot["visual_probe"] = visual;
+            } else {
+                return Err(invalid("document changed between semantic and targeted visual observations"));
+            }
+        }
+        snapshot["page_content_is_untrusted"] = json!(true);
+    }
+    let bytes = attach_observation_metadata(&mut snapshot, decision);
     controlla_browser::scheduler::telemetry::record_observation(
         snapshot["scanned_nodes"].as_u64().unwrap_or(0),
         bytes,
@@ -337,6 +528,21 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
     ).await;
     Ok(snapshot)
+}
+
+fn semantic_ambiguity<'a>(items: impl Iterator<Item = &'a Value>) -> f32 {
+    let mut counts = std::collections::BTreeMap::<(String, String), usize>::new();
+    let mut total = 0usize;
+    for item in items {
+        let role = item.get("role").and_then(Value::as_str).unwrap_or_default().trim();
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default().trim();
+        if role.is_empty() || name.is_empty() { continue; }
+        total += 1;
+        *counts.entry((role.to_ascii_lowercase(), name.to_ascii_lowercase())).or_default() += 1;
+    }
+    if total == 0 { return 0.0; }
+    let collisions = counts.values().map(|count| count.saturating_sub(1)).sum::<usize>();
+    (collisions as f32 / total as f32).clamp(0.0, 1.0)
 }
 
 async fn resolve_reference(app: &AppV2, session_id: &str, tab_id: &str, reference: &str) -> Result<String, rmcp::ErrorData> {
@@ -408,6 +614,8 @@ async fn retained_mutation(
             href_hint: expected.href.clone(),
             within: ancestor,
             exhaustive: true,
+            model_profile: None,
+            needs_layout: false,
         }),
         max_scan_nodes: Some(65_536),
     }).await;
@@ -467,7 +675,7 @@ async fn retained_click(
         selector: None, max_items: Some(200), max_text_chars: Some(0), max_bytes: Some(100_000),
         href_hint: None, frame_id: None,
         goal: Some(SnapshotGoal { query: Some(expected.name.clone()), roles: Some(vec![expected.role.clone()]),
-            href_hint: expected.href.clone(), within: None, exhaustive: true }),
+            href_hint: expected.href.clone(), within: None, exhaustive: true, model_profile: None, needs_layout: false }),
         max_scan_nodes: Some(65_536),
     }).await?;
     if fresh["scope_complete"] != true { return Ok(first); }
@@ -543,21 +751,28 @@ async fn retained_mutation_once(
     }
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
-    let before = {
+    let (before, interaction) = {
         let connection = shared
             .connection
             .as_ref()
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
         let registry = shared.registry()?;
-        tokio::time::timeout_at(
+        let before = tokio::time::timeout_at(
             deadline,
             shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
         )
         .await
         .map_err(|_| invalid("action preflight timed out; no mutation dispatched"))?
-        .map_err(invalid)?
+        .map_err(invalid)?;
+        let interaction = tokio::time::timeout_at(
+            deadline,
+            super::shared_interaction_epoch(connection, registry, &shared.handle, &args.chrome_tab_id, &snapshot.object_id),
+        ).await.map_err(|_| invalid("action epoch check timed out; no mutation dispatched"))?
+          .map_err(invalid)?;
+        (before, interaction)
     };
-    if !unrestricted && before != snapshot.identity {
+    let epoch_use=if action=="slider" {crate::v3::EpochUse::PointerMutation}else{crate::v3::EpochUse::TextMutation};
+    if !unrestricted && !super::shared_epoch_matches(&snapshot, &args.chrome_tab_id, &before, &interaction, epoch_use) {
         return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
     }
     if allow_password && action != "fill" {
@@ -567,6 +782,8 @@ async fn retained_mutation_once(
         r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement)||e.type!=='password'||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(r.width<=0||r.height<=0||r.left<0||r.top<0||r.right>innerWidth||r.bottom>innerHeight||s.visibility==='hidden'||s.display==='none'||s.pointerEvents==='none'||document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)!==e)return {ok:false,reason:'blocked'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value,dispatched:true};}"#
     } else if action == "fill" {
         r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)||['password','hidden','file','checkbox','radio','button','submit','reset','image'].includes(e.type||'')||e.matches(':disabled')||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value,dispatched:true};}"#
+    } else if action == "slider" {
+        r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLInputElement)||e.type!=='range'||e.matches(':disabled')||e.getAttribute('aria-disabled')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};const n=Number(value),min=e.min===''?0:Number(e.min),max=e.max===''?100:Number(e.max),step=e.step==='any'?0:Number(e.step);if(!Number.isFinite(n)||n<min||n>max||(step>0&&Math.abs((n-min)/step-Math.round((n-min)/step))>1e-6))return {ok:false,reason:'invalid_range_value'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'missing_value_setter'};setter.call(e,String(n));e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertReplacementText',data:String(n)}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===String(n),value:e.value,aria_value:e.getAttribute('aria-valuenow'),dispatched:true};}"#
     } else {
         r#"function(index,expected,value){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'target_replaced'};if(!(e instanceof HTMLSelectElement)||e.matches(':disabled')||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'blocked'};if(e.value!==expected)return {ok:false,reason:'stale_value',value:e.value};if(![...e.options].some(o=>o.value===value))return {ok:false,reason:'option_missing'};e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,value:e.value};}"#
     };
@@ -733,32 +950,107 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
             goal: None,
             max_scan_nodes: None,
     }).await?;
+    if let BrowserPredicate::DownloadArtifact { artifact_handle, sha256, min_bytes } = &args.predicate {
+        if artifact_handle.is_empty() || artifact_handle.len() > 256 || !valid_sha256(sha256) {
+            return Err(invalid("download verification requires a bounded artifact handle and lowercase SHA-256"));
+        }
+        let live = app.legacy.shared_sessions.lock().await.get(&args.session_id).cloned()
+            .ok_or_else(|| invalid("unknown shared session for download verification"))?;
+        let live = live.lock().await;
+        if live.handle.principal != app.legacy.principal.as_ref() {
+            return Err(invalid("artifact session is not owned by this server principal"));
+        }
+        let handle: controlla_browser::sessions::ArtifactHandle = serde_json::from_value(json!(artifact_handle))
+            .map_err(|_| invalid("invalid opaque artifact_handle"))?;
+        let registry = live.registry()?;
+        let metadata = registry.artifact_metadata(&live.handle, &handle)
+            .map_err(|_| invalid("download artifact is unavailable in this session"))?;
+        let path = registry.artifact_path_for(&live.handle.id, &live.handle.principal, &handle)
+            .map_err(|_| invalid("download artifact path is unavailable"))?;
+        let bytes = tokio::fs::read(path).await.map_err(|_| invalid("download artifact could not be read"))?;
+        let digest = crate::artifacts::ArtifactExpectation::sha256(&bytes);
+        let passed = bytes.len() as u64 >= *min_bytes && digest == *sha256 && metadata.size as u64 == bytes.len() as u64;
+        return Ok(json!({"status":if passed {"passed"} else {"failed"},"observer":"runtime_owned_artifact_readback",
+            "observed":{"sha256":digest,"bytes":bytes.len()},"document":snapshot["document"]}));
+    }
     let state = app.semantic.lock().await;
     let state = state.get(&tab_key(&args.session_id, &args.chrome_tab_id)).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
-    let (passed, observed) = match &args.predicate {
-        BrowserPredicate::Exists { reference } => (state.items.contains_key(reference), json!(state.items.get(reference))),
+    let (passed, observed, complete) = match &args.predicate {
+        BrowserPredicate::Exists { reference } => (state.items.contains_key(reference), json!(state.items.get(reference)), true),
         BrowserPredicate::Text { reference, equals } => {
+            let item = state.items.get(reference).filter(|item| semantic_text_is_authoritative(item));
+            let actual = item.and_then(|v| v.get("name")).and_then(Value::as_str);
+            (semantic_string_field_equals(item, "name", equals), json!(actual), true)
+        }
+        BrowserPredicate::TextPresent { scope, text } => {
+            if text.is_empty() || text.len() > 4096 { return Err(invalid("verification text must contain 1..4096 bytes")); }
+            let matched = if let Some(reference) = scope {
+                state.items.get(reference).is_some_and(|item| semantic_text_is_authoritative(item) && item.get("text").or_else(|| item.get("name")).and_then(Value::as_str).is_some_and(|value| value.contains(text)))
+            } else {
+                state.items.values().any(|item| semantic_text_is_authoritative(item) && item.get("text").or_else(|| item.get("name")).and_then(Value::as_str).is_some_and(|value| value.contains(text)))
+            };
+            let complete = scope.is_some() || snapshot["scope_complete"] == true;
+            (matched, json!({"text_present":matched,"scope":scope}), complete)
+        }
+        BrowserPredicate::Attribute { reference, name, equals } => {
+            if !matches!(name.as_str(), "href" | "datetime" | "role" | "selected" | "expanded") {
+                return Err(invalid("attribute verification is limited to href, datetime, role, selected, or expanded"));
+            }
             let item = state.items.get(reference);
-            let actual = item.and_then(|v| v.get("name")).and_then(Value::as_str).unwrap_or_default();
-            (actual == equals, json!(actual))
+            let actual = item.and_then(|item| item.get(name)).cloned().unwrap_or(Value::Null);
+            (semantic_string_field_equals(item, name, equals), actual, true)
+        }
+        BrowserPredicate::CountDelta { role, before, delta } => {
+            if role.is_empty() || role.len() > 64 { return Err(invalid("count_delta role must be 1..64 bytes")); }
+            let (matched, actual) = semantic_count_delta(&state.items, role, *before, *delta);
+            (matched, json!({"role":role,"count":actual,"before":before,"delta":delta}), snapshot["scope_complete"] == true)
         }
         BrowserPredicate::Value { reference, equals } => {
             let item = state.items.get(reference);
-            let actual = item.and_then(|v| v.get("raw_value")).and_then(Value::as_str).unwrap_or_default();
-            (actual == equals, json!(actual))
+            let actual = item.and_then(|v| v.get("raw_value")).and_then(Value::as_str);
+            (semantic_string_field_equals(item, "raw_value", equals), json!(actual), true)
         }
         BrowserPredicate::Url { equals } => {
             let actual = snapshot.get("url").and_then(Value::as_str).unwrap_or_default();
-            (actual == equals, json!(actual))
+            (actual == equals, json!(actual), true)
         }
         BrowserPredicate::UrlStartsWith { prefix } => {
             if prefix.is_empty() { return Err(invalid("URL prefix cannot be empty")); }
             let actual = snapshot.get("url").and_then(Value::as_str).unwrap_or_default();
-            (actual.starts_with(prefix), json!(actual))
+            (actual.starts_with(prefix), json!(actual), true)
+        }
+        BrowserPredicate::Attachment { filename, size } => {
+            if filename.is_empty() || filename.len() > 512 {
+                return Err(invalid("attachment filename must contain 1..512 bytes"));
+            }
+            let found = state.items.values().find(|item| {
+                semantic_text_is_authoritative(item)
+                    && matches!(item.get("role").and_then(Value::as_str), Some("attachment" | "listitem" | "option"))
+                    && (item.get("filename").and_then(Value::as_str) == Some(filename)
+                        || item.get("name").and_then(Value::as_str) == Some(filename))
+                    && size.is_none_or(|expected| item.get("size").and_then(Value::as_u64) == Some(expected))
+            });
+            (found.is_some(), json!({"filename":filename,"size":found.and_then(|item|item.get("size")).cloned()}), snapshot["scope_complete"] == true)
+        }
+        BrowserPredicate::DownloadArtifact { .. } => unreachable!("handled before the semantic snapshot borrow"),
+        BrowserPredicate::VisualRegionChanged { .. } => {
+            return Ok(json!({"status":"inconclusive","observer":"fresh_shared_page_snapshot","reason":"visual_region_changed requires two same-document runtime probe results supplied to workflow verify","document":snapshot["document"]}));
+        }
+        BrowserPredicate::AppSpecific { adapter, predicate } => {
+            if adapter != "semantic_field_equals" { return Err(invalid("app_specific adapter is not registered")); }
+            let reference = predicate["reference"].as_str().ok_or_else(|| invalid("semantic_field_equals requires reference"))?;
+            let field = predicate["field"].as_str().ok_or_else(|| invalid("semantic_field_equals requires field"))?;
+            let expected = predicate.get("equals").and_then(Value::as_str).ok_or_else(|| invalid("semantic_field_equals requires string equals"))?;
+            if !matches!(field, "name" | "role" | "href" | "datetime" | "selected" | "expanded" | "raw_value") || expected.len() > 4096 {
+                return Err(invalid("semantic_field_equals field or value is outside its allowlist"));
+            }
+            let item = state.items.get(reference).filter(|item| semantic_text_is_authoritative(item));
+            let actual = item.and_then(|item| item.get(field)).and_then(Value::as_str);
+            (actual == Some(expected), json!({"field":field,"value":actual}), true)
         }
     };
     Ok(json!({
-        "status": if passed { "passed" } else { "failed" },
+        "status": if passed { "passed" } else if complete { "failed" } else { "incomplete" },
         "observer":"fresh_shared_page_snapshot",
         "observed":observed,
         "semantic_revision":snapshot["semantic_revision"],
@@ -806,7 +1098,7 @@ impl AppV2 {
         let reference = args.reference.as_deref().ok_or_else(|| invalid("reference is required"))?;
         let result = match args.action.as_str() {
             "click" => {
-                if let Some(BrowserClickOutcome::Navigation { url: Some(url) }) = args.outcome.as_ref() {
+                if let Some(BrowserClickOutcome::Navigation { url: Some(url) } | BrowserClickOutcome::NewTab { url: Some(url) }) = args.outcome.as_ref() {
                     super::validate_shared_url(url)?;
                 }
                 if let Some(frame_ref) = reference.strip_prefix("@f:") {
@@ -837,15 +1129,16 @@ impl AppV2 {
                 retained_click(self, &args, reference, outcome).await?
                 }
             }
-            "fill" | "select" => retained_mutation(self, &args, reference, false, &args.action).await?,
-            _ => return Err(invalid("action must be click, fill, or select")),
+            "fill" | "select" | "slider" => retained_mutation(self, &args, reference, false, &args.action).await?,
+            _ => return Err(invalid("action must be click, fill, select, or slider")),
         };
         Ok(Json(result))
     }
 
     #[tool(name = "browser_extract", description = "Run a bounded structured extraction from one explicitly paired Chrome tab while requiring the root frame, loader, and URL to remain stable across the read.")]
     async fn browser_extract(&self, Parameters(args): Parameters<BrowserExtractArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
-        let result = self.legacy.shared_observe(Parameters(SharedObserveArgs {
+    let relevance_goal = args.goal.clone();
+    let result = self.legacy.shared_observe(Parameters(SharedObserveArgs {
             session_id: args.session_id,
             chrome_tab_id: args.chrome_tab_id,
             spec: ObserveInput {
@@ -858,7 +1151,14 @@ impl AppV2 {
             },
         })).await;
         match result {
-            Ok(value) => Ok(Json(value.0)),
+            Ok(value) => {
+                let mut value = value.0;
+                if let Some(items) = value["items"].as_array().cloned() {
+                    value["items"] = json!(crate::relevance::filter_items(&items, relevance_goal.as_deref(), args.max_items.unwrap_or(100)));
+                }
+                crate::relevance::mark_untrusted(&mut value);
+                Ok(Json(value))
+            },
             Err(error) => match selector_error_receipt(&error.message) {
                 Some(receipt) => Ok(Json(receipt)),
                 None => Err(error),
@@ -1027,6 +1327,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expanded_verifier_predicates_are_exposed_with_typed_inputs() {
+        let download: BrowserVerifyArgs = serde_json::from_value(json!({"session_id":"s","chrome_tab_id":"t","predicate":{"kind":"download_artifact","artifact_handle":"opaque","sha256":"a".repeat(64),"min_bytes":12}})).unwrap();
+        assert!(matches!(download.predicate, BrowserPredicate::DownloadArtifact { min_bytes: 12, .. }));
+        let attachment: BrowserVerifyArgs = serde_json::from_value(json!({"session_id":"s","chrome_tab_id":"t","predicate":{"kind":"attachment","filename":"report.pdf","size":42}})).unwrap();
+        assert!(matches!(attachment.predicate, BrowserPredicate::Attachment { size: Some(42), .. }));
+        let app_specific: BrowserVerifyArgs = serde_json::from_value(json!({"session_id":"s","chrome_tab_id":"t","predicate":{"kind":"app_specific","adapter":"semantic_field_equals","predicate":{"reference":"@c1","field":"selected","equals":"true"}}})).unwrap();
+        assert!(matches!(app_specific.predicate, BrowserPredicate::AppSpecific { .. }));
+    }
+
+    #[test]
+    fn document_reset_never_reuses_prior_semantic_reference_numbers() {
+        let mut state = SemanticTabState {
+            document_key: "old-document".into(),
+            next_ref: 9,
+            ..Default::default()
+        };
+        reset_semantic_document(&mut state, "new-document", &json!({
+            "document":{"frame_id":"frame-2","loader_id":"loader-2","url":"https://example.test/new"}
+        }));
+        assert_eq!(state.document_key, "new-document");
+        assert_eq!(state.next_ref, 9);
+        assert!(state.key_to_short.is_empty());
+    }
+
+    #[test]
     fn extraction_selector_failures_are_typed_and_field_bound() {
         let receipt = selector_error_receipt("browser response was invalid: selector_error:announcement:invalid_selector").unwrap();
         assert_eq!(receipt["status"], "not_dispatched");
@@ -1034,6 +1359,80 @@ mod tests {
         assert_eq!(receipt["reason_code"], "invalid_selector");
         assert!(selector_error_receipt("selector_error:body:browser_crash").is_none());
         assert!(selector_error_receipt("unrelated failure").is_none());
+    }
+
+    #[test]
+    fn missing_or_non_string_semantic_fields_never_match_empty_expected_values() {
+        assert!(!semantic_string_field_equals(None, "name", ""));
+        assert!(!semantic_string_field_equals(Some(&json!({"name": null})), "name", ""));
+        assert!(semantic_string_field_equals(Some(&json!({"name": ""})), "name", ""));
+    }
+
+    #[test]
+    fn boolean_semantic_attributes_match_string_predicates() {
+        assert!(semantic_string_field_equals(Some(&json!({"selected": true})), "selected", "true"));
+        assert!(semantic_string_field_equals(Some(&json!({"expanded": false})), "expanded", "false"));
+        assert!(!semantic_string_field_equals(Some(&json!({"selected": true})), "selected", "false"));
+        assert!(!semantic_string_field_equals(Some(&json!({"selected": null})), "selected", "true"));
+    }
+
+    #[test]
+    fn repeated_semantic_controls_raise_observation_ambiguity() {
+        let unique = [json!({"role":"button","name":"Submit"}), json!({"role":"link","name":"Help"})];
+        let ambiguous = [json!({"role":"button","name":"Open"}), json!({"role":"button","name":"Open"}), json!({"role":"button","name":"Save"})];
+        assert_eq!(semantic_ambiguity(unique.iter()), 0.0);
+        let score = semantic_ambiguity(ambiguous.iter());
+        assert!((score - 1.0 / 3.0).abs() < f32::EPSILON);
+        assert_eq!(
+            crate::observation_router::choose_observation(
+                crate::observation_router::ObservationRequest { ambiguity: score, ..Default::default() }
+            ).mode,
+            crate::observation_router::ObservationMode::SemanticRich,
+        );
+        assert_eq!(semantic_ambiguity(std::iter::empty()), 0.0);
+    }
+
+    #[test]
+    fn scoped_html_expression_quotes_scope_and_redacts_executable_or_input_content() {
+        let expression = scoped_html_expression("main[data-x=\"a'\"]", 50_000);
+        assert!(expression.contains("main[data-x=\\\"a'\\\"]"));
+        assert!(expression.contains("script,style,noscript,iframe,object,embed,svg,input,textarea,select,button"));
+        assert!(expression.contains("32_768") || expression.contains("32768"));
+        assert!(query_needs_layout("read the chart labels"));
+        assert!(!query_needs_layout("summarize this paragraph"));
+    }
+
+    #[test]
+    fn observation_metadata_reports_the_serialized_payload_size() {
+        let mut value = json!({"items":[{"name":"fixture"}]});
+        let bytes = attach_observation_metadata(
+            &mut value,
+            crate::observation_router::ObservationDecision {
+                mode: crate::observation_router::ObservationMode::SemanticCompact,
+                reason: "test",
+            },
+        );
+        assert_eq!(bytes as usize, serde_json::to_vec(&value).unwrap().len());
+        assert_eq!(value["observation"]["bytes"], json!(bytes));
+    }
+
+    #[test]
+    fn semantic_count_delta_uses_live_counts_and_rejects_underflow() {
+        let items = BTreeMap::from([
+            ("a".into(), json!({"role":"row"})),
+            ("b".into(), json!({"role":"row"})),
+            ("c".into(), json!({"role":"button"})),
+        ]);
+        assert_eq!(semantic_count_delta(&items, "row", 1, 1), (true, 2));
+        assert_eq!(semantic_count_delta(&items, "row", 1, -1), (false, 2));
+        assert_eq!(semantic_count_delta(&items, "row", 0, -1), (false, 2));
+    }
+
+    #[test]
+    fn success_toast_and_live_regions_cannot_satisfy_page_outcome_text() {
+        assert!(!semantic_text_is_authoritative(&json!({"role":"status","text":"Saved successfully"})));
+        assert!(!semantic_text_is_authoritative(&json!({"role":"generic","feedback_region":true,"text":"Saved successfully"})));
+        assert!(semantic_text_is_authoritative(&json!({"role":"heading","feedback_region":false,"text":"Saved record"})));
     }
 
     #[test]

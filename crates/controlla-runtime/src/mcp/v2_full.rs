@@ -55,23 +55,23 @@ struct FullActArgs {
 
 #[derive(Clone, Copy, serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ProbeRegionArgs {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+pub(super) struct ProbeRegionArgs {
+    pub(super) x: f64,
+    pub(super) y: f64,
+    pub(super) width: f64,
+    pub(super) height: f64,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct FullProbeArgs {
-    session_id: String,
-    chrome_tab_id: String,
-    reference: Option<String>,
-    selector: Option<String>,
-    region: Option<ProbeRegionArgs>,
-    max_bytes: Option<usize>,
-    timeout_ms: Option<u64>,
+pub(super) struct FullProbeArgs {
+    pub(super) session_id: String,
+    pub(super) chrome_tab_id: String,
+    pub(super) reference: Option<String>,
+    pub(super) selector: Option<String>,
+    pub(super) region: Option<ProbeRegionArgs>,
+    pub(super) max_bytes: Option<usize>,
+    pub(super) timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -210,8 +210,13 @@ fn validate_reference_expr(reference: &str, vars: &BTreeSet<String>) -> Result<(
 fn predicate_references(predicate: &BrowserPredicate) -> Option<&str> {
     match predicate {
         BrowserPredicate::Text { reference, .. }
+        | BrowserPredicate::Attribute { reference, .. }
         | BrowserPredicate::Value { reference, .. }
         | BrowserPredicate::Exists { reference } => Some(reference),
+        BrowserPredicate::TextPresent { scope, .. } => scope.as_deref(),
+        BrowserPredicate::CountDelta { .. } | BrowserPredicate::Attachment { .. }
+        | BrowserPredicate::DownloadArtifact { .. } | BrowserPredicate::VisualRegionChanged { .. } => None,
+        BrowserPredicate::AppSpecific { predicate, .. } => predicate.get("reference").and_then(Value::as_str),
         BrowserPredicate::Url { .. } | BrowserPredicate::UrlStartsWith { .. } => None,
     }
 }
@@ -365,6 +370,13 @@ fn substitute_predicate(
             reference: substitute(&reference, vars)?,
             equals,
         },
+        BrowserPredicate::TextPresent { scope, text } => BrowserPredicate::TextPresent {
+            scope: scope.map(|reference| substitute(&reference, vars)).transpose()?, text,
+        },
+        BrowserPredicate::Attribute { reference, name, equals } => BrowserPredicate::Attribute {
+            reference: substitute(&reference, vars)?, name, equals,
+        },
+        BrowserPredicate::CountDelta { role, before, delta } => BrowserPredicate::CountDelta { role, before, delta },
         BrowserPredicate::Value { reference, equals } => BrowserPredicate::Value {
             reference: substitute(&reference, vars)?,
             equals,
@@ -374,6 +386,10 @@ fn substitute_predicate(
         },
         BrowserPredicate::Url { equals } => BrowserPredicate::Url { equals },
         BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
+        BrowserPredicate::Attachment { filename, size } => BrowserPredicate::Attachment { filename, size },
+        BrowserPredicate::DownloadArtifact { artifact_handle, sha256, min_bytes } => BrowserPredicate::DownloadArtifact { artifact_handle, sha256, min_bytes },
+        BrowserPredicate::VisualRegionChanged { evidence_before, evidence_after } => BrowserPredicate::VisualRegionChanged { evidence_before: substitute(&evidence_before, vars)?, evidence_after: substitute(&evidence_after, vars)? },
+        BrowserPredicate::AppSpecific { adapter, predicate } => BrowserPredicate::AppSpecific { adapter, predicate },
     })
 }
 
@@ -821,7 +837,7 @@ async fn retained_press(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp
     }))
 }
 
-fn probe_region_valid(region: ProbeRegionArgs) -> bool {
+pub(super) fn probe_region_valid(region: ProbeRegionArgs) -> bool {
     region.x.is_finite()
         && region.y.is_finite()
         && region.width.is_finite()
@@ -852,7 +868,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-async fn visual_probe(app: &AppFull, args: FullProbeArgs) -> Result<Value, rmcp::ErrorData> {
+pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Value, rmcp::ErrorData> {
     let modes = usize::from(args.reference.is_some())
         + usize::from(args.selector.is_some())
         + usize::from(args.region.is_some());
@@ -872,8 +888,7 @@ async fn visual_probe(app: &AppFull, args: FullProbeArgs) -> Result<Value, rmcp:
     let max_bytes = args.max_bytes.unwrap_or(262_144).clamp(4_096, 1_000_000);
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
-    let shared = app
-        .core
+    let shared = core
         .legacy
         .shared_sessions
         .lock()
@@ -882,7 +897,7 @@ async fn visual_probe(app: &AppFull, args: FullProbeArgs) -> Result<Value, rmcp:
         .cloned()
         .ok_or_else(|| invalid("unknown shared session_id"))?;
     let shared = shared.lock().await;
-    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+    if shared.handle.principal != core.legacy.principal.as_ref() {
         return Err(invalid("session is not owned by this server principal"));
     }
     let connection = shared
@@ -905,7 +920,7 @@ async fn visual_probe(app: &AppFull, args: FullProbeArgs) -> Result<Value, rmcp:
     let region = if let Some(region) = args.region {
         region
     } else if let Some(reference) = args.reference.as_deref() {
-        let legacy_reference = resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
+        let legacy_reference = resolve_reference(core, &args.session_id, &args.chrome_tab_id, reference).await?;
         let snapshot = shared
             .snapshots
             .get(&args.chrome_tab_id)
@@ -1176,6 +1191,7 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         chrome_tab_id: Some(args.chrome_tab_id.clone()),
                         url,
                         idempotency_key: None,
+                        active: None,
                         wait_until: None,
                     }))
                     .await?;
@@ -1439,8 +1455,16 @@ async fn current_skill_context(
     session_id: &str,
     tab_id: &str,
 ) -> Result<(String, String), rmcp::ErrorData> {
+    current_skill_context_core(&app.core, session_id, tab_id).await
+}
+
+pub(super) async fn current_skill_context_core(
+    core: &AppV2,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(String, String), rmcp::ErrorData> {
     let snapshot = snapshot_impl(
-        &app.core,
+        core,
         &BrowserSnapshotArgs {
             session_id: session_id.to_owned(),
             chrome_tab_id: tab_id.to_owned(),
@@ -1461,7 +1485,7 @@ async fn current_skill_context(
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("snapshot omitted document URL"))?;
     let scope = site_scope(url)?;
-    let semantic = app.core.semantic.lock().await;
+    let semantic = core.semantic.lock().await;
     let state = semantic
         .get(&tab_key(session_id, tab_id))
         .ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
@@ -1760,7 +1784,7 @@ impl AppFull {
         &self,
         Parameters(args): Parameters<FullProbeArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        Ok(Json(visual_probe(self, args).await?))
+        Ok(Json(visual_probe(&self.core, args).await?))
     }
 
     #[tool(name = "browser_verify", description = "Independently re-observe the selected tab with fresh runtime-owned evidence and evaluate a bounded text/value/existence/URL predicate.")]

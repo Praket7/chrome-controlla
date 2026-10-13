@@ -45,6 +45,7 @@ const tabPairReservations = new Map();
 const fileChooserEvents = new Map();
 const fileChooserWaiters = new Map();
 const fileChooserOperations = new Map();
+const recentlyCreatedTabs = new Map();
 let fileChooserEventSequence = 0;
 const frameSessions = new Map();
 const frameSessionWaiters = new Map();
@@ -53,6 +54,7 @@ let openTabQueue = Promise.resolve();
 let activationEpoch = 0;
 let focusEpoch = 0;
 chrome.tabs.onActivated.addListener(() => { activationEpoch++; });
+chrome.tabs.onCreated.addListener(tab => { if (Number.isSafeInteger(tab.id)) { recentlyCreatedTabs.set(tab.id, { opener_tab_id: tab.openerTabId, window_id: tab.windowId, created_at_ms: Date.now() }); for (const [id, value] of recentlyCreatedTabs) if (value.created_at_ms < Date.now() - 60000) recentlyCreatedTabs.delete(id); } });
 chrome.windows.onFocusChanged.addListener(() => { focusEpoch++; });
 function recordFrameSession(tabId, frameId, sessionId) {
   let frames = frameSessions.get(tabId);
@@ -458,9 +460,24 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (!frame?.documentId || frame.documentId !== expectedDocumentId) { await detachPairedTab(tabId); respond({ type: "result", id: request.id, error: "Target document identity changed; pair the tab again." }); return; }
     if (request.method === "Controlla.openTab") {
       const url = validateNavigationUrl(request.params?.url); const native = nativeRoute; const waitUntil = request.params?.wait_until ?? "dom_content_loaded";
+      const active = request.params?.active ?? true;
       if (waitUntil !== "document_committed" && waitUntil !== "dom_content_loaded") throw new Error("wait_until must be document_committed or dom_content_loaded.");
-      const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration, waitUntil);
+      if (typeof active !== "boolean") throw new Error("active must be a boolean.");
+      const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration, waitUntil, active);
       respond({ type: "result", id: request.id, result }); return;
+    }
+    if (request.method === "Controlla.newTabs") {
+      const since = request.params?.since_ms;
+      if (!Number.isSafeInteger(since) || since < 0) throw new Error("New-tab verification requires a valid click timestamp.");
+      const expectedUrl = request.params?.url;
+      if (expectedUrl != null && validateNavigationUrl(expectedUrl) !== expectedUrl) throw new Error("New-tab expected URL must be an exact absolute HTTP(S) URL.");
+      const tabs = await chrome.tabs.query({});
+      const created = tabs.filter(tab => {
+        const event = recentlyCreatedTabs.get(tab.id);
+        const openerMatch = event?.opener_tab_id === tabId;
+        return event?.created_at_ms >= since && openerMatch && (!expectedUrl || tab.url === expectedUrl) && /^https?:\/\//i.test(tab.url || "");
+      }).slice(0, 8).map(tab => ({ tab_id: String(tab.id), url: String(tab.url).slice(0, 2048), opener_match: recentlyCreatedTabs.get(tab.id)?.opener_tab_id === tabId }));
+      respond({ type: "result", id: request.id, result: { tabs: created } }); return;
     }
     if (request.method === "Controlla.fastType") {
       const result = await fastTypeProgram(tabId, request.params, isAuthorized);
@@ -750,8 +767,8 @@ async function returnExistingOpen(receipt, url, native, generation) {
   }
   return { tab_id: receipt.tab_id, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true };
 }
-async function createControllaTab(url, native, generation, tab, markerUrl, reused = false, waitUntil = "dom_content_loaded") {
-  tab ||= await chrome.tabs.create({ url: markerUrl, active: true });
+async function createControllaTab(url, native, generation, tab, markerUrl, reused = false, waitUntil = "dom_content_loaded", active = true) {
+  tab ||= await chrome.tabs.create({ url: markerUrl, active });
   let identity, attachedIdentity;
   try {
     const current = await chrome.tabs.get(tab.id);
@@ -766,12 +783,13 @@ async function createControllaTab(url, native, generation, tab, markerUrl, reuse
   }
   return { tab_id: String(tab.id), ...identity, idempotent_reuse: reused, created_by_controlla: true };
 }
-async function openControllaTab(url, clientKey, native, generation, waitUntil = "dom_content_loaded") {
+async function openControllaTab(url, clientKey, native, generation, waitUntil = "dom_content_loaded", active = true) {
   if (clientKey === undefined) throw new Error("idempotency_key is required so an open retry cannot create another tab.");
   if (typeof clientKey !== "string" || clientKey.length < 8 || clientKey.length > 256 || /[\u0000-\u001f\u007f]/.test(clientKey)) throw new Error("idempotency_key must be 8..256 bounded printable characters.");
   const pending = openTabInflight.get(clientKey);
   if (pending) {
     if (pending.url !== url) throw new Error("Idempotency key is already bound to a different URL.");
+    if (pending.active !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
     return pending.promise;
   }
   const operation = openTabQueue.then(async () => {
@@ -781,6 +799,7 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     let receipt = receipts[clientKey];
     if (receipt?.status === "failed") throw new Error(`Open attempt left Controlla-created tab ${receipt.tab_id} for recovery; rediscover and pair that tab before retrying.`);
     if (receipt?.status === "complete" || receipt?.document_id) {
+      if ((receipt.active ?? true) !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
       const result = await returnExistingOpen(receipt, url, native, generation);
       receipts[clientKey] = { ...receipt, status: "complete", requested_url: receipt.requested_url || url };
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
@@ -793,12 +812,13 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     if (tab && receipt?.url !== undefined && receipt.url !== url) throw new Error("Idempotency key is already bound to a different URL.");
     if (tab && ![markerUrl, url].includes(tab.url)) throw new Error("Open recovery tab changed before completion; no replacement tab was opened.");
     const reused = !!receipt || !!tab;
-    if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active: true });
-    receipt = { status: "creating", tab_id: String(tab.id), url, requested_url: url, marker_url: markerUrl, created_ms: receipt?.created_ms || Date.now() };
+    if (receipt && (receipt.active ?? true) !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
+    if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active });
+    receipt = { status: "creating", tab_id: String(tab.id), url, requested_url: url, marker_url: markerUrl, active, created_ms: receipt?.created_ms || Date.now() };
     receipts[clientKey] = receipt;
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
     let result;
-    try { result = await createControllaTab(url, native, generation, tab, markerUrl, reused, waitUntil); }
+    try { result = await createControllaTab(url, native, generation, tab, markerUrl, reused, waitUntil, active); }
     catch (error) {
       if (error?.controllaOrphanTabId) {
         receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, url, created_ms: Date.now() };
@@ -806,12 +826,12 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
       }
       throw error;
     }
-    receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, created_ms: receipt.created_ms };
+    receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, active, created_ms: receipt.created_ms };
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
     return result;
   });
   openTabQueue = operation.catch(() => {});
-  const inflight = { url, promise: operation };
+  const inflight = { url, active, promise: operation };
   openTabInflight.set(clientKey, inflight);
   try { return await operation; } finally { if (openTabInflight.get(clientKey) === inflight) openTabInflight.delete(clientKey); }
 }

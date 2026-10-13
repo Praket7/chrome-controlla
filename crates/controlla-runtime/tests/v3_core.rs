@@ -104,6 +104,26 @@ fn target_leases_serialize_same_tab_without_blocking_other_tabs() {
 }
 
 #[test]
+fn workflow_lease_survives_nested_action_release() {
+    let target = TargetKey {
+        browser_id: "b".into(),
+        tab_id: "t".into(),
+    };
+    let mut leases = LeaseTable::default();
+    leases
+        .acquire(target.clone(), "workflow-1", 1, 10_000)
+        .unwrap();
+    leases
+        .acquire_nested(target.clone(), "workflow-1", 2, 10_000)
+        .unwrap();
+    assert!(leases.acquire(target.clone(), "other", 3, 10_000).is_err());
+    assert!(leases.release(&target, "workflow-1"));
+    assert_eq!(leases.owner(&target, 4).as_deref(), Some("workflow-1"));
+    assert!(leases.release(&target, "workflow-1"));
+    assert_eq!(leases.owner(&target, 5), None);
+}
+
+#[test]
 fn target_lease_can_cover_the_maximum_single_action_deadline() {
     let mut leases = LeaseTable::default();
     let target = TargetKey {
@@ -112,6 +132,21 @@ fn target_lease_can_cover_the_maximum_single_action_deadline() {
     };
     let lease = leases.acquire(target, "codex", 100, 120_000).unwrap();
     assert_eq!(lease.expires_at_ms, 120_100);
+}
+
+#[test]
+fn workflow_lease_renews_only_for_its_live_owner_and_never_resurrects_expired_lease() {
+    let target = TargetKey {
+        browser_id: "chrome".into(),
+        tab_id: "renewable".into(),
+    };
+    let mut leases = LeaseTable::default();
+    leases.acquire(target.clone(), "owner", 10, 1_000).unwrap();
+    assert_eq!(leases.renew(&target, "other", 500, 1_000), None);
+    let renewed = leases.renew(&target, "owner", 900, 2_000).unwrap();
+    assert_eq!(renewed.expires_at_ms, 2_900);
+    assert!(leases.renew(&target, "owner", 2_900, 2_000).is_none());
+    assert_eq!(leases.owner(&target, 2_901), None);
 }
 
 #[test]

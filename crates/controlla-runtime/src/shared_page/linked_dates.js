@@ -1,4 +1,5 @@
-async function(urls) {
+async function(urls, expectedDocument) {
+  if (expectedDocument?.url !== location.href || expectedDocument?.revision !== String(performance.timeOrigin)) return {snapshot_matches:false,dates:[]};
   if (!Array.isArray(urls) || urls.length > 12) return [];
   const normalized = (value, base = location.href) => {
     const raw = typeof value === 'string' ? value : value?.['@id'];
@@ -29,7 +30,7 @@ async function(urls) {
       for (const child of Object.values(node)) if (child && typeof child === 'object') queue.push(...(Array.isArray(child) ? child : [child]));
     }
   }
-  return Promise.all(urls.map(async href => {
+  const dates = await Promise.all(urls.map(async href => {
     try {
       const url = new URL(href, location.href);
       if (url.origin !== location.origin || !/^https?:$/.test(url.protocol)) return {href, error:'cross_origin'};
@@ -71,4 +72,5 @@ async function(urls) {
       } finally { clearTimeout(timer); }
     } catch (_) { return {href, error:'fetch_failed'}; }
   }));
+  return {snapshot_matches:true,dates};
 }

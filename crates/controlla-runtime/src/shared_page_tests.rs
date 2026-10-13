@@ -42,7 +42,7 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
                     t.generation,
                     &t.revision,
                     "Runtime.evaluate",
-                    json!({"expression":script,"returnByValue":true}),
+                    json!({"expression":script,"returnByValue":true,"awaitPromise":true}),
                 )
                 .await
                 .unwrap()
@@ -50,7 +50,12 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
     };
     let result=AssertUnwindSafe(async {
         eval(r##"document.body.innerHTML='<style>button,a{display:block;margin:4px}</style>'+ '<div>padding</div>'.repeat(200)+'<button id="account" aria-label="Accounts" aria-expanded="false" onclick="this.setAttribute(\'aria-expanded\',\'true\')"></button><button aria-label="Twin">Twin</button><button aria-label="Twin">Twin</button><button id="menu" onclick="setTimeout(()=>{document.body.insertAdjacentHTML(\'beforeend\',\'<div id=late>Ready</div>\')},150)">Menu</button><button id="uncertain" onclick="window.clicks=(window.clicks||0)+1">Count</button><a id="nav" href="#done">Story</a><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before" onclick="window.trustedClicks=(window.trustedClicks||0)+1"><div data-masked>PRIVATE-SENTINEL</div><button><span data-requires-trusted>PROTECTED-SENTINEL</span></button><span id="secretLabel" data-masked>LABEL-SENTINEL</span><button aria-labelledby="secretLabel" aria-label="Safe">safe</button><button hidden>Hidden</button><div id="late-target">needle</div><iframe id="composed-text" srcdoc="&lt;body&gt;&lt;label&gt;COMPOSED-FRAME-SENTINEL&lt;/label&gt;&lt;/body&gt;"></iframe>';document.querySelector('#account').style.cssText='width:70px;height:25px';"##.into()).await;
-        eval(r##"document.body.insertAdjacentHTML('beforeend','<article><a href="/story-date">Date precision</a><time datetime="2024-04-01">April 1</time></article><article><a href="/story-instant">Instant precision</a><time datetime="2024-04-02T12:00:00Z">April 2</time></article>');"##.into()).await;
+        eval(r##"document.body.insertAdjacentHTML('beforeend','<article><a href="/story-date">Date precision</a><time datetime="2024-04-01">April 1</time></article><article><a href="/story-instant">Instant precision</a><time datetime="2024-04-02T12:00:00Z">April 2</time></article><article><a target="_blank" rel="noopener" href="/story-new-tab">New tab story</a></article>');"##.into()).await;
+        let linked_dates = include_str!("shared_page/linked_dates.js");
+        let stale_revision = eval(format!("({linked_dates})([],{{url:location.href,revision:'stale'}})")).await;
+        assert_eq!(stale_revision["result"]["value"]["snapshot_matches"], false, "same-URL reload must invalidate a prior candidate snapshot");
+        let current_revision = eval(format!("({linked_dates})([],{{url:location.href,revision:String(performance.timeOrigin)}})")).await;
+        assert_eq!(current_revision["result"]["value"]["snapshot_matches"], true, "the current document revision should pass the metadata guard");
         let spec=ObserveSpec{selector:"#late-target".into(),fields:BTreeMap::from([("text".into(),"#late-target".into())]),max_items:1,max_text_chars:100,max_bytes:4096,cursor:None};
         let command=observation_command(&spec).unwrap();
         let observed=eval(command["expression"].as_str().unwrap().into()).await;
@@ -97,6 +102,8 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(accepted.structured_content.unwrap()["accepted"],true);
         let mut snapshot=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","max_text_chars":6000,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
         assert!(snapshot["text"].as_str().unwrap_or_default().contains("COMPOSED-FRAME-SENTINEL"), "text walker omitted text in a loaded same-origin frame: {snapshot}");
+        let root_control=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Accounts").unwrap();
+        assert!(root_control["bounds"]["width"].as_f64().is_some_and(|width|width>0.0),"root semantic controls need exact page bounds for targeted region grounding: {root_control}");
         let date_precision = snapshot["items"].as_array().unwrap().iter().find(|item| item["name"] == "Date precision").unwrap();
         assert_eq!(date_precision["datetime_precision"], "date");
         assert!(date_precision["datetime_utc_ms"].is_null());
@@ -105,6 +112,9 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let instant_precision = snapshot["items"].as_array().unwrap().iter().find(|item| item["name"] == "Instant precision").unwrap();
         assert_eq!(instant_precision["datetime_precision"], "instant");
         assert!(instant_precision["datetime_utc_ms"].as_i64().is_some());
+        let new_tab_story = snapshot["items"].as_array().unwrap().iter().find(|item| item["name"] == "New tab story").unwrap();
+        assert_eq!(new_tab_story["target"], "_blank");
+        assert_eq!(new_tab_story["rel"], "noopener");
         assert_eq!(host_round_trips.load(std::sync::atomic::Ordering::Relaxed),3,"fresh snapshot uses one identity read, one evaluation, and one readback batch");
         let goal_snapshot=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Accounts","roles":["button"]},"max_items":1,"max_text_chars":6000,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
         assert_eq!(goal_snapshot["goal_satisfied"],true,"{goal_snapshot}");

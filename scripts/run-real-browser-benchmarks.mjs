@@ -1,15 +1,26 @@
 #!/usr/bin/env node
-// Real-browser competitor benchmark runner — orchestrates Playwright, CDP, agent-browser, Stagehand, Browser-Use vs Controlla
-// Stub records versions and thresholds; full runs require installed browsers and competitor SDKs.
+// Compatibility entry point for the paired Phase 11 runner.
+import { spawn } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const baselines = ["playwright-mcp","playwright-cli","chrome-devtools-mcp","agent-browser","public-browser","stagehand","browser-use","controlla"];
-console.log("Real browser benchmark runner (stub)");
-console.log(`Baselines: ${baselines.join(', ')}`);
-console.log("For full benchmark, install competitors and run with --real --chrome /path/to/chrome");
-console.log(JSON.stringify({
-  baselines,
-  chrome: "154.0.8037.99",
-  scenario: "espn_bills_latest_story",
-  metrics: ["mcp_calls","model_turns","wall_ms","verification"],
-  note: "Stub — no competitor execution performed; populate bench/results with real runs"
-}, null, 2));
+const here = dirname(fileURLToPath(import.meta.url));
+const runner = resolve(here, '../bench/runners/phase11-suite.mjs');
+const child = spawn(process.execPath, [runner, ...process.argv.slice(2)], {
+  cwd: resolve(here, '..'),
+  env: process.env,
+  stdio: 'inherit',
+  windowsHide: true,
+});
+child.on('error', error => {
+  console.error(`Could not start paired Phase 11 runner: ${error.message}`);
+  process.exitCode = 1;
+});
+child.on('exit', (code, signal) => {
+  if (signal) {
+    console.error(`Paired Phase 11 runner stopped by ${signal}`);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = code ?? 1;
+  }
+});

@@ -36,6 +36,7 @@ fn definition() -> SkillDefinition {
         preconditions: vec!["ready".into()],
         workflow: json!({"steps":[]}),
         postconditions: vec!["saved".into()],
+        failure_guards: Vec::new(),
         structural_signatures: vec!["sig-v1".into()],
         version: 1,
     }
@@ -44,10 +45,13 @@ fn definition() -> SkillDefinition {
 fn qualified(runtime: &SkillRuntime) {
     runtime.register_candidate(definition()).unwrap();
     runtime
-        .record_training_success("fault-skill", "train")
+        .record_training_example("fault-skill", "train-a", "input-a")
         .unwrap();
     runtime
-        .record_validation_success("fault-skill", "validate")
+        .record_training_example("fault-skill", "train-b", "input-b")
+        .unwrap();
+    runtime
+        .record_validation_example("fault-skill", "validate", "input-c")
         .unwrap();
     runtime
         .qualify("fault-skill", Verification::Passed, 10, 10_000)

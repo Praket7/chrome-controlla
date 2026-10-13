@@ -481,7 +481,8 @@ pub fn validate_script_artifact(
 }
 
 /// Declared effects are scheduling hints, never proof that a page is side-effect free.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     ReadOnly,
     Reversible,

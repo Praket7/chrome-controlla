@@ -14,6 +14,9 @@ pub enum TaskPrimitive {
     Research {
         urls: Vec<String>,
         selector: Option<String>,
+        /// User/task intent used to rank observations and verify read results.
+        #[serde(default)]
+        goal: Option<String>,
         #[serde(default)]
         tab_ids: Option<Vec<String>>,
     },
@@ -22,6 +25,11 @@ pub enum TaskPrimitive {
         save_without_submit: bool,
         #[serde(default)]
         save_control: Option<SaveControl>,
+    },
+    /// Bounded reusable mutation workflow. Every click carries an explicit
+    /// runtime-verifiable outcome; only fills and clicks are admitted.
+    Mutation {
+        steps: Vec<MutationStep>,
     },
     Upload {
         artifact_handle: String,
@@ -54,6 +62,20 @@ pub struct SaveControl {
     pub reference: String,
     pub confirmation_selector: String,
     pub confirmation_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MutationStep {
+    Fill {
+        reference: String,
+        expected_value: String,
+        value: String,
+    },
+    Click {
+        reference: String,
+        outcome: Value,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
@@ -102,11 +124,87 @@ pub enum ExpandedStep {
 }
 
 impl TaskPrimitive {
+    /// Stable opaque key for task-shape lookup. Research URLs are bound at
+    /// replay time by exact site scope and live structure, allowing safe
+    /// same-site input variation without persisting a user's target URL.
+    pub fn intent_fingerprint(&self) -> String {
+        let mut canonical = serde_json::to_value(self).expect("task primitive serializes");
+        if let Self::Research { .. } = self
+            && let Some(object) = canonical.as_object_mut()
+        {
+            object.remove("tab_ids");
+            object.remove("urls");
+            object.remove("goal");
+        }
+        if let Self::FormDraft {
+            fields,
+            save_without_submit,
+            save_control,
+        } = self
+        {
+            // Field references and values are run inputs. The reusable skill
+            // shape is the bounded field count plus whether an external save
+            // action was requested; evidence_fingerprint retains the values.
+            canonical = serde_json::json!({
+                "kind":"form_draft",
+                "field_count":fields.len(),
+                "save_without_submit":save_without_submit,
+                "save_confirmation":save_control.as_ref().map(|control| serde_json::json!({
+                    "selector":control.confirmation_selector,
+                    "text":control.confirmation_text,
+                })),
+            });
+        }
+        if let Self::Repeat {
+            references,
+            action,
+            click_outcome,
+        } = self
+        {
+            canonical = serde_json::json!({
+                "kind":"repeat",
+                "count":references.len(),
+                "action":action,
+                "click_outcome":click_outcome,
+            });
+        }
+        if let Self::Mutation { steps } = self {
+            canonical = serde_json::json!({
+                "kind":"mutation",
+                "steps":steps.iter().enumerate().map(|(index, step)| match step {
+                    MutationStep::Fill { .. } => serde_json::json!({"action":"fill","slot":index}),
+                    MutationStep::Click { outcome, .. } => serde_json::json!({"action":"click","slot":index,"outcome":outcome}),
+                }).collect::<Vec<_>>(),
+            });
+        }
+        use sha2::Digest as _;
+        sha2::Sha256::digest(serde_json::to_vec(&canonical).expect("JSON value serializes"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Evidence history is narrower than the reusable skill shape: retain the
+    /// URL and goal (but not ephemeral tab IDs) so distinct reads never share
+    /// prior task evidence merely because their workflow shape matches.
+    pub fn evidence_fingerprint(&self) -> String {
+        let mut canonical = serde_json::to_value(self).expect("task primitive serializes");
+        if let Some(object) = canonical.as_object_mut() {
+            object.remove("tab_ids");
+        }
+        use sha2::Digest as _;
+        sha2::Sha256::digest(serde_json::to_vec(&canonical).expect("JSON value serializes"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn expand(&self) -> Result<Vec<ExpandedStep>, &'static str> {
         let steps = match self {
             Self::Research {
                 urls,
                 selector,
+                goal,
                 tab_ids,
             } => {
                 if urls.is_empty() || urls.len() > MAX_RESEARCH_PAGES {
@@ -125,6 +223,12 @@ impl TaskPrimitive {
                 let selector = selector.clone().unwrap_or_else(|| "body".to_owned());
                 if selector.is_empty() || selector.len() > 512 {
                     return Err("selector must be 1..512 bytes");
+                }
+                if goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.trim().is_empty() || goal.len() > 512)
+                {
+                    return Err("research goal must be 1..512 bytes when provided");
                 }
                 urls.iter()
                     .enumerate()
@@ -257,6 +361,25 @@ impl TaskPrimitive {
                     })
                     .collect()
             }
+            Self::Mutation { steps } => {
+                if steps.is_empty() || steps.len() > 32 {
+                    return Err("mutation requires 1..32 bounded steps");
+                }
+                steps.iter().map(|step| match step {
+                    MutationStep::Fill { reference, expected_value, value } => {
+                        if !reference.starts_with("@c") || expected_value.len() > 16_384 || value.len() > 16_384 {
+                            return Err("mutation fill requires a fresh semantic ref and bounded values");
+                        }
+                        Ok(ExpandedStep::Fill { reference: reference.clone(), expected_value: expected_value.clone(), value: value.clone() })
+                    }
+                    MutationStep::Click { reference, outcome } => {
+                        if !reference.starts_with("@c") || outcome.as_object().is_none() || serde_json::to_vec(outcome).map_or(true, |bytes| bytes.len() > 8_192) {
+                            return Err("mutation click requires a fresh semantic ref and bounded explicit outcome");
+                        }
+                        Ok(ExpandedStep::Click { reference: reference.clone(), outcome: outcome.clone() })
+                    }
+                }).collect::<Result<Vec<_>, _>>()?
+            }
         };
         if steps.len() > MAX_TASK_STEPS {
             return Err("expanded task exceeds 128 deterministic steps");
@@ -276,6 +399,167 @@ fn valid_http_url(url: &str) -> bool {
         .and_then(|rest| rest.split(['/', '?', '#']).next())
         .unwrap_or_default();
     !authority.is_empty() && !authority.contains('@')
+}
+
+#[cfg(test)]
+mod task_expansion_tests {
+    use super::{ExpandedStep, FormField, MutationStep, RepeatAction, SaveControl, TaskPrimitive};
+    use serde_json::Value;
+
+    #[test]
+    fn research_expansion_keeps_the_explicit_target_with_its_url() {
+        let task = TaskPrimitive::Research {
+            urls: vec!["https://example.test/story".into()],
+            selector: Some("article".into()),
+            goal: Some("latest story".into()),
+            tab_ids: Some(vec!["tab-7".into()]),
+        };
+        let steps = task.expand().unwrap();
+        assert!(matches!(&steps[0], ExpandedStep::Open { tab_id: Some(id), .. } if id == "tab-7"));
+        assert!(
+            matches!(&steps[1], ExpandedStep::Extract { selector, .. } if selector == "article")
+        );
+    }
+
+    #[test]
+    fn research_intent_fingerprint_ignores_target_url_and_tab_id_for_scoped_replay() {
+        let task = |tab_id: &str| TaskPrimitive::Research {
+            urls: vec!["https://example.test/story".into()],
+            selector: Some("article".into()),
+            goal: None,
+            tab_ids: Some(vec![tab_id.into()]),
+        };
+        assert_eq!(
+            task("1").intent_fingerprint(),
+            task("2").intent_fingerprint()
+        );
+        assert_eq!(
+            task("1").intent_fingerprint(),
+            TaskPrimitive::Research {
+                urls: vec!["https://example.test/other".into()],
+                selector: Some("article".into()),
+                goal: None,
+                tab_ids: Some(vec!["1".into()]),
+            }
+            .intent_fingerprint()
+        );
+        let same_shape_different_goal = TaskPrimitive::Research {
+            urls: vec!["https://example.test/search?q=another".into()],
+            selector: Some("article".into()),
+            goal: Some("find a different current topic".into()),
+            tab_ids: None,
+        };
+        assert_eq!(
+            task("1").intent_fingerprint(),
+            same_shape_different_goal.intent_fingerprint()
+        );
+        assert_ne!(
+            task("1").evidence_fingerprint(),
+            same_shape_different_goal.evidence_fingerprint()
+        );
+    }
+
+    #[test]
+    fn form_draft_skill_shape_ignores_values_and_ephemeral_references_but_evidence_does_not() {
+        let make = |reference: &str, expected: &str, value: &str| TaskPrimitive::FormDraft {
+            fields: vec![FormField {
+                reference: reference.into(),
+                expected_value: expected.into(),
+                value: value.into(),
+            }],
+            save_without_submit: false,
+            save_control: None,
+        };
+        let first = make("@c1", "old", "alpha");
+        let second = make("@c9", "changed", "beta");
+        assert_eq!(first.intent_fingerprint(), second.intent_fingerprint());
+        assert_ne!(first.evidence_fingerprint(), second.evidence_fingerprint());
+    }
+
+    #[test]
+    fn form_draft_intent_binds_the_explicit_save_confirmation_contract() {
+        let make = |selector: &str, text: &str| TaskPrimitive::FormDraft {
+            fields: vec![FormField {
+                reference: "@c1".into(),
+                expected_value: "old".into(),
+                value: "new".into(),
+            }],
+            save_without_submit: true,
+            save_control: Some(SaveControl {
+                reference: "@c2".into(),
+                confirmation_selector: selector.into(),
+                confirmation_text: text.into(),
+            }),
+        };
+        assert_eq!(
+            make("#status", "Saved").intent_fingerprint(),
+            make("#status", "Saved").intent_fingerprint()
+        );
+        assert_ne!(
+            make("#status", "Saved").intent_fingerprint(),
+            make("#status", "Published").intent_fingerprint()
+        );
+        assert_ne!(
+            make("#status", "Saved").intent_fingerprint(),
+            make("#notice", "Saved").intent_fingerprint()
+        );
+    }
+
+    #[test]
+    fn mutation_intent_rebinds_current_refs_and_values_but_keeps_action_contract() {
+        let task = |reference: &str, expected: &str, value: &str| TaskPrimitive::Mutation {
+            steps: vec![
+                MutationStep::Fill {
+                    reference: reference.into(),
+                    expected_value: expected.into(),
+                    value: value.into(),
+                },
+                MutationStep::Click {
+                    reference: "@c-save".into(),
+                    outcome: serde_json::json!({"kind":"text","selector":"#saved","text":"Draft saved"}),
+                },
+            ],
+        };
+        assert_eq!(
+            task("@c1", "old", "one").intent_fingerprint(),
+            task("@c9", "other", "two").intent_fingerprint()
+        );
+        let TaskPrimitive::Mutation { steps } = task("@c1", "old", "one") else {
+            unreachable!()
+        };
+        assert!(matches!(
+            TaskPrimitive::Mutation { steps }
+                .expand()
+                .unwrap()
+                .as_slice(),
+            [ExpandedStep::Fill { .. }, ExpandedStep::Click { .. }]
+        ));
+        let changed = TaskPrimitive::Mutation {
+            steps: vec![MutationStep::Click {
+                reference: "@c-save".into(),
+                outcome: serde_json::json!({"kind":"text","selector":"#saved","text":"Different"}),
+            }],
+        };
+        let original = task("@c1", "old", "one");
+        assert_ne!(original.intent_fingerprint(), changed.intent_fingerprint());
+    }
+
+    #[test]
+    fn repeat_skill_shape_ignores_ephemeral_refs_but_keeps_action_and_outcome() {
+        let make = |reference: &str, outcome: Value| TaskPrimitive::Repeat {
+            references: vec![reference.to_owned()],
+            action: RepeatAction::Click,
+            click_outcome: Some(outcome),
+        };
+        let first = make("@c1", serde_json::json!({"kind":"selected"}));
+        let second = make("@c9", serde_json::json!({"kind":"selected"}));
+        assert_eq!(first.intent_fingerprint(), second.intent_fingerprint());
+        assert_ne!(first.evidence_fingerprint(), second.evidence_fingerprint());
+        assert_ne!(
+            first.intent_fingerprint(),
+            make("@c2", serde_json::json!({"kind":"expanded"})).intent_fingerprint()
+        );
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

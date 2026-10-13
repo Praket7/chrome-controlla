@@ -24,6 +24,8 @@ pub enum SkillRuntimeError {
     NotQualified,
     #[error("skill runtime lock is poisoned")]
     LockPoisoned,
+    #[error("skill trace store failed: {0}")]
+    Trace(String),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -32,6 +34,10 @@ pub struct SkillReplay {
     pub workflow: Value,
     pub version: u32,
     pub internal_model_calls: u32,
+    /// Induction-derived safe fallback classes. Unknown mutations are never
+    /// represented here and cannot authorize retry.
+    #[serde(default)]
+    pub failure_guards: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +74,28 @@ impl SkillRuntime {
         Ok(record)
     }
 
+    /// Induce and persist a candidate from bounded local traces. Candidates are
+    /// never promoted here; qualification still requires independent runs.
+    pub fn induce_from_traces(
+        &self,
+        traces: &crate::skill_induction::SkillTraceStore,
+        site_scope: &str,
+        intent_fingerprint: &str,
+    ) -> Result<Option<SkillRecord>, SkillRuntimeError> {
+        let evidence = traces
+            .evidence(site_scope, intent_fingerprint)
+            .map_err(SkillRuntimeError::Trace)?;
+        let Some(candidate) = crate::skill_induction::induce_candidate(&evidence) else {
+            return Ok(None);
+        };
+        if let Some(existing) = self.store.get(&candidate.definition.skill_id)? {
+            // Do not replace training/validation evidence already attached to a
+            // candidate. A new induction round needs a new versioned proposal.
+            return Ok(Some(existing));
+        }
+        self.register_candidate(candidate.definition).map(Some)
+    }
+
     pub fn record_training_success(
         &self,
         skill_id: &str,
@@ -86,6 +114,32 @@ impl SkillRuntime {
     ) -> Result<SkillRecord, SkillRuntimeError> {
         self.update(skill_id, |record| {
             record.record_validation_success(run_id);
+            Ok(())
+        })
+    }
+
+    pub fn record_training_example(
+        &self,
+        skill_id: &str,
+        run_id: impl Into<String>,
+        input_signature: impl Into<String>,
+    ) -> Result<SkillRecord, SkillRuntimeError> {
+        let signature = input_signature.into();
+        self.update(skill_id, |record| {
+            record.record_training_example(run_id, signature);
+            Ok(())
+        })
+    }
+
+    pub fn record_validation_example(
+        &self,
+        skill_id: &str,
+        run_id: impl Into<String>,
+        input_signature: impl Into<String>,
+    ) -> Result<SkillRecord, SkillRuntimeError> {
+        let signature = input_signature.into();
+        self.update(skill_id, |record| {
+            record.record_validation_example(run_id, signature);
             Ok(())
         })
     }
@@ -150,7 +204,49 @@ impl SkillRuntime {
             workflow: record.definition.workflow,
             version: record.definition.version,
             internal_model_calls: 0,
+            failure_guards: record.definition.failure_guards,
         })
+    }
+
+    /// Finds a qualified skill for a deterministic task intent. Only exact site
+    /// and structural identity can produce a replay; stale structure is quarantined.
+    pub fn replay_matching(
+        &self,
+        intent_fingerprint: &str,
+        site_scope: &str,
+        structural_signature: &str,
+        now_ms: u64,
+    ) -> Result<Option<SkillReplay>, SkillRuntimeError> {
+        let candidates = self.store.load()?;
+        for (skill_id, record) in candidates {
+            if record.status != SkillStatus::Qualified
+                || record.definition.intent_fingerprint != intent_fingerprint
+                || record.definition.site_scope != site_scope
+            {
+                continue;
+            }
+            match self.replay(&skill_id, site_scope, structural_signature, now_ms) {
+                Ok(replay) => return Ok(Some(replay)),
+                Err(SkillRuntimeError::NotQualified) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn has_qualified_intent(
+        &self,
+        intent_fingerprint: &str,
+        site_scope: &str,
+        now_ms: u64,
+    ) -> Result<bool, SkillRuntimeError> {
+        Ok(self.store.load()?.values().any(|record| {
+            record.status == SkillStatus::Qualified
+                && record.definition.intent_fingerprint == intent_fingerprint
+                && record.definition.site_scope == site_scope
+                && record.qualified_at_ms.is_some_and(|start| now_ms >= start)
+                && record.expires_at_ms.is_some_and(|end| now_ms < end)
+        }))
     }
 
     pub fn record_runtime_verification(
@@ -217,6 +313,7 @@ mod tests {
             preconditions: vec!["form-present".into()],
             workflow: json!({"steps":[{"kind":"find"},{"kind":"fill"},{"kind":"verify"}]}),
             postconditions: vec!["email-matches".into()],
+            failure_guards: Vec::new(),
             structural_signatures: vec!["registration:v1".into()],
             version: 1,
         }
@@ -225,10 +322,13 @@ mod tests {
     fn qualify(runtime: &SkillRuntime) {
         runtime.register_candidate(definition()).unwrap();
         runtime
-            .record_training_success("registration", "train-1")
+            .record_training_example("registration", "train-1", "input-1")
             .unwrap();
         runtime
-            .record_validation_success("registration", "validate-1")
+            .record_training_example("registration", "train-2", "input-2")
+            .unwrap();
+        runtime
+            .record_validation_example("registration", "validate-1", "input-3")
             .unwrap();
         runtime
             .qualify("registration", Verification::Passed, 100, 1000)
@@ -249,6 +349,73 @@ mod tests {
             .unwrap();
         assert_eq!(replay.internal_model_calls, 0);
         assert_eq!(replay.skill_id, "registration");
+        let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());
+    }
+
+    #[test]
+    fn replay_matching_retrieves_only_qualified_intent_on_exact_site_and_structure() {
+        let runtime = runtime();
+        qualify(&runtime);
+        assert!(
+            runtime
+                .has_qualified_intent("registration-form", "https://example.test", 200)
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .has_qualified_intent("registration-form", "https://example.test", 1000)
+                .unwrap()
+        );
+        assert_eq!(
+            runtime
+                .replay_matching(
+                    "registration-form",
+                    "https://example.test",
+                    "registration:v1",
+                    200
+                )
+                .unwrap()
+                .unwrap()
+                .skill_id,
+            "registration"
+        );
+        assert!(
+            runtime
+                .replay_matching(
+                    "other-intent",
+                    "https://example.test",
+                    "registration:v1",
+                    200
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .replay_matching(
+                    "registration-form",
+                    "https://other.test",
+                    "registration:v1",
+                    200
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .replay_matching(
+                    "registration-form",
+                    "https://example.test",
+                    "registration:v2",
+                    200
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.status("registration", 200).unwrap().status,
+            SkillStatus::Quarantined
+        );
         let _ = std::fs::remove_dir_all(runtime.store().path().parent().unwrap());
     }
 

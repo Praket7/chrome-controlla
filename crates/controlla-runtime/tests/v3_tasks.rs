@@ -13,6 +13,7 @@ fn research_expands_without_an_autonomous_loop() {
             "https://example.com/b".into(),
         ],
         selector: Some("main".into()),
+        goal: None,
         tab_ids: None,
     };
     let steps = task.expand().unwrap();
@@ -34,6 +35,7 @@ fn ten_page_research_is_bounded_and_keeps_each_citation_url() {
             .map(|n| format!("https://example.com/{n}"))
             .collect(),
         selector: Some("article".into()),
+        goal: None,
         tab_ids: Some((0..10).map(|n| format!("tab-{n}")).collect()),
     };
     let steps = task.expand().unwrap();
@@ -64,6 +66,7 @@ fn research_rejects_missing_host_and_mismatched_tab_list() {
         let task = TaskPrimitive::Research {
             urls: vec![url.into()],
             selector: None,
+            goal: None,
             tab_ids,
         };
         assert!(task.expand().is_err());

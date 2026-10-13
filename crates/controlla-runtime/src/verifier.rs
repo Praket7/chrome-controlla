@@ -7,6 +7,43 @@ const TEST_OBSERVER_KEY: &[u8] = b"controlla-phase7-test-observer-only";
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Predicate {
+    Url {
+        equals: String,
+    },
+    Value {
+        reference: String,
+        equals: Value,
+    },
+    TextPresent {
+        scope: Option<String>,
+        text: String,
+    },
+    Attribute {
+        reference: String,
+        name: String,
+        equals: String,
+    },
+    CountDelta {
+        selector: String,
+        before: usize,
+        delta: i64,
+    },
+    Attachment {
+        filename: String,
+        size: Option<u64>,
+    },
+    DownloadArtifact {
+        sha256: String,
+        min_bytes: u64,
+    },
+    VisualRegionChanged {
+        evidence_before: String,
+        evidence_after: String,
+    },
+    AppSpecific {
+        adapter: String,
+        predicate: Value,
+    },
     FieldEq {
         path: String,
         expected: Value,
@@ -189,6 +226,81 @@ fn receipt(bytes: &[u8]) -> String {
 
 fn evaluate(predicate: &Predicate, state: &Value) -> Verification {
     let matches = match predicate {
+        Predicate::Url { equals } => state.get("url").and_then(Value::as_str) == Some(equals),
+        Predicate::Value { reference, equals } => {
+            state.get("values").and_then(|values| values.get(reference)) == Some(equals)
+        }
+        Predicate::TextPresent { scope, text } => {
+            let source = scope
+                .as_ref()
+                .and_then(|scope| state.get("scopes")?.get(scope))
+                .or_else(|| state.get("text"));
+            source
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.contains(text))
+        }
+        Predicate::Attribute {
+            reference,
+            name,
+            equals,
+        } => {
+            state
+                .get("elements")
+                .and_then(|elements| elements.get(reference))
+                .and_then(|element| element.get("attributes"))
+                .and_then(|attributes| attributes.get(name))
+                .and_then(Value::as_str)
+                == Some(equals)
+        }
+        Predicate::CountDelta {
+            selector,
+            before,
+            delta,
+        } => state
+            .get("counts")
+            .and_then(|counts| counts.get(selector))
+            .and_then(|count| count.as_u64().or_else(|| count.get("after")?.as_u64()))
+            .and_then(|after| i64::try_from(after).ok())
+            .zip(i64::try_from(*before).ok())
+            .is_some_and(|(after, before)| after.saturating_sub(before) == *delta),
+        Predicate::Attachment { filename, size } => state
+            .get("attachments")
+            .and_then(Value::as_array)
+            .is_some_and(|attachments| {
+                attachments.iter().any(|item| {
+                    item.get("filename").and_then(Value::as_str) == Some(filename)
+                        && size.is_none_or(|expected| {
+                            item.get("size").and_then(Value::as_u64) == Some(expected)
+                        })
+                })
+            }),
+        Predicate::DownloadArtifact { sha256, min_bytes } => {
+            state.get("download").is_some_and(|download| {
+                download.get("sha256").and_then(Value::as_str) == Some(sha256)
+                    && download
+                        .get("bytes")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|bytes| bytes >= *min_bytes)
+            })
+        }
+        Predicate::VisualRegionChanged {
+            evidence_before,
+            evidence_after,
+        } => state
+            .get("visual_evidence")
+            .and_then(|evidence| {
+                Some((
+                    evidence.get(evidence_before)?,
+                    evidence.get(evidence_after)?,
+                ))
+            })
+            .is_some_and(|(before, after)| before != after),
+        Predicate::AppSpecific { adapter, predicate } => {
+            state
+                .get("adapters")
+                .and_then(|adapters| adapters.get(adapter))
+                == Some(predicate)
+        }
         Predicate::FieldEq { path, expected } => {
             state.pointer(&json_pointer(path)) == Some(expected)
         }
@@ -446,6 +558,101 @@ mod tests {
         assert_eq!(
             verify_observed(&stale_observation, &binding, 150, 100, &predicate),
             Verification::Inconclusive
+        );
+    }
+
+    #[test]
+    fn outcome_predicates_check_underlying_state_not_toasts_or_dispatch_receipts() {
+        let cases = [
+            (
+                Predicate::Url {
+                    equals: "https://app.test/saved".into(),
+                },
+                json!({"url":"https://app.test/saved"}),
+            ),
+            (
+                Predicate::Value {
+                    reference: "title".into(),
+                    equals: json!("Saved"),
+                },
+                json!({"values":{"title":"Saved"}}),
+            ),
+            (
+                Predicate::TextPresent {
+                    scope: Some("main".into()),
+                    text: "Saved record".into(),
+                },
+                json!({"scopes":{"main":"Saved record #12"}}),
+            ),
+            (
+                Predicate::Attribute {
+                    reference: "@c1".into(),
+                    name: "aria-checked".into(),
+                    equals: "true".into(),
+                },
+                json!({"elements":{"@c1":{"attributes":{"aria-checked":"true"}}}}),
+            ),
+            (
+                Predicate::CountDelta {
+                    selector: ".record".into(),
+                    before: 2,
+                    delta: 1,
+                },
+                json!({"counts":{".record":3}}),
+            ),
+            (
+                Predicate::Attachment {
+                    filename: "report.pdf".into(),
+                    size: Some(42),
+                },
+                json!({"attachments":[{"filename":"report.pdf","size":42}]}),
+            ),
+            (
+                Predicate::DownloadArtifact {
+                    sha256: "abc".into(),
+                    min_bytes: 10,
+                },
+                json!({"download":{"sha256":"abc","bytes":10}}),
+            ),
+            (
+                Predicate::VisualRegionChanged {
+                    evidence_before: "before".into(),
+                    evidence_after: "after".into(),
+                },
+                json!({"visual_evidence":{"before":"hash-a","after":"hash-b"}}),
+            ),
+            (
+                Predicate::AppSpecific {
+                    adapter: "records".into(),
+                    predicate: json!({"record_id":"12"}),
+                },
+                json!({"adapters":{"records":{"record_id":"12"}}}),
+            ),
+        ];
+        for (predicate, state) in cases {
+            assert_eq!(
+                evaluate(&predicate, &state),
+                Verification::Passed,
+                "{predicate:?}"
+            );
+            assert_eq!(
+                evaluate(
+                    &predicate,
+                    &json!({"toast":"Saved successfully","dispatched":true})
+                ),
+                Verification::Failed,
+                "{predicate:?}"
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &Predicate::VisualRegionChanged {
+                    evidence_before: "missing-a".into(),
+                    evidence_after: "missing-b".into()
+                },
+                &json!({"toast":"Saved"})
+            ),
+            Verification::Failed
         );
     }
 }

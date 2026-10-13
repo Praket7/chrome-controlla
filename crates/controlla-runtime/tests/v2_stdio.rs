@@ -152,6 +152,9 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .unwrap_or_default();
     assert!(snapshot_description.contains("credential_input"));
     assert!(snapshot_description.contains("raw_value=null"));
+    let snapshot = schema("snapshot");
+    assert!(snapshot.to_string().contains("element_focus"));
+    assert!(snapshot.to_string().contains("region_focus"));
     assert!(act_description.contains("allow_password=true"));
     assert!(
         act.to_string()
@@ -308,8 +311,10 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .await
         .expect_err("background mode cannot activate a new tab");
     assert!(
-        error.to_string().contains("requires foreground mode"),
-        "{error}"
+        error
+            .to_string()
+            .contains("session was not created in the requested browser mode"),
+        "a background open must use a background-paired session: {error}"
     );
     let request = serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":"123",
         "task":{"kind":"download","reference":"@c1"}});
