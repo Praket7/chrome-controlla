@@ -11,7 +11,11 @@ if (override && !path.isAbsolute(override)) {
   process.stderr.write('CONTROLLA_BIN must be an absolute path when set.\n');
   process.exit(2);
 }
-const binary = override || path.join(__dirname, '..', 'bin', `controlla${process.platform === 'win32' ? '.exe' : ''}`);
+// The MCP subcommand currently lives in the v2-core executable. The package's
+// POSIX `controlla` launcher and Windows `controlla.cmd` route `mcp` there too;
+// resolve it directly so this plugin works on Windows without trying to spawn
+// a nonexistent `controlla.exe` (or shelling through a .cmd file).
+const binary = override || path.join(__dirname, '..', 'bin', `controlla-v2-core${process.platform === 'win32' ? '.exe' : ''}`);
 if (!fs.existsSync(binary) || !fs.statSync(binary).isFile()) {
   process.stderr.write(`Chrome Controlla binary is missing from this package: ${binary}\n`);
   process.exit(127);
