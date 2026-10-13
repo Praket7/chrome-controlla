@@ -64,10 +64,11 @@ impl ExecutionCostRouter {
             return Err("invalid route cost sample");
         }
         let key = profile_key(context, tier);
-        if !self.profiles.contains_key(&key) && self.profiles.len() >= MAX_PROFILES {
-            if let Some(oldest) = self.profiles.keys().next().cloned() {
-                self.profiles.remove(&oldest);
-            }
+        if !self.profiles.contains_key(&key)
+            && self.profiles.len() >= MAX_PROFILES
+            && let Some(oldest) = self.profiles.keys().next().cloned()
+        {
+            self.profiles.remove(&oldest);
         }
         let samples = self.profiles.entry(key).or_default();
         samples.push(LatencySample {

@@ -535,7 +535,11 @@ impl AppV3 {
         match accepted {
             Ok(Json(value)) if value["accepted"] == true => {
                 let mut cache = self.cold_open_cache.lock().await;
-                if cache.len() >= 128 { if let Some(oldest) = cache.keys().next().cloned() { cache.remove(&oldest); } }
+                if cache.len() >= 128
+                    && let Some(oldest) = cache.keys().next().cloned()
+                {
+                    cache.remove(&oldest);
+                }
                 cache.insert(cache_key, (session_id.clone(), mode));
                 Ok(session_id)
             }

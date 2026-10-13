@@ -44,3 +44,30 @@ test('transparent stdio proxy records receive, browser, verification, and delive
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('unavailable browser-command telemetry stays null instead of becoming a false zero', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'controlla-trace-proxy-'));
+  try {
+    const tracePath = join(directory, 'prompt-trace.jsonl');
+    const traceId = 'prompt-no-metrics';
+    const proxy = resolve(fileURLToPath(new URL('./mcp-stdio-trace-proxy.mjs', import.meta.url)));
+    const server = resolve(fileURLToPath(new URL('./test-fixtures/traced-mcp-server.mjs', import.meta.url)));
+    await recordPromptTraceEvent(tracePath, traceId, 'prompt_sent');
+    const child = spawn(process.execPath, [proxy, process.execPath, server], {
+      env: { ...process.env, CONTROLLA_PROMPT_TRACE_FILE: tracePath, CONTROLLA_PROMPT_TRACE_ID: traceId, TRACE_FIXTURE_NO_METRICS: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdout.resume();
+    child.stderr.resume();
+    child.stdin.end(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser', arguments: { action: 'task' } } })}\n`);
+    const exit = await new Promise((resolveExit, reject) => {
+      child.once('error', reject);
+      child.once('close', resolveExit);
+    });
+    assert.equal(exit, 0);
+    const summary = summarizePromptTrace(await readPromptTrace(tracePath));
+    assert.equal(summary.counters.browser_cdp_commands, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

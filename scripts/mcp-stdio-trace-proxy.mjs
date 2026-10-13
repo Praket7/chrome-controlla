@@ -46,7 +46,7 @@ function summaryFields(result) {
     .map(value => value.execution_route.selected ?? value.execution_route.tier).find(value => typeof value === 'string');
   const fallbacks = collectValues(roots, value => typeof value.fallback_reason === 'string').length;
   const verified = collectValues(roots, value => value.status === 'verified' || value.verified === true).length > 0;
-  return { cdp_commands: Number.isSafeInteger(cdp) ? cdp : 0,
+  return { ...(Number.isSafeInteger(cdp) ? { cdp_commands: cdp } : {}),
     ...(Number.isSafeInteger(internal) ? { internal_model_calls: internal } : {}),
     ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbacks, verified };
 }

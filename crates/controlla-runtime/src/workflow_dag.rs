@@ -27,7 +27,7 @@ pub struct CompiledDag {
 /// Run a read wave concurrently only when estimated saved execution time beats
 /// the attach/alignment overhead. Small waves remain serial by design.
 pub fn parallel_wave_is_worthwhile(estimated_node_ms: &[u64], setup_cost_ms: u64) -> bool {
-    if estimated_node_ms.len() < 4 || estimated_node_ms.iter().any(|duration| *duration == 0) {
+    if estimated_node_ms.len() < 4 || estimated_node_ms.contains(&0) {
         return false;
     }
     let serial = estimated_node_ms

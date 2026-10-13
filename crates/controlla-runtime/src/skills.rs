@@ -56,6 +56,9 @@ impl SkillDefinition {
     /// cannot downgrade a consequential action.
     fn risk_tier(&self) -> SkillRisk {
         let encoded = self.workflow.to_string().to_ascii_lowercase();
+        if encoded.contains("form_fill_save") {
+            return SkillRisk::ReversibleMutation;
+        }
         if [
             "submit",
             "purchase",
@@ -65,12 +68,13 @@ impl SkillDefinition {
             "transfer",
             "publish",
             "account_change",
+            "save",
         ]
         .iter()
         .any(|token| encoded.contains(token))
         {
             SkillRisk::Consequential
-        } else if ["fill", "type", "save", "click", "upload", "form"]
+        } else if ["fill", "type", "click", "upload", "form"]
             .iter()
             .any(|token| encoded.contains(token))
         {

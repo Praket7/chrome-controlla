@@ -288,18 +288,23 @@ mod tests {
     use crate::skills::SKILL_SCHEMA_VERSION;
     use serde_json::json;
     use std::{
-        sync::{Arc, Barrier},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     fn runtime() -> SkillRuntime {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         SkillRuntime::new(std::env::temp_dir().join(format!(
-            "controlla-skill-runtime-{}-{nonce}/skills.json",
-            std::process::id()
+            "controlla-skill-runtime-{}-{nonce}-{}/skills.json",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         )))
     }
 
