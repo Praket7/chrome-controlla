@@ -4,9 +4,10 @@ import { fingerprintToolSchema, validateClientEvidence, validateClientSmoke } fr
 import { resolveClientAdapterConfig, runLiveClientSmokes } from './run-live-client-smokes.mjs';
 import { EXPECTED_V3_TOOL_SCHEMA_SHA256, registeredClientMcpAdapters, runClientMcpContract } from './client-adapters.mjs';
 import { buildClientHostInvocation, prepareClientHostConfig, registeredClientHostAdapters, resolveClientHostAdapter, runClientHostTask } from './client-host-adapters.mjs';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const required = ['startup', 'persistent_session'];
@@ -88,6 +89,7 @@ test('client adapter orchestrator runs each configured client and stores only cu
     const context = await resolveClientAdapterConfig('codex', codexRow, { env, stateRoot: directory });
     assert.deepEqual(context.args, ['mcp']);
     assert.equal(context.command, process.execPath);
+    assert.ok(isAbsolute(context.command));
     assert.equal(context.integration_config, codexRow.integrationConfig);
     assert.ok(context.config_sha256);
     const result = await runLiveClientSmokes({ matrixPath, outputPath, commands: { codex: [process.execPath, adapter] },
@@ -126,14 +128,15 @@ test('public client smoke path requires and invokes its configured host task ada
     await writeFile(matrixPath, JSON.stringify({ clients: { codex: row } }));
     const env = { ...process.env, CONTROLLA_BINARY_PATH: process.execPath, CONTROLLA_CLIENT_SMOKE_STATE_ROOT: directory };
     const mcpContractRunner = async () => ({ status: 'contract_verified', qualification_status: 'not_run', schema_sha256: EXPECTED_V3_TOOL_SCHEMA_SHA256 });
-    await assert.rejects(runLiveClientSmokes({ matrixPath, outputPath: join(directory, 'missing.json'), commands: { codex: [process.execPath, 'unused'] }, mcpContractRunner, env }), /CONTROLLA_CLIENT_HOST_TASKS_JSON must provide/);
+    const clientHostAdapterResolver = async () => ({ client: 'codex', kind: 'cli', status: 'ready', qualification_status: 'not_run', executable: process.execPath });
+    await assert.rejects(runLiveClientSmokes({ matrixPath, outputPath: join(directory, 'missing.json'), commands: { codex: [process.execPath, 'unused'] }, clientHostAdapterResolver, mcpContractRunner, env }), /CONTROLLA_CLIENT_HOST_TASKS_JSON must provide/);
     await assert.rejects(runLiveClientSmokes({ matrixPath, outputPath: join(directory, 'not-invoked.json'), commands: { codex: [process.execPath, 'unused'] },
       hostTasks: { codex: { read_only: 'read', verified_mutation: 'mutate', mode_specific: 'mode' } },
-      hostTaskRunner: async () => ({ status: 'no_host_tool_invocation_observed', tool_events: [] }), mcpContractRunner, env }), /did not invoke a Controlla MCP tool/);
+      clientHostAdapterResolver, hostTaskRunner: async () => ({ status: 'no_host_tool_invocation_observed', tool_events: [] }), mcpContractRunner, env }), /did not invoke a Controlla MCP tool/);
     await assert.rejects(runLiveClientSmokes({ matrixPath, outputPath: join(directory, 'wrong-mode.json'), commands: { codex: [process.execPath, 'unused'] },
       hostTasks: { codex: { read_only: 'read', verified_mutation: 'mutate', mode_specific: 'mode' } },
       hostTaskRunner: async (client, { task }) => ({ status: 'host_tool_invocation_observed', process_id: 321,
-        tool_events: (task === 'read_only' ? ['snapshot', 'extract'] : task === 'verified_mutation' ? ['act', 'verify'] : ['browser']).map(name => ({ name: `chrome-controlla.${name}`, input: { action: 'open', mode: 'foreground' } })) }), mcpContractRunner, env }), /did not request a supported background or headless browser mode/);
+        tool_events: (task === 'read_only' ? ['snapshot', 'extract'] : task === 'verified_mutation' ? ['act', 'verify'] : ['browser']).map(name => ({ name: `chrome-controlla.${name}`, input: { action: 'open', mode: 'foreground' } })) }), clientHostAdapterResolver, mcpContractRunner, env }), /did not request a supported background or headless browser mode/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -156,7 +159,7 @@ test('each named client adapter resolves its checked-in integration config into 
       assert.equal(config.env.CONTROLLA_STATE_DIR, config.state_dir);
       if (config.client === 'chatgpt-desktop') {
         assert.equal(config.command, process.execPath);
-        assert.ok(config.args[0].endsWith('/packages/chrome-controlla/plugin/launch.cjs'));
+        assert.ok(config.args[0].endsWith(join('packages', 'chrome-controlla', 'plugin', 'launch.cjs')));
       } else {
         assert.equal(config.command, process.execPath);
         assert.deepEqual(config.args, ['mcp']);
@@ -191,7 +194,7 @@ test('client host adapters distinguish runnable CLI hosts from interactive and p
   assert.deepEqual(Object.keys(hosts).sort(), ['chatgpt-desktop', 'claude-code', 'codex', 'freebuff', 'generic-mcp', 'opencode'].sort());
   assert.equal((await resolveClientHostAdapter('generic-mcp')).status, 'protocol_only');
   assert.equal((await resolveClientHostAdapter('chatgpt-desktop')).status, 'manual_host_required');
-  assert.equal((await resolveClientHostAdapter('freebuff')).status, 'interactive_only');
+  assert.equal((await resolveClientHostAdapter('freebuff', { env: { PATH: '' } })).status, 'interactive_only');
   assert.equal((await resolveClientHostAdapter('codex', { env: { PATH: '', CONTROLLA_CODEX_BIN: '/definitely/missing/codex' } })).status, 'missing_dependency');
 });
 
@@ -223,8 +226,8 @@ test('host task adapter records real client MCP tool events without promoting th
   try {
     const fakeCodex = join(directory, 'fake-codex.mjs');
     await writeFile(fakeCodex, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'item.completed', item:{type:'mcp_tool_call', tool:'chrome-controlla.snapshot', call_id:'fixture-call'}}));\n`);
-    await chmod(fakeCodex, 0o755);
-    const result = await runClientHostTask('codex', { executable: fakeCodex, workDir: directory, mcpConfig: { command: '/tmp/controlla', args: ['mcp'], env: {} }, prompt: 'inspect only', timeoutMs: 1000 });
+    const result = await runClientHostTask('codex', { executable: fakeCodex, workDir: directory, mcpConfig: { command: '/tmp/controlla', args: ['mcp'], env: {} }, prompt: 'inspect only', timeoutMs: 1000,
+      spawnProcess: (_command, _args, options) => spawn(process.execPath, [fakeCodex], options) });
     assert.equal(result.status, 'host_tool_invocation_observed');
     assert.equal(result.qualification_status, 'not_run');
     assert.equal(result.tool_events[0].name, 'chrome-controlla.snapshot');

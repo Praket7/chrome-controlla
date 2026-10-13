@@ -26,11 +26,11 @@ export async function resolveClientHostAdapter(clientId, { env = process.env } =
   if (!host) throw new Error(`no client host adapter is registered for ${clientId}`);
   if (host.kind === 'protocol') return { client: clientId, kind: host.kind, status: 'protocol_only', qualification_status: 'not_run', reason: 'Generic MCP has no model-client host; run the stdio contract adapter.' };
   if (host.kind === 'desktop') return { client: clientId, kind: host.kind, status: 'manual_host_required', qualification_status: 'not_run', reason: 'ChatGPT Desktop exposes no supported isolated non-interactive host runner; desktop launch and in-app evidence are required.' };
+  if (host.support === 'interactive_only') return { client: clientId, kind: host.kind, status: 'interactive_only', qualification_status: 'not_run', executable: host.executable, reason: 'Freebuff currently exposes no non-interactive prompt command; its app must provide the client-side smoke driver.' };
   const override = env[`CONTROLLA_${clientId.toUpperCase().replaceAll('-', '_')}_BIN`];
   const executable = override ? resolve(override) : await findExecutable(host.executable, env);
   if (!executable) return { client: clientId, kind: host.kind, status: 'missing_dependency', qualification_status: 'not_run', executable: host.executable, reason: `Required client executable '${host.executable}' was not found on PATH or in its CONTROLLA_*_BIN override.` };
   try { await access(executable, constants.X_OK); } catch { return { client: clientId, kind: host.kind, status: 'missing_dependency', qualification_status: 'not_run', executable, reason: `Configured client executable is missing or not executable: ${executable}` }; }
-  if (host.support === 'interactive_only') return { client: clientId, kind: host.kind, status: 'interactive_only', qualification_status: 'not_run', executable, reason: 'Freebuff currently exposes no non-interactive prompt command; its app must provide the client-side smoke driver.' };
   return { client: clientId, kind: host.kind, status: 'ready', qualification_status: 'not_run', executable };
 }
 

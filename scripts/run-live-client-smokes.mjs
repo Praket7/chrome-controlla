@@ -3,7 +3,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { invokeJsonCommand, parseCommand } from '../bench/runners/phase11-runner.mjs';
@@ -49,7 +49,7 @@ export async function resolveClientAdapterConfig(clientId, row, { env = process.
   }
   const stateDir = resolve(stateRoot, clientId);
   const binary = env.CONTROLLA_BINARY_PATH ?? env.CONTROLLA_BIN;
-  if (!binary || !resolve(binary).startsWith('/')) throw new Error(`CONTROLLA_BINARY_PATH must name an absolute built Controlla binary for the ${clientId} adapter`);
+  if (!binary || !isAbsolute(binary)) throw new Error(`CONTROLLA_BINARY_PATH must name an absolute built Controlla binary for the ${clientId} adapter`);
   await access(binary, constants.X_OK).catch(() => { throw new Error(`configured Controlla binary is not executable: ${binary}`); });
   if (clientId === 'chatgpt-desktop') command = process.execPath;
   else {
@@ -79,6 +79,7 @@ export async function runLiveClientSmokes({
   commands,
   hostTasks,
   hostTaskRunner = runClientHostTask,
+  clientHostAdapterResolver = resolveClientHostAdapter,
   mcpContractRunner,
   env = process.env,
   allowSyntheticTestEvidence = false,
@@ -102,7 +103,7 @@ export async function runLiveClientSmokes({
     const startedAtMs = Date.now();
     const clientAdapter = await resolveClientAdapterConfig(id, clients[id], { env,
       stateRoot: env.CONTROLLA_CLIENT_SMOKE_STATE_ROOT ?? join(tmpdir(), `controlla-client-smoke-${runId}`) });
-    const hostAdapter = await resolveClientHostAdapter(id, { env });
+    const hostAdapter = await clientHostAdapterResolver(id, { env });
     const runContract = mcpContractRunner ?? (await import('./client-adapters.mjs')).runClientMcpContract;
     const clientSchemaContract = await runContract(id, clients[id], { launch: clientAdapter });
     if (clientSchemaContract.status !== 'contract_verified' || clientSchemaContract.qualification_status !== 'not_run') {
