@@ -57,7 +57,14 @@ impl ExecutionCostRouter {
             || context.origin.len() > 512
             || context.intent.is_empty()
             || context.intent.len() > 128
-            || !matches!(context.warmth, "cold" | "warm" | "unknown")
+            || !matches!(
+                context.warmth,
+                "warm_browser_first_seen_site"
+                    | "warm_browser_seen_site"
+                    | "warm_qualified_route"
+                    | "cold_browser"
+                    | "unknown"
+            )
             || !matches!(context.task_size, "small" | "medium" | "large")
             || elapsed_ms == 0
         {
@@ -150,7 +157,7 @@ mod tests {
         RouteCostContext {
             origin: "https://example.test",
             intent: "intent-a",
-            warmth: "warm",
+            warmth: "warm_qualified_route",
             task_size: "small",
         }
     }

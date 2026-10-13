@@ -196,10 +196,14 @@ mod route_telemetry_tests {
     }
 
     #[test]
-    fn site_cost_cohorts_measure_cold_then_warm_observations() {
-        let mut seen = std::collections::BTreeSet::new();
-        assert_eq!(observe_site_warmth(&mut seen, "https://example.test"), "cold");
-        assert_eq!(observe_site_warmth(&mut seen, "https://example.test"), "warm");
+    fn site_cost_cohorts_distinguish_site_warmth_from_a_qualified_route() {
+        let mut seen_sites = std::collections::BTreeSet::new();
+        let mut qualified_routes = std::collections::BTreeSet::new();
+        let context = ("session-1", "origin-hash", "intent", "small");
+        assert_eq!(observe_site_warmth(&mut seen_sites, &qualified_routes, context), "warm_browser_first_seen_site");
+        assert_eq!(observe_site_warmth(&mut seen_sites, &qualified_routes, context), "warm_browser_seen_site");
+        qualified_routes.insert("session-1\u{1f}origin-hash\u{1f}intent\u{1f}small".to_owned());
+        assert_eq!(observe_site_warmth(&mut seen_sites, &qualified_routes, context), "warm_qualified_route");
     }
 
     #[test]
@@ -273,6 +277,21 @@ mod route_telemetry_tests {
     }
 
     #[test]
+    fn mutation_trace_dataflow_uses_typed_input_bindings_and_outcomes() {
+        let task = crate::v3_tasks::TaskPrimitive::Mutation { steps: vec![
+            crate::v3_tasks::MutationStep::Fill { reference:"@c1".into(), expected_value:"old".into(), value:"new".into() },
+            crate::v3_tasks::MutationStep::Click { reference:"@c2".into(), outcome:json!({"visible":"Saved"}) },
+        ]};
+        let receipts = [json!({"kind":"fill","verified":true}), json!({"kind":"click","verified":true})];
+        let trace_steps = task_trace_steps(&task, &receipts);
+        assert_eq!(trace_steps.len(), 1);
+        assert!(trace_steps[0].dataflow_evidence.contains("input_binding:mutation_step:0:target"));
+        assert!(trace_steps[0].dataflow_evidence.contains("input_binding:mutation_step:0:value"));
+        assert!(trace_steps[0].dataflow_evidence.contains("typed_postcondition:mutation_step:1:outcome"));
+        assert!(!trace_steps[0].dataflow_evidence.iter().any(|entry| entry.contains("sequence")));
+    }
+
+    #[test]
     fn task_cost_receipt_uses_observed_operation_telemetry_not_step_count_estimates() {
         let mut receipt = json!({"execution_route":{"actual_cost":{"browser_operations":null}}});
         attach_operation_costs(&mut receipt, &controlla_browser::scheduler::telemetry::OperationMetrics {
@@ -309,6 +328,7 @@ struct AppV3 {
     site_profiles: Arc<Mutex<crate::site_profiles::SiteProfileStore>>,
     execution_costs: Arc<std::sync::Mutex<crate::execution_cost_router::ExecutionCostRouter>>,
     cost_seen_sites: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    cost_seen_qualified_routes: Arc<Mutex<std::collections::BTreeSet<String>>>,
     dag_costs: Arc<Mutex<crate::workflow_dag::DagCostHistory>>,
     active_tasks: Arc<std::sync::atomic::AtomicUsize>,
     workflow_lease_owners: Arc<Mutex<std::collections::BTreeSet<String>>>,
@@ -355,6 +375,7 @@ impl AppV3 {
                 super::super::state_directory().join("execution-costs-v1.json"),
             ))),
             cost_seen_sites: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            cost_seen_qualified_routes: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             dag_costs: Arc::new(Mutex::new(crate::workflow_dag::DagCostHistory::open(
                 super::super::state_directory().join("dag-costs-v1.json"),
             ))),
@@ -3409,7 +3430,14 @@ fn task_trace_steps(task: &crate::v3_tasks::TaskPrimitive, receipts: &[Value]) -
             evidence
         }
         crate::v3_tasks::TaskPrimitive::Mutation { steps } =>
-            steps.iter().enumerate().map(|(index, _)| format!("caller_declared_sequence:mutation_step:{index}")).collect(),
+            steps.iter().enumerate().flat_map(|(index, step)| {
+                let mut evidence = vec![format!("input_binding:mutation_step:{index}:target")];
+                match step {
+                    crate::v3_tasks::MutationStep::Fill { .. } => evidence.push(format!("input_binding:mutation_step:{index}:value")),
+                    crate::v3_tasks::MutationStep::Click { .. } => evidence.push(format!("typed_postcondition:mutation_step:{index}:outcome")),
+                }
+                evidence
+            }).collect(),
         crate::v3_tasks::TaskPrimitive::Repeat { references, .. } =>
             references.iter().enumerate().map(|(index, _)| format!("independent_input_target:repeat:{index}")).collect(),
         _ => return Vec::new(),
@@ -4429,8 +4457,22 @@ fn task_cost_context(task: &crate::v3_tasks::TaskPrimitive, current_url: Option<
     Some((origin, intent, size))
 }
 
-fn observe_site_warmth(seen: &mut std::collections::BTreeSet<String>, origin: &str) -> &'static str {
-    if seen.insert(origin.to_owned()) { "cold" } else { "warm" }
+fn observe_site_warmth(
+    seen_sites: &mut std::collections::BTreeSet<String>,
+    qualified_routes: &std::collections::BTreeSet<String>,
+    (session_id, origin, intent, task_size): (&str, &str, &str, &str),
+) -> &'static str {
+    let route_key = format!("{session_id}\u{1f}{origin}\u{1f}{intent}\u{1f}{task_size}");
+    let site_key = format!("{session_id}\u{1f}{origin}");
+    let already_seen = seen_sites.contains(&site_key);
+    seen_sites.insert(site_key);
+    if qualified_routes.contains(&route_key) {
+        "warm_qualified_route"
+    } else if already_seen {
+        "warm_browser_seen_site"
+    } else {
+        "warm_browser_first_seen_site"
+    }
 }
 
 fn task_needs_visual_evidence(goal: &str) -> bool {
@@ -7108,8 +7150,10 @@ impl AppV3 {
         let budget = crate::v3::CommandBudget::interactive_default();
         let wall_limit = Duration::from_millis(budget.max_wall_ms);
         let session_id = args.session_id.clone();
+        let cost_session_id = session_id.clone();
         let tab_id = args.chrome_tab_id.clone();
         let cost_router = self.execution_costs.clone();
+        let qualified_route_history = self.cost_seen_qualified_routes.clone();
         let task_started = std::time::Instant::now();
         let sequence = NEXT_WORKFLOW_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let task_owner = format!("task:{session_id}:{tab_id}:{}:{sequence}", now_ms());
@@ -7144,6 +7188,15 @@ impl AppV3 {
                 && value["receipts"].as_array().is_some_and(|receipts| !receipts.is_empty()
                     && receipts.iter().all(|step| step["verified"] == true));
             if let Some(tier) = tier {
+                if verified && matches!(tier,
+                    crate::capability_router::ExecutionTier::QualifiedSkill
+                        | crate::capability_router::ExecutionTier::WebMcpOrSiteTool
+                        | crate::capability_router::ExecutionTier::SpeculativeRead
+                        | crate::capability_router::ExecutionTier::SemanticProgram)
+                {
+                    let route_key = format!("{}\u{1f}{}\u{1f}{}\u{1f}{}", cost_session_id, origin, intent, task_size);
+                    qualified_route_history.lock().await.insert(route_key);
+                }
                 let elapsed_ms = task_started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64;
                 tokio::task::spawn_blocking(move || {
                     let context = crate::execution_cost_router::RouteCostContext {
@@ -7192,8 +7245,10 @@ impl AppV3 {
         // was already observed for execution. Cross-site research stays out of
         // the router so unlike sites can never share a learned cohort.
         let cost_context = task_cost_context(&args.task, current_page_url.as_deref());
-        let cost_warmth = if let Some((origin, _, _)) = cost_context.as_ref() {
-            observe_site_warmth(&mut *self.cost_seen_sites.lock().await, origin)
+        let cost_warmth = if let Some((origin, intent, size)) = cost_context.as_ref() {
+            let seen_sites = &mut *self.cost_seen_sites.lock().await;
+            let qualified_routes = self.cost_seen_qualified_routes.lock().await;
+            observe_site_warmth(seen_sites, &qualified_routes, (&args.session_id, origin, intent, size))
         } else { "unknown" };
         let (qualified_skill_available, speculative_read_available, site_tool_available, routed_profile) =
             if let crate::v3_tasks::TaskPrimitive::Research { urls, .. } = &args.task {
