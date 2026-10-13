@@ -5,8 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-// Single current MCP binary — no V2 debt
-const binary = path.join(__dirname, `controlla${process.platform === 'win32' ? '.exe' : ''}`);
+// Keep the package CLI on the current command binary. POSIX packages also ship
+// a `controlla` script, while Windows packages contain `controlla-core.exe`.
+const binary = path.join(__dirname, `controlla-core${process.platform === 'win32' ? '.exe' : ''}`);
 const legacyV2 = path.join(__dirname, `controlla-v2-core${process.platform === 'win32' ? '.exe' : ''}`);
 const target = fs.existsSync(binary) ? binary : legacyV2;
 if (!fs.existsSync(target)) {
