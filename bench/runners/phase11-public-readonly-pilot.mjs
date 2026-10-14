@@ -112,8 +112,12 @@ export function stagehandProcessCleanup(before, after, serverPath) {
 }
 
 export function noNewStagehandProfiles(before, after) {
+  return newStagehandProfiles(before, after).length === 0;
+}
+
+export function newStagehandProfiles(before, after) {
   const knownProfiles = new Set(before);
-  return after.every(profile => knownProfiles.has(profile));
+  return after.filter(profile => !knownProfiles.has(profile));
 }
 
 export function stagehandSingleCall(events, server) {
@@ -451,7 +455,10 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
         final_answer_matches_reference: finalAnswerMatchesReference,
         cleanup_verification_method: cleanupVerified ? adapter === 'stagehand' ? 'browser_close_request_plus_os_process_and_temp_profile_inventory' : 'adapter_specific_close_result' : 'not_verified',
         ...(adapter === 'stagehand' ? { stagehand_process_cleanup_verified: processCleanup,
-          stagehand_temp_profile_cleanup_verified: profileCleanup } : {}),
+          stagehand_temp_profile_cleanup_verified: profileCleanup,
+          stagehand_temp_profile_names_before: stagehandProfilesBefore,
+          stagehand_temp_profile_names_after: stagehandProfilesAfter,
+          stagehand_new_temp_profile_names: newStagehandProfiles(stagehandProfilesBefore, stagehandProfilesAfter) } : {}),
         ...(adapter === 'stagehand' ? { stagehand_single_call_contract_met: stagehandSingleCall(events, server) } : {}),
         unrelated_actions: otherActions.map(({ event }) => event.item?.type), reference: reference && { title: reference.title, paragraph: reference.paragraph } },
     };

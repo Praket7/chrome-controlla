@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles } from './phase11-public-readonly-pilot.mjs';
+import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles, newStagehandProfiles } from './phase11-public-readonly-pilot.mjs';
 
 test('Controlla pilot uses one private task call without a launch round trip', () => {
   const prompt = setup('controlla', '/chrome', '/controlla', '/state').prompt;
@@ -123,6 +123,7 @@ test('Stagehand cleanup requires a browser close request and no new server or Ch
     ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'], '/tmp/stagehand/server.mjs'), true);
   assert.equal(noNewStagehandProfiles([], ['stagehand-chrome-new']), false);
   assert.equal(noNewStagehandProfiles(['stagehand-chrome-existing'], ['stagehand-chrome-existing']), true);
+  assert.deepEqual(newStagehandProfiles(['stagehand-chrome-existing'], ['stagehand-chrome-existing', 'stagehand-chrome-new']), ['stagehand-chrome-new']);
 });
 
 test('Stagehand process inventory parses Windows process IDs and command lines', () => {
