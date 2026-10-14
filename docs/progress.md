@@ -1,5 +1,13 @@
 # Build progress
 
+## Background pointer click behind other apps — 2026-10-14
+
+Root cause: the extension's `Controlla.pointerClick` path rejected every click when `chrome.windows.get(...).focused` was false. That prevented CDP mouse dispatch even though the extension can briefly activate the tab within its own unfocused Chrome window and route input directly to its debugger target. The guard is removed; final document/lease/target/viewport checks remain, and the prior active tab is restored. Tool instructions now state the supported behavior and the remaining background gesture limits.
+
+The first live attempt after reload confirmed `window_focused:false` but was stopped by the last viewport guard. The extension now allows the exact-target guard's fresh hit test and current coordinates to remain authoritative after Controlla's temporary tab activation; it still requires a fresh successful guard and restores the prior tab. The regression fixture changes viewport identity during activation and verifies dispatch without focusing Chrome.
+
+Verification: `node extensions/chrome-controlla/test-background.cjs` passes, including unfocused-window mouse dispatch, viewport movement during activation, and prior-tab restoration. Runtime tests, release build, `cargo fmt --all -- --check`, `npm run check:docs`, and `npm run check:clients` passed before the final extension-only viewport adjustment. The final extension harness passed after it. These fixtures do not prove Chrome delivered a real click; the extension needs one more reload before the live ESPN check.
+
 ## Prompt-to-outcome reliability implementation — 2026-10-14
 
 Follow-up changes: secure fill accepts an optional one-shot user-supplied value only on `act(action="secure_fill")`; omission retains the extension prompt. Receipts omit both value and length, and the original chat/client tool history remains outside Controlla's redaction boundary. The Codex CLI benchmark adapter sends prompts through stdin. Process-argument spans are no longer labeled or reported as prompt-send timing. Research action-memory misses skip a structural snapshot; verified first-time learning is deferred to background work.

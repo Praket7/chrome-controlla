@@ -43,6 +43,7 @@ let tabsReplaced;
 let tabsRemoved;
 let tabsActivated;
 let emitActivationEvents = false;
+let afterNextTabActivation;
 let tabsCreated;
 let windowFocusChanged;
 let navigationBefore;
@@ -140,7 +141,7 @@ const chrome = {
     async update(tabId, { url, active }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
-      if (active !== undefined) { tab.active = active; if (active) { focusedWindowActiveTabId = tabId; if (emitActivationEvents) { for (const sibling of tabList) if (sibling.windowId === tab.windowId) sibling.active = false; tab.active = true; tabsActivated?.({ tabId, windowId: tab.windowId }); } } }
+      if (active !== undefined) { tab.active = active; if (active) { focusedWindowActiveTabId = tabId; if (emitActivationEvents) { for (const sibling of tabList) if (sibling.windowId === tab.windowId) sibling.active = false; tab.active = true; tabsActivated?.({ tabId, windowId: tab.windowId }); } if (afterNextTabActivation) { const callback = afterNextTabActivation; afterNextTabActivation = undefined; callback(tabId); } } }
       if (url === undefined) return tab;
       const delayedCommit = delayedNextCommitMs;
       delayedNextCommitMs = 0;
@@ -747,15 +748,20 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   assert.deepEqual(debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").slice(-3).map(call => call.params.type),
     ["mouseMoved", "mousePressed", "mouseReleased"], "inactive pointer click sends an actual mouse sequence");
   focusedWindowFocused = false;
-  emitActivationEvents = false;
+  emitActivationEvents = true;
+  afterNextTabActivation = () => { pointerGuardValue = { ...pointerGuardValue, viewport: "fixture-viewport-after-activation" }; };
   const pointerCallsBeforeUnfocused = debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length;
   native.hostMessage({ type: "command", id: "unfocused-window-pointer-click", target_id: "41", method: "Controlla.pointerClick", params: {
     object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
     index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport"
   } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(native.sent.at(-1).result.reason_code, "chrome_window_not_focused", "inactive target in an unfocused window fails closed");
-  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length, pointerCallsBeforeUnfocused, "unfocused window receives no pointer events");
+  assert.equal(native.sent.at(-1).result.status, "dispatched", "inactive tab receives pointer input while its Chrome window remains behind another app");
+  assert.equal(native.sent.at(-1).result.restored_previous_tab, true, "unfocused-window click restores the prior tab");
+  assert.equal(focusedWindowFocused, false, "background pointer click does not focus the Chrome window");
+  assert.equal(tabList.find(tab => tab.id === 41).active, false, "background pointer click restores the prior active tab");
+  assert.deepEqual(debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").slice(-3).map(call => call.params.type),
+    ["mouseMoved", "mousePressed", "mouseReleased"], "unfocused Chrome window still receives the guarded mouse sequence");
   afterNextDebuggerCall = () => {
     tabsActivated({ tabId: 42 }); tabsActivated({ tabId: 41 });
     windowFocusChanged(9); windowFocusChanged(-1);

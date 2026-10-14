@@ -3075,7 +3075,7 @@ impl App {
 
     #[tool(
         name = "shared_click",
-        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse clicks on inactive tabs briefly activate the tab only if its Chrome window is already focused, then restore the prior tab when safe. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse clicks on inactive tabs briefly activate the tab inside its Chrome window, dispatch guarded CDP input, then restore the prior tab when safe; this does not focus a Chrome window behind another app. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
     async fn shared_click(
         &self,
