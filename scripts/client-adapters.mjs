@@ -1,6 +1,7 @@
-// Built-in per-client stdio launch adapter. This verifies that each checked-in
-// client configuration launches Controlla and exposes the exact V3 tool schema;
-// it deliberately does not create behavioral/live-client qualification claims.
+// Built-in per-client stdio contract check. This resolves each checked-in
+// client configuration, launches the packaged MCP server, and verifies its
+// initialize/tools-list contract; it does not prove that a client host consumes
+// that configuration or create behavioral/live-client qualification claims.
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { resolveClientAdapterConfig } from './run-live-client-smokes.mjs';
