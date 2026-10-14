@@ -64,10 +64,17 @@ function(q) {
     const rendered = present && b.width > 0 && b.height > 0 && s.visibility === 'visible' && s.display !== 'none' && Number.parseFloat(s.opacity || '1') > 0 && !composedClosest(e, '[hidden],[inert]');
     const view = e.ownerDocument.defaultView;
     const inViewport = rendered && b.right > 0 && b.bottom > 0 && b.left < view.innerWidth && b.top < view.innerHeight;
-    const disabled = e.matches(':disabled') || e.getAttribute('aria-disabled') === 'true';
+    // ARIA communicates state to assistive technology; it does not suppress
+    // pointer events. Some apps (including Classroom's upload picker) leave
+    // aria-disabled=true on a control that still opens its picker. Preserve
+    // both signals so the caller can distinguish an actual native disable
+    // from a possibly stale ARIA annotation.
+    const nativeDisabled = e.matches(':disabled');
+    const ariaDisabled = e.getAttribute('aria-disabled') === 'true';
+    const disabled = nativeDisabled;
     const pointerEventsNone = s.pointerEvents === 'none';
     const actionability = !rendered ? 'not_rendered' : disabled ? 'disabled' : pointerEventsNone ? 'pointer_blocked' : inViewport ? 'candidate' : 'offscreen';
-    return {present,rendered,in_viewport:!!inViewport,disabled,pointer_events_none:pointerEventsNone,actionability};
+    return {present,rendered,in_viewport:!!inViewport,disabled,native_disabled:nativeDisabled,aria_disabled:ariaDisabled,pointer_events_none:pointerEventsNone,actionability};
   };
   const raw = e => isCredentialInput(e) ? null : /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName) ? e.value : richEditor(e) ? editableText(e) : (e.innerText ?? '');
   const name = e => {
@@ -92,6 +99,16 @@ function(q) {
     const siblingTime = e.parentElement ? e.parentElement.querySelector('time[datetime]') : null;
     if (siblingTime) return siblingTime.getAttribute('datetime');
     return null;
+  };
+  const freshnessTextOf = e => {
+    const card = e.closest('article,li,[data-card],[role="article"]') || e.parentElement;
+    if (!readable(card)) return null;
+    const labelled = [...card.querySelectorAll('time,[data-testid*="time" i],[class*="time" i],[aria-label]')]
+      .map(node => node.getAttribute('datetime') || node.getAttribute('aria-label') || node.innerText || node.textContent || '')
+      .join(' ');
+    const text = `${labelled} ${card.innerText || ''}`.replace(/\s+/g, ' ').trim();
+    const match = text.match(/(?:^|[\s•·])((?:\d{1,3}\s*(?:m|min|minutes?|h|hr|hours?|d|days?|w|weeks?))(?:\s+ago)?)(?=$|[\s•·])/i);
+    return match?.[1]?.trim() || null;
   };
   const sectionOf = e => {
     const s = e.closest('section,[data-section],article,nav,main');
@@ -118,6 +135,7 @@ function(q) {
   let scanned = 0, truncated = false, bytes = 0, omitted_by_limit = 0, omitted_oversized = 0, early_stopped = false, goal_satisfied = false, goal_score = 0;
   let truncation_reason = null;
   const goalQuery = q.goal?.query?.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ').trim() || '';
+  const goalTerms = new Set(goalQuery.split(/[^\p{L}\p{N}]+/u).filter(term => term.length > 2));
   const goalRoles = Array.isArray(q.goal?.roles) ? new Set(q.goal.roles) : null;
   const maxScanNodes = Number.isSafeInteger(q.max_scan_nodes) ? Math.max(1, Math.min(65536, q.max_scan_nodes)) : 65536;
   const encoder = new TextEncoder();
@@ -170,34 +188,69 @@ function(q) {
       if (q.goal) {
         const normalize = text => text.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ').trim();
         const candidateText = normalize(label+' '+(typeof value === 'string' ? value : ''));
-        queryScore = !goalQuery ? 0 : normalize(label) === goalQuery || typeof value === 'string' && normalize(value) === goalQuery ? 100 : candidateText.includes(goalQuery) ? 60 : 0;
+        const candidateTerms = new Set(candidateText.split(/[^\p{L}\p{N}]+/u).filter(term => term.length > 2));
+        const overlap = [...goalTerms].reduce((count, term) => count + (candidateTerms.has(term) ? 1 : 0), 0);
+        queryScore = !goalQuery ? 0
+          : normalize(label) === goalQuery || typeof value === 'string' && normalize(value) === goalQuery ? 100
+          : candidateText.includes(goalQuery) ? 60
+          : goalTerms.size ? Math.round(60 * overlap / goalTerms.size) : 0;
         const roleScore = !goalRoles ? 0 : goalRoles.has(item.role) ? 40 : -1000;
         const hrefScore = !q.goal.href_hint ? 0 : item.href?.includes(q.goal.href_hint) ? 30 : -1000;
-        if (goalQuery && queryScore === 0 || roleScore < 0 || hrefScore < 0) { e = walker.nextNode(); continue; }
-        goal_score = queryScore + roleScore + hrefScore;
-        item.goal_score = goal_score;
+        if (roleScore < 0 || hrefScore < 0) { e = walker.nextNode(); continue; }
+        item.goal_score = queryScore + roleScore + hrefScore;
+        goal_score = Math.max(goal_score, item.goal_score);
         if (!goalQuery || queryScore === 100) goal_satisfied = true;
       }
-      if (q.href_hint && e.tagName === 'A') {
+      if ((q.href_hint || q.goal?.href_hint) && e.tagName === 'A') {
         const context = e.closest('article,li,[data-card]') || e.parentElement;
         item.context_text = readable(context) ? (context.innerText || '').replace(/\s+/g,' ').slice(0,320) : null;
+        item.freshness_text = freshnessTextOf(e);
+        item.freshness_observed_at_ms = item.freshness_text ? Date.now() : null;
         const group = e.closest('section,[role="feed"],[role="list"]');
         const heading = group?.querySelector('h1,h2,h3,[role="heading"]');
         item.group_heading = readable(heading) ? heading.innerText.replace(/\s+/g,' ').slice(0,120) : null;
       }
       if (trustedText(e)) item.requires_trusted_events = true;
       const size = encoder.encode(JSON.stringify(item)).length;
-      if (q.goal && items.length >= q.max_items) {
-        let lowest = 0;
-        for (let i = 1; i < items.length; i++) if ((items[i].goal_score || 0) < (items[lowest].goal_score || 0)) lowest = i;
-        if ((item.goal_score || 0) > (items[lowest].goal_score || 0)) {
-          const previousSize = encoder.encode(JSON.stringify(items[lowest])).length;
-          if (bytes - previousSize + size > q.max_bytes - q.max_text_chars * 6 - 2048) { omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_bytes'; break; }
-          bytes += size - previousSize; items[lowest] = item; nodes[lowest] = e;
+      if (q.goal) {
+        // Keep the best-ranked candidates even when early DOM content fills the
+        // item/byte budget. Scan remains bounded by maxScanNodes; omitted items
+        // keep coverage partial so a ranked prefix is never treated as exhaustive.
+        const byteBudget = q.max_bytes - q.max_text_chars * 6 - 2048;
+        let projectedItems = items.length + 1;
+        let projectedBytes = bytes + size;
+        const evictions = [];
+        const lowerRanked = items.map((candidate, index) => ({candidate, index, size:encoder.encode(JSON.stringify(candidate)).length}))
+          .filter(entry => (entry.candidate.goal_score || 0) < (item.goal_score || 0))
+          .sort((a,b)=>(a.candidate.goal_score||0)-(b.candidate.goal_score||0)||b.size-a.size||b.index-a.index);
+        while ((projectedItems > q.max_items || projectedBytes > byteBudget) && lowerRanked.length) {
+          const evicted = lowerRanked.shift();
+          evictions.push(evicted);
+          projectedItems--;
+          projectedBytes -= evicted.size;
         }
-        omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_items';
+        if (projectedItems <= q.max_items && projectedBytes <= byteBudget) {
+          if (evictions.length) {
+            omitted_by_limit += evictions.length;
+            truncated = true;
+            truncation_reason = truncation_reason || (items.length >= q.max_items ? 'max_items' : 'max_bytes');
+          }
+          for (const evicted of evictions.sort((a,b)=>b.index-a.index)) {
+            bytes -= evicted.size;
+            items.splice(evicted.index,1);
+            nodes.splice(evicted.index,1);
+          }
+          items.push(item); nodes.push(e); bytes += size;
+        } else {
+          omitted_by_limit++; truncated = true;
+          truncation_reason = truncation_reason || (projectedBytes > byteBudget ? 'max_bytes' : 'max_items');
+        }
       } else {
-        if (bytes + size > q.max_bytes - q.max_text_chars * 6 - 2048) { omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_bytes'; break; }
+        if (bytes + size > q.max_bytes - q.max_text_chars * 6 - 2048) {
+          omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_bytes';
+          if (!q.goal) break;
+          e = walker.nextNode(); continue;
+        }
         bytes += size; nodes.push(e); items.push(item);
       }
       const exactTargetScore = (goalQuery ? 100 : 0) + (goalRoles ? 40 : 0) + (q.goal?.href_hint ? 30 : 0);
@@ -206,7 +259,7 @@ function(q) {
     }
     e = walker.nextNode();
     }
-    if (early_stopped || truncation_reason === 'scanned_nodes_exceeded' || truncation_reason === 'max_bytes') break;
+    if (early_stopped || truncation_reason === 'scanned_nodes_exceeded' || truncation_reason === 'max_bytes' && !q.goal) break;
   }
   if (q.goal && items.length > 1) {
     const ranked = items.map((item,index)=>({item,node:nodes[index],index})).sort((a,b)=>(b.item.goal_score||0)-(a.item.goal_score||0)||a.index-b.index);
@@ -252,7 +305,9 @@ function(q) {
     }
     if (text_truncated) break;
   }
-  if (q.goal?.exhaustive) goal_satisfied = items.length > 0;
+  // Exhaustive search controls how far we scan; it does not make a weakly
+  // ranked candidate satisfy the requested semantic goal. Preserve the exact
+  // query/role match result computed for each candidate above.
   const controls_complete = !truncated && omitted_by_limit === 0 && omitted_oversized === 0;
   const frames_complete = cross_origin_frames_unread === 0 && same_origin_frames_pending === 0;
   const text_requested = q.max_text_chars > 0;
@@ -269,8 +324,9 @@ function(q) {
   if (same_origin_frames_pending) incomplete_reasons.push('same_origin_frames_pending');
   const coverage = truncated || cross_origin_frames_unread || same_origin_frames_pending || text_truncated ? 'partial: '+(truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : 'same_origin_frames_pending')) : (q.href_hint ? 'visible links matching href hint in reachable DOM and frames' : 'visible controls in light DOM, open shadow roots, and loaded same-origin frames in this scope');
   // Cross-origin frames cannot be inspected; they do not truncate the reachable first-party link scope.
-  const first_party_complete = !!q.href_hint && !truncated && !same_origin_frames_pending && items.every(item => { try { return new URL(item.href).origin === location.origin; } catch (_) { return false; } });
-  const scope_complete = q.goal ? !truncated && !early_stopped && frames_complete : q.href_hint ? first_party_complete : complete;
+  const firstPartyHint = q.href_hint || q.goal?.href_hint;
+  const first_party_complete = !!firstPartyHint && !truncated && !same_origin_frames_pending && items.every(item => { try { return new URL(item.href).origin === location.origin; } catch (_) { return false; } });
+  const scope_complete = firstPartyHint ? first_party_complete : q.goal ? !truncated && !early_stopped && frames_complete : complete;
   const target_uniqueness = scope_complete ? 'scope_complete' : 'unverified';
   for (const item of items) item.target_uniqueness = target_uniqueness;
   return {nodes,items,raw,name,presentation,visible:e=>presentation(e).rendered,public:{interaction_epoch:interactionEpoch(),url:location.href,title:document.title,ready_state:document.readyState,items,text:text.slice(0,q.max_text_chars),text_requested,text_truncated,truncated:!complete,complete,global_complete:complete,completeness:{controls:controls_complete?'complete':'partial',text:text_complete?'complete':'partial',frames:frames_complete?'complete':'partial'},incomplete_reasons,goal_satisfied,goal_score:goal_satisfied?goal_score:null,scope_complete,coverage,coverage_scope:q.goal?'ranked_target':q.href_hint ? 'matching_first_party_links' : 'all_reachable_controls',first_party_complete,scanned_nodes:Math.min(scanned,maxScanNodes),scanned_text_nodes:textScanned,search_budget_exhausted:truncation_reason==='scanned_nodes_exceeded',omitted_by_limit,omitted_oversized,shadow_roots_seen,iframes_seen,same_origin_frames_read,same_origin_frames_pending,blank_frames_seen,cross_origin_frames_unread,truncation_reason:truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : same_origin_frames_pending ? 'same_origin_frames_pending' : null),total_candidates:items.length+omitted_by_limit}};

@@ -6,7 +6,8 @@ const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
 const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
 const OPEN_RECEIPTS_KEY = "openReceipts";
-// shortcut: receipts never expire; storage exhaustion fails closed before navigation to preserve retry safety.
+const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const OPEN_RECEIPT_MAX_COUNT = 256;
 const MAX_BATCH_ACTIONS = 64;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
   "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
@@ -792,18 +793,25 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     if (pending.active !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
     return pending.promise;
   }
-  const operation = openTabQueue.then(async () => {
+  const withReceiptLock = async operation => {
+    const result = openTabQueue.then(operation);
+    openTabQueue = result.catch(() => {});
+    return result;
+  };
+  const operation = (async () => {
+    const reservation = await withReceiptLock(async () => {
     const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
     const receipts = saved[OPEN_RECEIPTS_KEY] || (await chrome.storage.session.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {};
+    pruneOpenReceipts(receipts);
+    if (!receipts[clientKey] && Object.keys(receipts).length >= OPEN_RECEIPT_MAX_COUNT) throw new Error("Open receipt capacity is full; old active or recoverable opens must be resolved before creating another tab.");
     const markerUrl = `${chrome.runtime.getURL("open-recovery.html")}#${encodeURIComponent(clientKey)}`;
     let receipt = receipts[clientKey];
     if (receipt?.status === "failed") throw new Error(`Open attempt left Controlla-created tab ${receipt.tab_id} for recovery; rediscover and pair that tab before retrying.`);
     if (receipt?.status === "complete" || receipt?.document_id) {
       if ((receipt.active ?? true) !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
-      const result = await returnExistingOpen(receipt, url, native, generation);
-      receipts[clientKey] = { ...receipt, status: "complete", requested_url: receipt.requested_url || url };
+      if ((receipt.requested_url || receipt.url) !== url) throw new Error("Idempotency key is already bound to a different URL.");
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
-      return result;
+      return { existing: receipt };
     }
     let tab;
     if (receipt?.tab_id) tab = await chrome.tabs.get(Number(receipt.tab_id)).catch(() => undefined);
@@ -816,24 +824,47 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active });
     receipt = { status: "creating", tab_id: String(tab.id), url, requested_url: url, marker_url: markerUrl, active, created_ms: receipt?.created_ms || Date.now() };
     receipts[clientKey] = receipt;
+    pruneOpenReceipts(receipts);
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    return { tab, markerUrl, reused, created_ms: receipt.created_ms };
+    });
+    if (reservation.existing) return returnExistingOpen(reservation.existing, url, native, generation);
     let result;
-    try { result = await createControllaTab(url, native, generation, tab, markerUrl, reused, waitUntil, active); }
+    try { result = await createControllaTab(url, native, generation, reservation.tab, reservation.markerUrl, reservation.reused, waitUntil, active); }
     catch (error) {
       if (error?.controllaOrphanTabId) {
-        receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, url, created_ms: Date.now() };
-        await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+        await withReceiptLock(async () => {
+          const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+          const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+          receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, url, requested_url: url, active, created_ms: reservation.created_ms };
+          pruneOpenReceipts(receipts);
+          await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+        });
       }
       throw error;
     }
-    receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, active, created_ms: receipt.created_ms };
-    await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    await withReceiptLock(async () => {
+      const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+      const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+      const current = receipts[clientKey];
+      if (current?.tab_id !== result.tab_id) throw new Error("Open receipt changed before completion; no second tab was opened.");
+      receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, active, created_ms: reservation.created_ms };
+      pruneOpenReceipts(receipts);
+      await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    });
     return result;
-  });
-  openTabQueue = operation.catch(() => {});
+  })();
   const inflight = { url, active, promise: operation };
   openTabInflight.set(clientKey, inflight);
   try { return await operation; } finally { if (openTabInflight.get(clientKey) === inflight) openTabInflight.delete(clientKey); }
+}
+function pruneOpenReceipts(receipts, now = Date.now()) {
+  for (const [key, receipt] of Object.entries(receipts)) {
+    if (receipt?.status === "complete" && Number.isSafeInteger(receipt.created_ms) && now - receipt.created_ms > OPEN_RECEIPT_MAX_AGE_MS) delete receipts[key];
+  }
+  const completed = Object.entries(receipts).filter(([, receipt]) => receipt?.status === "complete")
+    .sort((a, b) => (a[1].created_ms || 0) - (b[1].created_ms || 0));
+  while (Object.keys(receipts).length > OPEN_RECEIPT_MAX_COUNT && completed.length) delete receipts[completed.shift()[0]];
 }
 async function attachUnrestrictedNativeTab(tabId, leaseId) {
   if (!Number.isSafeInteger(tabId) || tabId < 0) throw new Error("Invalid Chrome tab ID.");

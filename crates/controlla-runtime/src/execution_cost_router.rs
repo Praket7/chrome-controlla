@@ -6,12 +6,16 @@ use std::collections::BTreeMap;
 
 const MAX_PROFILES: usize = 512;
 const MAX_SAMPLES_PER_PROFILE: usize = 32;
-const MIN_CLEAN_SAMPLES: usize = 8;
+const MIN_CLEAN_SAMPLES: usize = 16;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionCostRouter {
     profiles: BTreeMap<String, Vec<LatencySample>>,
+    #[serde(default)]
+    profile_recency: BTreeMap<String, u64>,
+    #[serde(default)]
+    next_profile_recency: u64,
     #[serde(skip)]
     path: Option<std::path::PathBuf>,
 }
@@ -41,6 +45,7 @@ impl ExecutionCostRouter {
             }
             _ => Self::default(),
         };
+        store.seed_missing_recency();
         store.path = Some(path);
         store
     }
@@ -73,10 +78,12 @@ impl ExecutionCostRouter {
         let key = profile_key(context, tier);
         if !self.profiles.contains_key(&key)
             && self.profiles.len() >= MAX_PROFILES
-            && let Some(oldest) = self.profiles.keys().next().cloned()
+            && let Some(oldest) = self.least_recent_profile()
         {
             self.profiles.remove(&oldest);
+            self.profile_recency.remove(&oldest);
         }
+        self.touch_profile(&key);
         let samples = self.profiles.entry(key).or_default();
         samples.push(LatencySample {
             elapsed_ms,
@@ -89,7 +96,7 @@ impl ExecutionCostRouter {
         self.persist()
     }
 
-    /// A route may override the static tier only after eight consecutive
+    /// A route may override the static tier only after sixteen consecutive
     /// independently verified, safety-clean observations for that exact cohort.
     /// Unmeasured routes keep the conservative static ordering.
     pub fn select(
@@ -116,10 +123,37 @@ impl ExecutionCostRouter {
                     .map(|sample| sample.elapsed_ms)
                     .collect::<Vec<_>>();
                 latencies.sort_unstable();
-                Some((*tier, latencies[latencies.len() - 1]))
+                let rank = (latencies.len() * 90).div_ceil(100).max(1);
+                Some((*tier, latencies[rank - 1]))
             })
-            .min_by_key(|(_, p95)| *p95)
+            .min_by_key(|(_, p90)| *p90)
             .map(|(tier, _)| tier)
+    }
+
+    fn touch_profile(&mut self, key: &str) {
+        self.next_profile_recency = self.next_profile_recency.saturating_add(1);
+        self.profile_recency
+            .insert(key.to_owned(), self.next_profile_recency);
+    }
+
+    fn least_recent_profile(&self) -> Option<String> {
+        self.profiles
+            .keys()
+            .min_by_key(|key| {
+                (
+                    self.profile_recency.get(*key).copied().unwrap_or(0),
+                    key.as_str(),
+                )
+            })
+            .cloned()
+    }
+
+    fn seed_missing_recency(&mut self) {
+        for key in self.profiles.keys().cloned().collect::<Vec<_>>() {
+            if !self.profile_recency.contains_key(&key) {
+                self.touch_profile(&key);
+            }
+        }
     }
 
     fn persist(&self) -> Result<(), &'static str> {
@@ -163,16 +197,18 @@ mod tests {
     }
 
     #[test]
-    fn learned_route_requires_eight_verified_clean_exact_cohort_samples() {
+    fn learned_route_requires_sixteen_verified_clean_exact_cohort_samples() {
         let mut router = ExecutionCostRouter::default();
         let fast = ExecutionTier::QualifiedSkill;
         let slow = ExecutionTier::SemanticProgram;
-        for elapsed in [20, 22, 21, 24, 23, 19, 25, 18] {
+        for elapsed in [
+            20, 22, 21, 24, 23, 19, 25, 18, 20, 22, 21, 24, 23, 19, 25, 18,
+        ] {
             router
                 .record(&context(), fast, elapsed, true, true)
                 .unwrap();
         }
-        for _ in 0..8 {
+        for _ in 0..16 {
             router.record(&context(), slow, 100, true, true).unwrap();
         }
         assert_eq!(router.select(&context(), &[slow, fast]), Some(fast));
@@ -184,10 +220,56 @@ mod tests {
     }
 
     #[test]
+    fn learned_route_waits_for_sixteen_clean_samples_and_uses_nearest_rank_p90() {
+        let mut router = ExecutionCostRouter::default();
+        let fast = ExecutionTier::QualifiedSkill;
+        let slow = ExecutionTier::SemanticProgram;
+        for elapsed in [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10] {
+            router
+                .record(&context(), fast, elapsed, true, true)
+                .unwrap();
+        }
+        for _ in 0..15 {
+            router.record(&context(), slow, 50, true, true).unwrap();
+        }
+        assert_eq!(
+            router.select(&context(), &[slow, fast]),
+            None,
+            "a route must not qualify before 16 clean samples"
+        );
+        router.record(&context(), fast, 250, true, true).unwrap();
+        router.record(&context(), slow, 50, true, true).unwrap();
+        assert_eq!(
+            router.select(&context(), &[slow, fast]),
+            Some(fast),
+            "one slow outlier must not make the recent maximum masquerade as p95"
+        );
+    }
+
+    #[test]
+    fn profile_capacity_evicts_least_recently_recorded_profile() {
+        let mut router = ExecutionCostRouter::default();
+        for index in 0..MAX_PROFILES {
+            let key = if index == 0 {
+                "z-old".to_owned()
+            } else {
+                format!("profile-{index:04}")
+            };
+            router.profiles.insert(key.clone(), Vec::new());
+            router.profile_recency.insert(key, index as u64 + 1);
+        }
+        router.profile_recency.insert("z-old".into(), 0);
+        router
+            .record(&context(), ExecutionTier::SemanticProgram, 1, true, true)
+            .unwrap();
+        assert!(!router.profiles.contains_key("z-old"));
+    }
+
+    #[test]
     fn failed_or_unsafe_recent_sample_disqualifies_learning_and_unavailable_routes() {
         let mut router = ExecutionCostRouter::default();
         let fast = ExecutionTier::QualifiedSkill;
-        for _ in 0..7 {
+        for _ in 0..15 {
             router.record(&context(), fast, 10, true, true).unwrap();
         }
         router.record(&context(), fast, 5, true, false).unwrap();

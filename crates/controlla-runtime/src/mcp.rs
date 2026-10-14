@@ -2040,8 +2040,31 @@ fn shared_epoch_matches(
             viewport_revision: revision(viewport.as_bytes()),
         }
     };
-    make(&snapshot.identity, &snapshot.interaction_epoch)
-        .compatible_with(&make(current, current_interaction), use_case)
+    let grounded = make(&snapshot.identity, &snapshot.interaction_epoch);
+    let fresh = make(current, current_interaction);
+    if use_case == crate::v3::EpochUse::GuardedClick {
+        // Only guarded semantic clicks revalidate the exact node, its name/value,
+        // visibility, hit target, and viewport in the browser-side guard immediately
+        // before dispatch. Other pointer mutations keep the strict page semantic epoch.
+        grounded.browser_generation == fresh.browser_generation
+            && grounded.target_id == fresh.target_id
+            && grounded.target_revision == fresh.target_revision
+            && grounded.frame_id == fresh.frame_id
+            && grounded.loader_id == fresh.loader_id
+            && grounded.document_id == fresh.document_id
+            && grounded.viewport_revision == fresh.viewport_revision
+    } else {
+        grounded.compatible_with(&fresh, use_case)
+    }
+}
+
+fn final_click_guard_matches_viewport(result: &Value, prepared_viewport: Option<&str>) -> bool {
+    result["ok"] == true
+        && result["x"].as_f64().is_some_and(f64::is_finite)
+        && result["y"].as_f64().is_some_and(f64::is_finite)
+        && result["viewport"]
+            .as_str()
+            .is_some_and(|viewport| prepared_viewport.is_none_or(|prepared| viewport == prepared))
 }
 
 fn find_cdp_frame(response: &Value, frame_id: &str) -> Option<(String, String)> {
@@ -3096,7 +3119,7 @@ impl App {
                     &args.chrome_tab_id,
                     &identity,
                     &interaction,
-                    crate::v3::EpochUse::PointerMutation,
+                    crate::v3::EpochUse::GuardedClick,
                 )
             {
                 return Err(ClickRefusal::Guard(crate::guard_reason::refusal(
@@ -3124,10 +3147,10 @@ impl App {
             {
                 return Err("outcome already satisfied; no click needed".into());
             }
-            Ok(guard)
+            Ok((guard, value))
         };
         let guard = match tokio::time::timeout_at(deadline, prepare).await {
-            Ok(Ok(guard)) => guard,
+            Ok(Ok(guard_and_check)) => guard_and_check,
             result => {
                 let refusal = match result {
                     Ok(Err(ClickRefusal::Guard(value))) => value,
@@ -3141,6 +3164,7 @@ impl App {
                 return Ok(rmcp::handler::server::wrapper::Json(refusal));
             }
         };
+        let (guard, initial_checked) = guard;
         // Consume before dispatch: even a lost reply must not permit a duplicate click with this reference.
         if !unrestricted {
             shared
@@ -3154,21 +3178,18 @@ impl App {
             .as_ref()
             .ok_or_else(|| invalid("session not accepted"))?;
         let registry = shared.registry()?;
-        let recheck=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true}))).await;
-        let checked = match recheck {
-            Ok(Ok(v)) => shared_value(&v).unwrap_or(Value::Null),
-            _ => Value::Null,
-        };
-        if checked["ok"] != true {
-            let mut refusal = if checked["reason"].is_string() {
-                crate::guard_reason::refusal(&checked)
-            } else {
-                json!({"status":"not_dispatched","reason":"target_changed_during_revalidation","reason_code":"changed_target","retry_class":"refresh_snapshot","dispatch_acknowledged":false})
-            };
-            refusal["phase"] = json!("revalidation");
-            return Ok(rmcp::handler::server::wrapper::Json(refusal));
-        }
+        let prepared_viewport = initial_checked["viewport"].as_str().map(str::to_owned);
         if !unrestricted {
+            let mut dispatch_snapshot = snapshot.clone();
+            let Some(prepared_viewport) = prepared_viewport.as_deref() else {
+                return Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "status":"not_dispatched",
+                    "reason":"click guard omitted its prepared viewport; inspect current state",
+                    "reason_code":"invalid_guard_receipt",
+                    "dispatch_acknowledged":false
+                })));
+            };
+            dispatch_snapshot.interaction_epoch["viewport"] = json!(prepared_viewport);
             let fresh = tokio::time::timeout_at(deadline, async {
                 let identity = shared_frame_identity(
                     connection,
@@ -3188,16 +3209,53 @@ impl App {
                 Ok::<_, String>((identity, interaction))
             })
             .await;
-            if !matches!(fresh, Ok(Ok((ref identity, ref interaction))) if shared_epoch_matches(&snapshot, &args.chrome_tab_id, identity, interaction, crate::v3::EpochUse::PointerMutation))
+            if !matches!(fresh, Ok(Ok((ref identity, ref interaction))) if shared_epoch_matches(&dispatch_snapshot, &args.chrome_tab_id, identity, interaction, crate::v3::EpochUse::GuardedClick))
             {
                 return Ok(rmcp::handler::server::wrapper::Json(
                     json!({"status":"not_dispatched","reason":"document changed before dispatch; take one fresh snapshot","dispatch_acknowledged":false}),
                 ));
             }
         }
+        // Revalidate the exact target and hit point after the last document/epoch
+        // read. The browser-side guard is the final CDP read before pointer dispatch.
+        let final_recheck = tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.callFunctionOn",
+                json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true}),
+            ),
+        )
+        .await;
+        let final_checked = match final_recheck {
+            Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        if !final_click_guard_matches_viewport(
+            &final_checked,
+            if unrestricted {
+                None
+            } else {
+                prepared_viewport.as_deref()
+            },
+        ) {
+            let mut refusal = if final_checked["reason"].is_string() {
+                crate::guard_reason::refusal(&final_checked)
+            } else {
+                json!({"status":"not_dispatched","reason":"target or viewport changed during final revalidation","reason_code":"changed_target","retry_class":"refresh_snapshot","dispatch_acknowledged":false})
+            };
+            refusal["phase"] = json!("final_revalidation");
+            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+        }
         let (x, y) = (
-            checked["x"].as_f64().ok_or_else(|| invalid("missing x"))?,
-            checked["y"].as_f64().ok_or_else(|| invalid("missing y"))?,
+            final_checked["x"]
+                .as_f64()
+                .ok_or_else(|| invalid("missing x"))?,
+            final_checked["y"]
+                .as_f64()
+                .ok_or_else(|| invalid("missing y"))?,
         );
         let [press_event, release_event] = click_mouse_events(x, y);
         let click_started_ms = std::time::SystemTime::now()
@@ -5126,14 +5184,35 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
-        SharedPageSnapshot, click_mouse_events, shared_epoch_matches,
-        shared_typing_minimum_duration, validate_loopback_ws,
+        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport,
+        shared_epoch_matches, shared_typing_minimum_duration, validate_loopback_ws,
     };
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn final_click_guard_requires_a_live_hit_test_and_stable_viewport() {
+        let checked = json!({"ok":true,"x":120.5,"y":80.0,"viewport":"800x600@0,0"});
+        assert!(final_click_guard_matches_viewport(
+            &checked,
+            Some("800x600@0,0")
+        ));
+        assert!(!final_click_guard_matches_viewport(
+            &checked,
+            Some("800x600@0,1")
+        ));
+        assert!(!final_click_guard_matches_viewport(
+            &json!({"ok":false,"x":120.5,"y":80.0,"viewport":"800x600@0,0"}),
+            Some("800x600@0,0")
+        ));
+        assert!(!final_click_guard_matches_viewport(
+            &json!({"ok":true,"x":"120.5","y":80.0,"viewport":"800x600@0,0"}),
+            Some("800x600@0,0")
+        ));
+    }
 
     #[test]
     fn semantic_click_dispatches_at_verified_point_without_a_separate_pointer_move() {
@@ -5407,6 +5486,20 @@ mod tests {
             &snapshot.identity,
             &json!({"semantic_revision":5,"focus":"body","selection":"collapsed:0","viewport":"800x600@0,0"}),
             crate::v3::EpochUse::PointerMutation
+        ));
+        assert!(shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":5,"focus":"body","selection":"collapsed:0","viewport":"800x600@0,0"}),
+            crate::v3::EpochUse::GuardedClick
+        ));
+        assert!(!shared_epoch_matches(
+            &snapshot,
+            "tab-1",
+            &snapshot.identity,
+            &json!({"semantic_revision":5,"focus":"body","selection":"collapsed:0","viewport":"900x600@0,0"}),
+            crate::v3::EpochUse::GuardedClick
         ));
         assert!(!shared_epoch_matches(
             &snapshot,

@@ -109,6 +109,19 @@ function sameOrigin(scope, destination) {
   }
 }
 
+function cssStringLiteral(value) {
+  let escaped = '';
+  for (const character of String(value)) {
+    const code = character.codePointAt(0);
+    if (character === '"' || character === '\\' || code <= 0x1f || code === 0x7f) {
+      escaped += `\\${code.toString(16)} `;
+    } else {
+      escaped += character;
+    }
+  }
+  return `"${escaped}"`;
+}
+
 function compactTool(tool) {
   const next = clone(tool);
   next.description = TOOL_DESCRIPTIONS[tool.name] ?? tool.description;
@@ -325,7 +338,7 @@ function explicitGoalProfile(goal) {
   };
 }
 
-function compileNewestWorkflow(goal, profile) {
+function compileNewestWorkflow(goal, profile, mode = 'foreground') {
   const maxCandidates = Math.max(2, Math.min(Number(goal.max_candidates ?? 12), 32));
   const query = goal.link_query ?? profile.link_query ?? goal.entity;
   const hrefHint = goal.href_hint ?? profile.href_hint ?? undefined;
@@ -345,14 +358,15 @@ function compileNewestWorkflow(goal, profile) {
     },
     {
       kind: 'find_all',
-      query,
       role: 'link',
       ...(hrefHint ? { href_hint: hrefHint } : {}),
       max_matches: maxCandidates,
       save_as: 'candidates'
     },
     { kind: 'choose', from: 'candidates', key: 'datetime', save_as: 'latest' },
-    { kind: 'click', reference: '$latest', outcome: { kind: 'navigation' } },
+    mode === 'background'
+      ? { kind: 'navigate_selected', from: 'latest' }
+      : { kind: 'click', reference: '$latest', outcome: { kind: 'navigation' } },
     { kind: 'verify', predicate: { kind: 'url_starts_with', prefix: verifyPrefix } }
   ];
 }
@@ -480,13 +494,17 @@ class AgentUxRuntime {
       };
     }
     const base = mergeAdvanced(args);
+    const mode = base.mode ?? 'foreground';
+    const steps = compileNewestWorkflow(goal, profile, mode);
+    const hrefHint = goal.href_hint ?? profile.href_hint;
     const openArgs = {
       ...base,
       action: 'open',
-      mode: base.mode ?? 'foreground',
-      url: profile.destination_url
+      mode,
+      url: profile.destination_url,
+      ...(hrefHint ? { ready_when: { selector: `a[href*=${cssStringLiteral(hrefHint)}]` } } : {}),
+      steps
     };
-    delete openArgs.steps;
     if (!openArgs.idempotency_key) openArgs.idempotency_key = this.openKeys.keyFor(openArgs);
     const opened = await this.callTool('browser', openArgs);
     const openedValue = getStructured(opened);
@@ -500,15 +518,8 @@ class AgentUxRuntime {
     const sessionId = openedValue.session_id;
     const tabId = openedValue.tab_id ?? openedValue.chrome_tab_id;
     const context = this.contexts.create(sessionId, tabId);
-    const steps = compileNewestWorkflow(goal, profile);
-    let workflow;
-    try {
-      workflow = await this.callTool('workflow', { session_id: sessionId, chrome_tab_id: tabId, steps });
-    } catch (error) {
-      this.routes.recordFailure(goal, { structuralDrift: false });
-      throw error;
-    }
-    const workflowValue = getStructured(workflow) ?? {};
+    const workflowValue = openedValue.workflow ?? {};
+    const actualWorkflowCalls = Array.isArray(steps) ? 1 : 0;
     const verified = !failureLike(workflowValue) && hasPassedVerify(workflowValue);
     if (verified) this.routes.recordSuccess(goal, profile);
     else this.routes.recordFailure(goal, { structuralDrift: structuralDrift(workflowValue) });
@@ -527,7 +538,7 @@ class AgentUxRuntime {
       workflow: workflowValue,
       orchestration: {
         external_tool_calls: 1,
-        internal_tool_calls: 2,
+        internal_tool_calls: actualWorkflowCalls,
         schema_discovery_calls: 0,
         repo_reads_required: 0,
         targeted_snapshots: 1,

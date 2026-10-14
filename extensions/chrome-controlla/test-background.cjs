@@ -1319,6 +1319,19 @@ function message(payload) {
   assert.ok(restartPort.sent.find(message => message.id === "open-conflict-b")?.error?.includes("different URL"),
     "an in-flight idempotency key cannot be reused with a different URL");
 
+  delayedNextCommitMs = 100;
+  restartPort.hostMessage({ type: "command", id: "open-independent-slow", target_id: "41", method: "Controlla.openTab",
+    params: { url: "https://example.test/independent-slow", idempotency_key: "client-fixture:independent-slow-1" } });
+  restartPort.hostMessage({ type: "command", id: "open-independent-fast", target_id: "41", method: "Controlla.openTab",
+    params: { url: "https://example.test/independent-fast", idempotency_key: "client-fixture:independent-fast-1" } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(restartPort.sent.find(message => message.id === "open-independent-fast")?.result,
+    "a distinct open should complete while another tab is still waiting for document readiness");
+  assert.equal(restartPort.sent.some(message => message.id === "open-independent-slow"), false,
+    "the slow open should remain pending until its own navigation commits");
+  await new Promise(resolve => setTimeout(resolve, 110));
+  assert.ok(restartPort.sent.find(message => message.id === "open-independent-slow")?.result);
+
   slowMediaNextNavigation = true;
   restartPort.hostMessage({ type: "command", id: "open-before-slow-media", target_id: "41", method: "Controlla.openTab",
     params: { url: "https://example.test/slow-media", idempotency_key: "client-fixture:slow-media-1234" } });
@@ -1362,6 +1375,11 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(restartPort.sent.at(-1).error, /activation mode/i, "one idempotency key cannot change activation mode");
   assert.equal(tabList.filter(tab => tab.url === backgroundParams.url).length, 1, "a conflicting retry cannot create a second tab");
+
+  localStorage.openReceipts["expired:receipt"] = { status: "complete", tab_id: "1", url: "https://example.test/old", document_id: "old", created_ms: -1_000_000_000_000, active: false };
+  restartPort.hostMessage({ ...openRequest, id: "open-prunes-expired-receipts", params: { url: "https://example.test/pruned", idempotency_key: "client-fixture:prune-expired-1", active: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(localStorage.openReceipts["expired:receipt"], undefined, "expired completed open receipts are pruned before new work");
 
   console.log("Extension version handshake, pairing cleanup, chooser event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

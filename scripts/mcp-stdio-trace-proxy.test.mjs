@@ -34,12 +34,38 @@ test('transparent stdio proxy records receive, browser, verification, and delive
     assert.ok(events.some(event => event.event === 'controlla_received' && event.tool === 'browser'));
     assert.ok(events.some(event => event.event === 'browser_operation'));
     assert.ok(events.some(event => event.event === 'verified_outcome' && event.selected_execution_tier === 'qualified_skill'));
-    assert.ok(events.some(event => event.event === 'tool_result_delivered' && event.schema_bytes > 0));
+    assert.ok(events.some(event => event.event === 'schema_delivered' && event.schema_bytes > 0));
+    const delivered = events.find(event => event.event === 'tool_result_delivered');
+    assert.ok(delivered && delivered.output_bytes > 0);
+    assert.equal(delivered.schema_bytes, undefined, 'tool-result timing must not end at tools/list schema delivery');
     const summary = summarizePromptTrace(events);
     assert.equal(summary.counters.external_controlla_calls, 1);
     assert.equal(summary.counters.browser_cdp_commands, 3);
     assert.equal(summary.counters.internal_model_calls, 0);
     assert.equal(summary.execution_tier, 'qualified_skill');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('partial workflow with an earlier verified receipt is not traced as a verified outcome', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'controlla-trace-proxy-'));
+  try {
+    const tracePath = join(directory, 'prompt-trace.jsonl');
+    const traceId = 'prompt-partial';
+    const proxy = resolve(fileURLToPath(new URL('./mcp-stdio-trace-proxy.mjs', import.meta.url)));
+    const server = resolve(fileURLToPath(new URL('./test-fixtures/traced-mcp-server.mjs', import.meta.url)));
+    await recordPromptTraceEvent(tracePath, traceId, 'prompt_sent');
+    const child = spawn(process.execPath, [proxy, process.execPath, server], {
+      env: { ...process.env, CONTROLLA_PROMPT_TRACE_FILE: tracePath, CONTROLLA_PROMPT_TRACE_ID: traceId, TRACE_FIXTURE_PARTIAL: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdout.resume(); child.stderr.resume();
+    child.stdin.end(`${JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'workflow', arguments: {} } })}\n`);
+    const exit = await new Promise((resolveExit, reject) => { child.once('error', reject); child.once('close', resolveExit); });
+    assert.equal(exit, 0);
+    const events = await readPromptTrace(tracePath);
+    assert.equal(events.some(event => event.event === 'verified_outcome'), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

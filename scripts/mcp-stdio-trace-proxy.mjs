@@ -47,7 +47,14 @@ function summaryFields(result) {
   const tier = collectValues(roots, value => value.execution_route?.selected || value.execution_route?.tier)
     .map(value => value.execution_route.selected ?? value.execution_route.tier).find(value => typeof value === 'string');
   const fallbacks = collectValues(roots, value => typeof value.fallback_reason === 'string').length;
-  const verified = collectValues(roots, value => value.status === 'verified' || value.verified === true).length > 0;
+  const terminal = roots.find(value => value && typeof value === 'object' && (value.status || value.workflow)) ?? {};
+  const workflow = terminal.workflow && typeof terminal.workflow === 'object' ? terminal.workflow : terminal;
+  const receipts = Array.isArray(workflow.receipts) ? workflow.receipts : [];
+  const terminalReceipt = receipts.at(-1);
+  const containsFailure = receipts.some(receipt => ['failed', 'unknown', 'not_dispatched', 'incomplete', 'unsupported'].includes(String(receipt?.status ?? '').toLowerCase()));
+  const verified = !containsFailure && (terminal.workflow
+    ? workflow.status === 'completed' && terminalReceipt?.step === 'verify' && terminalReceipt.status === 'passed'
+    : terminal.status === 'verified' || terminal.verified === true || terminal.status === 'passed' && !!terminal.predicate);
   return { ...(Number.isSafeInteger(cdp) ? { cdp_commands: cdp } : {}),
     ...(Number.isSafeInteger(internal) ? { internal_model_calls: internal } : {}),
     ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbacks, verified };
@@ -83,7 +90,7 @@ function inspectServerChunk(chunk) {
       const context = pending.get(String(response.id));
       if (context.kind === 'schema') {
         pending.delete(String(response.id));
-        trace('tool_result_delivered', { schema_bytes: lineBytes.length + 1, output_bytes: lineBytes.length + 1 });
+        trace('schema_delivered', { schema_bytes: lineBytes.length + 1, output_bytes: lineBytes.length + 1 });
         process.stdout.write(Buffer.concat([lineBytes, Buffer.from('\n')]));
       } else {
         pending.delete(String(response.id));

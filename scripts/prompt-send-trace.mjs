@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 
 export const PROMPT_TRACE_EVENTS = Object.freeze([
   'prompt_sent', 'first_tool_decision', 'controlla_received', 'browser_operation',
-  'verified_outcome', 'tool_result_delivered', 'final_answer', 'model_turn',
+  'verified_outcome', 'schema_delivered', 'tool_result_delivered', 'final_answer', 'model_turn',
   'model_visible_observation',
 ]);
 

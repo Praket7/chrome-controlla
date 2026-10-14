@@ -7,6 +7,7 @@ function(index, outcome, opts) {
   const rectOf = b => ({l:round(b.left), t:round(b.top), r:round(b.right), b:round(b.bottom)});
   let e = this.nodes[index];
   const saved = this.items[index];
+  const t = e?.type || '';
   const composedClosest = (node, selector) => {
     for (let n=node, depth=0; n && depth<16; n=n.parentElement || n.getRootNode()?.host, depth++) {
       if (n.matches?.(selector)) return n;
@@ -32,9 +33,18 @@ function(index, outcome, opts) {
   if (this.raw(e) !== saved.raw_value || this.name(e) !== saved.name || (e.tagName === 'A' && e.href !== saved.href)) {
     return fail('changed_target', {field: this.raw(e) !== saved.raw_value ? 'value' : (this.name(e) !== saved.name ? 'name' : 'href')});
   }
+  // Reject static safety boundaries before scrolling. A denied click must not
+  // move the page and stale the caller's viewport-bound snapshot.
+  if (composedClosest(e, '[data-masked]') || e.querySelector('[data-masked]')) return fail('masked_boundary');
+  const trusted = composedClosest(e, '[data-requires-trusted]');
+  const preScrollTrustedText = trusted === e && (e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(e.type));
+  if (e.querySelector('[data-requires-trusted]') || trusted && (trusted !== e || !preScrollTrustedText || outcome?.kind !== 'focused')) {
+    return fail('trusted_boundary', {self: trusted === e});
+  }
+  if (__UNSAFE__) return fail('unsafe_page', {tag:e.tagName.toLowerCase(), type:e.type || null});
   if (align !== 'none') e.scrollIntoView({block: align, inline: 'nearest'});
   if (frame && align !== 'none') frame.scrollIntoView({block:align, inline:'nearest'});
-  const t = e.type || '', s = e.ownerDocument.defaultView.getComputedStyle(e), b = e.getBoundingClientRect();
+  const s = e.ownerDocument.defaultView.getComputedStyle(e), b = e.getBoundingClientRect();
   const fb = frame?.getBoundingClientRect();
   const x = b.left + b.width / 2 + (fb?.left || 0), y = b.top + b.height / 2 + (fb?.top || 0);
   const unsafe = __UNSAFE__;
@@ -53,7 +63,10 @@ function(index, outcome, opts) {
     () => unsafe ? fail('unsafe_page', {tag: e.tagName.toLowerCase(), type: t || null}) : null,
     () => !this.visible(e) ? fail('hidden', {zero_size: !(b.width > 0 && b.height > 0), visibility: s.visibility, display: s.display, hidden_ancestor: !!e.closest('[hidden],[inert]')}) : null,
     () => e.matches(':disabled') ? fail('disabled') : null,
-    () => e.getAttribute('aria-disabled') === 'true' ? fail('aria_disabled') : null,
+    // aria-disabled is an accessibility annotation, not a browser-level
+    // pointer block. Keep native :disabled and the actual hit-test checks
+    // authoritative here; a stale ARIA flag must not prevent a working
+    // picker/button from being clicked. Fill/select guards still honor it.
     () => s.pointerEvents === 'none' ? fail('pointer_events_none') : null,
     () => (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) ? fail('outside_viewport', {rect: rectOf(b), viewport: {w: innerWidth, h: innerHeight}, scroll: align}) : null,
     () => !deepHit() ? fail('no_hit_target', {rect: rectOf(b)}) : null,
@@ -68,5 +81,5 @@ function(index, outcome, opts) {
     },
   ];
   for (const check of ordered) { const r = check(); if (r) return r; }
-  return {ok:true, x, y};
+  return {ok:true, x, y, viewport:JSON.stringify([innerWidth,innerHeight,scrollX,scrollY,visualViewport?.width,visualViewport?.height,visualViewport?.offsetLeft,visualViewport?.offsetTop,visualViewport?.scale])};
 }

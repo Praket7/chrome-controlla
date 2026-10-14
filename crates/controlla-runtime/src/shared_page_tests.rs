@@ -50,7 +50,8 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
     };
     let result=AssertUnwindSafe(async {
         eval(r##"document.body.innerHTML='<style>button,a{display:block;margin:4px}</style>'+ '<div>padding</div>'.repeat(200)+'<button id="account" aria-label="Accounts" aria-expanded="false" onclick="this.setAttribute(\'aria-expanded\',\'true\')"></button><button aria-label="Twin">Twin</button><button aria-label="Twin">Twin</button><button id="menu" onclick="setTimeout(()=>{document.body.insertAdjacentHTML(\'beforeend\',\'<div id=late>Ready</div>\')},150)">Menu</button><button id="uncertain" onclick="window.clicks=(window.clicks||0)+1">Count</button><a id="nav" href="#done">Story</a><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before" onclick="window.trustedClicks=(window.trustedClicks||0)+1"><div data-masked>PRIVATE-SENTINEL</div><button><span data-requires-trusted>PROTECTED-SENTINEL</span></button><span id="secretLabel" data-masked>LABEL-SENTINEL</span><button aria-labelledby="secretLabel" aria-label="Safe">safe</button><button hidden>Hidden</button><div id="late-target">needle</div><iframe id="composed-text" srcdoc="&lt;body&gt;&lt;label&gt;COMPOSED-FRAME-SENTINEL&lt;/label&gt;&lt;/body&gt;"></iframe>';document.querySelector('#account').style.cssText='width:70px;height:25px';"##.into()).await;
-        eval(r##"document.body.insertAdjacentHTML('beforeend','<article><a href="/story-date">Date precision</a><time datetime="2024-04-01">April 1</time></article><article><a href="/story-instant">Instant precision</a><time datetime="2024-04-02T12:00:00Z">April 2</time></article><article><a target="_blank" rel="noopener" href="/story-new-tab">New tab story</a></article>');"##.into()).await;
+        eval(r##"document.body.insertAdjacentHTML('beforeend','<article><a href="/story-date">Date precision</a><time datetime="2024-04-01">April 1</time></article><article><a href="/story-instant">Instant precision</a><time datetime="2024-04-02T12:00:00Z">April 2</time></article><article><a target="_blank" rel="noopener" href="/story-new-tab">New tab story</a></article><article><a href="/story-relative">Fresh Bills story</a><time>2h</time><span>Nick Suss</span></article>');"##.into()).await;
+        eval(r##"document.body.insertAdjacentHTML('beforeend','<button id="aria-upload" aria-label="ARIA Upload" aria-disabled="true" onclick="document.body.insertAdjacentHTML(\'beforeend\',\'<div id=upload-opened>Upload picker</div>\')">Upload</button>');"##.into()).await;
         let linked_dates = include_str!("shared_page/linked_dates.js");
         let stale_revision = eval(format!("({linked_dates})([],{{url:location.href,revision:'stale'}})")).await;
         assert_eq!(stale_revision["result"]["value"]["snapshot_matches"], false, "same-URL reload must invalidate a prior candidate snapshot");
@@ -116,6 +117,10 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(new_tab_story["target"], "_blank");
         assert_eq!(new_tab_story["rel"], "noopener");
         assert_eq!(host_round_trips.load(std::sync::atomic::Ordering::Relaxed),3,"fresh snapshot uses one identity read, one evaluation, and one readback batch");
+        let freshness_goal=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Bills story","roles":["link"],"href_hint":"/story-relative"},"max_items":10,"max_text_chars":0,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
+        let fresh_story=freshness_goal["items"].as_array().unwrap().iter().find(|item|item["href"].as_str().is_some_and(|href|href.ends_with("/story-relative"))).unwrap();
+        assert_eq!(fresh_story["freshness_text"],"2h","relative publication evidence must be extracted from the story card");
+        assert!(fresh_story["freshness_observed_at_ms"].as_i64().is_some());
         let goal_snapshot=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Accounts","roles":["button"]},"max_items":1,"max_text_chars":6000,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
         assert_eq!(goal_snapshot["goal_satisfied"],true,"{goal_snapshot}");
         assert!(goal_snapshot["text"].as_str().unwrap_or_default().contains("COMPOSED-FRAME-SENTINEL"),"goal snapshots must collect bounded text from the same-origin frame scopes: {goal_snapshot}");
@@ -124,17 +129,33 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(fast_twin["items"][0]["target_uniqueness"],"unverified","early stop must not imply a unique target");
         let exhaustive_twins=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Twin","roles":["button"],"exhaustive":true},"max_items":10,"max_text_chars":0,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
         assert_eq!(exhaustive_twins["scope_complete"],true,"{exhaustive_twins}");
-        assert_eq!(exhaustive_twins["items"].as_array().unwrap().len(),2,"exhaustive uniqueness read must surface duplicate exact labels");
+        assert_eq!(
+            exhaustive_twins["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["name"] == "Twin")
+                .count(),
+            2,
+            "exhaustive intent ranking must retain both exact duplicate labels without treating the query as a hard filter"
+        );
         snapshot=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","max_text_chars":6000,"max_bytes":60000}))).await.unwrap().structured_content.unwrap();
         let rendered=snapshot.to_string();
         for secret in ["PRIVATE-SENTINEL","PROTECTED-SENTINEL","LABEL-SENTINEL"] {assert!(!rendered.contains(secret));}
         let item=|snapshot:&Value,name:&str|snapshot["items"].as_array().unwrap().iter().find(|v|v["name"]==name).unwrap().clone();
+        let aria_upload=item(&snapshot,"ARIA Upload");
+        assert_eq!(aria_upload["disabled"],false,"ARIA-only disabled state must not be reported as a browser-native disabled control");
+        assert_eq!(aria_upload["native_disabled"],false);
+        assert_eq!(aria_upload["aria_disabled"],true);
+        assert_eq!(aria_upload["actionability"],"candidate");
         assert_eq!(item(&snapshot,"Trusted keys")["requires_trusted_events"],true);
         assert!(!snapshot["items"].as_array().unwrap().iter().any(|v|v["name"]=="Hidden"));
         assert_eq!(item(&snapshot,"Accounts")["raw_value"],"");
+        let before_guard_scroll=eval("scrollY".into()).await["result"]["value"].as_i64().unwrap();
         let wrong_outcome=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"navigation"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(wrong_outcome["status"],"not_dispatched","{wrong_outcome}");
         assert_eq!(eval("window.trustedClicks||0".into()).await["result"]["value"],0);
+        assert_eq!(eval("scrollY".into()).await["result"]["value"].as_i64().unwrap(),before_guard_scroll,"a denied trusted-event action must not move the page");
         let trusted=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"focused"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(trusted["status"],"verified","{trusted}");
         assert_eq!(eval("document.activeElement.id".into()).await["result"]["value"],"trusted");
@@ -142,6 +163,8 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let first_ref=item(&snapshot,"Accounts")["reference"].clone();
         let clicked=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":first_ref,"outcome":{"kind":"expanded"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(clicked["status"],"verified","{clicked}");
+        let aria_upload_click=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":aria_upload["reference"],"outcome":{"kind":"visible","selector":"#upload-opened"}}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(aria_upload_click["status"],"verified","a working upload-picker button with a stale aria-disabled annotation must still dispatch and verify: {aria_upload_click}");
         let duplicate=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":first_ref,"outcome":{"kind":"expanded"}}))).await;
         assert!(duplicate.is_err() || duplicate.unwrap().is_error==Some(true));
         let menu=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&clicked["snapshot"],"Menu")["reference"],"outcome":{"kind":"text","selector":"#late","text":"Ready"}}))).await.unwrap().structured_content.unwrap();
@@ -178,6 +201,10 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(sparse_text["goal_satisfied"],true,"{sparse_text}");
         assert_eq!(sparse_text["completeness"]["text"],"partial","bounded sparse-text traversal must be reported as incomplete");
         assert!(sparse_text["scanned_text_nodes"].as_u64().unwrap()<=4096,"targeted snapshot text traversal exceeded its separate budget: {sparse_text}");
+        eval("document.body.replaceChildren(Object.assign(document.createElement('button'),{textContent:'edit New announcement'}))".into()).await;
+        let weak_exhaustive_match=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"announcement editor textbox attach file Post button","exhaustive":true},"max_scan_nodes":50000,"max_items":20,"max_text_chars":0,"max_bytes":20000}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(weak_exhaustive_match["goal_satisfied"],false,"one weak token overlap must not satisfy an exhaustive semantic goal: {weak_exhaustive_match}");
+        assert_eq!(weak_exhaustive_match["items"][0]["name"],"edit New announcement","fixture must retain the tempting weak candidate");
         let no_text=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Open requested panel","roles":["button"]},"max_scan_nodes":50000,"max_items":1,"max_text_chars":0,"max_bytes":8192}))).await.unwrap().structured_content.unwrap();
         assert_eq!(no_text["scanned_text_nodes"],0,"zero requested text must skip text traversal");
         assert_eq!(no_text["text_requested"],false,"control-only snapshots must state that page text was omitted");

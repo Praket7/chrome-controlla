@@ -140,6 +140,7 @@ pub struct InteractionEpoch {
 pub enum EpochUse {
     Read,
     PointerMutation,
+    GuardedClick,
     TextMutation,
 }
 
@@ -157,6 +158,10 @@ impl InteractionEpoch {
         match use_case {
             EpochUse::Read => true,
             EpochUse::PointerMutation => {
+                self.semantic_revision == fresh.semantic_revision
+                    && self.viewport_revision == fresh.viewport_revision
+            }
+            EpochUse::GuardedClick => {
                 self.semantic_revision == fresh.semantic_revision
                     && self.viewport_revision == fresh.viewport_revision
             }

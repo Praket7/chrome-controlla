@@ -120,6 +120,7 @@ const MAX_SESSION_ARTIFACT_BYTES: usize = 50 * 1024 * 1024;
 pub enum ArtifactScope {
     PrivateHeadlessSession,
     LocalUnrestrictedSharedSession,
+    GuardedSharedSession,
 }
 
 impl ArtifactScope {
@@ -127,6 +128,7 @@ impl ArtifactScope {
         match self {
             Self::PrivateHeadlessSession => "private_headless_session",
             Self::LocalUnrestrictedSharedSession => "local_unrestricted_shared_session",
+            Self::GuardedSharedSession => "guarded_shared_session",
         }
     }
 }
@@ -152,6 +154,9 @@ impl<'de> Deserialize<'de> for ArtifactHandle {
             }
             Some((opaque, "local_unrestricted_shared_session")) => {
                 (opaque, ArtifactScope::LocalUnrestrictedSharedSession)
+            }
+            Some((opaque, "guarded_shared_session")) => {
+                (opaque, ArtifactScope::GuardedSharedSession)
             }
             Some(_) => return Err(serde::de::Error::custom("unknown artifact scope")),
             None => (value.as_str(), ArtifactScope::PrivateHeadlessSession),
@@ -1310,6 +1315,21 @@ mod tests {
                 ArtifactScope::LocalUnrestrictedSharedSession,
             )
             .unwrap();
+        let guarded = registry
+            .put_artifact_bytes_scoped(
+                &alice,
+                "guarded.txt",
+                b"inline",
+                ArtifactScope::GuardedSharedSession,
+            )
+            .unwrap();
+        assert_eq!(guarded.scope, ArtifactScope::GuardedSharedSession);
+        let guarded_encoded = serde_json::to_string(&guarded.handle).unwrap();
+        assert!(guarded_encoded.ends_with("@guarded_shared_session\""));
+        assert_eq!(
+            serde_json::from_str::<ArtifactHandle>(&guarded_encoded).unwrap(),
+            guarded.handle
+        );
         let encoded = serde_json::to_string(&local.handle).unwrap();
         assert!(encoded.ends_with("@local_unrestricted_shared_session\""));
         let round_trip: ArtifactHandle = serde_json::from_str(&encoded).unwrap();
@@ -1363,7 +1383,7 @@ mod tests {
             registry.put_artifact_bytes(&alice, "large", &vec![0; MAX_ARTIFACT_BYTES + 1]),
             Err(SessionError::ArtifactTooLarge)
         );
-        for index in 0..(MAX_SESSION_ARTIFACT_COUNT - 2) {
+        for index in 0..(MAX_SESSION_ARTIFACT_COUNT - 3) {
             registry
                 .put_artifact_bytes(&alice, &format!("extra-{index}"), b"x")
                 .unwrap();

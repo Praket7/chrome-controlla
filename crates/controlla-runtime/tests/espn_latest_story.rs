@@ -56,6 +56,12 @@ fn fixture_server() -> (String, thread::JoinHandle<()>, Arc<AtomicBool>) {
                     let path = request.split_whitespace().nth(1).unwrap_or("/");
                     let (status, body) = match path {
                         "/" => ("200 OK", include_str!("../../../bench/fixtures/espn_bills_latest_story/index.html").to_owned()),
+                        "/live-shaped" => {
+                            let scoreboard = (0..96).map(|index| format!("<a href='/game/{index}'>Gamecast Game {index}</a>")).collect::<String>();
+                            ("200 OK", format!("<html><head><title>Buffalo Bills latest stories</title></head><body><main><h1>Buffalo Bills</h1><nav>{scoreboard}</nav><section id='news'><article><a href='/nfl/story/older-relative'>Bills look ahead to Sunday</a><time>3h</time></article><article><a href='/nfl/story/newest-relative'>Josh Allen: Buffalo's latest injury update</a><time>2h</time></article></section><iframe src='https://ads.example.test/embed'></iframe></main></body></html>"))
+                        },
+                        "/nfl/story/older" => ("200 OK", r#"<html><head><script type="application/ld+json">{"@type":"NewsArticle","url":"/nfl/story/older","datePublished":"2026-10-09T16:30:00Z"}</script></head><body><h1>Bills look ahead to Sunday</h1></body></html>"#.to_owned()),
+                        "/nfl/story/newest" => ("200 OK", r#"<html><head><script type="application/ld+json">{"@type":"NewsArticle","url":"/nfl/story/newest","datePublished":"2026-10-11T12:00:00Z"}</script></head><body><h1>Josh Allen: Buffalo's latest injury update</h1></body></html>"#.to_owned()),
                         "/overlay" => ("200 OK", include_str!("../../../bench/fixtures/espn_bills_latest_story/index.html").replace("</body>", "<div style='position:fixed;inset:0;background:#0008;z-index:99999'>fixture obstruction</div></body>")),
                         "/linked" => ("200 OK", "<html><head><title>Linked story metadata</title></head><body><main><article><a href='/article-older.html'>Bills look ahead to the weekend</a></article><article><a href='/article-newest.html'>Bills latest: injury report before Sunday</a></article></main></body></html>".to_owned()),
                         "/listed" => ("200 OK", r#"<html><head><title>Listed story metadata</title><script type="application/ld+json">{"@graph":[{"@type":"NewsArticle","url":"/article-older.html","datePublished":"2026-10-09T16:30:00Z"},{"@type":"NewsArticle","url":"/article-newest.html","datePublished":"2026-10-10T12:00:00Z"}]}</script></head><body><main><article><a href='/article-older.html'>Bills look ahead to the weekend</a></article><article><a href='/article-newest.html'>Bills latest: injury report before Sunday</a></article></main></body></html>"#.to_owned()),
@@ -191,7 +197,13 @@ async fn nested_snapshot_reports_read_and_unread_sources() {
     let _ = std::fs::remove_dir_all(state);
 }
 
-async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_json::Value {
+async fn run_latest_story(
+    overlay: bool,
+    linked: bool,
+    listed: bool,
+    live_shape: bool,
+    live_url: Option<String>,
+) -> serde_json::Value {
     let started = std::time::Instant::now();
     let state = state_dir();
     std::fs::create_dir_all(&state).unwrap();
@@ -210,7 +222,11 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
         CallToolRequestParams::new(name.to_owned())
             .with_arguments(value.as_object().unwrap().clone())
     };
-    let start_url = if listed {
+    let start_url = if let Some(url) = live_url.as_ref() {
+        url.clone()
+    } else if live_shape {
+        format!("{base}/live-shaped")
+    } else if listed {
         format!("{base}/listed")
     } else if linked {
         format!("{base}/linked")
@@ -219,10 +235,15 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
     } else {
         base.clone()
     };
+    let launch_url = if live_url.is_some() {
+        "about:blank"
+    } else {
+        start_url.as_str()
+    };
     let launch = client
         .call_tool(call(
             "browser",
-            serde_json::json!({"action":"launch","mode":"headless","url":start_url}),
+            serde_json::json!({"action":"launch","mode":"headless","url":launch_url}),
         ))
         .await
         .unwrap()
@@ -230,17 +251,53 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
         .unwrap();
     let session = launch["session_id"].as_str().unwrap();
     let tab = launch["target_ids"][0].as_str().unwrap();
-    let snapshot = client.call_tool(call("snapshot", serde_json::json!({"session_id":session,"chrome_tab_id":tab,"max_items":20,"max_text_chars":0}))).await.unwrap().structured_content.unwrap();
-    assert_eq!(
-        snapshot["scope_complete"], true,
-        "fixture story candidates need a complete freshness scope: {snapshot}"
-    );
-    let workflow = client.call_tool(call("workflow", serde_json::json!({"session_id":session,"chrome_tab_id":tab,"steps":[
-        {"kind":"find_all","role":"link","href_hint":"/article-","max_matches":10,"save_as":"stories"},
-        {"kind":"choose","from":"stories","key":"datetime","save_as":"story"},
-        {"kind":"click","reference":"$story","outcome":{"kind":"navigation"}},
-        {"kind":"verify","predicate":{"kind":"url","equals":"$story.href"}}
-    ]}))).await;
+    let live_navigation = if live_url.is_some() {
+        Some(client.call_tool(call("browser", serde_json::json!({
+            "action":"task","session_id":session,"chrome_tab_id":tab,
+            "task":{"kind":"research","urls":[start_url.clone()],"goal":"open the Buffalo Bills team page"}
+        }))).await.unwrap().structured_content.unwrap())
+    } else {
+        None
+    };
+    let snapshot_args = if live_shape {
+        serde_json::json!({"session_id":session,"chrome_tab_id":tab,"goal":{"query":"Buffalo Bills newest story headlines publication dates","roles":["link"],"exhaustive":true},"max_items":8,"max_bytes":8192,"max_text_chars":0,"max_scan_nodes":20000})
+    } else {
+        serde_json::json!({"session_id":session,"chrome_tab_id":tab,"max_items":20,"max_text_chars":0})
+    };
+    let snapshot = client
+        .call_tool(call("snapshot", snapshot_args))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    if !live_shape {
+        assert_eq!(
+            snapshot["scope_complete"], true,
+            "fixture story candidates need a complete freshness scope: {snapshot}"
+        );
+    }
+    let workflow_steps = if live_shape {
+        serde_json::json!([
+            {"kind":"snapshot","goal":{"query":"Buffalo Bills newest story headlines publication dates","roles":["link"],"href_hint":"/nfl/story/","exhaustive":true},"max_items":8,"max_text_chars":0,"max_scan_nodes":20000},
+            {"kind":"find_all","role":"link","href_hint":"/nfl/story/","max_matches":10,"save_as":"stories"},
+            {"kind":"choose","from":"stories","key":"datetime","save_as":"story"},
+            {"kind":"navigate_selected","from":"story"},
+            {"kind":"verify","predicate":{"kind":"url","equals":"$story.href"}}
+        ])
+    } else {
+        serde_json::json!([
+            {"kind":"find_all","role":"link","href_hint":"/article-","max_matches":10,"save_as":"stories"},
+            {"kind":"choose","from":"stories","key":"datetime","save_as":"story"},
+            {"kind":"click","reference":"$story","outcome":{"kind":"navigation"}},
+            {"kind":"verify","predicate":{"kind":"url","equals":"$story.href"}}
+        ])
+    };
+    let workflow = client
+        .call_tool(call(
+            "workflow",
+            serde_json::json!({"session_id":session,"chrome_tab_id":tab,"steps":workflow_steps}),
+        ))
+        .await;
     let result = match workflow {
         Ok(response) => response.structured_content.unwrap_or_default(),
         Err(error) => {
@@ -258,7 +315,7 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
     let _ = server.join();
     let _ = std::fs::remove_dir_all(state);
     let workflow_steps = result["steps"].as_u64().unwrap_or(0);
-    serde_json::json!({"result":result,"mcp_calls":4,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
+    serde_json::json!({"launch":launch,"live_navigation":live_navigation,"result":result,"candidate_snapshot":snapshot,"mcp_calls":4,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
 }
 
 #[cfg(target_os = "macos")]
@@ -266,7 +323,7 @@ async fn run_latest_story(overlay: bool, linked: bool, listed: bool) -> serde_js
 #[allow(clippy::await_holding_lock)]
 async fn espn_latest_story_flow_completes_and_verifies_newest() {
     let _serial = TEST_LOCK.lock().unwrap();
-    let result = run_latest_story(false, false, false).await;
+    let result = run_latest_story(false, false, false, false, None).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(result["result"]["steps"], 4, "workflow step budget");
     assert!(result["result"]["elapsed_ms"].is_number());
@@ -295,7 +352,7 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
 #[allow(clippy::await_holding_lock)]
 async fn espn_latest_story_recovers_from_safe_obstruction_without_model_retry() {
     let _serial = TEST_LOCK.lock().unwrap();
-    let result = run_latest_story(true, false, false).await;
+    let result = run_latest_story(true, false, false, false, None).await;
     let click = &result["result"]["receipts"][2];
     assert!(
         click["status"] == "verified"
@@ -313,7 +370,7 @@ async fn espn_latest_story_recovers_from_safe_obstruction_without_model_retry() 
 #[allow(clippy::await_holding_lock)]
 async fn linked_article_metadata_resolves_same_origin_story_dates() {
     let _serial = TEST_LOCK.lock().unwrap();
-    let result = run_latest_story(false, true, false).await;
+    let result = run_latest_story(false, true, false, false, None).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(
         result["result"]["receipts"][1]["selected"]["freshness_source"],
@@ -333,11 +390,100 @@ async fn linked_article_metadata_resolves_same_origin_story_dates() {
 #[allow(clippy::await_holding_lock)]
 async fn listing_json_ld_avoids_linked_page_reads() {
     let _serial = TEST_LOCK.lock().unwrap();
-    let result = run_latest_story(false, false, true).await;
+    let result = run_latest_story(false, false, true, false, None).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(
         result["result"]["receipts"][1]["selected"]["freshness_source"],
         "listing_json_ld"
     );
     assert_eq!(result["result"]["receipts"][3]["status"], "passed");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn live_shaped_story_task_survives_natural_query_scoreboard_and_unread_embed() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let result = run_latest_story(false, false, false, true, None).await;
+    let snapshot = &result["candidate_snapshot"];
+    let candidates = snapshot["items"].as_array().unwrap();
+    assert!(
+        candidates.iter().any(|item| item["href"]
+            .as_str()
+            .is_some_and(|href| href.ends_with("/nfl/story/newest-relative"))),
+        "natural-language query and a large scoreboard must retain the relevant story links: {snapshot}"
+    );
+    assert!(
+        candidates[0]["href"]
+            .as_str()
+            .is_some_and(|href| href.ends_with("/nfl/story/newest-relative"))
+            && candidates[0]["goal_score"].as_i64().unwrap_or_default()
+                > candidates
+                    .iter()
+                    .filter(|item| item["section"] == "nav")
+                    .map(|item| item["goal_score"].as_i64().unwrap_or_default())
+                    .max()
+                    .unwrap_or_default(),
+        "relevance-ranked stories must precede scoreboard links within the bounded result: {snapshot}"
+    );
+    let execution = &result["result"];
+    assert_eq!(execution["status"], "completed", "{result}");
+    assert_eq!(
+        execution["receipts"][1]["coverage_complete"], true,
+        "an unread unrelated cross-origin embed must not invalidate the complete first-party story-link scope: {result}"
+    );
+    assert_eq!(
+        execution["receipts"][3]["status"], "verified",
+        "story click must be dispatched only after scope-local freshness proof: {result}"
+    );
+    assert_eq!(
+        execution["receipts"][4]["status"], "passed",
+        "selected article URL must be independently verified: {result}"
+    );
+    assert!(
+        execution["receipts"][2]["selected"]["href"]
+            .as_str()
+            .is_some_and(|href| href.ends_with("/nfl/story/newest-relative")),
+        "the latest article should win from linked publication metadata or observed relative-age labels: {result}"
+    );
+    assert_eq!(
+        execution["receipts"][2]["selected"]["freshness_source"],
+        "relative_age_label"
+    );
+    assert_eq!(
+        execution["receipts"][2]["freshness_evidence"]["label"],
+        "2h"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "live ESPN network qualification; isolated headless Chrome only"]
+#[allow(clippy::await_holding_lock)]
+async fn live_espn_headless_latest_story_smoke() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let result = run_latest_story(
+        false,
+        false,
+        false,
+        true,
+        Some("https://www.espn.com/nfl/team/_/name/buf/buffalo-bills".into()),
+    )
+    .await;
+    let execution = &result["result"];
+    assert_eq!(execution["status"], "completed", "{result}");
+    assert_eq!(
+        execution["receipts"][3]["status"], "verified",
+        "live ESPN story click must be guarded and observed: {result}"
+    );
+    assert_eq!(
+        execution["receipts"][4]["status"], "passed",
+        "live ESPN article destination must be independently verified: {result}"
+    );
+    assert!(
+        execution["receipts"][2]["selected"]["href"]
+            .as_str()
+            .is_some_and(|href| href.starts_with("https://www.espn.com/nfl/story/")),
+        "selected article must remain within ESPN NFL stories: {result}"
+    );
 }

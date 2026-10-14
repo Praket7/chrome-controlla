@@ -379,6 +379,9 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         rich_context: args.max_text_chars.is_some_and(|limit| limit > 2_000),
         frame_id: args.frame_id.is_some(),
         scoped_selector: args.selector.is_some(),
+        query_signature: stable_intent_signature(args.goal.as_ref().map(|goal| format!("{}|{}", goal.query.as_deref().unwrap_or_default(), goal.roles.as_ref().map(|roles| roles.join(",")).unwrap_or_default())).as_deref()),
+        scope_signature: stable_intent_signature(args.selector.as_ref().map(|selector| format!("{}|{}", selector, args.goal.as_ref().and_then(|goal| goal.href_hint.as_deref()).unwrap_or_default())).or_else(|| args.goal.as_ref().and_then(|goal| goal.href_hint.clone())).as_deref()),
+        query_required: args.goal.as_ref().and_then(|goal| goal.query.as_deref()).is_some_and(|query| !query.trim().is_empty()),
     };
     let decision = app.observation_history.lock().map(|history|
         crate::observation_router::choose_observation_with_history(request, &history)
@@ -547,13 +550,28 @@ fn record_observation_feedback(
     value: &Value,
     bytes: u64,
 ) {
-    let has_evidence = value["items"].as_array().is_some_and(|items| !items.is_empty())
+    let usable = observation_is_usable(request, value);
+    if let Ok(mut history) = app.observation_history.lock() {
+        history.record(request, decision, started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64, bytes, usable);
+    }
+}
+
+fn observation_is_usable(request: crate::observation_router::ObservationRequest, value: &Value) -> bool {
+    let has_content = value["items"].as_array().is_some_and(|items| !items.is_empty())
         || value["nodes"].as_array().is_some_and(|nodes| !nodes.is_empty())
         || value["global_complete"] == true;
+    let scope_complete = value["scope_complete"] == true || value["complete"] == true || value["global_complete"] == true;
+    let no_truncation = value["omitted_by_limit"].as_u64().unwrap_or(0) == 0
+        && value["omitted_oversized"].as_u64().unwrap_or(0) == 0
+        && (value["text_requested"] != true || value["completeness"]["text"] == "complete");
+    let intent_satisfied = !request.query_required || value["goal_satisfied"] == true;
     let explicitly_failed = matches!(value["status"].as_str(), Some("failed" | "unknown" | "incomplete"));
-    if let Ok(mut history) = app.observation_history.lock() {
-        history.record(request, decision, started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64, bytes, has_evidence && !explicitly_failed);
-    }
+    has_content && scope_complete && no_truncation && intent_satisfied && !explicitly_failed
+}
+
+fn stable_intent_signature(value: Option<&str>) -> u64 {
+    value.unwrap_or_default().trim().to_ascii_lowercase().bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
 }
 
 fn semantic_ambiguity<'a>(items: impl Iterator<Item = &'a Value>) -> f32 {
@@ -799,6 +817,37 @@ async fn retained_mutation_once(
     };
     let epoch_use=if action=="slider" {crate::v3::EpochUse::PointerMutation}else{crate::v3::EpochUse::TextMutation};
     if !unrestricted && !super::shared_epoch_matches(&snapshot, &args.chrome_tab_id, &before, &interaction, epoch_use) {
+        // A same-document rerender can detach the referenced node and advance the
+        // semantic epoch. Permit only a read-only connectivity probe in that case;
+        // retained_mutation may then reacquire the unique semantic identity and
+        // retry once. Never use a stale epoch to dispatch a mutation.
+        if before == snapshot.identity {
+            let detached = {
+                let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+                connection.command(
+                    shared.registry()?,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": snapshot.object_id,
+                        "functionDeclaration": "function(index){const e=this.nodes[index];return {connected:!!e&&e.isConnected}}",
+                        "arguments": [{"value": index}],
+                        "returnByValue": true
+                    }),
+                ).await
+            };
+            if let Ok(response) = detached
+                && shared_value(&response).is_ok_and(|value| value["connected"] == false)
+            {
+                return Ok(json!({
+                    "status":"not_dispatched",
+                    "action":action,
+                    "reason":"target was replaced after the snapshot; no mutation was dispatched",
+                    "readback":{"reason":"target_replaced","connected":false}
+                }));
+            }
+        }
         return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
     }
     if allow_password && action != "fill" {
@@ -964,6 +1013,31 @@ async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmc
 }
 
 async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
+    if matches!(&args.predicate, BrowserPredicate::Url { .. } | BrowserPredicate::UrlStartsWith { .. }) {
+        let live = app.legacy.shared_sessions.lock().await.get(&args.session_id).cloned()
+            .ok_or_else(|| invalid("unknown session for URL verification"))?;
+        let live = live.lock().await;
+        if live.handle.principal != app.legacy.principal.as_ref() {
+            return Err(invalid("URL verification session is not owned by this server principal"));
+        }
+        let connection = live.connection.as_ref().ok_or_else(|| invalid("shared browser connection is unavailable"))?;
+        let registry = live.registry()?;
+        let identity = super::shared_frame_identity(connection, registry, &live.handle, &args.chrome_tab_id)
+            .await.map_err(invalid)?;
+        let actual = identity.2;
+        let passed = match &args.predicate {
+            BrowserPredicate::Url { equals } => actual == *equals,
+            BrowserPredicate::UrlStartsWith { prefix } => !prefix.is_empty() && actual.starts_with(prefix),
+            _ => unreachable!(),
+        };
+        return Ok(json!({
+            "status": if passed { "passed" } else { "failed" },
+            "observer": "browser_frame_identity",
+            "observed": actual,
+            "document": {"frame_id":identity.0,"loader_id":identity.1},
+            "scope_complete": true
+        }));
+    }
     let snapshot = snapshot_impl(app, &BrowserSnapshotArgs {
         session_id: args.session_id.clone(),
         chrome_tab_id: args.chrome_tab_id.clone(),
@@ -1351,6 +1425,17 @@ fn selector_error_receipt(message: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_learning_requires_relevant_complete_scope_not_just_nonempty_items() {
+        let request = crate::observation_router::ObservationRequest { query_required: true, ..Default::default() };
+        let irrelevant = json!({"items":[{"name":"scoreboard"}],"scope_complete":true,"goal_satisfied":false});
+        assert!(!observation_is_usable(request, &irrelevant));
+        let truncated = json!({"items":[{"name":"Bills story"}],"scope_complete":true,"goal_satisfied":true,"omitted_by_limit":1});
+        assert!(!observation_is_usable(request, &truncated));
+        let scoped = json!({"items":[{"name":"Bills story"}],"scope_complete":true,"complete":false,"truncated":true,"incomplete_reasons":["cross_origin_frames_unread"],"goal_satisfied":true});
+        assert!(observation_is_usable(request, &scoped), "unrelated unread frames must not invalidate a complete relevant scope");
+    }
 
     #[test]
     fn expanded_verifier_predicates_are_exposed_with_typed_inputs() {

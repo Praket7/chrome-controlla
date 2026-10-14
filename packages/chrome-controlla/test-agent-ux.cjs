@@ -107,6 +107,9 @@ test('newest-item compiler emits one targeted snapshot and no homepage detour', 
   assert.equal(steps.filter(step => step.kind === 'snapshot').length, 1);
   assert.deepEqual(steps.map(step => step.kind), ['snapshot', 'find_all', 'choose', 'click', 'verify']);
   assert.equal(steps[0].goal.exhaustive, true);
+  assert.equal(steps[0].goal.href_hint, '/nfl/story/');
+  assert.equal(steps[1].query, undefined, 'choose(datetime) must compare every story in the scoped collection, including headlines that omit the team name');
+  assert.equal(steps[1].href_hint, '/nfl/story/');
   assert.equal(steps[0].max_text_chars, 0);
   assert.equal(steps[3].reference, '$latest');
 });
@@ -139,7 +142,7 @@ test('qualified route memory requires verification evidence and quarantines stru
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('ESPN Bills goal compiles to one external call, direct team URL, and one internal workflow', async () => {
+test('ESPN Bills goal compiles to one browser call with an inline verified workflow', async () => {
   const calls = [];
   const dir = tempDir();
   const runtime = new AgentUxRuntime({
@@ -147,19 +150,17 @@ test('ESPN Bills goal compiles to one external call, direct team URL, and one in
     callTool: async (name, args) => {
       calls.push({ name, args: structuredClone(args) });
       if (name === 'browser') {
-        return { structuredContent: { status: 'verified', session_id: 's1', tab_id: '77', url: args.url } };
-      }
-      if (name === 'workflow') {
         return {
           structuredContent: {
+            status: 'verified', session_id: 's1', tab_id: '77', url: args.url,
             status: 'completed',
-            receipts: [
+            workflow: { status: 'completed', receipts: [
               { step: 'snapshot', status: 'collected' },
               { step: 'find_all', status: 'collected' },
               { step: 'choose', status: 'selected' },
               { step: 'click', status: 'verified' },
               { step: 'verify', status: 'passed' }
-            ]
+            ] }
           }
         };
       }
@@ -171,19 +172,20 @@ test('ESPN Bills goal compiles to one external call, direct team URL, and one in
     action: 'open',
     goal: { kind: 'open_newest_item', site: 'espn.com', entity: 'Buffalo Bills', item_type: 'story' }
   });
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
   assert.equal(calls[0].name, 'browser');
   assert.equal(calls[0].args.url, 'https://www.espn.com/nfl/team/_/name/buf/buffalo-bills');
+  assert.deepEqual(calls[0].args.ready_when, { selector: 'a[href*="/nfl/story/"]' },
+    'the direct newest-story route should start after its first story link appears, not wait for the full document');
   assert.notEqual(calls[0].args.url, 'https://www.espn.com/');
   assert.match(calls[0].args.idempotency_key, /^auto_/);
-  assert.equal(calls[1].name, 'workflow');
-  assert.deepEqual(calls[1].args.steps.map(step => step.kind), ['snapshot', 'find_all', 'choose', 'click', 'verify']);
-  assert.equal(calls[1].args.steps.filter(step => step.kind === 'snapshot').length, 1);
+  assert.deepEqual(calls[0].args.steps.map(step => step.kind), ['snapshot', 'find_all', 'choose', 'click', 'verify']);
+  assert.equal(calls[0].args.steps.filter(step => step.kind === 'snapshot').length, 1);
   assert.equal(result.structuredContent.status, 'verified');
   assert.match(result.structuredContent.context, /^ctx_/);
   assert.deepEqual(result.structuredContent.orchestration, {
     external_tool_calls: 1,
-    internal_tool_calls: 2,
+    internal_tool_calls: 1,
     schema_discovery_calls: 0,
     repo_reads_required: 0,
     targeted_snapshots: 1,
@@ -192,6 +194,23 @@ test('ESPN Bills goal compiles to one external call, direct team URL, and one in
   });
   assert.equal(routeKey(result.structuredContent.goal), 'espn.com|open_newest_item|buffalo bills|story');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('background newest-story goals navigate to the selected href without activating pointer input', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    return { structuredContent: { status: 'completed', session_id: 's1', tab_id: '77',
+      workflow: { status: 'completed', receipts: [{ step: 'verify', status: 'passed' }] } } };
+  }});
+  runtime.setServerTools(fakeTools());
+  await runtime.handleToolCall('browser', { action: 'open', mode: 'background', goal: {
+    kind: 'open_newest_item', site: 'espn.com', entity: 'Buffalo Bills', item_type: 'story'
+  }});
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].args.mode, 'background');
+  assert.deepEqual(calls[0].args.ready_when, { selector: 'a[href*="/nfl/story/"]' });
+  assert.deepEqual(calls[0].args.steps.map(step => step.kind), ['snapshot', 'find_all', 'choose', 'navigate_selected', 'verify']);
 });
 
 test('follow-up tools can use only the opaque context handle', async () => {

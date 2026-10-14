@@ -40,6 +40,9 @@ pub struct ObservationRequest {
     pub rich_context: bool,
     pub frame_id: bool,
     pub scoped_selector: bool,
+    pub query_signature: u64,
+    pub scope_signature: u64,
+    pub query_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +55,10 @@ pub struct ObservationDecision {
 #[serde(deny_unknown_fields)]
 pub struct ObservationHistory {
     profiles: BTreeMap<String, Vec<ObservationSample>>,
+    #[serde(default)]
+    profile_recency: BTreeMap<String, u64>,
+    #[serde(default)]
+    next_profile_recency: u64,
     #[serde(skip)]
     path: Option<std::path::PathBuf>,
 }
@@ -74,6 +81,7 @@ impl ObservationHistory {
             }
             _ => Self::default(),
         };
+        history.seed_missing_recency();
         history.path = Some(path);
         history
     }
@@ -92,10 +100,12 @@ impl ObservationHistory {
         let key = profile_key(request);
         if !self.profiles.contains_key(&key)
             && self.profiles.len() >= MAX_PROFILES
-            && let Some(oldest) = self.profiles.keys().next().cloned()
+            && let Some(oldest) = self.least_recent_profile()
         {
             self.profiles.remove(&oldest);
+            self.profile_recency.remove(&oldest);
         }
+        self.touch_profile(&key);
         let samples = self.profiles.entry(key).or_default();
         samples.push(ObservationSample {
             mode: decision.mode,
@@ -108,6 +118,32 @@ impl ObservationHistory {
         }
         if samples.len().is_multiple_of(8) {
             self.persist();
+        }
+    }
+
+    fn touch_profile(&mut self, key: &str) {
+        self.next_profile_recency = self.next_profile_recency.saturating_add(1);
+        self.profile_recency
+            .insert(key.to_owned(), self.next_profile_recency);
+    }
+
+    fn least_recent_profile(&self) -> Option<String> {
+        self.profiles
+            .keys()
+            .min_by_key(|key| {
+                (
+                    self.profile_recency.get(*key).copied().unwrap_or(0),
+                    key.as_str(),
+                )
+            })
+            .cloned()
+    }
+
+    fn seed_missing_recency(&mut self) {
+        for key in self.profiles.keys().cloned().collect::<Vec<_>>() {
+            if !self.profile_recency.contains_key(&key) {
+                self.touch_profile(&key);
+            }
         }
     }
 
@@ -185,11 +221,30 @@ impl ObservationHistory {
 }
 
 fn profile_key(request: ObservationRequest) -> String {
-    // Pool comparable tasks across requested richness/scope so the history
-    // can compare modes observed in naturally varied runs. Hard requirements
-    // (frame, exhaustive coverage, and visual layout evidence) are still
-    // enforced by `best_mode` and never learned away.
-    format!("{:?}|{:?}", request.task_class, request.model_profile)
+    // Learn only across requests with matching intent and collection scope.
+    // Hard requirements and ambiguity bands stay separate so a cheap partial
+    // observation cannot qualify a materially different request.
+    let ambiguity_band = if request.ambiguity > 0.6 {
+        3
+    } else if request.ambiguity > 0.3 {
+        2
+    } else if request.ambiguity > 0.1 {
+        1
+    } else {
+        0
+    };
+    format!(
+        "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}",
+        request.task_class,
+        request.model_profile,
+        request.exhaustive,
+        request.needs_layout,
+        request.rich_context,
+        request.scoped_selector,
+        ambiguity_band,
+        request.query_signature,
+        request.scope_signature
+    )
 }
 
 fn mode_rank(mode: ObservationMode) -> u8 {
@@ -312,5 +367,69 @@ mod history_tests {
             choose_observation_with_history(request, &history).mode,
             ObservationMode::SemanticCompact
         );
+    }
+
+    #[test]
+    fn learned_mode_does_not_cross_query_or_scope_boundaries() {
+        let request = ObservationRequest {
+            task_class: TaskClass::Research,
+            model_profile: Some(ModelProfile::RichContext),
+            rich_context: true,
+            query_signature: 11,
+            scope_signature: 21,
+            query_required: true,
+            ..Default::default()
+        };
+        let mut history = ObservationHistory::default();
+        let compact = ObservationDecision {
+            mode: ObservationMode::SemanticCompact,
+            reason: "test",
+        };
+        for _ in 0..8 {
+            history.record(request, compact, 1, 1, true);
+        }
+        let unrelated = ObservationRequest {
+            query_signature: 12,
+            ..request
+        };
+        assert_eq!(
+            choose_observation_with_history(unrelated, &history).mode,
+            ObservationMode::SemanticRich
+        );
+        let other_scope = ObservationRequest {
+            scope_signature: 22,
+            ..request
+        };
+        assert_eq!(
+            choose_observation_with_history(other_scope, &history).mode,
+            ObservationMode::SemanticRich
+        );
+    }
+
+    #[test]
+    fn history_capacity_evicts_least_recently_recorded_profile() {
+        let request = ObservationRequest::default();
+        let mut history = ObservationHistory::default();
+        for index in 0..MAX_PROFILES {
+            let key = if index == 0 {
+                "z-old".to_owned()
+            } else {
+                format!("profile-{index:04}")
+            };
+            history.profiles.insert(key.clone(), Vec::new());
+            history.profile_recency.insert(key, index as u64 + 1);
+        }
+        history.profile_recency.insert("z-old".into(), 0);
+        history.record(
+            request,
+            ObservationDecision {
+                mode: ObservationMode::SemanticCompact,
+                reason: "test",
+            },
+            1,
+            1,
+            true,
+        );
+        assert!(!history.profiles.contains_key("z-old"));
     }
 }
