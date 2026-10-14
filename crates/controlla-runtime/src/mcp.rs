@@ -3067,7 +3067,7 @@ impl App {
 
     #[tool(
         name = "shared_click",
-        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse clicks on inactive tabs briefly activate the tab only if its Chrome window is already focused, then restore the prior tab when safe. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
     async fn shared_click(
         &self,
@@ -3288,42 +3288,80 @@ impl App {
                 .as_f64()
                 .ok_or_else(|| invalid("missing y"))?,
         );
-        let (input_method, [press_event, release_event]) =
-            pointer_events(x, y, input_mode).map_err(invalid)?;
         let click_started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        let press = tokio::time::timeout_at(
-            deadline,
-            connection.command(
-                registry,
-                &shared.handle,
-                &args.chrome_tab_id,
-                input_method,
-                press_event,
-            ),
-        )
-        .await;
-        // Release once even when the press reply was lost; never repeat the press.
-        let release = tokio::time::timeout(
-            Duration::from_secs(2),
-            connection.command(
-                registry,
-                &shared.handle,
-                &args.chrome_tab_id,
-                input_method,
-                release_event,
-            ),
-        )
-        .await;
-        let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
+        let mut pointer_activation = Value::Null;
+        let (acknowledged, dispatch_failed) = if input_mode == "mouse"
+            && shared.handle.mode == controlla_browser::sessions::SessionMode::Shared
+        {
+            let dispatch = tokio::time::timeout_at(
+                deadline,
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Controlla.pointerClick",
+                    json!({"object_id":snapshot.object_id,"index":index,"outcome":outcome,
+                    "function_declaration":guard,"viewport":prepared_viewport}),
+                ),
+            )
+            .await;
+            match dispatch {
+                Ok(Ok(response)) => {
+                    let value = shared_value(&response).unwrap_or(Value::Null);
+                    if value["status"] == "not_dispatched" {
+                        return Ok(rmcp::handler::server::wrapper::Json(value));
+                    }
+                    pointer_activation = json!({
+                        "temporary_activation":value["temporary_activation"],
+                        "restored_previous_tab":value["restored_previous_tab"]
+                    });
+                    (
+                        value["dispatch_acknowledged"] == true,
+                        value["status"] == "not_dispatched",
+                    )
+                }
+                _ => (false, true),
+            }
+        } else {
+            let (input_method, [press_event, release_event]) =
+                pointer_events(x, y, input_mode).map_err(invalid)?;
+            let press = tokio::time::timeout_at(
+                deadline,
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    input_method,
+                    press_event,
+                ),
+            )
+            .await;
+            // Release once even when the press reply was lost; never repeat the press.
+            let release = tokio::time::timeout(
+                Duration::from_secs(2),
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    input_method,
+                    release_event,
+                ),
+            )
+            .await;
+            (
+                matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_))),
+                false,
+            )
+        };
         let mut result = json!({
             "status":"unknown",
             "dispatch_acknowledged":acknowledged,
             "input_mode":input_mode,
-            "reason_code":click_unknown_reason_code(acknowledged),
+            "reason_code":if dispatch_failed {"pointer_dispatch_unknown"} else {click_unknown_reason_code(acknowledged)},
             "mutation_retry_policy":"reconcile_read_only_first",
             "next_action":"inspect_current_state_once_before_retrying",
             "reason":"outcome not verified before deadline; inspect state, do not automatically retry"
@@ -3384,6 +3422,9 @@ impl App {
             result["reason"] = json!(
                 "mouse dispatch/release uncertain; inspect state before deciding any further action"
             );
+        }
+        if pointer_activation.is_object() {
+            result["pointer_activation"] = pointer_activation;
         }
         let snapshot_args = SharedSnapshotArgs {
             session_id: args.session_id,

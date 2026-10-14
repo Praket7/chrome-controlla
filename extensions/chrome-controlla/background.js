@@ -513,6 +513,57 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const win = await chrome.windows.get(tab.windowId);
       respond({ type: "result", id: request.id, result: { tab_active: !!tab.active, window_focused: !!win.focused, window_id: tab.windowId, activation_epoch: activationEpoch, focus_epoch: focusEpoch } }); return;
     }
+    if (request.method === "Controlla.pointerClick") {
+      const params = request.params || {}, objectId = params.object_id, index = params.index, outcome = params.outcome;
+      const guard = params.function_declaration, expectedViewport = params.viewport;
+      if (typeof objectId !== "string" || !objectId || objectId.length > 512 || !Number.isSafeInteger(index) || index < 0 ||
+          typeof guard !== "string" || !guard.startsWith("function(index,") || guard.length > 12000 ||
+          (expectedViewport != null && (typeof expectedViewport !== "string" || expectedViewport.length > 256))) throw new Error("pointer click requires a bounded guarded target.");
+      const target = await chrome.tabs.get(tabId), window = await chrome.windows.get(target.windowId);
+      if (!window.focused) { respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"chrome_window_not_focused",reason:"Cannot pointer-click an inactive tab without briefly foregrounding its Chrome window."} }); return; }
+      const wasActive = !!target.active;
+      const previous = wasActive ? target : (await chrome.tabs.query({ active:true, windowId:target.windowId }))[0];
+      if (!previous?.id) { respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"active_tab_unavailable",reason:"Could not identify the tab to restore after pointer input."} }); return; }
+      const documentId = pairedTabDocumentIds.get(tabId), generation = routeGeneration, activationEpochBefore = activationEpoch;
+      let activated = false, restoredPreviousTab = false, pressAttempted = false, acknowledged = false, finalChecked;
+      try {
+        if (!wasActive) {
+          await chrome.tabs.update(tabId, { active:true });
+          activated = true;
+          const activeTarget = await chrome.tabs.get(tabId), activeWindow = await chrome.windows.get(target.windowId);
+          if (!isAuthorized(tabId) || (nativeRoute && resolveNativeLease(request.lease_id, tabId)?.generation !== generation) ||
+              pairedTabDocumentIds.get(tabId) !== documentId || !activeTarget.active || !activeWindow.focused) {
+            respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"activation_revalidation_failed",reason:"Target or focused-window identity changed during temporary activation."} }); return;
+          }
+        }
+        const checked = await chrome.debugger.sendCommand({tabId}, "Runtime.callFunctionOn", {objectId,
+          functionDeclaration:guard, arguments:[{value:index},{value:outcome}], returnByValue:true});
+        finalChecked = checked?.result?.value;
+        if (!finalChecked?.ok || (expectedViewport != null && finalChecked.viewport !== expectedViewport) || !Number.isFinite(finalChecked.x) || !Number.isFinite(finalChecked.y)) {
+          respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"final_target_revalidation_failed",reason:finalChecked?.reason || "Target or viewport changed before pointer input."} }); return;
+        }
+        const point = {x:finalChecked.x,y:finalChecked.y};
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseMoved",...point});
+        pressAttempted = true;
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",button:"left",clickCount:1,...point});
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",button:"left",clickCount:1,...point});
+        acknowledged = true;
+      } catch (error) {
+        if (pressAttempted) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",button:"left",clickCount:1,x:finalChecked?.x,y:finalChecked?.y}).catch(() => {});
+        respond({ type:"result", id:request.id, result:{status:pressAttempted?"unknown":"not_dispatched",dispatch_acknowledged:false,reason_code:pressAttempted?"pointer_delivery_unknown":"pointer_dispatch_failed",reason:safeNativeError(String(error))} });
+        return;
+      } finally {
+        if (activated && previous.id !== tabId) {
+          const current = await chrome.tabs.get(tabId).catch(() => undefined);
+          if (current?.active && activationEpoch <= activationEpochBefore + 1 && isAuthorized(tabId) && pairedTabDocumentIds.get(tabId) === documentId) {
+            restoredPreviousTab = !!(await chrome.tabs.update(previous.id, {active:true}).catch(() => undefined));
+          }
+        }
+      }
+      respond({ type:"result", id:request.id, result:{status:acknowledged?"dispatched":"unknown",dispatch_acknowledged:acknowledged,
+        temporary_activation:activated,restored_previous_tab:restoredPreviousTab,
+        reason:activated?"Pointer input used a brief tab activation in the already focused Chrome window.":undefined} }); return;
+    }
     if (request.method === "Controlla.securePasswordFill") {
       const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
       const label = typeof request.params?.label === "string" ? request.params.label.slice(0, 120) : "Password";
