@@ -98,7 +98,7 @@ function stagehandProfileInventory(directory) {
 
 export function stagehandProcessCleanup(before, after, serverPath) {
   const normalizedServerPath = resolve(serverPath);
-  if (after.some(line => line.includes(normalizedServerPath))) return false;
+  if (after.some(line => processLineContainsPath(line, normalizedServerPath))) return false;
   const chromeProcesses = lines => lines.filter(line => /stagehand-chrome-|--user-data-dir=[^\s]*stagehand/i.test(line))
     .map(line => line.replace(/^\s*\d+\s+/, '').trim());
   const prior = new Map();
@@ -109,6 +109,11 @@ export function stagehandProcessCleanup(before, after, serverPath) {
     prior.set(signature, count - 1);
   }
   return true;
+}
+
+export function processLineContainsPath(line, resolvedPath, platform = process.platform) {
+  if (platform === 'win32') return line.toLowerCase().includes(resolvedPath.toLowerCase());
+  return line.includes(resolvedPath);
 }
 
 export function noNewStagehandProfiles(before, after) {

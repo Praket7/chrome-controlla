@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles, newStagehandProfiles } from './phase11-public-readonly-pilot.mjs';
+import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles, newStagehandProfiles, processLineContainsPath } from './phase11-public-readonly-pilot.mjs';
 
 test('Controlla pilot uses one private task call without a launch round trip', () => {
   const prompt = setup('controlla', '/chrome', '/controlla', '/state').prompt;
@@ -134,6 +134,8 @@ test('Stagehand process inventory parses Windows process IDs and command lines',
     '101 node C:\\stagehand\\stdio-server.mjs',
     '202 chrome.exe --user-data-dir=C:\\Temp\\stagehand-chrome-abc',
   ]);
+  assert.equal(processLineContainsPath('node C:\\Users\\RUNNER\\stagehand\\server.mjs', 'c:\\users\\runner\\stagehand\\server.mjs', 'win32'), true);
+  assert.equal(processLineContainsPath('/Users/runner/stagehand/server.mjs', '/users/runner/stagehand/server.mjs', 'darwin'), false);
 });
 
 test('Stagehand outcome requires one successful run result with exact live page evidence', () => {
