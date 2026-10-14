@@ -163,7 +163,7 @@ struct BrowserProbeArgs {
 enum BrowserPredicate {
     Text { reference: String, equals: String },
     TextPresent {
-        #[schemars(description = "Optional exact fresh @cN reference to the semantic item whose text is checked.")]
+        #[schemars(description = "Optional exact fresh @cN semantic node or @f child-frame reference. A fresh @f reference scopes text verification to that frame and is loader-bound.")]
         scope: Option<String>,
         text: String,
     },
@@ -614,6 +614,79 @@ async fn resolve_reference(app: &AppV2, session_id: &str, tab_id: &str, referenc
     Ok(legacy)
 }
 
+async fn secure_password_fill(app: &AppV2, args: &BrowserActArgs, reference: &str) -> Result<Value, rmcp::ErrorData> {
+    if args.value.as_ref().is_some_and(|value| value.is_empty() || value.chars().count() > 4096) {
+        return Ok(json!({"status":"not_dispatched","action":"secure_fill","reason_code":"password_length_out_of_bounds",
+            "dispatch_may_have_occurred":false,"verified":false,
+            "reason":"secure_fill password must contain 1 to 4096 characters."}));
+    }
+    if args.expected_value.is_some() {
+        return Ok(json!({"status":"not_dispatched","action":"secure_fill","reason_code":"secret_argument_forbidden",
+            "dispatch_may_have_occurred":false,"verified":false,
+            "reason":"secure_fill accepts no expected_value; use only its one-shot value or the extension prompt."}));
+    }
+    let shared = app.legacy.shared_sessions.lock().await.get(&args.session_id).cloned()
+        .ok_or_else(|| invalid("unknown shared session_id"))?;
+    let mut shared = shared.lock().await;
+    if shared.handle.principal != app.legacy.principal.as_ref() { return Err(invalid("session is not owned by this server principal")); }
+    let snapshot = shared.snapshots.get(&args.chrome_tab_id).cloned().ok_or_else(|| invalid("take browser_snapshot first"))?;
+    let (frame_id, loader_id, backend_node_id) = if reference.starts_with("@f:") {
+        let (frame_id, loader_id, backend_node_id) = frame_scope_parts(reference)
+            .ok_or_else(|| invalid("secure_fill requires a fresh @f frame reference or @c reference"))?;
+        (frame_id, loader_id, backend_node_id)
+    } else {
+        let legacy = resolve_reference(app, &args.session_id, &args.chrome_tab_id, reference).await?;
+        let (token, index) = legacy.rsplit_once(':').ok_or_else(|| invalid("invalid retained reference"))?;
+        let index = index.parse::<usize>().map_err(|_| invalid("invalid retained reference index"))?;
+        if index >= snapshot.count || (!crate::guard_reason::unrestricted_mode() && (token != snapshot.token || snapshot.consumed)) {
+            return Err(invalid("stale or consumed reference; take a fresh browser_snapshot"));
+        }
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = shared.registry()?;
+        let remote = connection.command(registry, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
+            "objectId":snapshot.object_id,"functionDeclaration":"function(index){return this.nodes[index]}",
+            "arguments":[{"value":index}],"returnByValue":false
+        })).await.map_err(|_| invalid("password reference is stale; take a fresh snapshot"))?;
+        let object_id = shared_value(&remote).ok().and_then(|value| value.pointer("/result/objectId").and_then(Value::as_str).map(str::to_owned)).ok_or_else(|| invalid("password reference could not be resolved"))?;
+        let described = connection.command(registry, &shared.handle, &args.chrome_tab_id, "DOM.describeNode", json!({"objectId":object_id})).await
+            .map_err(|_| invalid("password field backend identity is unavailable"))?;
+        let backend = shared_value(&described).ok().and_then(|value| value.pointer("/node/backendNodeId").and_then(Value::as_i64)).filter(|id| *id > 0)
+            .ok_or_else(|| invalid("password field backend identity is unavailable"))?;
+        let identity = super::shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await.map_err(invalid)?;
+        if identity != snapshot.identity { return Ok(json!({"status":"not_dispatched","action":"secure_fill","reason_code":"stale_document","dispatch_may_have_occurred":false,"verified":false})); }
+        (identity.0, identity.1, backend)
+    };
+    let identity = {
+        let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+        let registry = shared.registry()?;
+        super::shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await.map_err(invalid)?
+    };
+    if identity.0 != frame_id && reference.starts_with("@f:") {
+        // Child-frame identity is independently checked by the extension. The root
+        // document must still match the epoch captured by the original snapshot.
+        if identity != snapshot.identity { return Ok(json!({"status":"not_dispatched","action":"secure_fill","reason_code":"stale_document","dispatch_may_have_occurred":false,"verified":false})); }
+    } else if identity != snapshot.identity {
+        return Ok(json!({"status":"not_dispatched","action":"secure_fill","reason_code":"stale_document","dispatch_may_have_occurred":false,"verified":false}));
+    }
+    if !crate::guard_reason::unrestricted_mode() {
+        shared.snapshots.get_mut(&args.chrome_tab_id).ok_or_else(|| invalid("snapshot disappeared before secure dispatch"))?.consumed = true;
+    }
+    let connection = shared.connection.as_ref().ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+    let registry = shared.registry()?;
+    let mut params = json!({
+        "frame_id":frame_id,"loader_id":loader_id,"backend_node_id":backend_node_id,
+        "label":"Password","timeout_ms":args.timeout_ms.unwrap_or(20_000).clamp(1_000,22_000)
+    });
+    if let Some(password) = args.value.as_deref() { params["password"] = json!(password); }
+    let response = connection.command(registry, &shared.handle, &args.chrome_tab_id, "Controlla.securePasswordFill", params).await;
+    match response {
+        Ok(response) => Ok(frame_click_receipt(response)),
+        Err(_) => Ok(json!({"status":"unknown","action":"secure_fill","dispatch_acknowledged":false,
+            "dispatch_may_have_occurred":true,"verified":false,"reason_code":"secure_input_delivery_unknown",
+            "reason":"Secure input delivery is uncertain; inspect the field before retrying."})),
+    }
+}
+
 async fn retained_mutation(
     app: &AppV2,
     args: &BrowserActArgs,
@@ -749,8 +822,9 @@ async fn retained_click_once(
     let shared_outcome: SharedClickOutcome = serde_json::from_value(serde_json::to_value(outcome).map_err(|e| invalid(e.to_string()))?)
         .map_err(|e| invalid(e.to_string()))?;
     let Json(value) = app.legacy.shared_click(Parameters(SharedClickArgs {
-        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(),
-        reference: legacy_reference, outcome: shared_outcome, timeout_ms: args.timeout_ms,
+                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(),
+                        reference: legacy_reference, outcome: shared_outcome, timeout_ms: args.timeout_ms,
+                        input_mode: (args.action == "touch").then(|| "touch".to_owned()),
     })).await?;
     Ok(value)
 }
@@ -1038,6 +1112,36 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
             "scope_complete": true
         }));
     }
+    if let BrowserPredicate::TextPresent { scope: Some(scope), text } = &args.predicate
+        && scope.starts_with("@f:")
+    {
+        if text.is_empty() || text.len() > 4096 {
+            return Err(invalid("verification text must contain 1..4096 bytes"));
+        }
+        let (frame_id, loader_id, _) = frame_scope_parts(scope)
+            .ok_or_else(|| invalid("frame-scoped text verification requires a fresh @f frame reference"))?;
+        let frame = snapshot_impl(app, &BrowserSnapshotArgs {
+            session_id: args.session_id.clone(),
+            chrome_tab_id: args.chrome_tab_id.clone(),
+            selector: None,
+            max_items: Some(200),
+            max_text_chars: Some(0),
+            max_bytes: Some(1_000_000),
+            href_hint: None,
+            frame_id: Some(frame_id.clone()),
+            goal: None,
+            max_scan_nodes: None,
+        }).await?;
+        let (found, complete) = frame_scoped_text_result(scope, text, &frame)
+            .ok_or_else(|| invalid("frame-scoped text verification reference is malformed"))?;
+        return Ok(json!({
+            "status": if found { "passed" } else if complete { "failed" } else { "incomplete" },
+            "observer": "fresh_shared_child_frame_accessibility",
+            "observed": {"text_present":found,"frame_id":frame_id,"frame_loader_id":loader_id},
+            "scope_complete":complete,
+            "document":frame["shared_frame_identity"]
+        }));
+    }
     let snapshot = snapshot_impl(app, &BrowserSnapshotArgs {
         session_id: args.session_id.clone(),
         chrome_tab_id: args.chrome_tab_id.clone(),
@@ -1158,6 +1262,31 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
     }))
 }
 
+fn frame_scope_parts(reference: &str) -> Option<(String, String, i64)> {
+    let parts = reference.strip_prefix("@f:")?.splitn(3, ':').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0].is_empty() || parts[1].is_empty() {
+        return None;
+    }
+    let backend_node_id = parts[2].parse::<i64>().ok().filter(|id| *id > 0)?;
+    Some((parts[0].to_owned(), parts[1].to_owned(), backend_node_id))
+}
+
+fn frame_scoped_text_result(scope: &str, text: &str, snapshot: &Value) -> Option<(bool, bool)> {
+    let (frame_id, loader_id, _) = frame_scope_parts(scope)?;
+    let frame_matches = snapshot["source_frame_id"] == frame_id
+        && snapshot["frame_loader_id"] == loader_id;
+    let found = frame_matches && snapshot["items"].as_array().is_some_and(|items| items.iter().any(|item| {
+        item.get("name").or_else(|| item.get("text")).and_then(Value::as_str)
+            .is_some_and(|value| value.contains(text))
+    }));
+    // The frame snapshot is an accessibility tree, not a complete rendered
+    // text inventory. A positive match is useful evidence, but absence from AX
+    // cannot prove absence from visible text (for example, unlabelled text or
+    // content omitted by the browser's AX projection). Keep negative results
+    // incomplete until a complete DOM-text observer is available.
+    Some((found, false))
+}
+
 fn substitute_reference(reference: &str, vars: &BTreeMap<String, String>) -> Result<String, rmcp::ErrorData> {
     if let Some(name) = reference.strip_prefix('$') {
         vars.get(name).cloned().ok_or_else(|| invalid(format!("workflow variable ${name} is unresolved")))
@@ -1166,8 +1295,94 @@ fn substitute_reference(reference: &str, vars: &BTreeMap<String, String>) -> Res
     }
 }
 
+fn is_workflow_reconciliation_step(step: &BrowserWorkflowStep) -> bool {
+    matches!(step, BrowserWorkflowStep::Verify { .. })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkflowReceiptProgress {
+    Continue,
+    ReconcileUnknown(usize),
+    StopUnknown,
+    StopFailed,
+}
+
+fn record_workflow_receipt(
+    receipts: &mut Vec<Value>,
+    receipt: Value,
+    reconciliation_index: Option<usize>,
+    next_step: Option<&BrowserWorkflowStep>,
+) -> WorkflowReceiptProgress {
+    let status = receipt.get("status").and_then(Value::as_str).map(str::to_owned);
+    if let Some(action_index) = reconciliation_index {
+        let passed = status.as_deref() == Some("passed");
+        receipts[action_index]["reconciliation"] = json!({
+            "status": if passed { "postcondition_observed" } else { "not_confirmed" },
+            "verify_step": receipts.len(),
+            "causality_established": false,
+            "mutation_retried": false,
+        });
+        if !passed {
+            receipts.push(receipt);
+            return WorkflowReceiptProgress::StopUnknown;
+        }
+    }
+
+    let receipt_index = receipts.len();
+    receipts.push(receipt);
+    match status.as_deref() {
+        Some("unknown") if next_step.is_some_and(is_workflow_reconciliation_step) => {
+            WorkflowReceiptProgress::ReconcileUnknown(receipt_index)
+        }
+        Some("unknown") => WorkflowReceiptProgress::StopUnknown,
+        Some("failed" | "not_dispatched") => WorkflowReceiptProgress::StopFailed,
+        _ => WorkflowReceiptProgress::Continue,
+    }
+}
+
 fn frame_click_receipt(response: Value) -> Value {
     response.pointer("/result/value").or_else(|| response.get("result")).cloned().unwrap_or(response)
+}
+
+/// Add stable recovery instructions to unknown mutation receipts at every MCP version
+/// boundary. Traverse only known receipt containers so page-provided data stays opaque.
+fn normalize_unknown_receipts(value: &mut Value) {
+    fn normalize(value: &mut Value, receipt: bool) {
+        match value {
+            Value::Object(object) => {
+                if receipt && object.get("status").and_then(Value::as_str) == Some("unknown") {
+                    if !object.get("reason_code").is_some_and(Value::is_string) {
+                        let acknowledged = object.get("dispatch_acknowledged") == Some(&Value::Bool(true));
+                        object.insert(
+                            "reason_code".into(),
+                            json!(if acknowledged { "outcome_verification_timeout" } else { "action_delivery_unknown" }),
+                        );
+                    }
+                    object.entry("mutation_retry_policy")
+                        .or_insert_with(|| json!("reconcile_read_only_first"));
+                    object.entry("next_action")
+                        .or_insert_with(|| json!("inspect_current_state_once_before_retrying"));
+                }
+                for key in ["receipts", "steps"] {
+                    if let Some(child) = object.get_mut(key) {
+                        normalize(child, true);
+                    }
+                }
+                if let Some(Value::Object(nodes)) = object.get_mut("nodes") {
+                    for node in nodes.values_mut() {
+                        normalize(node, true);
+                    }
+                }
+            }
+            Value::Array(items) if receipt => {
+                for item in items {
+                    normalize(item, true);
+                }
+            }
+            Value::Array(_) | Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    normalize(value, true);
 }
 
 #[tool_router]
@@ -1193,11 +1408,11 @@ impl AppV2 {
         Ok(Json(find_impl(self, &args).await?))
     }
 
-    #[tool(name = "browser_act", description = "Act on an exact @cN reference. click reuses Controlla's single-use guarded click semantics. fill/select use the retained DOM identity directly, consume the reference before dispatch, verify local readback, and return unknown rather than retry when delivery or final document state is uncertain.")]
+#[tool(name = "browser_act", description = "Act on an exact semantic reference. click uses guarded mouse input; touch uses guarded touchStart/touchEnd with no mouse fallback. For a visible empty password field, secure_fill accepts an optional one-shot value or opens Controlla's local prompt when omitted; only the verified boolean is returned. Never use password values in other actions or workflows. fill/select use retained DOM identity, consume references before dispatch, verify readback, and return unknown rather than retry when delivery is uncertain.")]
     async fn browser_act(&self, Parameters(args): Parameters<BrowserActArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         let reference = args.reference.as_deref().ok_or_else(|| invalid("reference is required"))?;
-        let result = match args.action.as_str() {
-            "click" => {
+        let mut result = match args.action.as_str() {
+            "click" | "touch" => {
                 if let Some(BrowserClickOutcome::Navigation { url: Some(url) } | BrowserClickOutcome::NewTab { url: Some(url) }) = args.outcome.as_ref() {
                     super::validate_shared_url(url)?;
                 }
@@ -1208,14 +1423,14 @@ impl AppV2 {
                     let backend = parts.next().unwrap_or_default();
                     let backend_node_id = backend.parse::<i64>().ok().filter(|id| *id > 0).ok_or_else(|| invalid("frame reference has an invalid backend node id"))?;
                     if frame_id.is_empty() || frame_id.len() > 256 || loader_id.is_empty() || loader_id.len() > 256 || args.outcome.is_none() {
-                        return Err(invalid("frame click requires a valid frame identity and explicit outcome"));
+                        return Err(invalid("frame pointer action requires a valid frame identity and explicit outcome"));
                     }
                     let outcome = args.outcome.as_ref().ok_or_else(|| invalid("frame click requires an explicit outcome"))?;
                     let shared = self.legacy.shared_sessions.lock().await.get(&args.session_id).cloned().ok_or_else(||invalid("unknown shared session_id"))?;
                     let shared = shared.lock().await;
                     if shared.handle.principal != self.legacy.principal.as_ref() { return Err(invalid("session is not owned by this server principal")); }
                     let connection = shared.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
-                    let response = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.frameClick", serde_json::json!({"frame_id":frame_id,"loader_id":loader_id,"backend_node_id":backend_node_id,"outcome":outcome,"timeout_ms":args.timeout_ms.unwrap_or(5000).clamp(250,10000)})).await;
+                    let response = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.frameClick", serde_json::json!({"frame_id":frame_id,"loader_id":loader_id,"backend_node_id":backend_node_id,"outcome":outcome,"input_mode":if args.action == "touch" {"touch"} else {"mouse"},"timeout_ms":args.timeout_ms.unwrap_or(5000).clamp(250,10000)})).await;
                     match response {
                         Ok(response) => {
                             let value = frame_click_receipt(response);
@@ -1225,13 +1440,15 @@ impl AppV2 {
                         Err(error) => json!({"status":"unknown","dispatch_acknowledged":null,"dispatch_may_have_occurred":true,"verified":false,"reference":reference,"source_frame_id":frame_id,"requested_outcome":outcome,"reason":format!("frame click delivery or readback became uncertain; inspect the frame before retrying: {error}")}),
                     }
                 } else {
-                let outcome = args.outcome.clone().ok_or_else(|| invalid("click requires an explicit bounded outcome"))?;
+                let outcome = args.outcome.clone().ok_or_else(|| invalid("pointer action requires an explicit bounded outcome"))?;
                 retained_click(self, &args, reference, outcome).await?
                 }
             }
+            "secure_fill" => secure_password_fill(self, &args, reference).await?,
             "fill" | "select" | "slider" => retained_mutation(self, &args, reference, false, &args.action).await?,
-            _ => return Err(invalid("action must be click, fill, select, or slider")),
+            _ => return Err(invalid("action must be click, touch, fill, secure_fill, select, or slider")),
         };
+        normalize_unknown_receipts(&mut result);
         Ok(Json(result))
     }
 
@@ -1283,14 +1500,20 @@ impl AppV2 {
         Ok(Json(verify_impl(self, &args).await?))
     }
 
-    #[tool(name = "browser_workflow", description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. Unknown mutation outcomes stop the workflow and are never automatically retried.")]
+    #[tool(name = "browser_workflow", description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. After an unknown mutation, only one immediately following read-only verify step may reconcile its postcondition; no mutation is retried.")]
     async fn browser_workflow(&self, Parameters(args): Parameters<BrowserWorkflowArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.steps.is_empty() || args.steps.len() > MAX_WORKFLOW_STEPS {
             return Err(invalid("workflow must contain 1..20 steps"));
         }
         let mut vars = BTreeMap::<String, String>::new();
-        let mut receipts = Vec::new();
-        for step in args.steps {
+        let mut receipts: Vec<Value> = Vec::new();
+        let mut steps = args.steps.into_iter().peekable();
+        let mut unknown_receipt_to_reconcile: Option<usize> = None;
+        while let Some(step) = steps.next() {
+            let reconciliation_index = unknown_receipt_to_reconcile.take();
+            if reconciliation_index.is_some() && !is_workflow_reconciliation_step(&step) {
+                break;
+            }
             let receipt = match step {
                 BrowserWorkflowStep::Snapshot => snapshot_impl(self, &BrowserSnapshotArgs {
                     session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), selector: None,
@@ -1333,30 +1556,50 @@ impl AppV2 {
                     let outcome: SharedClickOutcome = serde_json::from_value(serde_json::to_value(outcome).map_err(|e| invalid(e.to_string()))?)
                         .map_err(|e| invalid(e.to_string()))?;
                     let Json(value) = self.legacy.shared_click(Parameters(SharedClickArgs {
-                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), reference: legacy_reference, outcome, timeout_ms: None,
+                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), reference: legacy_reference, outcome, timeout_ms: None, input_mode: None,
                     })).await?;
                     value
                 }
-                BrowserWorkflowStep::Verify { predicate } => verify_impl(self, &BrowserVerifyArgs {
-                    session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate,
-                }).await?,
+                BrowserWorkflowStep::Verify { predicate } => {
+                    let verification = verify_impl(self, &BrowserVerifyArgs {
+                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), predicate,
+                    }).await;
+                    match verification {
+                        Ok(receipt) => receipt,
+                        Err(error) if reconciliation_index.is_some() => json!({
+                            "status":"incomplete",
+                            "reason":format!("bounded read-only reconciliation could not complete: {error}"),
+                        }),
+                        Err(error) => return Err(error),
+                    }
+                }
             };
-            let status = receipt
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            receipts.push(receipt);
-            if matches!(
-                status.as_deref(),
-                Some("unknown" | "failed" | "not_dispatched")
+            match record_workflow_receipt(
+                &mut receipts,
+                receipt,
+                reconciliation_index,
+                steps.peek(),
             ) {
-                break;
+                WorkflowReceiptProgress::Continue => {}
+                WorkflowReceiptProgress::ReconcileUnknown(index) => {
+                    unknown_receipt_to_reconcile = Some(index);
+                }
+                WorkflowReceiptProgress::StopUnknown | WorkflowReceiptProgress::StopFailed => break,
             }
         }
         let terminal = receipts.last().and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("completed");
+        let unreconciled_unknown = receipts.iter().any(|receipt| {
+            receipt["status"] == "unknown"
+                && receipt["reconciliation"]["status"] != "postcondition_observed"
+        });
+        let reconciled_unknown_mutations = receipts.iter().filter(|receipt| {
+            receipt["status"] == "unknown"
+                && receipt["reconciliation"]["status"] == "postcondition_observed"
+        }).count();
         Ok(Json(json!({
-            "status": if terminal == "unknown" { "unknown" } else if terminal == "failed" || terminal == "not_dispatched" { "failed" } else { "completed" },
+            "status": if unreconciled_unknown || terminal == "unknown" { "unknown" } else if terminal == "failed" || terminal == "not_dispatched" { "failed" } else { "completed" },
             "completed_steps": receipts.len(),
+            "reconciled_unknown_mutations": reconciled_unknown_mutations,
             "internal_model_calls": 0,
             "steps": receipts
         })))
@@ -1435,6 +1678,29 @@ mod tests {
         assert!(!observation_is_usable(request, &truncated));
         let scoped = json!({"items":[{"name":"Bills story"}],"scope_complete":true,"complete":false,"truncated":true,"incomplete_reasons":["cross_origin_frames_unread"],"goal_satisfied":true});
         assert!(observation_is_usable(request, &scoped), "unrelated unread frames must not invalidate a complete relevant scope");
+    }
+
+    #[test]
+    fn frame_scoped_text_verification_requires_matching_loader_and_complete_evidence() {
+        let scope = "@f:frame-1:loader-1:42";
+        let visible = json!({
+            "source_frame_id":"frame-1", "frame_loader_id":"loader-1", "complete":true,
+            "items":[{"name":"controlla-classroom-test.txt"}]
+        });
+        assert_eq!(frame_scoped_text_result(scope, "classroom-test.txt", &visible), Some((true, false)));
+
+        let stale = json!({
+            "source_frame_id":"frame-1", "frame_loader_id":"loader-2", "complete":true,
+            "items":[{"name":"controlla-classroom-test.txt"}]
+        });
+        assert_eq!(frame_scoped_text_result(scope, "classroom-test.txt", &stale), Some((false, false)));
+
+        let incomplete = json!({
+            "source_frame_id":"frame-1", "frame_loader_id":"loader-1", "complete":false,
+            "items":[{"name":"controlla-classroom-test.txt"}]
+        });
+        assert_eq!(frame_scoped_text_result(scope, "classroom-test.txt", &incomplete), Some((true, false)));
+        assert_eq!(frame_scope_parts("@f:frame-1:loader-1:0"), None);
     }
 
     #[test]
@@ -1551,6 +1817,116 @@ mod tests {
         let receipt = json!({"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"verified":true});
         assert_eq!(frame_click_receipt(receipt.clone()), receipt);
         assert_eq!(frame_click_receipt(json!({"result":{"value":receipt}})), receipt);
+    }
+
+    #[test]
+    fn unknown_mutation_receipts_expose_reconciliation_contract_without_walking_page_data() {
+        let mut receipt = json!({
+            "status":"unknown",
+            "dispatch_acknowledged":false,
+            "steps":[{"status":"unknown","dispatch_acknowledged":true}],
+            "page_content":{"status":"unknown"}
+        });
+        normalize_unknown_receipts(&mut receipt);
+        assert_eq!(receipt["reason_code"], "action_delivery_unknown");
+        assert_eq!(receipt["mutation_retry_policy"], "reconcile_read_only_first");
+        assert_eq!(receipt["steps"][0]["reason_code"], "outcome_verification_timeout");
+        assert_eq!(receipt["steps"][0]["next_action"], "inspect_current_state_once_before_retrying");
+        assert!(receipt["page_content"].get("reason_code").is_none());
+    }
+
+    #[test]
+    fn only_an_immediate_verify_step_can_follow_an_unknown_workflow_action() {
+        let verify = BrowserWorkflowStep::Verify {
+            predicate: BrowserPredicate::TextPresent {
+                scope: None,
+                text: "Saved".into(),
+            },
+        };
+        let snapshot = BrowserWorkflowStep::Snapshot;
+        let click = BrowserWorkflowStep::Click {
+            reference: "@c1".into(),
+            outcome: BrowserClickOutcome::Focused,
+        };
+
+        assert!(is_workflow_reconciliation_step(&verify));
+        assert!(!is_workflow_reconciliation_step(&snapshot));
+        assert!(!is_workflow_reconciliation_step(&click));
+        assert!(!is_workflow_reconciliation_step(&BrowserWorkflowStep::Fill {
+            reference: "@c1".into(),
+            expected_value: "".into(),
+            value: "mutate".into(),
+        }));
+    }
+
+    #[test]
+    fn passing_unknown_workflow_reconciliation_records_state_without_replaying_action() {
+        let verify = BrowserWorkflowStep::Verify {
+            predicate: BrowserPredicate::UrlStartsWith {
+                prefix: "https://example.test/".into(),
+            },
+        };
+        let mut receipts = Vec::new();
+        assert_eq!(
+            record_workflow_receipt(
+                &mut receipts,
+                json!({"status":"unknown","action":"click"}),
+                None,
+                Some(&verify),
+            ),
+            WorkflowReceiptProgress::ReconcileUnknown(0),
+        );
+
+        assert_eq!(
+            record_workflow_receipt(
+                &mut receipts,
+                json!({"status":"passed","observer":"fresh_snapshot"}),
+                Some(0),
+                None,
+            ),
+            WorkflowReceiptProgress::Continue,
+        );
+        assert_eq!(receipts[0]["status"], "unknown");
+        assert_eq!(receipts[0]["reconciliation"]["status"], "postcondition_observed");
+        assert_eq!(receipts[0]["reconciliation"]["causality_established"], false);
+        assert_eq!(receipts[0]["reconciliation"]["mutation_retried"], false);
+    }
+
+    #[test]
+    fn failed_or_incomplete_unknown_reconciliation_stops_before_a_retry() {
+        for verify_status in ["failed", "incomplete"] {
+            let verify = BrowserWorkflowStep::Verify {
+                predicate: BrowserPredicate::TextPresent {
+                    scope: None,
+                    text: "Saved".into(),
+                },
+            };
+            let retry_click = BrowserWorkflowStep::Click {
+                reference: "@c1".into(),
+                outcome: BrowserClickOutcome::Focused,
+            };
+            let mut receipts = Vec::new();
+            let first = record_workflow_receipt(
+                &mut receipts,
+                json!({"status":"unknown","action":"click","reference":"@c1"}),
+                None,
+                Some(&verify),
+            );
+            assert_eq!(first, WorkflowReceiptProgress::ReconcileUnknown(0));
+            assert!(is_workflow_reconciliation_step(&verify));
+
+            let after_verify = record_workflow_receipt(
+                &mut receipts,
+                json!({"status":verify_status}),
+                Some(0),
+                Some(&retry_click),
+            );
+            assert_eq!(after_verify, WorkflowReceiptProgress::StopUnknown);
+            assert_eq!(receipts.len(), 2, "the following click must not execute");
+            assert_eq!(receipts[0]["status"], "unknown");
+            assert_eq!(receipts[0]["reconciliation"]["status"], "not_confirmed");
+            assert_eq!(receipts[0]["reconciliation"]["mutation_retried"], false);
+        }
     }
 
     #[test]

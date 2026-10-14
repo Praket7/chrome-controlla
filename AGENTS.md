@@ -4,7 +4,7 @@
 - Treat `docs/design/` as proposals; claim support only after the matching evidence gate passes.
 - Preserve Comptrol Apache-2.0 attribution for extracted files and update `provenance/extraction.json` when extracted source changes.
 - Keep Rust at the version in `rust-toolchain.toml`; keep direct dependency versions exact and commit `Cargo.lock` changes.
-- Do not add monolithic Comptrol, native desktop automation, credentials, browser profiles, or unrelated assets.
+- Do not add monolithic Comptrol, native desktop automation, credential storage, browser profiles, or unrelated assets. A user-supplied password may pass once through `act(action="secure_fill")`; keep it out of every other tool, observation, workflow, trace, log, and persistent memory. Synthetic test sentinels may be used only to assert redaction. Do not claim the chat message or client tool history can be erased.
 - Update `docs/progress.md`, `docs/verification-matrix.md`, and `docs/blockers.md` at phase gates. Retain failed evidence.
 
 ## Controlla browser fast path
@@ -28,4 +28,4 @@ A normal browser task should have zero repository reads, zero schema/describe ca
 
 Successful speculative routes become reusable only after independent page-identity verification. Persisted route/skill memory must be bounded, origin-scoped, expiring, and quarantined on structural drift or repeated verification failure. Failed, ambiguous, credential-bearing, or sensitive routes must not be learned or replayed.
 
-Recovery remains fail-closed: `not_dispatched` may be corrected and retried; `unknown` requires fresh read-only verification and must not replay the side effect. Password values never belong in snapshots, workflows, logs, tests, or persistent route/skill memory.
+Recovery remains fail-closed: `not_dispatched` may be corrected and retried; `unknown` requires fresh read-only verification and must not replay the side effect. Password values are allowed only as an optional one-shot `secure_fill` value or via the extension prompt. Never include them in snapshots, workflows, logs, or persistent route/skill memory.

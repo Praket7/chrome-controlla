@@ -9,6 +9,7 @@ export const PROMPT_TRACE_EVENTS = Object.freeze([
 
 const MAX_TRACE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_TRACE_LINE_BYTES = 16 * 1024;
+const ACCEPTED_PROMPT_BOUNDARIES = new Set(['client_stdin_write', 'actual_user_submit']);
 
 export async function recordPromptTraceEvent(path, traceId, event, fields = {}, monotonicNs = process.hrtime.bigint()) {
   if (typeof path !== 'string' || !path || typeof traceId !== 'string' || !traceId
@@ -44,25 +45,61 @@ export async function readPromptTrace(path) {
 export function summarizePromptTrace(events) {
   const ids = new Set(events.map(event => event.trace_id));
   const eventTimes = new Map();
-  let traceValid = ids.size <= 1;
+  const allPromptEvents = events.filter(event => event.event === 'prompt_sent');
+  const promptEvents = allPromptEvents.filter(event => ACCEPTED_PROMPT_BOUNDARIES.has(event.prompt_boundary));
+  let traceValid = ids.size <= 1 && allPromptEvents.length <= 1;
+  let previousTraceTime;
   for (const event of events) {
     if (!PROMPT_TRACE_EVENTS.includes(event.event) || !/^\d+$/.test(String(event.monotonic_ns))) {
       traceValid = false;
       continue;
     }
     const time = BigInt(event.monotonic_ns);
+    if (previousTraceTime !== undefined && time < previousTraceTime) traceValid = false;
+    previousTraceTime = time;
     const prior = eventTimes.get(event.event);
     if (event.event === 'browser_operation') {
       const list = prior ?? [];
       list.push(time);
       eventTimes.set(event.event, list);
+    } else if (event.event === 'prompt_sent' && !ACCEPTED_PROMPT_BOUNDARIES.has(event.prompt_boundary)) {
+      continue;
     } else if (prior === undefined || event.event === 'final_answer' && time > prior) {
       eventTimes.set(event.event, time);
     }
   }
   const prompt = eventTimes.get('prompt_sent');
+  const promptEvent = promptEvents[0];
   const first = name => eventTimes.get(name);
   const lastBrowser = eventTimes.get('browser_operation');
+  const callEvents = new Map();
+  for (const event of events) {
+    if (!['controlla_received', 'browser_operation', 'tool_result_delivered'].includes(event.event)
+      || typeof event.call_id !== 'string') continue;
+    const call = callEvents.get(event.call_id) ?? {};
+    const time = BigInt(event.monotonic_ns);
+    if (event.event === 'browser_operation') call.browser = time;
+    else call[event.event] = time;
+    callEvents.set(event.call_id, call);
+  }
+  if (callEvents.size) {
+    const promptDecision = [first('prompt_sent'), first('first_tool_decision')].filter(time => time !== undefined);
+    if (promptDecision.some((time, index) => index > 0 && time < promptDecision[index - 1])) traceValid = false;
+    for (const call of callEvents.values()) {
+      const ordered = [call.controlla_received, call.browser, call.tool_result_delivered].filter(time => time !== undefined);
+      if (ordered.some((time, index) => index > 0 && time < ordered[index - 1])) traceValid = false;
+      if (prompt !== undefined && ordered.some(time => time < prompt)) traceValid = false;
+    }
+    const lastResult = [...callEvents.values()].map(call => call.tool_result_delivered).filter(time => time !== undefined)
+      .reduce((latest, time) => latest === undefined || time > latest ? time : latest, undefined);
+    if (lastResult !== undefined && first('final_answer') !== undefined && first('final_answer') < lastResult) traceValid = false;
+  } else {
+    const orderedPipeline = [
+      first('prompt_sent'), first('first_tool_decision'), first('controlla_received'),
+      lastBrowser?.[0], first('tool_result_delivered'), first('final_answer'),
+    ].filter(time => time !== undefined);
+    if (orderedPipeline.some((time, index) => index > 0 && time < orderedPipeline[index - 1])) traceValid = false;
+  }
   const timeOf = name => name === 'first_browser_op' ? lastBrowser?.[0]
     : name === 'last_browser_op' ? lastBrowser?.at(-1) : first(name);
   const elapsed = name => {
@@ -83,17 +120,28 @@ export function summarizePromptTrace(events) {
   const modelCalls = events.map(event => event.internal_model_calls).find(Number.isSafeInteger);
   const tier = events.map(event => event.selected_execution_tier).find(value => typeof value === 'string') ?? null;
   const warmth = events.map(event => event.cold_warm).find(value => value === 'cold' || value === 'warm') ?? 'unknown';
+  const promptToFirstToolDecisionMs = elapsed('first_tool_decision');
+  const promptToControllaReceivedMs = elapsed('controlla_received');
+  const promptToFirstBrowserOpMs = elapsed('first_browser_op');
+  const promptToLastBrowserOpMs = elapsed('last_browser_op');
+  const promptToVerifiedMs = elapsed('verified_outcome');
+  const promptToToolResultDeliveredMs = elapsed('tool_result_delivered');
+  const promptToFinalMs = elapsed('final_answer');
   return {
     schema_version: 1,
     trace_id: ids.size === 1 ? [...ids][0] : null,
     trace_valid: traceValid,
-    prompt_to_first_tool_decision_ms: elapsed('first_tool_decision'),
-    prompt_to_controlla_received_ms: elapsed('controlla_received'),
-    prompt_to_first_browser_op_ms: elapsed('first_browser_op'),
-    prompt_to_last_browser_op_ms: elapsed('last_browser_op'),
-    prompt_to_verified_ms: elapsed('verified_outcome'),
-    prompt_to_tool_result_delivered_ms: elapsed('tool_result_delivered'),
-    prompt_to_final_ms: elapsed('final_answer'),
+    prompt_sent_observed: promptEvent !== undefined,
+    prompt_boundary: typeof allPromptEvents[0]?.prompt_boundary === 'string' ? allPromptEvents[0].prompt_boundary : null,
+    prompt_sent_monotonic_ns: typeof promptEvent?.monotonic_ns === 'string' && /^\d+$/.test(promptEvent.monotonic_ns)
+      ? promptEvent.monotonic_ns : null,
+    prompt_to_first_tool_decision_ms: promptToFirstToolDecisionMs,
+    prompt_to_controlla_received_ms: promptToControllaReceivedMs,
+    prompt_to_first_browser_op_ms: promptToFirstBrowserOpMs,
+    prompt_to_last_browser_op_ms: promptToLastBrowserOpMs,
+    prompt_to_verified_ms: promptToVerifiedMs,
+    prompt_to_tool_result_delivered_ms: promptToToolResultDeliveredMs,
+    prompt_to_final_ms: promptToFinalMs,
     counters: {
       external_controlla_calls: externalCalls,
       model_turns: hasHostEvents ? modelTurns : null,

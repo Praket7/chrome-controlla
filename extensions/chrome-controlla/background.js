@@ -10,7 +10,7 @@ const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const OPEN_RECEIPT_MAX_COUNT = 256;
 const MAX_BATCH_ACTIONS = 64;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-  "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
+  "Input.dispatchMouseEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
 let nativePort;
 let nativeReady = false;
 let nativeError;
@@ -51,6 +51,7 @@ const recentlyCreatedTabs = new Map();
 let fileChooserEventSequence = 0;
 const frameSessions = new Map();
 const frameSessionWaiters = new Map();
+const pendingSecureInputs = new Map();
 const openTabInflight = new Map();
 let openTabQueue = Promise.resolve();
 let activationEpoch = 0;
@@ -510,6 +511,93 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const win = await chrome.windows.get(tab.windowId);
       respond({ type: "result", id: request.id, result: { tab_active: !!tab.active, window_focused: !!win.focused, window_id: tab.windowId, activation_epoch: activationEpoch, focus_epoch: focusEpoch } }); return;
     }
+    if (request.method === "Controlla.securePasswordFill") {
+      const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
+      const label = typeof request.params?.label === "string" ? request.params.label.slice(0, 120) : "Password";
+      const timeoutMs = request.params?.timeout_ms ?? 20000;
+      if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 22000) throw new Error("secure password fill requires bounded frame identity and timeout.");
+      const target = await chrome.tabs.get(tabId), window = await chrome.windows.get(target.windowId);
+      if (!target.active || !window.focused) {
+        respond({ type: "result", id: request.id, result: { status: "not_dispatched", dispatch_may_have_occurred: false, reason_code: "secure_input_requires_active_target", reason: "Secure password entry requires the target tab to be active in the focused Chrome window." } }); return;
+      }
+      const root = { tabId }, frameTree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+      const findFrame = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(findFrame).find(Boolean);
+      const frame = findFrame(frameTree.frameTree);
+      if (!frame || frame.loaderId !== loaderId) throw new Error("Password field frame changed since its fresh snapshot.");
+      await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      let promptTab;
+      const route = () => { const sessionId = frameSessions.get(tabId)?.get(frameId); return sessionId ? { tabId, sessionId } : root; };
+      const checkPassword = async () => {
+        if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || !isAuthorized(tabId)) throw new Error("Target document or Controlla lease changed during secure entry.");
+        const current = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+        if (findFrame(current.frameTree)?.loaderId !== loaderId) throw new Error("Password field frame navigated during secure entry.");
+        const resolved = await chrome.debugger.sendCommand(route(), "DOM.resolveNode", { backendNodeId });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw new Error("Password field is no longer available.");
+        const result = await chrome.debugger.sendCommand(route(), "Runtime.callFunctionOn", { objectId,
+          functionDeclaration: "function(){const e=this;const r=e.getBoundingClientRect(),s=getComputedStyle(e);const visible=e.isConnected&&r.width>0&&r.height>0&&r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight&&s.display!=='none'&&s.visibility!=='hidden'&&Number.parseFloat(s.opacity||'1')>0&&s.pointerEvents!=='none'&&document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)===e;return {ok:e instanceof HTMLInputElement&&e.type==='password'&&visible&&!e.disabled&&!e.readOnly&&e.getAttribute('aria-disabled')!=='true'&&e.getAttribute('aria-readonly')!=='true'&&!e.hasAttribute('data-masked')&&!e.hasAttribute('data-requires-trusted')&&e.value.length===0,reason:e.value.length?'not_empty':'not_actionable'}}",
+          returnByValue: true });
+        if (result.result?.value?.ok !== true) throw new Error("Password field is stale, non-empty, hidden, disabled, masked, or not an ordinary password input.");
+        return { route: route(), objectId };
+      };
+      const expectedDocumentId = pairedTabDocumentIds.get(tabId);
+      if (!expectedDocumentId) throw new Error("Target document identity is unavailable.");
+      try {
+        const field = await checkPassword();
+        const nonceBytes = new Uint8Array(32); crypto.getRandomValues(nonceBytes);
+        const nonce = [...nonceBytes].map(value => value.toString(16).padStart(2, "0")).join("");
+        let origin;
+        try { origin = new URL(frame.securityOrigin).origin; } catch { throw new Error("Password field has no trustworthy HTTP(S) frame origin."); }
+        if (!/^https?:$/.test(new URL(origin).protocol)) throw new Error("Password field has no trustworthy HTTP(S) frame origin.");
+        const hasChatPassword = Object.hasOwn(request.params || {}, "password");
+        let chatPassword = hasChatPassword ? request.params.password : undefined;
+        if (hasChatPassword) request.params.password = "";
+        if (hasChatPassword && (typeof chatPassword !== "string" || chatPassword.length < 1 || chatPassword.length > 4096)) {
+          throw new Error("Chat-provided password is empty or exceeds the allowed length.");
+        }
+        let submitted;
+        if (hasChatPassword) {
+          submitted = { value: chatPassword };
+          chatPassword = undefined;
+        } else {
+          const pending = {};
+          const input = new Promise((resolve, reject) => {
+            pending.resolve = resolve; pending.reject = reject;
+            pending.timer = setTimeout(() => { pendingSecureInputs.delete(nonce); reject(new Error("Secure password entry timed out; no password was dispatched.")); }, timeoutMs);
+          });
+          pending.tabId = tabId; pending.origin = origin; pending.label = label; pendingSecureInputs.set(nonce, pending);
+          promptTab = await chrome.tabs.create({ url: chrome.runtime.getURL(`secure-input.html#${nonce}`), active: true, windowId: target.windowId });
+          submitted = await input;
+        }
+        if (!submitted || typeof submitted.value !== "string" || submitted.value.length < 1 || submitted.value.length > 4096) throw new Error("Secure password entry was cancelled or exceeded its bound.");
+        let password = submitted.value;
+        let passwordDispatchStarted = false;
+        try {
+          const latest = await checkPassword();
+          if (latest.objectId !== field.objectId) throw new Error("Password field identity changed during secure entry.");
+          passwordDispatchStarted = true;
+          const result = await chrome.debugger.sendCommand(latest.route, "Runtime.callFunctionOn", { objectId: latest.objectId,
+            functionDeclaration: "function(value){const e=this;if(!(e instanceof HTMLInputElement)||e.type!=='password'||!e.isConnected||e.value.length!==0||e.disabled||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'field_changed'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'setter_unavailable'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value,length:e.value.length}}",
+            arguments: [{ value: password }], returnByValue: true });
+          const evidence = result.result?.value;
+          if (evidence?.ok !== true) throw new Error("Password fill did not pass its independent redacted readback.");
+          respond({ type: "result", id: request.id, result: { status: "verified", dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified: true, action: "secure_fill", readback: { credential_filled: true } } });
+        } catch (error) {
+          respond({ type: "result", id: request.id, result: passwordDispatchStarted
+            ? { status: "unknown", dispatch_acknowledged: false, dispatch_may_have_occurred: true, verified: false, action: "secure_fill", reason: "Password dispatch or readback is uncertain; inspect the field before retrying." }
+            : { status: "not_dispatched", dispatch_acknowledged: false, dispatch_may_have_occurred: false, verified: false, action: "secure_fill", reason: "Password target changed before dispatch; take a fresh snapshot." } });
+        } finally {
+          password = "";
+          if (submitted) submitted.value = "";
+        }
+      } finally {
+        for (const [nonce, pending] of pendingSecureInputs) if (pending.tabId === tabId) { clearTimeout(pending.timer); pendingSecureInputs.delete(nonce); }
+        if (promptTab?.id != null) await chrome.tabs.remove(promptTab.id).catch(() => {});
+        await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      }
+      return;
+    }
     if (request.method === "Page.setInterceptFileChooserDialog" && request.params?.enabled === true) clearFileChooserState(tabId);
     if (request.method === "Controlla.waitForFileChooser") {
       const timeout = request.params?.timeout_ms;
@@ -643,7 +731,8 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (request.method === "Controlla.frameClick") {
       const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
       if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0) throw new Error("frame click requires bounded frame, loader, and backend node identities.");
-      const outcome = request.params?.outcome, timeoutMs = request.params?.timeout_ms;
+      const outcome = request.params?.outcome, timeoutMs = request.params?.timeout_ms, inputMode = request.params?.input_mode ?? "mouse";
+      if (!(["mouse", "touch"].includes(inputMode))) throw new Error("frame click input_mode must be mouse or touch.");
       if (!outcome || !["navigation", "focused", "visible", "text", "expanded", "selected"].includes(outcome.kind) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 250 || timeoutMs > 10000) throw new Error("frame click requires a supported postcondition and a 250..10000ms timeout.");
       if (["visible", "text"].includes(outcome.kind) && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512) || outcome.kind === "text" && (typeof outcome.text !== "string" || outcome.text.length > 512) || outcome.kind === "navigation" && outcome.url != null && !isExactHttpUrl(outcome.url) || ["expanded", "selected"].includes(outcome.kind) && outcome.selector != null && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512)) throw new Error("frame click postcondition is invalid or exceeds its bound.");
       const route = { tabId };
@@ -679,11 +768,18 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
         let pressAttempted = false;
         try {
-          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+          if (inputMode === "mouse") await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
           pressAttempted = true;
-          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-          await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+          if (inputMode === "touch") {
+            await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
+            await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+          } else {
+            await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+            await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+          }
         } catch (error) {
+          if (pressAttempted && inputMode === "touch") await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
+          if (pressAttempted && inputMode === "mouse") await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
           respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: false, dispatch_may_have_occurred: pressAttempted, verified: false, reason: String(error) } });
           return;
         }
@@ -702,7 +798,53 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const deadline = Date.now() + timeoutMs;
         let verified = false;
         do { verified = await verifyOutcome().catch(() => false); if (verified || Date.now() >= deadline) break; await new Promise(resolve => setTimeout(resolve, 50)); } while (Date.now() < deadline);
-        respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified, reason: verified ? undefined : "requested frame click outcome was not observed before its deadline" } });
+        respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, input_mode: inputMode, dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified, reason: verified ? undefined : "requested frame click outcome was not observed before its deadline" } });
+      } finally {
+        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      }
+      return;
+    }
+    if (request.method === "Controlla.frameFill") {
+      const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
+      const expected = request.params?.expected_value, value = request.params?.value, timeoutMs = request.params?.timeout_ms;
+      if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0) throw new Error("frame fill requires bounded frame, loader, and backend node identities.");
+      if (typeof expected !== "string" || typeof value !== "string" || expected.length > 16384 || value.length > 16384 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 250 || timeoutMs > 10000) throw new Error("frame fill values or timeout exceed their bounds.");
+      const route = { tabId };
+      const frameLoader = async () => {
+        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
+        return visit(tree.frameTree);
+      };
+      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      let dispatchAttempted = false;
+      try {
+        if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
+        let sessionId = frameSessions.get(tabId)?.get(frameId);
+        if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
+        const child = sessionId ? { tabId, sessionId } : route;
+        const ax = await chrome.debugger.sendCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const node = ax.nodes?.find(item => item.backendDOMNodeId === backendNodeId);
+        if (!node || !["textbox", "searchbox", "combobox"].includes(node.role?.value)) throw new Error("Frame field is stale or is not an editable text control.");
+        const resolved = await chrome.debugger.sendCommand(child, "DOM.resolveNode", { backendNodeId });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw new Error("Frame field could not be resolved for guarded fill.");
+        if ((sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame document changed before fill dispatch.");
+        const functionDeclaration = "function(expected,value){const e=this;const blocked=r=>({dispatch_may_have_occurred:false,verified:false,matches_requested_value:false,reason_code:r});if(!e||!e.isConnected)return blocked('target_stale');const input=e instanceof HTMLInputElement,area=e instanceof HTMLTextAreaElement;if(!input&&!area)return blocked('unsupported_control');if(input&&['password','file','hidden','checkbox','radio','submit','button','reset'].includes((e.type||'').toLowerCase()))return blocked('protected_or_nontext_control');if(e.disabled||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return blocked('field_blocked');const r=e.getBoundingClientRect(),s=getComputedStyle(e),x=Math.min(innerWidth-1,Math.max(0,r.left+r.width/2)),y=Math.min(innerHeight-1,Math.max(0,r.top+r.height/2));if(r.width<=0||r.height<=0||s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||document.elementFromPoint(x,y)!==e)return blocked('field_not_actionable');if(e.value!==expected)return blocked('stale_value');try{e.focus({preventScroll:true});if(document.activeElement!==e)return blocked('focus_failed');const proto=input?HTMLInputElement.prototype:HTMLTextAreaElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return blocked('native_setter_unavailable');setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));const matches=e.value===value;return {dispatch_may_have_occurred:true,verified:matches,matches_requested_value:matches,length:e.value.length,reason_code:matches?null:'readback_mismatch'}}catch(_){return {dispatch_may_have_occurred:true,verified:false,matches_requested_value:false,reason_code:'fill_delivery_uncertain'}}}";
+        let result;
+        try {
+          dispatchAttempted = true;
+          result = await chrome.debugger.sendCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration, arguments: [{ value: expected }, { value }], returnByValue: true, awaitPromise: false });
+        } catch (error) {
+          respond({ type: "result", id: request.id, result: { dispatch_acknowledged: false, dispatch_may_have_occurred: dispatchAttempted, verified: false, matches_requested_value: false, reason_code: "frame_fill_delivery_uncertain", reason: String(error) } });
+          return;
+        }
+        const evidence = result.result?.value;
+        if (!evidence || typeof evidence.verified !== "boolean") throw new Error("Frame fill returned no structured readback.");
+        respond({ type: "result", id: request.id, result: { dispatch_acknowledged: true, ...evidence, frame_id: frameId, backend_node_id: backendNodeId } });
+      } catch (error) {
+        respond({ type: "result", id: request.id, result: { dispatch_acknowledged: false, dispatch_may_have_occurred: dispatchAttempted,
+          verified: false, matches_requested_value: false, reason_code: dispatchAttempted ? "frame_fill_delivery_uncertain" : "frame_fill_preflight_rejected",
+          reason: String(error) } });
       } finally {
         await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
@@ -941,6 +1083,22 @@ async function detachPairedTab(tabId) { clearFileChooserState(tabId); clearFrame
 async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
 async function detachNative(generation) { if (generation !== nativeGeneration) return; for (const leaseId of [...nativeLeases.keys()]) await detachNativeLease(leaseId); }
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
+  if (["secure-input-ready", "secure-input-submit", "secure-input-cancel"].includes(message?.type)) {
+    const nonce = message?.nonce;
+    const pending = typeof nonce === "string" ? pendingSecureInputs.get(nonce) : undefined;
+    const expectedUrl = chrome.runtime.getURL("secure-input.html");
+    if (!pending || typeof _sender?.url !== "string" || _sender.url.split("#", 1)[0] !== expectedUrl) { respond({ ok: false }); return; }
+    if (message.type === "secure-input-ready") { respond({ ok: true, origin: pending.origin, label: pending.label }); return; }
+    clearTimeout(pending.timer); pendingSecureInputs.delete(nonce);
+    if (message.type === "secure-input-cancel") pending.reject(new Error("Secure password entry was cancelled."));
+    else if (typeof message.password === "string" && message.password.length > 0 && message.password.length <= 4096) {
+      const password = message.password;
+      message.password = "";
+      pending.resolve({ value: password });
+    }
+    else pending.reject(new Error("Secure password value is empty or exceeds the allowed length."));
+    respond({ ok: true }); return;
+  }
   if (message?.type === "pair") { pair(message.endpoint, message.token, message.tabIds).then(() => respond({ ok: true })).catch(error => respond({ ok: false, error: String(error) })); return true; }
   if (message?.type === "status") respond({ connected: socket?.readyState === WebSocket.OPEN, attached: [...manualAttachedTabs] });
   if (message?.type === "release") { const current = socket; const generation = ++manualGeneration; socket = undefined; current?.close(); detachManual(generation).then(() => respond({ ok: true })); return true; }

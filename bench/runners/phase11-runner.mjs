@@ -138,7 +138,7 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   const fixtureUrl = task.url ? liveTaskUrl(task) : new URL(task.fixture, fixtureBaseUrl).toString();
   const input = { task_id: task.id, scenario: task.scenario, mode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
-  const promptSentNs = process.hrtime.bigint();
+  const adapterRequestStartedNs = process.hrtime.bigint();
   const invocationMetrics = {};
   let raw;
   try {
@@ -156,25 +156,42 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   }
   validateAdapterResult(raw, contract, { adapter: adapter.id, task_id: task.id, mode, concurrency, source_ref: adapter.source_ref });
   const verification = await independentlyVerify(verifierCommand, input, raw, deadlineMs, env);
-  const verifiedOutcomeNs = process.hrtime.bigint();
+  const verifierDecisionNs = process.hrtime.bigint();
   const promptTrace = raw.prompt_trace && typeof raw.prompt_trace === 'object' ? raw.prompt_trace : {};
-  const reportedFinalMs = Number.isFinite(raw.prompt_to_final_ms) ? raw.prompt_to_final_ms : promptTrace.prompt_to_final_ms;
+  const promptBoundary = promptTrace.prompt_boundary;
+  const promptSentNs = typeof promptTrace.prompt_sent_monotonic_ns === 'string' && /^\d+$/.test(promptTrace.prompt_sent_monotonic_ns)
+    ? BigInt(promptTrace.prompt_sent_monotonic_ns) : null;
+  const exactPromptTrace = promptTrace.trace_valid === true && promptTrace.prompt_sent_observed === true
+    && promptBoundary === 'client_stdin_write' && promptSentNs !== null && promptSentNs <= verifierDecisionNs;
+  const reportedFinalMs = exactPromptTrace
+    ? Number.isFinite(raw.prompt_to_final_ms) ? raw.prompt_to_final_ms : promptTrace.prompt_to_final_ms
+    : null;
   const traceCounters = promptTrace.counters && typeof promptTrace.counters === 'object' ? promptTrace.counters : {};
+  const promptToVerifierDecisionMs = exactPromptTrace ? Number(verifierDecisionNs - promptSentNs) / 1_000_000 : null;
+  const promptToVerifiedMs = verification.passed ? promptToVerifierDecisionMs : null;
+  const adapterRequestToVerifierDecisionMs = Number(verifierDecisionNs - adapterRequestStartedNs) / 1_000_000;
+  const adapterRequestToVerifiedMs = verification.passed ? adapterRequestToVerifierDecisionMs : null;
   return {
     ...raw,
-    prompt_to_verified_ms: Number(verifiedOutcomeNs - promptSentNs) / 1_000_000,
+    prompt_to_verified_ms: promptToVerifiedMs,
+    prompt_to_verifier_decision_ms: promptToVerifierDecisionMs,
     prompt_to_final_ms: Number.isFinite(reportedFinalMs) && reportedFinalMs >= 0 ? reportedFinalMs : null,
+    adapter_request_to_verified_ms: adapterRequestToVerifiedMs,
+    adapter_request_to_verifier_decision_ms: adapterRequestToVerifierDecisionMs,
     prompt_trace: {
-      prompt_sent: true,
-      first_tool_decision_ms: Number.isFinite(promptTrace.prompt_to_first_tool_decision_ms) ? promptTrace.prompt_to_first_tool_decision_ms : null,
-      controlla_received_ms: Number.isFinite(promptTrace.prompt_to_controlla_received_ms) ? promptTrace.prompt_to_controlla_received_ms : null,
-      first_browser_op_ms: Number.isFinite(promptTrace.prompt_to_first_browser_op_ms) ? promptTrace.prompt_to_first_browser_op_ms : null,
-      last_browser_op_ms: Number.isFinite(promptTrace.prompt_to_last_browser_op_ms) ? promptTrace.prompt_to_last_browser_op_ms : null,
-      tool_result_delivered_ms: Number.isFinite(promptTrace.prompt_to_tool_result_delivered_ms)
-        ? promptTrace.prompt_to_tool_result_delivered_ms
-        : Number.isFinite(invocationMetrics.command_elapsed_ms) ? invocationMetrics.command_elapsed_ms : null,
-      verified_outcome_ms: Number(verifiedOutcomeNs - promptSentNs) / 1_000_000,
+      prompt_sent: promptTrace.prompt_sent_observed === true ? true : null,
+      prompt_boundary: typeof promptBoundary === 'string' ? promptBoundary : null,
+      prompt_sent_monotonic_ns: exactPromptTrace ? promptSentNs.toString() : null,
+      first_tool_decision_ms: exactPromptTrace && Number.isFinite(promptTrace.prompt_to_first_tool_decision_ms) ? promptTrace.prompt_to_first_tool_decision_ms : null,
+      controlla_received_ms: exactPromptTrace && Number.isFinite(promptTrace.prompt_to_controlla_received_ms) ? promptTrace.prompt_to_controlla_received_ms : null,
+      first_browser_op_ms: exactPromptTrace && Number.isFinite(promptTrace.prompt_to_first_browser_op_ms) ? promptTrace.prompt_to_first_browser_op_ms : null,
+      last_browser_op_ms: exactPromptTrace && Number.isFinite(promptTrace.prompt_to_last_browser_op_ms) ? promptTrace.prompt_to_last_browser_op_ms : null,
+      tool_result_delivered_ms: exactPromptTrace && Number.isFinite(promptTrace.prompt_to_tool_result_delivered_ms)
+        ? promptTrace.prompt_to_tool_result_delivered_ms : null,
+      verified_outcome_ms: promptToVerifiedMs,
+      verifier_decision_ms: promptToVerifierDecisionMs,
       final_answer_ms: Number.isFinite(reportedFinalMs) && reportedFinalMs >= 0 ? reportedFinalMs : null,
+      adapter_command_completed_ms: Number.isFinite(invocationMetrics.command_elapsed_ms) ? invocationMetrics.command_elapsed_ms : null,
       input_bytes: invocationMetrics.input_bytes ?? null,
       output_bytes: invocationMetrics.output_bytes ?? null,
       schema_bytes: Number.isSafeInteger(raw.schema_bytes) ? raw.schema_bytes : Number.isSafeInteger(traceCounters.schema_bytes) ? traceCounters.schema_bytes : null,
@@ -186,7 +203,7 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
       cold_warm: mode,
       execution_tier: typeof promptTrace.execution_tier === 'string' ? promptTrace.execution_tier : raw.execution_tier ?? null,
       fallback_count: Number.isSafeInteger(raw.fallback_count) ? raw.fallback_count : raw.recovery_events ?? null,
-      trace_valid: promptTrace.trace_valid === true,
+      trace_valid: exactPromptTrace,
     },
     independently_verified_success: Boolean(raw.success && verification.passed),
     verifier_evidence_hash: verification.evidence_hash,

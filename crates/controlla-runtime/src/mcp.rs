@@ -18,7 +18,8 @@ use tokio::sync::Mutex;
 
 const LOCAL_STDIO_PRINCIPAL: &str = "local-stdio";
 pub const SHARED_CLICK_UNSAFE_PREDICATE: &str = "['password','hidden','file','image'].includes(t)||(e instanceof HTMLInputElement&&!['text','search','email','url','tel','submit','reset','button'].includes(e.type))||(e.hasAttribute('data-requires-trusted')&&!(e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(t)))||((e instanceof HTMLButtonElement||e instanceof HTMLInputElement)&&!!e.form&&['submit','reset'].includes(t))";
-const SHARED_CLICK_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SHARED_CLICK_VERIFY_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SHARED_CLICK_VERIFY_MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Why a click was refused before any input was dispatched.
 enum ClickRefusal {
     /// Typed guard failure; already shaped as the compact `not_dispatched` result.
@@ -795,6 +796,16 @@ enum SharedClickOutcome {
         selector: Option<String>,
     },
 }
+
+/// Stable result code for an action whose input may already have reached the
+/// page. These outcomes are deliberately terminal for mutation replay.
+fn click_unknown_reason_code(dispatch_acknowledged: bool) -> &'static str {
+    if dispatch_acknowledged {
+        "outcome_verification_timeout"
+    } else {
+        "click_dispatch_uncertain"
+    }
+}
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SharedClickArgs {
@@ -803,6 +814,8 @@ struct SharedClickArgs {
     reference: String,
     outcome: SharedClickOutcome,
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    input_mode: Option<String>,
 }
 
 fn shared_value(response: &Value) -> Result<Value, String> {
@@ -1125,6 +1138,20 @@ fn click_mouse_events(x: f64, y: f64) -> [Value; 2] {
         json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
         json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
     ]
+}
+
+fn pointer_events(x: f64, y: f64, mode: &str) -> Result<(&'static str, [Value; 2]), &'static str> {
+    match mode {
+        "mouse" => Ok(("Input.dispatchMouseEvent", click_mouse_events(x, y))),
+        "touch" => Ok((
+            "Input.dispatchTouchEvent",
+            [
+                json!({"type":"touchStart","touchPoints":[{"id":1,"x":x,"y":y,"radiusX":1,"radiusY":1,"force":1}]}),
+                json!({"type":"touchEnd","touchPoints":[]}),
+            ],
+        )),
+        _ => Err("input_mode must be mouse or touch"),
+    }
 }
 
 #[derive(Clone)]
@@ -3040,13 +3067,17 @@ impl App {
 
     #[tool(
         name = "shared_click",
-        description = "Click exactly one reference from shared_snapshot. No selectors or raw text needed for the target. Declare a bounded outcome: navigation (optional observed destination URL), visible/text selector (may be absent before click), expanded/selected (defaults to the target), or focused for a supported text field. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
     async fn shared_click(
         &self,
         Parameters(args): Parameters<SharedClickArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         validate_shared_click_outcome(&args.outcome)?;
+        let input_mode = args.input_mode.as_deref().unwrap_or("mouse");
+        if !matches!(input_mode, "mouse" | "touch") {
+            return Err(invalid("input_mode must be mouse or touch"));
+        }
         let outcome = json!(args.outcome);
         if outcome
             .get("selector")
@@ -3257,7 +3288,8 @@ impl App {
                 .as_f64()
                 .ok_or_else(|| invalid("missing y"))?,
         );
-        let [press_event, release_event] = click_mouse_events(x, y);
+        let (input_method, [press_event, release_event]) =
+            pointer_events(x, y, input_mode).map_err(invalid)?;
         let click_started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3269,7 +3301,7 @@ impl App {
                 registry,
                 &shared.handle,
                 &args.chrome_tab_id,
-                "Input.dispatchMouseEvent",
+                input_method,
                 press_event,
             ),
         )
@@ -3281,13 +3313,22 @@ impl App {
                 registry,
                 &shared.handle,
                 &args.chrome_tab_id,
-                "Input.dispatchMouseEvent",
+                input_method,
                 release_event,
             ),
         )
         .await;
         let acknowledged = matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_)));
-        let mut result = json!({"status":"unknown","dispatch_acknowledged":acknowledged,"reason":"outcome not verified before deadline; inspect state, do not automatically retry"});
+        let mut result = json!({
+            "status":"unknown",
+            "dispatch_acknowledged":acknowledged,
+            "input_mode":input_mode,
+            "reason_code":click_unknown_reason_code(acknowledged),
+            "mutation_retry_policy":"reconcile_read_only_first",
+            "next_action":"inspect_current_state_once_before_retrying",
+            "reason":"outcome not verified before deadline; inspect state, do not automatically retry"
+        });
+        let mut verification_poll = SHARED_CLICK_VERIFY_INITIAL_POLL_INTERVAL;
         while tokio::time::Instant::now() < deadline {
             let check = async {
                 let identity = shared_frame_identity(
@@ -3331,14 +3372,13 @@ impl App {
                 Ok::<_, String>((identity, verified))
             };
             if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
-                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity,"new_tab_observed":matches!(&args.outcome, SharedClickOutcome::NewTab { .. })});
+                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"input_mode":input_mode,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity,"new_tab_observed":matches!(&args.outcome, SharedClickOutcome::NewTab { .. })});
                 break;
             }
-            let _ = tokio::time::timeout_at(
-                deadline,
-                tokio::time::sleep(SHARED_CLICK_VERIFY_POLL_INTERVAL),
-            )
-            .await;
+            let _ = tokio::time::timeout_at(deadline, tokio::time::sleep(verification_poll)).await;
+            verification_poll = verification_poll
+                .saturating_mul(2)
+                .min(SHARED_CLICK_VERIFY_MAX_POLL_INTERVAL);
         }
         if result["status"] == "unknown" && !acknowledged {
             result["reason"] = json!(
@@ -5184,7 +5224,7 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
-        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport,
+        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport, pointer_events,
         shared_epoch_matches, shared_typing_minimum_duration, validate_loopback_ws,
     };
     use rmcp::{
@@ -5223,6 +5263,18 @@ mod tests {
         assert_eq!(events[1]["type"], "mouseReleased");
         assert_eq!(events[1]["x"], 12.0);
         assert_eq!(events[1]["y"], 34.0);
+    }
+
+    #[test]
+    fn guarded_touch_tap_uses_touch_start_and_end_without_mouse_fallback() {
+        let (method, events) = pointer_events(12.0, 34.0, "touch").unwrap();
+        assert_eq!(method, "Input.dispatchTouchEvent");
+        assert_eq!(events[0]["type"], "touchStart");
+        assert_eq!(events[0]["touchPoints"][0]["x"], 12.0);
+        assert_eq!(events[0]["touchPoints"][0]["y"], 34.0);
+        assert_eq!(events[1]["type"], "touchEnd");
+        assert_eq!(events[1]["touchPoints"].as_array().unwrap().len(), 0);
+        assert!(pointer_events(12.0, 34.0, "keyboard").is_err());
     }
 
     #[tokio::test]
@@ -5373,6 +5425,16 @@ mod tests {
                 "malformed exact destination must be rejected before dispatch: {malformed}"
             );
         }
+    }
+
+    #[test]
+    fn click_unknown_reasons_are_machine_readable_and_never_retryable() {
+        use super::click_unknown_reason_code;
+        assert_eq!(
+            click_unknown_reason_code(true),
+            "outcome_verification_timeout"
+        );
+        assert_eq!(click_unknown_reason_code(false), "click_dispatch_uncertain");
     }
 
     #[test]

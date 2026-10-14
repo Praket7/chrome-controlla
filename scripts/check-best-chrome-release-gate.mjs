@@ -58,6 +58,9 @@ function validateResultSide(side, expectedAdapter, taskId, mode, concurrency) {
     assert.ok(Number.isFinite(side[metric]) && side[metric] >= 0, `invalid ${expectedAdapter}.${metric}`);
   }
   assert.ok(side.prompt_trace && side.prompt_trace.prompt_sent === true, `missing prompt-send trace for ${expectedAdapter}`);
+  assert.equal(side.prompt_trace.prompt_sent_observed, true, `${expectedAdapter} prompt trace must observe a real prompt-send boundary`);
+  assert.ok(['client_stdin_write', 'actual_user_submit'].includes(side.prompt_trace.prompt_boundary),
+    `${expectedAdapter} prompt trace must use an actual prompt-send boundary`);
   for (const span of ['first_tool_decision_ms','controlla_received_ms','first_browser_op_ms','last_browser_op_ms','tool_result_delivered_ms','verified_outcome_ms','final_answer_ms']) {
     assert.equal(typeof side.prompt_trace[span], 'number', `missing ${expectedAdapter} prompt_trace.${span}`);
     assert.ok(Number.isFinite(side.prompt_trace[span]) && side.prompt_trace[span] >= 0, `invalid ${expectedAdapter} prompt_trace.${span}`);

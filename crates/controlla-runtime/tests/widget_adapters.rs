@@ -38,6 +38,23 @@ fn adapters_match_generic_semantics_and_fall_back_on_ambiguous_shapes() {
 }
 
 #[test]
+fn button_with_null_expanded_state_is_not_misclassified_as_disclosure() {
+    let classroom_new_announcement = json!({
+        "tag":"button",
+        "role":"button",
+        "name":"edit New announcement",
+        "expanded":null
+    });
+    assert_eq!(classify_widget(&classroom_new_announcement), None);
+    assert_eq!(
+        classify_widget(
+            &json!({"tag":"button","role":"button","name":"Class options","expanded":"false"})
+        ),
+        Some(WidgetKind::Disclosure)
+    );
+}
+
+#[test]
 fn plans_are_bounded_and_require_exact_live_postconditions() {
     let item = json!({"tag":"input","role":"combobox","name":"Search"});
     let plan = plan_widget(&item, "Bills").unwrap();

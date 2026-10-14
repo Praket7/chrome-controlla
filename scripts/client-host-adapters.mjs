@@ -63,7 +63,7 @@ export function buildClientHostInvocation(clientId, { executable, workDir, mcpCo
   if (!HOSTS[clientId] || typeof executable !== 'string' || typeof workDir !== 'string' || typeof prompt !== 'string') {
     throw new Error(`invalid host invocation context for ${clientId}`);
   }
-  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${codexTomlInlineTable(mcpConfig.env)}`, prompt] };
+  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${codexTomlInlineTable(mcpConfig.env)}`, '-'], stdin: prompt, promptBoundary: 'client_stdin_write' };
   if (clientId === 'opencode') return { command: executable, args: ['run', '--format', 'json', '--dir', workDir, prompt], env: { OPENCODE_CONFIG_DIR: mcpConfig.configDir } };
   if (clientId === 'claude-code') return { command: executable, args: ['-p', '--output-format', 'json', '--strict-mcp-config', '--mcp-config', mcpConfig.configPath, '--max-turns', '8', prompt] };
   throw new Error(`${clientId} has no supported non-interactive host invocation`);
@@ -118,9 +118,8 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
     let traceWrites = Promise.resolve();
     let lineBuffer = '';
     const hostEvents = [];
-    const queueTrace = (event, fields = {}) => {
+    const queueTrace = (event, fields = {}, happenedAt = process.hrtime.bigint()) => {
       if (!traceFile) return;
-      const happenedAt = process.hrtime.bigint();
       traceWrites = traceWrites.then(() => recordPromptTraceEvent(traceFile, traceId, event, fields, happenedAt));
     };
     let firstToolDecisionRecorded = false;
@@ -149,10 +148,19 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
         queueTrace('final_answer');
       }
     };
-    const child = spawnProcess(invocation.command, invocation.args, { cwd: workDir, env: { ...env, ...invocation.env }, stdio: ['ignore', 'pipe', 'pipe'] });
-    // The prompt is delivered as a process argument; timestamp immediately after
-    // process creation, before consuming any host output or MCP events.
-    queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm });
+    const child = spawnProcess(invocation.command, invocation.args, { cwd: workDir, env: { ...env, ...invocation.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    if (invocation.stdin !== undefined) {
+      // Codex exec reads `-` from stdin. The prompt is not exposed in the process list.
+      queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm,
+        prompt_boundary: invocation.promptBoundary }, process.hrtime.bigint());
+      child.stdin.end(invocation.stdin);
+    } else {
+      // Other CLI adapters currently accept prompts as arguments; this is an
+      // invocation boundary, not proof of an interactive user's SEND event.
+      queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm,
+        prompt_boundary: 'client_process_spawn_argument' });
+      child.stdin.end();
+    }
     const stdout = []; const stderr = []; let stdoutBytes = 0; let stderrBytes = 0;
     child.stdout.on('data', chunk => {
       const bounded = Buffer.from(chunk).subarray(0, Math.max(0, 4_000_000 - stdoutBytes));

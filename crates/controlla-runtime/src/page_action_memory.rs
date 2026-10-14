@@ -114,6 +114,17 @@ impl ActionMemory {
         })
     }
 
+    /// Fast prefilter for the common miss path. Callers can avoid a live
+    /// structural snapshot unless a fresh entry could match this origin/intent.
+    pub fn has_fresh_origin_intent(&self, origin: &str, intent: &str, now_ms: u64) -> bool {
+        self.entries.iter().any(|(key, entry)| {
+            key.origin == origin
+                && key.intent == intent
+                && entry.last_verified_ms <= now_ms
+                && now_ms.saturating_sub(entry.last_verified_ms) <= MAX_AGE_MS
+        })
+    }
+
     /// Returns only fresh hints for an exact page identity. Hints remain advisory;
     /// execution must resolve a new live semantic target before dispatch.
     pub fn lookup_page(

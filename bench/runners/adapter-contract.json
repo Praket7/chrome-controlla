@@ -15,11 +15,12 @@
     "severe_wrong_target_events","authority_violations","silent_stale_mutations"
   ],
   "runner_enriched_output": [
-    "prompt_to_verified_ms","prompt_to_final_ms","prompt_trace"
+    "prompt_to_verified_ms","prompt_to_verifier_decision_ms","prompt_to_final_ms",
+    "adapter_request_to_verified_ms","adapter_request_to_verifier_decision_ms","prompt_trace"
   ],
   "prompt_trace_fields": [
-    "prompt_sent","first_tool_decision_ms","controlla_received_ms","first_browser_op_ms",
-    "last_browser_op_ms","tool_result_delivered_ms","verified_outcome_ms","final_answer_ms",
+    "prompt_sent","prompt_boundary","prompt_sent_monotonic_ns","first_tool_decision_ms","controlla_received_ms","first_browser_op_ms",
+    "last_browser_op_ms","tool_result_delivered_ms","verified_outcome_ms","verifier_decision_ms","final_answer_ms",
     "input_bytes","output_bytes","schema_bytes","external_controlla_calls","model_turns",
     "model_visible_observations","internal_model_calls","browser_cdp_commands","cold_warm",
     "execution_tier","fallback_count"
@@ -30,7 +31,7 @@
     "computer-use is reported as a separate vision track",
     "adapters may report unsupported but may not silently replace a requested task with an easier one",
     "all mutating tasks use an independent verifier outside the acting adapter",
-    "runner report schema version 2 adds monotonic prompt-to-verified and prompt-to-final timing; unavailable client-side spans/counters remain null until a real client trace reports them",
+    "runner reports prompt-to-verified only when the independent verifier passes; rejected outcomes retain prompt-to-verifier-decision latency separately. A valid client prompt-dispatch timestamp on the same monotonic clock is required, prompt-to-final comes from the client trace, and absent boundaries leave prompt spans null",
     "performance claims require prompt-to-verified and prompt-to-final evidence, complete traces, and p50/p95 non-regression"
   ]
 }

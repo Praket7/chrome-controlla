@@ -1,5 +1,22 @@
 # Verification matrix
 
+| Chat-provided secure fill | source + extension harness | `act(action="secure_fill", allow_password=true, value=...)` carries a one-shot user-supplied password only to the guarded extension dispatch; omission keeps the local prompt. Receipts omit the value and length. The chat message and MCP argument history may still retain it; real account sign-in is not verified. |
+| Codex prompt input and timing | local adapter tests | Codex host prompts travel via `codex exec -` stdin rather than argv. Only the stdin-write boundary counts as prompt dispatch. Other CLI adapters with prompt arguments do not produce prompt-send timing. |
+| Research action-memory miss | unit/source | Fresh origin+intent prefilter skips a full structural snapshot when no bounded hint can match. First-time learning is deferred after a verified read. Paired end-to-end latency improvement remains unmeasured. |
+
+## Prompt-to-outcome implementation pass — 2026-10-14
+
+| Gate | Status | Evidence / limit |
+|---|---|---|
+| Download local destination safety | pass, local unit tests | Unix-only preflight rejects symlink/traversal and pre-existing destinations; bounded staged-inode readback precedes the atomic no-replace commit, so no failure result is emitted after the destination is published. Non-Unix returns unsupported before browser dispatch. Chrome-only download tests remain ignored. |
+| Unknown outcome recovery contract | pass, local unit tests | Click receipts distinguish dispatch uncertainty from verification timeout. A V2 workflow may run one immediate explicit read-only `verify` after an unknown action; a passing predicate records the current postcondition without claiming causality, while any other result leaves the workflow unknown. No mutation is repeated. V2 step-policy and V3 receipt-normalization tests passed. |
+| Prompt-to-outcome instrumentation | code pass, live host spans unverified | The Codex CLI adapter records prompt dispatch when it writes the prompt to stdin; process-argument timestamps are explicitly excluded from prompt-send metrics. The Phase 11 runner reports prompt-to-verified only after a passing independent verifier; rejected outcomes expose separate decision latency. Prompt-to-final comes from the client trace. The proxy does not infer independent verification from acting receipts, and per-call ordering handles multi-call workflows. No configured live-client timing run was performed. |
+| Browser-command reduction | code pass, paired latency unmeasured | Research action-memory misses avoid a full structural snapshot, first-time learning runs after verification in background, and task navigation uses one CDP document read per readiness poll rather than separate frame-tree and document-state reads. The 75 ms native pairing poll reduces worst-case file pickup wait from 250 ms; end-to-end gains have not been measured on a paired live cohort. |
+| User browser / live sites / external-client qualification / competitor comparison | not run | Workspace fixtures may use isolated headless Chrome, but no user Chrome profile, live website/account mutation, configured-client qualification, hosted CI, or paired competitor test was used in this pass. |
+| Local repository gates | pass | `cargo test --workspace --locked --no-fail-fast`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; formatting/diff checks; `npm run check:docs`, `check:clients`, `check:apps`, `check:bench`, `check:release`, and `check:v3`. Fixture browser tests may launch isolated headless Chrome; live ESPN/account tests are ignored/not run. |
+| Hosted GitHub CI | base HEAD pass; working diff unqualified | Existing run [38545681232](https://github.com/Praket7/chrome-controlla/actions/runs/38545681232) is green for base `5573a9f6053e411d94e1a069f4fb9a2f3d1db23e` across Agent UX, Ubuntu, Windows, macOS, and headless/background stress. The current uncommitted working-tree changes were not included. |
+
+
 ## Stage 3 S3-11–S3-16 implementation verification — 2026-10-13
 
 | Requirement | Code path / local evidence | Boundary |
@@ -816,3 +833,12 @@ The snapshot Chrome fixture additionally verifies that native `<input role="text
 # Stage 3 continuation verification status — 2026-10-12
 
 Current source changes add a persistent V3 skill-management action, exact-intent/read-only Research replay guards, selected-tab task dispatch, task-scoped reentrant mutation leases, and cost-route receipts. Workspace tests, warning-denied Clippy, formatting, docs/client/V3/release/app/provenance/agent-UX checks, and extension harness pass. The release binary rebuilt, and direct stdio initialize/tools/list verified the exact six-tool surface and visible skill inputs. These are local source/fixture checks only. No live Codex client reload, real-client adapter run, real-site CAP matrix, or paired competitor measurement is recorded for this revision.
+# Controlla follow-up verification — 2026-10-14
+
+| Area | Evidence | Boundary |
+|---|---|---|
+| Frame-scoped negative text verification | Focused Rust regression now expects an AX miss to remain `incomplete`, even when the frame AX capture reports complete. | Positive AX text matches remain useful; no full rendered-text observer is claimed. |
+| Child-frame text fill | Extension background fixture passes child-target dispatch, redacted receipt, stale prior-value and wrong-role refusal, stale-loader refusal before `Runtime.callFunctionOn`, and uncertain-delivery reporting; V3 package compilation is included in the focused Rust test build. | Fixture only; no live OOPIF form was used. Password and key-event typing in child frames remain unsupported. |
+| Touch tap | Real CDP `Input.dispatchTouchEvent` start/end path with no mouse fallback; unit and extension bridge harnesses pass. | Swipe/drag remains unsupported; no touch-capable hardware qualification. |
+| Secret entry | Extension harness verifies one-use foreground prompt, sender-origin binding, selected field/frame identity, redacted result/storage/telemetry, prompt cleanup, and target-tab restoration. Legacy MCP password values are refused. | Human-operated prompt has not been qualified in installed Chrome. Values are transient in extension runtime messaging and CDP dispatch; no credential vault is present or claimed. |
+| Live OOPIF and client qualification | Existing OOPIF routes have fixture coverage; Codex/OpenCode host executables are present and client adapter contracts are locally testable. | No installed-extension live OOPIF task or real prompt-to-outcome client smoke was completed in this pass. Full six-client matrix remains unqualified; Claude Code is absent, Freebuff is interactive-only, and ChatGPT Desktop needs an in-app evidence driver. |

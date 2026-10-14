@@ -1739,7 +1739,7 @@ impl AppFull {
         &self,
         Parameters(args): Parameters<FullActArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        let value = match args.action.as_str() {
+        let mut value = match args.action.as_str() {
             "click" | "fill" | "select" => {
                 let Json(value) = self
                     .core
@@ -1760,6 +1760,7 @@ impl AppFull {
             "press" => retained_press(self, &args).await?,
             _ => return Err(invalid("action must be click, fill, select, type, or press")),
         };
+        super::normalize_unknown_receipts(&mut value);
         Ok(Json(value))
     }
 
@@ -1776,7 +1777,9 @@ impl AppFull {
         &self,
         Parameters(args): Parameters<FullWorkflowArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        Ok(Json(execute_workflow(self, args).await?))
+        let mut value = execute_workflow(self, args).await?;
+        super::normalize_unknown_receipts(&mut value);
+        Ok(Json(value))
     }
 
     #[tool(name = "browser_probe", description = "Capture a targeted PNG visual probe for exactly one @cN element, unique selector, or bounded region. The crop is document-bound and full-page screenshots are not the default path.")]

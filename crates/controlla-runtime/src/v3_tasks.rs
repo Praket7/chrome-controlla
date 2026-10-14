@@ -28,9 +28,7 @@ pub enum TaskPrimitive {
     },
     /// Bounded reusable mutation workflow. Every click carries an explicit
     /// runtime-verifiable outcome; only fills and clicks are admitted.
-    Mutation {
-        steps: Vec<MutationStep>,
-    },
+    Mutation { steps: Vec<MutationStep> },
     Upload {
         artifact_handle: String,
         selector: Option<String>,
@@ -40,6 +38,10 @@ pub enum TaskPrimitive {
     },
     Download {
         reference: String,
+        /// Optional local destination for the verified download bytes.
+        #[serde(default)]
+        #[schemars(description = "Absolute Unix path for a new file; no overwrite.")]
+        destination_path: Option<String>,
     },
     Repeat {
         references: Vec<String>,
@@ -110,6 +112,7 @@ pub enum ExpandedStep {
     },
     Download {
         reference: String,
+        destination_path: Option<String>,
     },
     Click {
         reference: String,
@@ -326,12 +329,20 @@ impl TaskPrimitive {
                     account_marker: account_marker.clone(),
                 }]
             }
-            Self::Download { reference } => {
-                if reference.is_empty() {
-                    return Err("download requires a reference");
+            Self::Download {
+                reference,
+                destination_path,
+            } => {
+                if reference.is_empty()
+                    || destination_path.as_deref().is_some_and(|path| {
+                        path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+                    })
+                {
+                    return Err("download requires a reference and a bounded destination path");
                 }
                 vec![ExpandedStep::Download {
                     reference: reference.clone(),
+                    destination_path: destination_path.clone(),
                 }]
             }
             Self::Repeat {
@@ -419,6 +430,19 @@ mod task_expansion_tests {
         assert!(
             matches!(&steps[1], ExpandedStep::Extract { selector, .. } if selector == "article")
         );
+    }
+
+    #[test]
+    fn download_expansion_carries_an_optional_local_destination() {
+        let steps = TaskPrimitive::Download {
+            reference: "@c4".into(),
+            destination_path: Some("/tmp/report.pdf".into()),
+        }
+        .expand()
+        .unwrap();
+        assert!(matches!(&steps[0], ExpandedStep::Download {
+            reference, destination_path: Some(path)
+        } if reference == "@c4" && path == "/tmp/report.pdf"));
     }
 
     #[test]

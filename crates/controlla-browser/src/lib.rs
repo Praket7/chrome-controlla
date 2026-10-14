@@ -358,12 +358,6 @@ impl BrowserConnection {
                         sequence: sequence_for_reader.fetch_add(1, Ordering::AcqRel) + 1,
                         value: value.clone(),
                     };
-                    let _ = events_for_reader.send(event.clone());
-                    let mut replay = replay_for_reader.lock().await;
-                    if replay.len() == 512 {
-                        replay.pop_front();
-                    }
-                    replay.push_back(event);
                     let frame_target_id =
                         if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
                             targets_for_reader
@@ -389,6 +383,16 @@ impl BrowserConnection {
                     {
                         frames.remove_target(target_id);
                     }
+                    drop(frames);
+                    // Publish only after target/session and frame state have
+                    // been updated. Consumers may immediately issue commands
+                    // based on this event (notably OOPIF bootstrap).
+                    let _ = events_for_reader.send(event.clone());
+                    let mut replay = replay_for_reader.lock().await;
+                    if replay.len() == 512 {
+                        replay.pop_front();
+                    }
+                    replay.push_back(event);
                     continue;
                 };
                 if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
@@ -409,7 +413,7 @@ impl BrowserConnection {
                 let _ = sender.send(Err(BrowserError::Closed));
             }
         });
-        Ok(Self {
+        let connection = Self {
             outgoing: outgoing_tx,
             instance_id,
             scheduler: scheduler::TargetScheduler::default(),
@@ -422,7 +426,33 @@ impl BrowserConnection {
             event_replay,
             event_sequence,
             extraction_cursors: Arc::new(Mutex::new(HashMap::new())),
-        })
+        };
+        // OOPIFs have their own flattened CDP sessions. Enabling Page and
+        // Runtime only on the top-level page leaves their frame and execution
+        // context events invisible, even though Target.getTargets reports the
+        // iframe as attached. Bootstrap each attached iframe session locally.
+        let mut bootstrap_events = connection.events.subscribe();
+        let bootstrap_connection = connection.clone();
+        let bootstrap_cancel = connection.cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = bootstrap_cancel.cancelled() => break,
+                    event = bootstrap_events.recv() => {
+                        let Ok(event) = event else { continue };
+                        if event.value["method"] != "Target.attachedToTarget"
+                            || event.value.pointer("/params/targetInfo/type").and_then(Value::as_str) != Some("iframe")
+                        {
+                            continue;
+                        }
+                        let Some(session_id) = event.value.pointer("/params/sessionId").and_then(Value::as_str) else { continue };
+                        let parent_frame_id = event.value.pointer("/params/targetInfo/parentFrameId").and_then(Value::as_str).map(str::to_owned);
+                        let _ = bootstrap_connection.bootstrap_attached_target(session_id.to_owned(), parent_frame_id).await;
+                    }
+                }
+            }
+        });
+        Ok(connection)
     }
 
     pub async fn command(
@@ -740,7 +770,15 @@ impl BrowserConnection {
         &self,
         session_id: impl Into<String>,
     ) -> Result<(), BrowserError> {
-        let session_id = session_id.into();
+        self.bootstrap_attached_target(session_id.into(), None)
+            .await
+    }
+
+    async fn bootstrap_attached_target(
+        &self,
+        session_id: String,
+        parent_frame_id: Option<String>,
+    ) -> Result<(), BrowserError> {
         let target_id = self
             .targets
             .read()
@@ -749,8 +787,50 @@ impl BrowserConnection {
             .ok_or_else(|| BrowserError::StaleReference(session_id.clone()))?;
         self.scheduler
             .run_target(&target_id, async {
+                self.command(Some(session_id.clone()), "Page.enable", Value::Null)
+                    .await?;
+                // Page.enable does not reliably replay an OOPIF's already
+                // committed root frame. Seed it from that target's own tree.
+                let tree = self
+                    .command(Some(session_id.clone()), "Page.getFrameTree", Value::Null)
+                    .await?;
+                let mut pending = vec![(&tree["frameTree"], None::<String>)];
+                let mut discovered = Vec::new();
+                while let Some((node, parent_id)) = pending.pop() {
+                    let frame = &node["frame"];
+                    let Some(frame_id) = frame["id"].as_str() else {
+                        continue;
+                    };
+                    discovered.push(FrameRecord {
+                        id: frame_id.to_owned(),
+                        parent_id: parent_id
+                            .clone()
+                            .or_else(|| frame["parentId"].as_str().map(str::to_owned))
+                            .or_else(|| parent_frame_id.clone()),
+                        target_id: target_id.clone(),
+                        loader_id: frame["loaderId"].as_str().map(str::to_owned),
+                        execution_context_ids: Vec::new(),
+                        generation: self.generation.load(Ordering::Acquire),
+                        revision: 0,
+                    });
+                    if let Some(children) = node["childFrames"].as_array() {
+                        pending.extend(
+                            children
+                                .iter()
+                                .map(|child| (child, Some(frame_id.to_owned()))),
+                        );
+                    }
+                }
+                if !discovered.is_empty() {
+                    let mut frames = self.frames.write().await;
+                    for frame in discovered {
+                        frames.upsert(frame);
+                    }
+                }
+                // Runtime.enable emits existing execution contexts. Do it
+                // after seeding the target's frames so those contexts attach
+                // to the correct OOPIF frame record instead of being dropped.
                 for method in [
-                    "Page.enable",
                     "Runtime.enable",
                     "DOM.enable",
                     "Network.enable",
@@ -1143,6 +1223,15 @@ impl TargetGraph {
     }
 
     pub fn apply_created(&mut self, mut target: TargetRecord) {
+        if let Some(existing) = self.targets.get(&target.id) {
+            // Chrome can report auto-attachment before target discovery. A
+            // delayed duplicate create event refreshes metadata but must not
+            // erase the already-observed flattened session binding.
+            if existing.attached {
+                target.attached = true;
+                target.session_id = existing.session_id.clone();
+            }
+        }
         target.generation = self.generation;
         target.revision = self.next_revision(&target.id);
         self.targets.insert(target.id.clone(), target);
@@ -1270,8 +1359,42 @@ impl TargetGraph {
                         target_id.or_else(|| params.get("targetId").and_then(Value::as_str));
                     if let (Some(target_id), Some(session_id)) =
                         (target_id, params.get("sessionId").and_then(Value::as_str))
-                        && self.targets.contains_key(target_id)
                     {
+                        // Auto-attach can deliver this event before a matching
+                        // Target.targetCreated event reaches the client. Preserve
+                        // the authoritative targetInfo here so OOPIF sessions are
+                        // immediately addressable instead of silently discarded.
+                        if !self.targets.contains_key(target_id) {
+                            let info = params.get("targetInfo");
+                            self.apply_created(TargetRecord {
+                                id: target_id.to_owned(),
+                                target_type: info
+                                    .and_then(|value| value.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                browser_context_id: info
+                                    .and_then(|value| value.get("browserContextId"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                session_id: None,
+                                url: info
+                                    .and_then(|value| value.get("url"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                title: info
+                                    .and_then(|value| value.get("title"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                opener_id: info
+                                    .and_then(|value| value.get("openerId"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                attached: false,
+                                generation: self.generation,
+                                revision: String::new(),
+                            });
+                        }
                         let revision = self.next_revision(target_id);
                         let target = self
                             .targets
@@ -2834,7 +2957,6 @@ mod tests {
                 serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"oopif-target","type":"iframe","url":"https://cross-origin.test/"}}}),
                 serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"session-oopif","targetInfo":{"targetId":"oopif-target","type":"iframe"}}}),
                 serde_json::json!({"sessionId":"session-oopif","method":"Page.frameAttached","params":{"frameId":"frame-oopif","parentFrameId":"root"}}),
-                serde_json::json!({"sessionId":"session-oopif","method":"Runtime.executionContextCreated","params":{"context":{"id":99,"auxData":{"frameId":"frame-oopif"}}}}),
             ] {
                 socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2843,17 +2965,42 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let request = socket.next().await.unwrap().unwrap();
-            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
-            assert_eq!(request["sessionId"], "session-oopif");
-            assert_eq!(request["method"], "Runtime.evaluate");
-            assert_eq!(request["params"]["contextId"], 99);
-            socket
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    serde_json::json!({"id": request["id"], "sessionId":"session-oopif", "result":{"result":{"type":"string","value":"https://cross-origin.test/"}}}).to_string().into(),
-                ))
-                .await
-                .unwrap();
+            loop {
+                let request = socket.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+                assert_eq!(request["sessionId"], "session-oopif");
+                let result = if request["method"] == "Page.getFrameTree" {
+                    serde_json::json!({"frameTree":{"frame":{"id":"frame-oopif","loaderId":"oopif-load","parentId":"root"}}})
+                } else {
+                    serde_json::json!({})
+                };
+                if request["method"] == "Runtime.evaluate" {
+                    assert_eq!(request["params"]["contextId"], 99);
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id": request["id"], "sessionId":"session-oopif", "result":{"result":{"type":"string","value":"https://cross-origin.test/"}}}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    break;
+                }
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"id": request["id"], "result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if request["method"] == "Runtime.enable" {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"sessionId":"session-oopif","method":"Runtime.executionContextCreated","params":{"context":{"id":99,"auxData":{"frameId":"frame-oopif"}}}}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
         });
         let connection = BrowserConnection::connect(&format!("ws://{address}"))
             .await
@@ -3101,16 +3248,21 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut methods = Vec::new();
-            while methods.len() < 5 {
+            while methods.len() < 6 {
                 if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
                     socket.next().await
                 {
                     let request: Value = serde_json::from_str(&text).unwrap();
                     assert_eq!(request["sessionId"], "session-1");
                     methods.push(request["method"].as_str().unwrap().to_owned());
+                    let result = if request["method"] == "Page.getFrameTree" {
+                        serde_json::json!({"frameTree":{"frame":{"id":"oopif-root","loaderId":"loader-1"}}})
+                    } else {
+                        serde_json::json!({})
+                    };
                     socket
                         .send(tokio_tungstenite::tungstenite::Message::Text(
-                            serde_json::json!({"id":request["id"],"result":{}})
+                            serde_json::json!({"id":request["id"],"result":result})
                                 .to_string()
                                 .into(),
                         ))
@@ -3137,6 +3289,7 @@ mod tests {
             server.await.unwrap(),
             vec![
                 "Page.enable",
+                "Page.getFrameTree",
                 "Runtime.enable",
                 "DOM.enable",
                 "Network.enable",
@@ -3173,5 +3326,45 @@ mod tests {
             &serde_json::json!({"method":"Page.frameDetached","params":{"frameId":"frame-1"}}),
         );
         assert!(frames.frames.is_empty());
+    }
+
+    #[test]
+    fn attached_target_event_seeds_target_graph_when_create_event_is_missing() {
+        let mut targets = TargetGraph::default();
+        targets.apply_event(&serde_json::json!({
+            "method":"Target.attachedToTarget",
+            "params":{"sessionId":"oopif-session","targetInfo":{
+                "targetId":"oopif-1","type":"iframe","url":"https://frame.example/",
+                "title":"Frame","browserContextId":"context-1","openerId":"parent-1"
+            }}
+        }));
+        let target = targets
+            .targets
+            .get("oopif-1")
+            .expect("attached OOPIF is retained even if Target.targetCreated was missed");
+        assert_eq!(target.target_type, "iframe");
+        assert_eq!(target.session_id.as_deref(), Some("oopif-session"));
+        assert_eq!(target.url.as_deref(), Some("https://frame.example/"));
+        assert_eq!(target.title.as_deref(), Some("Frame"));
+        assert_eq!(target.browser_context_id.as_deref(), Some("context-1"));
+        assert_eq!(target.opener_id.as_deref(), Some("parent-1"));
+        assert!(target.attached);
+        targets.apply_event(&serde_json::json!({
+            "method":"Target.targetCreated",
+            "params":{"targetInfo":{
+                "targetId":"oopif-1","type":"iframe","url":"https://frame.example/",
+                "title":"Frame","browserContextId":"context-1","openerId":"parent-1"
+            }}
+        }));
+        let target = targets.targets.get("oopif-1").unwrap();
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("oopif-session"),
+            "a late create event must not erase the attached session"
+        );
+        assert!(
+            target.attached,
+            "a late create event must not detach the target"
+        );
     }
 }

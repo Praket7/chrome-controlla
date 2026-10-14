@@ -97,6 +97,32 @@ fn stale_memory_is_a_hint_that_expires_and_never_executes_by_itself() {
 }
 
 #[test]
+fn origin_intent_prefilter_avoids_live_snapshot_when_no_fresh_hint_can_match() {
+    let key = ActionMemoryKey {
+        origin: "https://example.test".into(),
+        structural_signature: "v1".into(),
+        intent: "read".into(),
+    };
+    let entry = ActionMemoryEntry {
+        semantic_target: json!({"selector":"main"}),
+        action: "extract".into(),
+        expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
+        last_verified_ms: 100,
+    };
+    let mut memory = ActionMemory::default();
+    assert!(!memory.has_fresh_origin_intent("https://example.test", "read", 101));
+    memory.record(key, entry, Verification::Passed);
+    assert!(memory.has_fresh_origin_intent("https://example.test", "read", 101));
+    assert!(!memory.has_fresh_origin_intent("https://other.test", "read", 101));
+    assert!(!memory.has_fresh_origin_intent("https://example.test", "other", 101));
+    assert!(!memory.has_fresh_origin_intent(
+        "https://example.test",
+        "read",
+        101 + controlla_runtime::page_action_memory::MAX_AGE_MS + 1
+    ));
+}
+
+#[test]
 fn verified_affordance_memory_survives_restart_but_unverified_changes_do_not() {
     let path = std::env::temp_dir().join(format!(
         "controlla-action-memory-{}.json",

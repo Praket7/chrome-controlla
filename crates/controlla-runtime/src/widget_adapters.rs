@@ -262,7 +262,11 @@ pub fn resolve_widget(item: &Value) -> Option<&'static WidgetAdapter> {
         WidgetKind::DatePicker
     } else if control_type == "time" {
         WidgetKind::TimePicker
-    } else if role == "button" && item.get("expanded").is_some() {
+    } else if role == "button"
+        && item.get("expanded").is_some_and(|expanded| {
+            expanded.as_bool().is_some() || matches!(expanded.as_str(), Some("true" | "false"))
+        })
+    {
         WidgetKind::Disclosure
     } else if item.get("hover_reveals").and_then(Value::as_bool) == Some(true)
         || item.get("data_hover_reveals").and_then(Value::as_bool) == Some(true)

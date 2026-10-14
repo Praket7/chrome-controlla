@@ -78,15 +78,68 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     assert.equal(row.candidate.independently_verified_success, true);
     assert.equal(row.baseline.independently_verified_success, true);
     assert.equal(row.candidate.wall_ms, 80);
-    assert.equal(typeof row.candidate.prompt_to_verified_ms, 'number');
-    assert.equal(row.candidate.prompt_trace.prompt_sent, true);
-    assert.equal(row.candidate.prompt_trace.tool_result_delivered_ms !== null, true);
+    assert.equal(row.candidate.prompt_to_verified_ms, null);
+    assert.equal(typeof row.candidate.adapter_request_to_verified_ms, 'number');
+    assert.equal(row.candidate.prompt_trace.prompt_sent, null);
+    assert.equal(row.candidate.prompt_trace.tool_result_delivered_ms, null);
+    assert.equal(typeof row.candidate.prompt_trace.adapter_command_completed_ms, 'number');
     assert.equal(row.baseline.wall_ms, 120);
     assert.match(row.candidate.verifier_evidence_hash, /^mock-/);
     assert.equal(row.candidate.severe_wrong_target_events, 0);
     assert.equal(row.candidate.authority_violations, 0);
     assert.equal(row.candidate.silent_stale_mutations, 0);
   }
+});
+
+test('prompt-to-verified ends at the independent verifier, not an acting-client receipt', async () => {
+  const report = await runBenchmark({
+    baselineId: 'playwright-mcp',
+    fixtureBaseUrl: 'https://fixtures.example.test/',
+    commands: {
+      controlla: adapter('controlla', 80, 1),
+      'playwright-mcp': adapter('playwright-mcp', 120, 3)
+    },
+    resetCommand: reset,
+    verifierCommand: verifier,
+    environment,
+    modes: ['warm_skill'],
+    concurrencyLevels: [1],
+    repetitions: 1,
+    deadlineMs: 5000,
+    env: { ...process.env, PHASE11_MOCK_TRACE: '1' }
+  });
+  const result = report.paired_rows[0].candidate;
+  assert.equal(result.independently_verified_success, true);
+  assert.equal(result.prompt_trace.prompt_boundary, 'client_stdin_write');
+  assert.equal(typeof result.prompt_to_verified_ms, 'number');
+  assert.equal(typeof result.prompt_to_verifier_decision_ms, 'number');
+  assert.equal(result.prompt_trace.verified_outcome_ms, result.prompt_to_verified_ms);
+  assert.ok(result.prompt_to_verified_ms > 0);
+  assert.ok(result.prompt_to_verified_ms < result.adapter_request_to_verified_ms);
+});
+
+test('failed independent verification reports decision latency without a verified-success span', async () => {
+  const report = await runBenchmark({
+    baselineId: 'playwright-mcp',
+    fixtureBaseUrl: 'https://fixtures.example.test/',
+    commands: { controlla: adapter('controlla', 80, 1), 'playwright-mcp': adapter('playwright-mcp', 120, 3) },
+    resetCommand: reset,
+    verifierCommand: verifier,
+    environment,
+    modes: ['warm_skill'],
+    concurrencyLevels: [1],
+    repetitions: 1,
+    deadlineMs: 5000,
+    env: { ...process.env, PHASE11_MOCK_TRACE: '1', PHASE11_MOCK_VERIFY_FAIL: '1' }
+  });
+  const result = report.paired_rows[0].candidate;
+  assert.equal(result.independently_verified_success, false);
+  assert.equal(result.prompt_to_verified_ms, null);
+  assert.equal(result.adapter_request_to_verified_ms, null);
+  assert.equal(typeof result.prompt_to_verifier_decision_ms, 'number');
+  assert.equal(typeof result.adapter_request_to_verifier_decision_ms, 'number');
+  assert.equal(result.prompt_trace.verified_outcome_ms, null);
+  assert.equal(typeof result.prompt_trace.verifier_decision_ms, 'number');
 });
 
 test('computer-use cannot be used as the structured release baseline', async () => {

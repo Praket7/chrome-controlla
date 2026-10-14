@@ -76,7 +76,9 @@ pub async fn run() -> Result<(), String> {
     let mut pairing_tasks = JoinSet::<(String, Result<(), String>, bool)>::new();
     let mut extension_protocol_version = 0_u32;
     let mut inventory_poll = tokio::time::interval(Duration::from_secs(5));
-    let mut pairing_poll = tokio::time::interval(Duration::from_millis(250));
+    // Pairing requests are tiny local files. Check often enough to keep cold
+    // pairing responsive without adding a filesystem watcher dependency.
+    let mut pairing_poll = tokio::time::interval(Duration::from_millis(75));
     loop {
         tokio::select! {
             _ = inventory_poll.tick() => request_inventory_shared(&output).await?,

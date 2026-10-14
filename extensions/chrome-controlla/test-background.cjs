@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
 
 const sockets = [];
 const detached = [];
@@ -19,6 +20,7 @@ const sessionStorage = {};
 const localStorage = {};
 const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete" }));
 let focusedWindowActiveTabId = 42;
+let focusedWindowFocused = false;
 tabList.push({ id: 102, title: "Extension page", url: "chrome://extensions" });
 tabList.push({ title: "Invalid tab", url: "https://example.test/invalid" });
 let listener;
@@ -67,6 +69,7 @@ let emitFileChooserOnFrameRelease = false;
 let emitFileChooserOnRootRelease = false;
 let frameOutcomeVerified = false;
 let frameActionable = true;
+let frameFillMockEvidence;
 let childFrameLoaderId = "fixture-loader";
 let navigateFrameDuringFileReadback = false;
 let fileReadbackEmpty = false;
@@ -127,10 +130,13 @@ const chrome = {
       if (query.active && query.lastFocusedWindow) return tabList.filter(tab => tab.id === focusedWindowActiveTabId);
       return tabList;
     },
-    async create({ url, active = true }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
-    async update(tabId, { url }) {
+    async create({ url, active = true, windowId }) { const tab = { id: nextCreatedTab++, windowId: windowId ?? 1, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (active) focusedWindowActiveTabId = tab.id; if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
+    async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) tabList.splice(index, 1); },
+    async update(tabId, { url, active }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
+      if (active !== undefined) { tab.active = active; if (active) focusedWindowActiveTabId = tabId; }
+      if (url === undefined) return tab;
       const delayedCommit = delayedNextCommitMs;
       delayedNextCommitMs = 0;
       const priorUrl = tabUrlOverrides.get(tabId) || tab.url;
@@ -184,7 +190,7 @@ const chrome = {
     onActivated: { addListener(callback) { tabsActivated = callback; } },
     onCreated: { addListener(callback) { tabsCreated = callback; } },
   },
-  windows: { async get() { return { focused: false }; }, onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } } },
+  windows: { async get() { return { focused: focusedWindowFocused }; }, onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } } },
   webNavigation: {
     async getFrame({ tabId, frameId }) {
       frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
@@ -246,6 +252,17 @@ const chrome = {
         if (prepare) fastTypeFocused = true;
         return { result: { value: { ok: fastTypeFocused && fastTypeValue === expected, reason: fastTypeFocused ? "stale_value" : "focus_or_selection_changed", value: fastTypeValue, rich: false } } };
       }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")) {
+        const [expected, value] = params.arguments.map(argument => argument.value);
+        if (frameFillMockEvidence) return { result: { value: frameFillMockEvidence } };
+        return { result: { value: { dispatch_may_have_occurred: true, verified: true, matches_requested_value: true,
+          length: value.length, reason_code: null, expected_was_checked: typeof expected === "string" } } };
+      }
+      if (method === "DOM.resolveNode" && params?.backendNodeId === 990) return { object: { objectId: "fixture-password-object" } };
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-password-object") {
+        if (params.functionDeclaration.includes("credential_filled")) return { result: { value: { ok: true, credential_filled: true, length: params.arguments?.[0]?.value?.length || 0 } } };
+        return { result: { value: { ok: true } } };
+      }
       if (method === "Input.dispatchKeyEvent") {
         if (params.type === "keyDown" && stealFocusAfterKeydown) { stealFocusAfterKeydown = false; fastTypeFocused = false; }
         if (params.type === "keyUp" && stealFocusAfterKeyup) { stealFocusAfterKeyup = false; fastTypeFocused = false; }
@@ -287,7 +304,7 @@ const chrome = {
         queueMicrotask(() => debuggerEvent?.({ tabId: target.tabId }, "Page.fileChooserOpened", { backendNodeId: 908, frameId: "frame-oopif", mode: "selectSingle" }));
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && navigateFrameOnClick) { navigateFrameOnClick = false; childFrameUrl = "https://picker.example.test/next"; }
-      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root" }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl } }] } };
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: "https://example.test" }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl, securityOrigin: "https://frame.example" } }] } };
       if (method === "DOM.getDocument" && target.sessionId === "fixture-oopif-session") return fallbackFrameFileInputDocument || { root: { nodeName: "#document" } };
       if (method === "DOM.getDocument" && fallbackFileInputDocument) return fallbackFileInputDocument;
       if (method === "Target.setAutoAttach" && params?.autoAttach && attachOopifOnNextAutoAttach) {
@@ -302,7 +319,7 @@ const chrome = {
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 999) return { model: { content: [100, 200, 300, 200, 300, 400, 100, 400] } };
       if (method === "DOM.getBoxModel" && target.sessionId === "fixture-oopif-session") return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
-      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 999 ? "fixture-frame-owner" : "fixture-file-object" } };
+      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 999 ? "fixture-frame-owner" : "fixture-file-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-file-object") {
         if (navigateFrameDuringFileReadback) { navigateFrameDuringFileReadback = false; childFrameLoaderId = "navigated-loader"; }
         if (fileReadbackEmpty) { fileReadbackEmpty = false; return { result: { value: [] } }; }
@@ -328,7 +345,7 @@ let backgroundContext;
 function runBackground() {
   backgroundContext = {
     chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
-    Date: { now() { return mockNow; } },
+    Date: { now() { return mockNow; } }, crypto: webcrypto,
     performance: { now() { return mockNow; } },
     console: { debug(...args) { commandDiagnostics.push(args); } },
     setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
@@ -341,6 +358,7 @@ runBackground();
 function message(payload) {
   return new Promise(resolve => listener(payload, {}, resolve));
 }
+function messageFrom(payload, sender) { return new Promise(resolve => listener(payload, sender, resolve)); }
 
 (async () => {
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -542,6 +560,115 @@ function message(payload) {
   assert.equal(native.sent.at(-1).result.dispatch_acknowledged, true, "frame control click is dispatched only after child-tree identity validation");
   assert.equal(native.sent.at(-1).result.verified, true, "frame click evaluates the requested postcondition before acknowledging success");
   assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent"), "frame click input is routed through the child target");
+  const frameMouseCallsBeforeTouch = debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent").length;
+  const frameTouchCallsBeforeTouch = debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchTouchEvent").length;
+  native.hostMessage({ type: "command", id: "oopif-touch", target_id: "41", method: "Controlla.frameClick", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 91, outcome: { kind: "focused" }, input_mode: "touch", timeout_ms: 250,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.input_mode, "touch");
+  assert.equal(native.sent.at(-1).result.verified, true);
+  assert.equal(debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchTouchEvent").length - frameTouchCallsBeforeTouch, 2,
+    "frame touch tap dispatches one touchStart and one touchEnd");
+  assert.equal(debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent").length, frameMouseCallsBeforeTouch,
+    "frame touch never falls back to mouse input");
+  focusedWindowActiveTabId = 41;
+  focusedWindowFocused = true;
+  const nextCreatedBeforeSecureInput = nextCreatedTab;
+  tabList.find(tab => tab.id === 41).active = true;
+  const passwordSentinel = "one-use-password-sentinel";
+  native.hostMessage({ type: "command", id: "secure-password", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, label: "School account password", timeout_ms: 20000,
+  } });
+  for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+  const secureTab = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+  assert.ok(secureTab, "password input uses a one-use extension-owned page");
+  const secureNonce = secureTab.url.split("#")[1];
+  assert.equal((await messageFrom({ type: "secure-input-ready", nonce: secureNonce }, { url: `chrome-extension://fixture/secure-input.html.evil#${secureNonce}` })).ok, false,
+    "lookalike extension page cannot read or submit a pending secret");
+  const securePromptContext = await messageFrom({ type: "secure-input-ready", nonce: secureNonce }, { url: secureTab.url });
+  assert.equal(securePromptContext.ok, true);
+  assert.equal(securePromptContext.origin, "https://example.test");
+  assert.equal(securePromptContext.label, "School account password");
+  assert.equal((await messageFrom({ type: "secure-input-submit", nonce: secureNonce, password: passwordSentinel }, { url: secureTab.url })).ok, true);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const secureReceipt = native.sent.find(item => item.id === "secure-password")?.result;
+  assert.equal(secureReceipt?.status, "verified", "fresh password field receives one value and verifies using redacted evidence");
+  assert.equal(secureReceipt?.readback?.credential_filled, true);
+  assert.equal(Object.hasOwn(secureReceipt?.readback || {}, "length"), false, "receipt does not disclose password length");
+  assert.equal(JSON.stringify(secureReceipt).includes(passwordSentinel), false, "password is excluded from the browser receipt");
+  assert.equal(commandDiagnostics.flat(Infinity).join(" ").includes(passwordSentinel), false, "password is excluded from extension trace diagnostics");
+  assert.equal(JSON.stringify(sessionStorage).includes(passwordSentinel), false, "password is never persisted in extension session storage");
+  assert.equal(tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")), false, "one-use prompt tab is closed");
+  assert.equal(focusedWindowActiveTabId, 41, "original target tab is restored after secure entry");
+  const createdTabsBeforeChatPassword = nextCreatedTab;
+  const debuggerCallsBeforeChatPassword = debuggerCalls.length;
+  const chatPasswordSentinel = "CHAT-PASSWORD-TEST-SENTINEL";
+  native.hostMessage({ type: "command", id: "secure-password-chat-value", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, label: "School account password", timeout_ms: 20000,
+    password: chatPasswordSentinel,
+  } });
+  for (let attempt = 0; attempt < 50 && !native.sent.some(item => item.id === "secure-password-chat-value"); attempt++) {
+    const prompt = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+    if (prompt) await messageFrom({ type: "secure-input-submit", nonce: prompt.url.split("#")[1], password: chatPasswordSentinel }, { url: prompt.url });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  const chatPasswordReceipt = native.sent.find(item => item.id === "secure-password-chat-value")?.result;
+  assert.equal(chatPasswordReceipt?.status, "verified", "chat-provided password is dispatched once and verified");
+  assert.equal(chatPasswordReceipt?.readback?.credential_filled, true);
+  assert.equal(Object.hasOwn(chatPasswordReceipt?.readback || {}, "length"), false, "receipt does not expose password length");
+  assert.equal(JSON.stringify(chatPasswordReceipt).includes(chatPasswordSentinel), false, "chat secret is excluded from the receipt");
+  assert.equal(commandDiagnostics.flat(Infinity).join(" ").includes(chatPasswordSentinel), false, "chat secret is excluded from extension diagnostics");
+  assert.equal(nextCreatedTab, createdTabsBeforeChatPassword, "chat-provided password does not open a second password prompt");
+  const chatPasswordDispatch = debuggerCalls.slice(debuggerCallsBeforeChatPassword).find(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled"));
+  assert.equal(chatPasswordDispatch?.params.arguments?.[0]?.value, chatPasswordSentinel, "the one-shot value reaches only the guarded password-field dispatch");
+  focusedWindowActiveTabId = 42;
+  focusedWindowFocused = false;
+  tabList.find(tab => tab.id === 41).active = false;
+  nextCreatedTab = nextCreatedBeforeSecureInput;
+  identityAxNodes = [{ nodeId: "field", role: { value: "textbox" }, name: { value: "Search" }, backendDOMNodeId: 92 }];
+  const frameFillCallStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "oopif-fill", target_id: "41", method: "Controlla.frameFill", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected_value: "old", value: "private-frame-value", timeout_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const frameFillResult = native.sent.at(-1).result;
+  assert.equal(frameFillResult.verified, true, "frame fill requires structured in-frame readback");
+  assert.equal(frameFillResult.matches_requested_value, true);
+  assert.ok(debuggerCalls.slice(frameFillCallStart).some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Runtime.callFunctionOn"), "frame fill is evaluated in the owning child target");
+  assert.ok(!JSON.stringify(frameFillResult).includes("private-frame-value"), "frame fill receipts never echo field contents");
+  frameFillMockEvidence = { dispatch_may_have_occurred: false, verified: false, matches_requested_value: false, reason_code: "stale_value" };
+  native.hostMessage({ type: "command", id: "oopif-fill-stale-value", target_id: "41", method: "Controlla.frameFill", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected_value: "stale", value: "must-not-overwrite", timeout_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.dispatch_may_have_occurred, false, "a changed field value remains a pre-dispatch refusal");
+  assert.equal(native.sent.at(-1).result.reason_code, "stale_value");
+  frameFillMockEvidence = undefined;
+  identityAxNodes = [{ nodeId: "field", role: { value: "button" }, name: { value: "Not a text field" }, backendDOMNodeId: 92 }];
+  const frameFillCallsBeforeWrongRole = debuggerCalls.filter(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")).length;
+  native.hostMessage({ type: "command", id: "oopif-fill-wrong-role", target_id: "41", method: "Controlla.frameFill", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected_value: "old", value: "must-not-dispatch", timeout_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.dispatch_may_have_occurred, false, "non-text frame controls are rejected before evaluation");
+  assert.equal(debuggerCalls.filter(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")).length, frameFillCallsBeforeWrongRole);
+  identityAxNodes = [{ nodeId: "field", role: { value: "textbox" }, name: { value: "Search" }, backendDOMNodeId: 92 }];
+  rejectNextCommand = "Runtime.callFunctionOn";
+  native.hostMessage({ type: "command", id: "oopif-fill-uncertain", target_id: "41", method: "Controlla.frameFill", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected_value: "old", value: "delivery-uncertain", timeout_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.dispatch_may_have_occurred, true, "lost fill acknowledgement is reported as uncertain, never safe to replay");
+  assert.equal(native.sent.at(-1).result.verified, false);
+  const frameFillDispatchesBeforeStale = debuggerCalls.filter(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")).length;
+  native.hostMessage({ type: "command", id: "oopif-fill-stale-loader", target_id: "41", method: "Controlla.frameFill", params: {
+    frame_id: "frame-oopif", loader_id: "stale-loader", backend_node_id: 92, expected_value: "old", value: "must-not-dispatch", timeout_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.dispatch_may_have_occurred, false, "a changed frame loader is rejected before dispatch");
+  assert.equal(debuggerCalls.filter(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")).length, frameFillDispatchesBeforeStale);
+  identityAxNodes = [];
   const frameInputCountBeforeInvalidUrl = debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length;
   for (const [index, url] of ["/relative-story", "javascript:alert(1)", "https://user:secret@example.test/", "https://example.test:bad", "https://[:::]/", "https://[gggg::1]/", " https://example.test/", `https://example.test/${"x".repeat(2048)}`].entries()) {
     const id = `oopif-click-invalid-navigation-url-${index}`;
@@ -920,6 +1047,10 @@ function message(payload) {
   }) });
   assert.equal(debuggerCalls.length, callsBeforeBlocked + 1);
   assert.equal(debuggerCalls.at(-1).method, "Input.dispatchMouseEvent");
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "allowed-touch", target_id: "18", method: "Input.dispatchTouchEvent", params: { type: "touchStart", touchPoints: [{ id: 1, x: 1, y: 1 }] }
+  }) });
+  assert.equal(debuggerCalls.at(-1).method, "Input.dispatchTouchEvent", "shared touch input is allowed only through the explicit CDP touch method");
   const callsBeforeTyping = debuggerCalls.length;
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed-key", target_id: "18", method: "Input.dispatchKeyEvent",

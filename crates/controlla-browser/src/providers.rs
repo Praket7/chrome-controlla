@@ -1998,6 +1998,229 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    #[ignore = "requires installed Google Chrome; starts only isolated local fixtures"]
+    async fn real_chrome_routes_cross_origin_iframe_runtime_through_frame_context() {
+        use crate::sessions::ProviderGrants;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        assert!(executable.is_file());
+        async fn fixture_server(listener: TcpListener, body: String, requests: Arc<AtomicU64>) {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                requests.fetch_add(1, Ordering::Relaxed);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        }
+        let child_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let child_address = child_listener.local_addr().unwrap();
+        let child_body = "<!doctype html><label for='cross-origin-field'>Cross-origin field</label><input id='cross-origin-field' value='oopif-live-readback'>".to_owned();
+        let child_requests = Arc::new(AtomicU64::new(0));
+        let child_server = tokio::spawn(fixture_server(
+            child_listener,
+            child_body,
+            Arc::clone(&child_requests),
+        ));
+        let root_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let root_address = root_listener.local_addr().unwrap();
+        let root_body = format!(
+            "<!doctype html><h1>Local OOPIF</h1><iframe title='cross-origin fixture' src='http://localhost:{}/child'></iframe>",
+            child_address.port()
+        );
+        let root_server = tokio::spawn(fixture_server(
+            root_listener,
+            root_body,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let wrapper_home = unique_profile_directory().unwrap();
+        let wrapper = wrapper_home.join("chrome-oopif-fixture");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --site-per-process --no-proxy-server \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = DedicatedChromeProvider::new(&wrapper);
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..ProviderGrants::default()
+        });
+        let handle = registry
+            .create_session(
+                crate::sessions::SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: Vec::new(),
+                },
+                "isolated-oopif-fixture",
+            )
+            .unwrap();
+        let mut session = provider
+            .launch(&mut registry, &handle, "about:blank")
+            .await
+            .unwrap();
+        session.process.preserve_on_drop = false;
+        let target_id = session.target_id().to_owned();
+        let connection = session.connection();
+        let (_, targets) = connection.target_snapshot().await;
+        let root_target = targets
+            .iter()
+            .find(|target| target.id == target_id)
+            .unwrap();
+        connection.command(root_target.session_id.clone(), "Target.setAutoAttach", json!({
+            "autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]
+        })).await.unwrap();
+        let event_cursor = connection.latest_event_sequence();
+        connection
+            .command(
+                root_target.session_id.clone(),
+                "Page.navigate",
+                json!({
+                "url":format!("http://127.0.0.1:{}/root", root_address.port())
+                                }),
+            )
+            .await
+            .unwrap();
+        let frame_result = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frames = connection.frames.read().await;
+                let root_frame_id = frames
+                    .frames
+                    .values()
+                    .find(|frame| frame.target_id == target_id && frame.parent_id.is_none())
+                    .map(|frame| frame.id.as_str());
+                if let Some(child) = root_frame_id.and_then(|root_id| {
+                    frames.frames.values().find(|frame| {
+                        frame.parent_id.as_deref() == Some(root_id)
+                            && frame.target_id != target_id
+                            && !frame.execution_context_ids.is_empty()
+                    })
+                }) {
+                    break child.clone();
+                }
+                drop(frames);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(error) => {
+                let (_, latest_targets) = connection.target_snapshot().await;
+                let protocol_targets = connection
+                    .command(None, "Target.getTargets", json!({}))
+                    .await;
+                let iframe_target_id = protocol_targets
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.get("targetInfos"))
+                    .and_then(Value::as_array)
+                    .and_then(|infos| infos.iter().find(|info| info["type"] == "iframe"))
+                    .and_then(|info| info["targetId"].as_str());
+                let explicit_attach = if let Some(iframe_target_id) = iframe_target_id {
+                    connection
+                        .command(
+                            None,
+                            "Target.attachToTarget",
+                            json!({"targetId":iframe_target_id,"flatten":true}),
+                        )
+                        .await
+                } else {
+                    Ok(Value::Null)
+                };
+                let mut cursor = event_cursor;
+                let mut target_events = Vec::new();
+                while let Ok(event) = connection
+                    .next_event_after(cursor, Duration::from_millis(1))
+                    .await
+                {
+                    cursor = event.sequence;
+                    if matches!(
+                        event.value["method"].as_str(),
+                        Some(
+                            "Target.attachedToTarget"
+                                | "Target.targetCreated"
+                                | "Target.targetInfoChanged"
+                        )
+                    ) {
+                        target_events.push(event.value);
+                    }
+                }
+                let target_debug = latest_targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            &target.id,
+                            &target.url,
+                            &target.target_type,
+                            &target.session_id,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let latest = latest_targets
+                    .iter()
+                    .find(|target| target.id == target_id)
+                    .unwrap();
+                let tree = connection
+                    .target_command(
+                        &target_id,
+                        latest.generation,
+                        &latest.revision,
+                        "Page.getFrameTree",
+                        json!({}),
+                    )
+                    .await;
+                let body = connection
+                    .target_command(
+                        &target_id,
+                        latest.generation,
+                        &latest.revision,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression":"document.body.innerHTML","returnByValue":true
+                        }),
+                    )
+                    .await;
+                panic!(
+                    "cross-origin iframe did not become an attached frame target: {error:?}; child_http_requests={}; targets={target_debug:?}; protocol_targets={protocol_targets:?}; explicit_attach={explicit_attach:?}; target_events={target_events:?}; tree={tree:?}; body={body:?}",
+                    child_requests.load(Ordering::Relaxed)
+                );
+            }
+        };
+        let observed = connection.frame_command(&frame.id, frame.generation, frame.revision, "Runtime.evaluate", json!({
+            "expression":"JSON.stringify({origin:location.origin,value:document.querySelector('#cross-origin-field')?.value})","returnByValue":true
+        })).await.unwrap();
+        let observed: Value = serde_json::from_str(
+            observed
+                .pointer("/result/value")
+                .and_then(Value::as_str)
+                .expect("OOPIF result was not returned in the child execution context"),
+        )
+        .unwrap();
+        assert_eq!(
+            observed["value"], "oopif-live-readback",
+            "cross-origin child document was not read through its own frame session: {observed}"
+        );
+        assert_eq!(
+            observed["origin"],
+            format!("http://localhost:{}", child_address.port())
+        );
+        let _ = session.shutdown(&mut registry, None).await;
+        child_server.abort();
+        root_server.abort();
+        std::fs::remove_dir_all(wrapper_home).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     #[ignore = "requires installed Google Chrome; runs an isolated headless profile"]
     async fn real_chrome_headless_provider_launch_and_runtime_smoke() {
         use crate::sessions::{CleanupObservation, IndependentTargetObserver, ProviderGrants};

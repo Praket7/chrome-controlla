@@ -47,17 +47,9 @@ function summaryFields(result) {
   const tier = collectValues(roots, value => value.execution_route?.selected || value.execution_route?.tier)
     .map(value => value.execution_route.selected ?? value.execution_route.tier).find(value => typeof value === 'string');
   const fallbacks = collectValues(roots, value => typeof value.fallback_reason === 'string').length;
-  const terminal = roots.find(value => value && typeof value === 'object' && (value.status || value.workflow)) ?? {};
-  const workflow = terminal.workflow && typeof terminal.workflow === 'object' ? terminal.workflow : terminal;
-  const receipts = Array.isArray(workflow.receipts) ? workflow.receipts : [];
-  const terminalReceipt = receipts.at(-1);
-  const containsFailure = receipts.some(receipt => ['failed', 'unknown', 'not_dispatched', 'incomplete', 'unsupported'].includes(String(receipt?.status ?? '').toLowerCase()));
-  const verified = !containsFailure && (terminal.workflow
-    ? workflow.status === 'completed' && terminalReceipt?.step === 'verify' && terminalReceipt.status === 'passed'
-    : terminal.status === 'verified' || terminal.verified === true || terminal.status === 'passed' && !!terminal.predicate);
   return { ...(Number.isSafeInteger(cdp) ? { cdp_commands: cdp } : {}),
     ...(Number.isSafeInteger(internal) ? { internal_model_calls: internal } : {}),
-    ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbacks, verified };
+    ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbacks };
 }
 
 function observeServerLine(line, bytes) {
@@ -70,9 +62,10 @@ function observeServerLine(line, bytes) {
   if (message.method !== 'tools/call' || message.id === undefined) return;
   const name = message.params?.name;
   if (typeof name !== 'string' || !MODEL_CALLS.has(name)) return;
-  pending.set(String(message.id), { kind: 'tool', name });
-  trace('controlla_received', { tool: name, input_bytes: bytes });
-  trace('browser_operation', { tool: name, input_bytes: bytes,
+  const callId = String(message.id);
+  pending.set(callId, { kind: 'tool', name, call_id: callId });
+  trace('controlla_received', { tool: name, call_id: callId, input_bytes: bytes });
+  trace('browser_operation', { tool: name, call_id: callId, input_bytes: bytes,
     ...(process.env.CONTROLLA_PROMPT_COLD_WARM ? { cold_warm: process.env.CONTROLLA_PROMPT_COLD_WARM } : {}) });
 }
 
@@ -95,9 +88,14 @@ function inspectServerChunk(chunk) {
       } else {
         pending.delete(String(response.id));
         const fields = summaryFields(response.result);
-        if (fields.verified) trace('verified_outcome', { selected_execution_tier: fields.selected_execution_tier ?? 'unreported',
-          cdp_commands: fields.cdp_commands, ...(Number.isSafeInteger(fields.internal_model_calls) ? { internal_model_calls: fields.internal_model_calls } : {}), fallback_count: fields.fallback_count });
-        process.stdout.write(Buffer.concat([lineBytes, Buffer.from('\n')]), () => trace('tool_result_delivered', { output_bytes: lineBytes.length + 1 }));
+        process.stdout.write(Buffer.concat([lineBytes, Buffer.from('\n')]), () => trace('tool_result_delivered', {
+          output_bytes: lineBytes.length + 1,
+          call_id: context.call_id,
+          ...(fields.selected_execution_tier ? { selected_execution_tier: fields.selected_execution_tier } : {}),
+          ...(Number.isSafeInteger(fields.cdp_commands) ? { cdp_commands: fields.cdp_commands } : {}),
+          ...(Number.isSafeInteger(fields.internal_model_calls) ? { internal_model_calls: fields.internal_model_calls } : {}),
+          fallback_count: fields.fallback_count,
+        }));
       }
     } else {
       process.stdout.write(Buffer.concat([lineBytes, Buffer.from('\n')]));

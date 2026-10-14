@@ -213,7 +213,9 @@ test('host launch adapters create isolated MCP-only configs and use supported no
     assert.ok(codexCall.args.includes('--ephemeral'));
     assert.ok(codexCall.args.includes('--ignore-user-config'));
     assert.ok(codexCall.args.includes('--approve-for-me'), 'isolated Codex host tasks need the supported scoped approval path for MCP tool use');
-    assert.ok(codexCall.args.includes('read-only prompt'));
+    assert.ok(!codexCall.args.includes('read-only prompt'), 'Codex prompt text must not appear in OS process arguments');
+    assert.equal(codexCall.args.at(-1), '-');
+    assert.equal(codexCall.stdin, 'read-only prompt');
     assert.ok(codexCall.args.includes(`mcp_servers.chrome-controlla.env={CONTROLLA_PROMPT = ${JSON.stringify(codexConfig.env.CONTROLLA_PROMPT)}, CONTROLLA_STATE_DIR = ${JSON.stringify(codexConfig.env.CONTROLLA_STATE_DIR)}}`), 'Codex config override must encode env as a TOML inline table, not a JSON object string');
     const openCall = buildClientHostInvocation('opencode', { executable: '/bin/opencode', workDir: directory, mcpConfig: opencode, prompt: 'read-only prompt' });
     assert.ok(openCall.args.includes('--format') && openCall.args.includes('json'));
@@ -228,7 +230,7 @@ test('host task adapter records real client MCP tool events without promoting th
   const directory = await mkdtemp(join(tmpdir(), 'controlla-host-task-'));
   try {
     const fakeCodex = join(directory, 'fake-codex.mjs');
-    await writeFile(fakeCodex, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'item.started', item:{id:'call-1',type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',arguments:{action:'open',mode:'background'},status:'in_progress'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{id:'call-1',type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',arguments:{action:'open',mode:'background'},status:'completed'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{type:'mcp_tool_call',tool:'chrome-controlla.snapshot',call_id:'fixture-call'}}));\nconsole.log(JSON.stringify({type:'item.started', item:{id:'call-2',type:'mcp_tool_call',server:'playwright',tool:'browser',arguments:{action:'navigate'},status:'in_progress'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{id:'call-2',type:'mcp_tool_call',server:'playwright',tool:'browser',arguments:{action:'navigate'},status:'completed'}}));\n`);
+    await writeFile(fakeCodex, `#!/usr/bin/env node\nlet prompt='';for await(const chunk of process.stdin)prompt+=chunk;if(prompt!=='inspect only')process.exitCode=2;\nconsole.log(JSON.stringify({type:'item.started', item:{id:'call-1',type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',arguments:{action:'open',mode:'background'},status:'in_progress'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{id:'call-1',type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',arguments:{action:'open',mode:'background'},status:'completed'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{type:'mcp_tool_call',tool:'chrome-controlla.snapshot',call_id:'fixture-call'}}));\nconsole.log(JSON.stringify({type:'item.started', item:{id:'call-2',type:'mcp_tool_call',server:'playwright',tool:'browser',arguments:{action:'navigate'},status:'in_progress'}}));\nconsole.log(JSON.stringify({type:'item.completed', item:{id:'call-2',type:'mcp_tool_call',server:'playwright',tool:'browser',arguments:{action:'navigate'},status:'completed'}}));\n`);
     const result = await runClientHostTask('codex', { executable: fakeCodex, workDir: directory, mcpConfig: { command: '/tmp/controlla', args: ['mcp'], env: {} }, prompt: 'inspect only', timeoutMs: 1000,
       spawnProcess: (_command, _args, options) => spawn(process.execPath, [fakeCodex], options) });
     assert.equal(result.status, 'host_tool_invocation_observed');

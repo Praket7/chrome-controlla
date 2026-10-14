@@ -23,6 +23,8 @@ function result(adapter, taskId, mode, concurrency, wallMs, modelRoundTrips) {
     prompt_to_final_ms: wallMs + 60,
     prompt_trace: {
       prompt_sent: true,
+      prompt_sent_observed: true,
+      prompt_boundary: 'client_stdin_write',
       first_tool_decision_ms: 5,
       controlla_received_ms: 10,
       first_browser_op_ms: 15,
@@ -134,6 +136,13 @@ test('claim gate passes only complete independently verified structured competit
     const missingTraceResult = runClaimGate();
     assert.notEqual(missingTraceResult.status, 0);
     assert.match(`${missingTraceResult.stderr}\n${missingTraceResult.stdout}`, /prompt_trace\.model_turns/);
+
+    const processArgumentTrace = structuredClone(good);
+    processArgumentTrace.comparisons[0].paired_rows[0].candidate.prompt_trace.prompt_boundary = 'client_process_spawn_argument';
+    await writeReport(processArgumentTrace);
+    const processArgumentResult = runClaimGate();
+    assert.notEqual(processArgumentResult.status, 0);
+    assert.match(`${processArgumentResult.stderr}\n${processArgumentResult.stdout}`, /actual prompt-send boundary/);
   } finally {
     await rm(reportPath, { force: true });
   }

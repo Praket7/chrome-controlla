@@ -323,7 +323,9 @@ function(q) {
   if (cross_origin_frames_unread) incomplete_reasons.push('cross_origin_frames_unread');
   if (same_origin_frames_pending) incomplete_reasons.push('same_origin_frames_pending');
   const coverage = truncated || cross_origin_frames_unread || same_origin_frames_pending || text_truncated ? 'partial: '+(truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : 'same_origin_frames_pending')) : (q.href_hint ? 'visible links matching href hint in reachable DOM and frames' : 'visible controls in light DOM, open shadow roots, and loaded same-origin frames in this scope');
-  // Cross-origin frames cannot be inspected; they do not truncate the reachable first-party link scope.
+  // An explicit first-party href scope intentionally excludes cross-origin
+  // embed contents. Keep global coverage partial, but do not let an unrelated
+  // unread embed invalidate a fully enumerated first-party link scope.
   const firstPartyHint = q.href_hint || q.goal?.href_hint;
   const first_party_complete = !!firstPartyHint && !truncated && !same_origin_frames_pending && items.every(item => { try { return new URL(item.href).origin === location.origin; } catch (_) { return false; } });
   const scope_complete = firstPartyHint ? first_party_complete : q.goal ? !truncated && !early_stopped && frames_complete : complete;
