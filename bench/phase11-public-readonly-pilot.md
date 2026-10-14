@@ -16,7 +16,7 @@ The latest five-adapter five-pair run is `reports/phase11-five-adapter-pilot-5pa
 
 In this sample, Browser Use returned browser evidence quickest, Controlla made fewer MCP calls, and Controlla returned its final answer quickest. The workload is one unauthenticated Example.com read; browser warmth is unknown, and time starts at Codex process spawn rather than prompt dispatch. The sample is too narrow for a general ranking or release claim.
 
-The newer six-adapter paired run is `reports/phase11-six-adapter-pilot-5pairs-2026-10-14.json`. It alternates adapter order across five replicates and independently verifies the browser result and cleanup for every run (30/30 each). Stagehand cleanup requires the browser close request, no surviving Stagehand server process, and no new Stagehand Chrome process. The medians were:
+The original six-adapter paired run is `reports/phase11-six-adapter-pilot-5pairs-2026-10-14.json`. It alternates adapter order across five replicates and independently verifies the browser result and adapter-specific cleanup for every run (30/30). Stagehand's original cleanup check was process-only; it did not inventory temporary profiles. The medians were:
 
 | Adapter | Verified result / cleanup | Median spawn to browser evidence | Median spawn to final | MCP calls per run |
 | --- | ---: | ---: | ---: | ---: |
