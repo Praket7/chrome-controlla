@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall } from './phase11-public-readonly-pilot.mjs';
+import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles } from './phase11-public-readonly-pilot.mjs';
 
 test('Controlla pilot uses one private task call without a launch round trip', () => {
   const prompt = setup('controlla', '/chrome', '/controlla', '/state').prompt;
@@ -96,6 +96,7 @@ test('Stagehand pilot uses one local MCP run call and asks its browser facade to
   const configured = setup('stagehand', '/chrome', '/controlla', '/state', undefined, '/tmp/stagehand/stdio-server.mjs');
   assert.equal(configured.server, 'stagehand');
   assert.match(configured.config.join(' '), /STAGEHAND_BROWSER = "local"/);
+  assert.match(configured.config.join(' '), /stagehand-tmp/);
   assert.match(configured.config.join(' '), /stdio-server\.mjs/);
   assert.match(configured.prompt, /exactly one call/);
   assert.match(configured.prompt, /await browser\.close\(\)/);
@@ -119,6 +120,18 @@ test('Stagehand cleanup requires a browser close request and no new server or Ch
     ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-new'], '/tmp/stagehand/server.mjs'), false);
   assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'],
     ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'], '/tmp/stagehand/server.mjs'), true);
+  assert.equal(noNewStagehandProfiles([], ['stagehand-chrome-new']), false);
+  assert.equal(noNewStagehandProfiles(['stagehand-chrome-existing'], ['stagehand-chrome-existing']), true);
+});
+
+test('Stagehand process inventory parses Windows process IDs and command lines', () => {
+  assert.deepEqual(parseWindowsProcessInventory(JSON.stringify([
+    { ProcessId: 101, CommandLine: 'node C:\\stagehand\\stdio-server.mjs' },
+    { ProcessId: 202, CommandLine: 'chrome.exe --user-data-dir=C:\\Temp\\stagehand-chrome-abc' },
+  ])), [
+    '101 node C:\\stagehand\\stdio-server.mjs',
+    '202 chrome.exe --user-data-dir=C:\\Temp\\stagehand-chrome-abc',
+  ]);
 });
 
 test('Stagehand outcome requires one successful run result with exact live page evidence', () => {

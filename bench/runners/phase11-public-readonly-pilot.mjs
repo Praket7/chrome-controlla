@@ -3,9 +3,9 @@
 // Phase 11 release matrix or the broad superiority gate.
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,7 +20,8 @@ const browserUseServerSha256 = '696aee232f331ca215bb6e5ed21d5400dda1e4e530a6af6a
 const defaultBrowserUseExecutable = '/Users/pcg/.local/share/chrome-controlla-bench/browser-use-venv/bin/browser-use';
 const stagehandCommit = 'cd7b230778cf92269e4cb90e80d97f5113781c51';
 const stagehandFacadeSha256 = '12333b5a0362833ab5175c28dc021d5e9b6061d4c3bab6ca5855c3144b4e4692';
-const defaultStagehandServer = '/Users/pcg/.local/share/chrome-controlla/comparison-mcps/stagehand-4.1.0/packages/integrations/core/dist/facade/stdio-server.mjs';
+const defaultStagehandServer = join(homedir(), '.local', 'share', 'chrome-controlla', 'comparison-mcps', 'stagehand-4.1.0',
+  'packages', 'integrations', 'core', 'dist', 'facade', 'stdio-server.mjs');
 const adapters = ['controlla', 'playwright-mcp', 'chrome-devtools-mcp', 'agent-browser', 'browser-use', 'stagehand'];
 const maxOutputBytes = 4_000_000;
 
@@ -74,8 +75,25 @@ export function inspectStagehandServer(serverPath) {
   return { commit, tag, facade_sha256, server_path: absolutePath, identity_scope: 'exact git commit/tag plus built stdio facade hash' };
 }
 
+export function parseWindowsProcessInventory(output) {
+  if (!output.trim()) return [];
+  const parsed = JSON.parse(output);
+  const processes = Array.isArray(parsed) ? parsed : [parsed];
+  return processes.filter(item => item?.ProcessId !== undefined && item.CommandLine)
+    .map(item => `${item.ProcessId} ${item.CommandLine}`);
+}
+
 function processInventory() {
+  if (process.platform === 'win32') {
+    const powershell = '$ErrorActionPreference = "Stop"; Get-CimInstance Win32_Process | ForEach-Object { [PSCustomObject]@{ ProcessId = $_.ProcessId; CommandLine = $_.CommandLine } } | ConvertTo-Json -Compress';
+    const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', powershell], { encoding: 'utf8' });
+    return parseWindowsProcessInventory(output);
+  }
   return execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+}
+
+function stagehandProfileInventory(directory) {
+  return readdirSync(directory).filter(name => name.startsWith('stagehand-chrome-'));
 }
 
 export function stagehandProcessCleanup(before, after, serverPath) {
@@ -91,6 +109,11 @@ export function stagehandProcessCleanup(before, after, serverPath) {
     prior.set(signature, count - 1);
   }
   return true;
+}
+
+export function noNewStagehandProfiles(before, after) {
+  const knownProfiles = new Set(before);
+  return after.every(profile => knownProfiles.has(profile));
 }
 
 export function stagehandSingleCall(events, server) {
@@ -154,7 +177,7 @@ export function setup(adapter, browserPath, binaryPath, stateDir, browserUseExec
     config: [
       '-c', `mcp_servers.stagehand.command=${toml(process.execPath)}`,
       '-c', `mcp_servers.stagehand.args=${toml([resolve(stagehandServerPath)])}`,
-      '-c', 'mcp_servers.stagehand.env={STAGEHAND_BROWSER = "local"}',
+      '-c', `mcp_servers.stagehand.env={STAGEHAND_BROWSER = "local", TMPDIR = ${toml(join(stateDir, 'stagehand-tmp'))}, TMP = ${toml(join(stateDir, 'stagehand-tmp'))}, TEMP = ${toml(join(stateDir, 'stagehand-tmp'))}}`,
     ],
     prompt: `Use only the Stagehand MCP run tool. Make exactly one call with code that runs: await page.goto("${targetUrl}"); const url = page.url(); const title = await page.title(); const paragraph = (await page.locator("p:first-of-type").innerText()).trim(); await browser.close(); return JSON.stringify({title, paragraph, url, cleanup_requested: true}); Copy the values from the successful tool result exactly. Return exactly one JSON object with string fields "title" and "paragraph", with no introduction or Markdown. Do not use shell commands, web search, prior knowledge, another browser tool, or a second Stagehand call. Return {"error":"browser failed"} if any read or close request fails or a value is missing.`,
   };
@@ -307,10 +330,14 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
   const runDir = await mkdtemp(join(parentDir, `${adapter}-`));
   const stateDir = join(runDir, 'state');
   await mkdir(stateDir);
+  const stagehandTempDir = join(stateDir, 'stagehand-tmp');
+  if (adapter === 'stagehand') await mkdir(stagehandTempDir);
   const { server, config, prompt, profileConfig } = setup(adapter, browserPath, binaryPath, stateDir, browserUseExecutable, stagehandServerPath);
   if (profileConfig) await writeFile(join(stateDir, 'config.json'), `${JSON.stringify(profileConfig)}\n`);
   const promptHash = createHash('sha256').update(prompt).digest('hex');
   const args = ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-m', model, '-C', runDir, ...config, prompt];
+  const stagehandProcessesBefore = adapter === 'stagehand' ? processInventory() : null;
+  const stagehandProfilesBefore = adapter === 'stagehand' ? stagehandProfileInventory(stagehandTempDir) : null;
   const started = process.hrtime.bigint();
   const events = [];
   let finalAt = null;
@@ -319,7 +346,6 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
   let buffer = '';
   let exitCode = null;
   let error = null;
-  const stagehandProcessesBefore = adapter === 'stagehand' ? processInventory() : null;
   const consume = line => {
     if (!line.trim()) return;
     try {
@@ -382,10 +408,13 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
           : adapter === 'browser-use' ? event.item.tool === 'browser_get_html'
             : adapter === 'stagehand' ? event.item.tool === 'run' && typeof stagehandResult?.title === 'string' && typeof stagehandResult?.paragraph === 'string'
             : ['agent_browser_get_text', 'agent_browser_get_title'].includes(event.item.tool));
+    const stagehandProcessesAfter = adapter === 'stagehand' ? processInventory() : null;
+    const stagehandProfilesAfter = adapter === 'stagehand' ? stagehandProfileInventory(stagehandTempDir) : null;
     const processCleanup = adapter === 'stagehand'
-      ? stagehandProcessCleanup(stagehandProcessesBefore, processInventory(), stagehandServerPath)
+      ? stagehandProcessCleanup(stagehandProcessesBefore, stagehandProcessesAfter, stagehandServerPath)
       : undefined;
-    const cleanupVerified = verifiedCleanup(events, adapter, server, targetUrl, { process_cleanup: processCleanup });
+    const profileCleanup = adapter === 'stagehand' ? noNewStagehandProfiles(stagehandProfilesBefore, stagehandProfilesAfter) : undefined;
+    const cleanupVerified = verifiedCleanup(events, adapter, server, targetUrl, { process_cleanup: processCleanup && profileCleanup });
     const browserOutcomeVerified = toolOutcomeMatchesReference(events, adapter, server, reference);
     const finalAnswerMatchesReference = answer?.title === reference?.title && answer?.paragraph === reference?.paragraph;
     return {
@@ -420,8 +449,9 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
       evidence: { expected_server: server, expected_navigation_observed: acted, read_tool_observed: observed,
         cleanup_verified: cleanupVerified, browser_outcome_matches_reference: browserOutcomeVerified,
         final_answer_matches_reference: finalAnswerMatchesReference,
-        cleanup_verification_method: cleanupVerified ? adapter === 'stagehand' ? 'browser_close_request_plus_os_process_inventory' : 'adapter_specific_close_result' : 'not_verified',
-        ...(adapter === 'stagehand' ? { stagehand_process_cleanup_verified: processCleanup } : {}),
+        cleanup_verification_method: cleanupVerified ? adapter === 'stagehand' ? 'browser_close_request_plus_os_process_and_temp_profile_inventory' : 'adapter_specific_close_result' : 'not_verified',
+        ...(adapter === 'stagehand' ? { stagehand_process_cleanup_verified: processCleanup,
+          stagehand_temp_profile_cleanup_verified: profileCleanup } : {}),
         ...(adapter === 'stagehand' ? { stagehand_single_call_contract_met: stagehandSingleCall(events, server) } : {}),
         unrelated_actions: otherActions.map(({ event }) => event.item?.type), reference: reference && { title: reference.title, paragraph: reference.paragraph } },
     };
