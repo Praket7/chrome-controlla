@@ -848,6 +848,14 @@ fn shared_value(response: &Value) -> Result<Value, String> {
     })
 }
 
+fn shared_command_value(response: &Value) -> Value {
+    if response["status"].is_string() {
+        response.clone()
+    } else {
+        shared_value(response).unwrap_or(Value::Null)
+    }
+}
+
 fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String)), String> {
     if batch["completed"] != 2 || batch.get("batch_error").is_some() {
         return Err(format!(
@@ -3311,7 +3319,7 @@ impl App {
             .await;
             match dispatch {
                 Ok(Ok(response)) => {
-                    let value = shared_value(&response).unwrap_or(Value::Null);
+                    let value = shared_command_value(&response);
                     if value["status"] == "not_dispatched" {
                         return Ok(rmcp::handler::server::wrapper::Json(value));
                     }
@@ -5266,13 +5274,22 @@ mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
         SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport, pointer_events,
-        shared_epoch_matches, shared_typing_minimum_duration, validate_loopback_ws,
+        shared_command_value, shared_epoch_matches, shared_typing_minimum_duration,
+        validate_loopback_ws,
     };
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn custom_shared_command_receipts_are_not_parsed_as_cdp_runtime_values() {
+        let receipt = json!({"status":"dispatched","dispatch_acknowledged":true,"temporary_activation":true,"restored_previous_tab":true});
+        assert_eq!(shared_command_value(&receipt), receipt);
+        let cdp = json!({"result":{"value":{"status":"verified"}}});
+        assert_eq!(shared_command_value(&cdp), json!({"status":"verified"}));
+    }
 
     #[test]
     fn final_click_guard_requires_a_live_hit_test_and_stable_viewport() {
