@@ -52,8 +52,8 @@ test('Browser Use pilot uses its installed MCP executable and isolates local hea
   assert.match(portableConfig, /BROWSER_USE_HEADLESS/);
   assert.match(portableConfig, /BROWSER_USE_CONFIG_DIR/);
   assert.equal(configured.profileConfig.browser_profile.pilot.browser_binary_path, '/chrome');
-  assert.equal(configured.profileConfig.browser_profile.pilot.user_data_dir, '/tmp/pilot-state/profile');
-  assert.equal(configured.profileConfig.browser_profile.pilot.downloads_path, '/tmp/pilot-state/downloads');
+  assert.equal(configured.profileConfig.browser_profile.pilot.user_data_dir.replaceAll(/\\/g, '/'), '/tmp/pilot-state/profile');
+  assert.equal(configured.profileConfig.browser_profile.pilot.downloads_path.replaceAll(/\\/g, '/'), '/tmp/pilot-state/downloads');
   assert.equal(configured.profileConfig.browser_profile.pilot.headless, true);
   assert.match(configured.prompt, /exactly three calls/);
   assert.match(configured.prompt, /browser_get_html with no selector/);
