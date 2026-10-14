@@ -30,6 +30,8 @@ let nativeErrorReads = 0;
 const tabUrlOverrides = new Map();
 const tabDocumentOverrides = new Map();
 const frameReadCounts = new Map();
+const unavailableIdentityReads = new Map();
+const transientIdentityAfterAttach = new Set();
 const reloadDuringAttach = new Set();
 const identityChangeDuringAttach = new Set();
 const navigationStartDuringAttach = new Set();
@@ -195,6 +197,11 @@ const chrome = {
     async getFrame({ tabId, frameId }) {
       frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
       if (frameId !== 0 || !tabList.some(tab => tab.id === tabId)) return undefined;
+      const unavailableReads = unavailableIdentityReads.get(tabId) || 0;
+      if (unavailableReads > 0) {
+        unavailableIdentityReads.set(tabId, unavailableReads - 1);
+        return undefined;
+      }
       if (blockedFrame?.tabId === tabId) {
         const wait = blockedFrame;
         blockedFrame = undefined;
@@ -229,6 +236,7 @@ const chrome = {
     async attach({ tabId }) {
       if (failAttach.delete(tabId)) throw new Error("fixture attach failure");
       attached.push(tabId);
+      if (transientIdentityAfterAttach.delete(tabId)) unavailableIdentityReads.set(tabId, 5);
       if (reloadDuringAttach.delete(tabId)) {
         tabsUpdated(tabId, { status: "loading" });
         tabsUpdated(tabId, { status: "complete" });
@@ -348,7 +356,11 @@ function runBackground() {
     Date: { now() { return mockNow; } }, crypto: webcrypto,
     performance: { now() { return mockNow; } },
     console: { debug(...args) { commandDiagnostics.push(args); } },
-    setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
+    setTimeout(callback, delay) {
+      if (delay === 10) return globalThis.setTimeout(callback, delay);
+      reconnectTimers.push({ callback, delay });
+      return reconnectTimers.length;
+    },
     clearTimeout,
   };
   vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations };`, backgroundContext);
@@ -803,15 +815,17 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   assert.equal(debuggerCalls.length, callsBeforeNavigationBatch + 1, "user navigation stops the next batch mutation");
   commandDiagnostics.splice(0);
   const openTabFrameReadsBefore = frameReadCounts.get(503) || 0;
+  transientIdentityAfterAttach.add(503);
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/", idempotency_key: "fixture:open-tab-12345" } });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  const opened = native.sent.at(-1);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  const opened = native.sent.find(message => message.id === "open-tab");
+  assert.ok(opened?.result, JSON.stringify(opened));
   assert.equal(opened.id, "open-tab");
   assert.equal(opened.result.tab_id, "503");
   assert.equal(opened.result.url, "https://www.espn.com/");
   assert.equal(opened.result.document_id, "document-503-next");
-  assert.equal(frameReadCounts.get(503) - openTabFrameReadsBefore, 6,
-    "a navigation that already reached DOMContentLoaded must not repeat its frame identity check");
+  assert.equal(frameReadCounts.get(503) - openTabFrameReadsBefore, 11,
+    "a transient missing frame identity is retried until Chrome exposes the committed document");
   assert.ok(attached.includes(503), "the opened tab joins the existing native session");
   native.hostMessage({ type: "command", id: "navigate-tab", target_id: "503", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/" } });
   await new Promise(resolve => setTimeout(resolve, 0));

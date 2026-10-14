@@ -873,7 +873,15 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
   } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error) }); }
 }
 function validateNavigationUrl(value) { if (typeof value !== "string" || value.length > 2048) throw new Error("URL must be a bounded HTTP(S) URL."); const url = new URL(value); if (!(url.protocol === "http:" || url.protocol === "https:") || !url.hostname || url.username || url.password) throw new Error("URL must be HTTP(S) and cannot contain credentials."); return url.href; }
-async function nativePageIdentity(tabId) { const tab = await chrome.tabs.get(tabId); const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }); if (!frame?.documentId || frame.url !== tab.url) throw new Error("Navigation committed without a stable document identity."); return { url: tab.url, document_id: frame.documentId }; }
+async function nativePageIdentity(tabId) {
+  for (let attempt = 0; attempt < 26; attempt++) {
+    const tab = await chrome.tabs.get(tabId);
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 });
+    if (frame?.documentId && frame.url === tab.url) return { url: tab.url, document_id: frame.documentId };
+    if (attempt < 25) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("Navigation did not expose a stable document identity within 250 ms.");
+}
 async function waitForTabDOMContentLoaded(tabId, afterDocumentId) {
   const currentDocumentReady = async () => {
     const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
