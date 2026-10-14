@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "playwright_mcp_version": "0.0.83",
+    "controlla_binary_sha256": "a566684df838b58e740f7636737453bbdc6d94d9018a008ff0d4ed6493626a8b",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla",
+        "playwright-mcp"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "2f580676e175a96a9e9b41f8e11e714d4c2d444795719eab9c7b88a893e93f2a",
+        "prompt_to_verified_ms": 23992.501209,
+        "prompt_to_final_ms": 23083.798792,
+        "first_browser_tool_started_ms": 6112.697,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 137380,
+        "external_tool_calls": 4,
+        "successful_browser_tool_calls": 4,
+        "tool_names": [
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.snapshot:completed",
+          "chrome-controlla.browser:completed"
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 21331,
+        "output_sha256": "9c75a9ac5a397c366eb9705f8167266bbe32d688ffe45ceafadf5d04a7364283",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "61c6f4103f5865c8099d01bfbd90458d94c07ea99df868a8872facf369e61773",
+        "prompt_to_verified_ms": 17151.583167,
+        "prompt_to_final_ms": 15766.675042,
+        "first_browser_tool_started_ms": 5771.53575,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 92924,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_evaluate:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 3061,
+        "output_sha256": "0f17321375e99043c7eba58ef20c05a95f6d52a8ee64bd271e7d7b28ab67c911",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

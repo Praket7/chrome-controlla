@@ -17,9 +17,9 @@ const ADAPTERS = Object.freeze({
 });
 // Contract pin for the six-tool V3 surface. A schema change requires an
 // intentional update of this value and the client qualification fixtures.
-export const EXPECTED_V3_TOOL_SCHEMA_SHA256 = '5d8576cf0ec3a49dc8f4e862aa56c0dad7f7b1188d2b2805fdf1587989a70cb4';
+export const EXPECTED_V3_TOOL_SCHEMA_SHA256 = 'a7ecd252cc41f2f65e88ddf7857509384bbc258cd84eba936b2a80c9c8797bc0';
 export const EXPECTED_CLIENT_TOOL_SCHEMA_SHA256 = Object.freeze({
-  'chatgpt-desktop': 'ee9b57c12d4eacfd28c22ec6b275249e6798eca11ba9f625c312f20bf2789630',
+  'chatgpt-desktop': '0bab2c961ca1e052b8aadb0619b18f65b9a32383cda5af4480d3b19bf7d1abc9',
 });
 
 function waitForResponse(child, id, timeoutMs, pending) {

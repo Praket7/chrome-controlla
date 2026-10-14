@@ -52,6 +52,7 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         eval(r##"document.body.innerHTML='<style>button,a{display:block;margin:4px}</style>'+ '<div>padding</div>'.repeat(200)+'<button id="account" aria-label="Accounts" aria-expanded="false" onclick="this.setAttribute(\'aria-expanded\',\'true\')"></button><button aria-label="Twin">Twin</button><button aria-label="Twin">Twin</button><button id="menu" onclick="setTimeout(()=>{document.body.insertAdjacentHTML(\'beforeend\',\'<div id=late>Ready</div>\')},150)">Menu</button><button id="uncertain" onclick="window.clicks=(window.clicks||0)+1">Count</button><a id="nav" href="#done">Story</a><input id="trusted" aria-label="Trusted keys" type="text" data-requires-trusted value="before" onclick="window.trustedClicks=(window.trustedClicks||0)+1"><div data-masked>PRIVATE-SENTINEL</div><button><span data-requires-trusted>PROTECTED-SENTINEL</span></button><span id="secretLabel" data-masked>LABEL-SENTINEL</span><button aria-labelledby="secretLabel" aria-label="Safe">safe</button><button hidden>Hidden</button><div id="late-target">needle</div><iframe id="composed-text" srcdoc="&lt;body&gt;&lt;label&gt;COMPOSED-FRAME-SENTINEL&lt;/label&gt;&lt;/body&gt;"></iframe>';document.querySelector('#account').style.cssText='width:70px;height:25px';"##.into()).await;
         eval(r##"document.body.insertAdjacentHTML('beforeend','<article><a href="/story-date">Date precision</a><time datetime="2024-04-01">April 1</time></article><article><a href="/story-instant">Instant precision</a><time datetime="2024-04-02T12:00:00Z">April 2</time></article><article><a target="_blank" rel="noopener" href="/story-new-tab">New tab story</a></article><article><a href="/story-relative">Fresh Bills story</a><time>2h</time><span>Nick Suss</span></article>');"##.into()).await;
         eval(r##"document.body.insertAdjacentHTML('beforeend','<button id="aria-upload" aria-label="ARIA Upload" aria-disabled="true" onclick="document.body.insertAdjacentHTML(\'beforeend\',\'<div id=upload-opened>Upload picker</div>\')">Upload</button>');"##.into()).await;
+        eval("document.querySelector('#aria-upload').style.cssText='position:fixed;bottom:0';".into()).await;
         let linked_dates = include_str!("shared_page/linked_dates.js");
         let stale_revision = eval(format!("({linked_dates})([],{{url:location.href,revision:'stale'}})")).await;
         assert_eq!(stale_revision["result"]["value"]["snapshot_matches"], false, "same-URL reload must invalidate a prior candidate snapshot");
@@ -143,7 +144,7 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let rendered=snapshot.to_string();
         for secret in ["PRIVATE-SENTINEL","PROTECTED-SENTINEL","LABEL-SENTINEL"] {assert!(!rendered.contains(secret));}
         let item=|snapshot:&Value,name:&str|snapshot["items"].as_array().unwrap().iter().find(|v|v["name"]==name).unwrap().clone();
-        let aria_upload=item(&snapshot,"ARIA Upload");
+        let mut aria_upload=item(&snapshot,"ARIA Upload");
         assert_eq!(aria_upload["disabled"],false,"ARIA-only disabled state must not be reported as a browser-native disabled control");
         assert_eq!(aria_upload["native_disabled"],false);
         assert_eq!(aria_upload["aria_disabled"],true);
@@ -163,11 +164,13 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let first_ref=item(&snapshot,"Accounts")["reference"].clone();
         let clicked=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":first_ref,"outcome":{"kind":"expanded"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(clicked["status"],"verified","{clicked}");
+        snapshot=clicked["snapshot"].clone();
+        aria_upload=item(&snapshot,"ARIA Upload");
         let aria_upload_click=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":aria_upload["reference"],"outcome":{"kind":"visible","selector":"#upload-opened"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(aria_upload_click["status"],"verified","a working upload-picker button with a stale aria-disabled annotation must still dispatch and verify: {aria_upload_click}");
         let duplicate=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":first_ref,"outcome":{"kind":"expanded"}}))).await;
         assert!(duplicate.is_err() || duplicate.unwrap().is_error==Some(true));
-        let menu=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&clicked["snapshot"],"Menu")["reference"],"outcome":{"kind":"text","selector":"#late","text":"Ready"}}))).await.unwrap().structured_content.unwrap();
+        let menu=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&aria_upload_click["snapshot"],"Menu")["reference"],"outcome":{"kind":"text","selector":"#late","text":"Ready"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(menu["status"],"verified","{menu}");
         let unknown=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&menu["snapshot"],"Count")["reference"],"outcome":{"kind":"visible","selector":"#never"},"timeout_ms":1000}))).await.unwrap().structured_content.unwrap();
         assert_eq!(unknown["status"],"unknown");

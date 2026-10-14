@@ -17,7 +17,8 @@ const reconnectTimers = [];
 const alarms = [];
 const sessionStorage = {};
 const localStorage = {};
-const tabList = Array.from({ length: 102 }, (_, id) => ({ id, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete" }));
+const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete" }));
+let focusedWindowActiveTabId = 42;
 tabList.push({ id: 102, title: "Extension page", url: "chrome://extensions" });
 tabList.push({ title: "Invalid tab", url: "https://example.test/invalid" });
 let listener;
@@ -26,11 +27,15 @@ let mockNativeError;
 let nativeErrorReads = 0;
 const tabUrlOverrides = new Map();
 const tabDocumentOverrides = new Map();
+const frameReadCounts = new Map();
 const reloadDuringAttach = new Set();
+const identityChangeDuringAttach = new Set();
+const navigationStartDuringAttach = new Set();
 const replaceDuringAttach = new Set();
 const failAttach = new Set();
 let tabsUpdated;
 let tabsReplaced;
+let tabsRemoved;
 let tabsActivated;
 let tabsCreated;
 let windowFocusChanged;
@@ -41,6 +46,9 @@ const committedListeners = new Set();
 const domContentLoadedListeners = new Set();
 let slowMediaNextNavigation = false;
 let delayedNextCommitMs = 0;
+let overlapSameUrlNextNavigation = false;
+let replacePendingOnFrameRead;
+let nextWebNavigationTimeStamp = 10_000;
 let navigationError;
 let debuggerDetached;
 let debuggerEvent;
@@ -115,7 +123,10 @@ const chrome = {
     onAlarm: { addListener(callback) { this.fire = callback; } },
   },
   tabs: {
-    async query() { return tabList; },
+    async query(query = {}) {
+      if (query.active && query.lastFocusedWindow) return tabList.filter(tab => tab.id === focusedWindowActiveTabId);
+      return tabList;
+    },
     async create({ url, active = true }) { const tab = { id: nextCreatedTab++, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
     async update(tabId, { url }) {
       const tab = tabList.find(tab => tab.id === tabId);
@@ -125,6 +136,22 @@ const chrome = {
       const priorUrl = tabUrlOverrides.get(tabId) || tab.url;
       const priorDocumentId = tabDocumentOverrides.get(tabId) || `document-${tabId}`;
       tab.url = url;
+      const currentNavigationStart = nextWebNavigationTimeStamp++;
+      navigationBefore?.({ tabId, frameId: 0, url, timeStamp: currentNavigationStart });
+      if (overlapSameUrlNextNavigation) {
+        overlapSameUrlNextNavigation = false;
+        tab.status = "loading";
+        const newerNavigationStart = nextWebNavigationTimeStamp++;
+        navigationBefore?.({ tabId, frameId: 0, url, timeStamp: newerNavigationStart });
+        const staleDocumentId = `${priorDocumentId}-stale-same-url`;
+        tabUrlOverrides.set(tabId, url);
+        tabDocumentOverrides.set(tabId, staleDocumentId);
+        const lateCommitEventTime = newerNavigationStart + 2;
+        assert.ok(lateCommitEventTime > newerNavigationStart, "the old commit callback fires after the newer navigation start callback");
+        navigationCommitted?.({ tabId, frameId: 0, documentId: staleDocumentId, url, timeStamp: lateCommitEventTime });
+        navigationDomContentLoaded?.({ tabId, frameId: 0, documentId: staleDocumentId, url, timeStamp: lateCommitEventTime + 1 });
+        return tab;
+      }
       tab.status = delayedCommit ? "complete" : slowMediaNextNavigation ? "loading" : "complete";
       const documentId = `${priorDocumentId}-next`;
       if (delayedCommit) {
@@ -132,14 +159,14 @@ const chrome = {
         setTimeout(() => {
           tabUrlOverrides.set(tabId, url);
           tabDocumentOverrides.set(tabId, documentId);
-          navigationCommitted?.({ tabId, frameId: 0, documentId, url });
+          navigationCommitted?.({ tabId, frameId: 0, documentId, url, timeStamp: nextWebNavigationTimeStamp++ });
           navigationDomContentLoaded?.({ tabId, frameId: 0, documentId, url });
         }, delayedCommit);
         return tab;
       }
       tabUrlOverrides.set(tabId, url);
       tabDocumentOverrides.set(tabId, documentId);
-      navigationCommitted?.({ tabId, frameId: 0, documentId, url });
+      navigationCommitted?.({ tabId, frameId: 0, documentId, url, timeStamp: nextWebNavigationTimeStamp++ });
       if (slowMediaNextNavigation) {
         slowMediaNextNavigation = false;
         setTimeout(() => navigationDomContentLoaded?.({ tabId, frameId: 0, documentId, url }), 0);
@@ -153,18 +180,28 @@ const chrome = {
     },
     onUpdated: { addListener(callback) { tabsUpdated = callback; }, removeListener() {} },
     onReplaced: { addListener(callback) { tabsReplaced = callback; } },
+    onRemoved: { addListener(callback) { tabsRemoved = callback; } },
     onActivated: { addListener(callback) { tabsActivated = callback; } },
     onCreated: { addListener(callback) { tabsCreated = callback; } },
   },
   windows: { async get() { return { focused: false }; }, onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } } },
   webNavigation: {
     async getFrame({ tabId, frameId }) {
+      frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
       if (frameId !== 0 || !tabList.some(tab => tab.id === tabId)) return undefined;
       if (blockedFrame?.tabId === tabId) {
         const wait = blockedFrame;
         blockedFrame = undefined;
         wait.started();
         await new Promise(resolve => { releaseBlockedFrame = resolve; });
+      }
+      if (replacePendingOnFrameRead?.tabId === tabId) {
+        replacePendingOnFrameRead.remaining--;
+        if (replacePendingOnFrameRead.remaining === 0) {
+          const replace = replacePendingOnFrameRead.replace;
+          replacePendingOnFrameRead = undefined;
+          replace();
+        }
       }
       const tab = tabList.find(item => item.id === tabId);
       return { documentId: tabDocumentOverrides.get(tabId) || `document-${tabId}`,
@@ -189,6 +226,11 @@ const chrome = {
       if (reloadDuringAttach.delete(tabId)) {
         tabsUpdated(tabId, { status: "loading" });
         tabsUpdated(tabId, { status: "complete" });
+      }
+      if (identityChangeDuringAttach.delete(tabId)) tabDocumentOverrides.set(tabId, `interloper-document-${tabId}`);
+      if (navigationStartDuringAttach.delete(tabId)) {
+        navigationBefore({ tabId, frameId: 0, url: "https://www.espn.com/nfl/other-story/" });
+        navigationDomContentLoaded({ tabId, frameId: 0, documentId: tabDocumentOverrides.get(tabId) });
       }
       if (replaceDuringAttach.delete(tabId)) tabsReplaced(tabId + 1000, tabId);
     },
@@ -282,15 +324,17 @@ const chrome = {
   },
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
+let backgroundContext;
 function runBackground() {
-  vm.runInNewContext(backgroundSource, {
+  backgroundContext = {
     chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
     Date: { now() { return mockNow; } },
     performance: { now() { return mockNow; } },
     console: { debug(...args) { commandDiagnostics.push(args); } },
     setTimeout(callback, delay) { reconnectTimers.push({ callback, delay }); return reconnectTimers.length; },
     clearTimeout,
-  });
+  };
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations };`, backgroundContext);
 }
 runBackground();
 
@@ -300,6 +344,8 @@ function message(payload) {
 
 (async () => {
   await new Promise(resolve => setTimeout(resolve, 0));
+  const nativeStatus = await message({ type: "native-status" });
+  assert.equal(nativeStatus.transport, "native", "the background worker registers its message handler using supported Chrome events");
   assert.equal(nativePorts[0].name, "chrome_controlla_bridge", "connect native host on worker startup");
   let native = nativePorts[0];
   if (process.argv.includes("--reconnect-only")) {
@@ -340,16 +386,51 @@ function message(payload) {
   assert.equal(listed.request_id, "list-1");
   assert.equal(listed.tabs.length, 100, "tab listing is capped");
   assert.equal(listed.truncated, true, "tab listing reports when eligible tabs were omitted");
+  assert.equal(listed.last_focused_window_id, 1, "tab inventory identifies the last-focused Chrome window");
   assert.ok(listed.tabs.every(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//.test(tab.url)));
   assert.ok(listed.tabs.every(tab => typeof tab.document_id === "string"));
   assert.ok(listed.tabs.every(tab => tab.title.length <= 256 && tab.url.length <= 2048));
+  assert.equal(listed.tabs.find(tab => tab.id === 42).active_for_open, true,
+    "the active tab in Chrome's last-focused window is marked as the open anchor");
+  assert.equal(listed.tabs.find(tab => tab.id === 41).active_for_open, false,
+    "other stable tabs cannot win the default open anchor");
+  assert.equal(listed.tabs.find(tab => tab.id === 41).window_id, 1);
+  assert.equal(listed.tabs.find(tab => tab.id === 41).last_accessed, 4100);
+  const focusedBeyondCap = { id: 104, windowId: 3, lastAccessed: 10400, title: "Focused late tab", url: "https://example.test/focused-late", status: "complete" };
+  tabList.push(focusedBeyondCap);
+  focusedWindowActiveTabId = focusedBeyondCap.id;
+  native.hostMessage({ type: "list_tabs", request_id: "list-focused-beyond-cap" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const focusedInventory = native.sent.at(-1);
+  assert.equal(focusedInventory.truncated, true);
+  assert.equal(focusedInventory.last_focused_window_id, 3);
+  assert.equal(focusedInventory.tabs.length, 100);
+  assert.equal(focusedInventory.tabs.find(tab => tab.id === focusedBeyondCap.id)?.active_for_open, true,
+    "the active stable tab must survive the inventory cap even when Chrome lists it after 100 tabs");
+  assert.equal(new Set(focusedInventory.tabs.map(tab => tab.id)).size, focusedInventory.tabs.length,
+    "prioritizing the active tab must not duplicate it in the bounded inventory");
+  tabList.pop();
+  focusedWindowActiveTabId = 42;
+  const unstableActive = { id: 103, windowId: 1, title: "New Tab", url: "about:blank", status: "complete" };
+  tabList.push(unstableActive);
+  focusedWindowActiveTabId = unstableActive.id;
+  native.hostMessage({ type: "list_tabs", request_id: "list-unstable-active" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const stableFallbackInventory = native.sent.at(-1);
+  assert.equal(stableFallbackInventory.last_focused_window_id, 1);
+  assert.equal(stableFallbackInventory.tabs.some(tab => tab.active_for_open), false,
+    "an active about:blank tab must not be misrepresented as a stable open anchor");
+  assert.ok(stableFallbackInventory.tabs.some(tab => tab.window_id === 1 && tab.document_id),
+    "the focused window still exposes stable tabs that can anchor a background open");
+  tabList.pop();
+  focusedWindowActiveTabId = 42;
   assert.deepEqual(attached, [], "listing tabs does not attach any tab");
   native.hostMessage({ type: "pair", request_id: "pair-1", tab_ids: [41, 43, 47], expected_urls: expectedUrls([41, 43, 47]), expected_document_ids: expectedDocuments([41, 43, 47]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent[1]), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
+  assert.equal(JSON.stringify(native.sent.find(message => message.request_id === "pair-1")), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
   fastTypeValue = ""; fastTypeFocused = true;
   native.hostMessage({ type: "command", id: "fast-type-program", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "Fast\nKeys", normalize_paragraphs: false } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -596,6 +677,7 @@ function message(payload) {
   assert.match(navigationBatch.error, /navigating/);
   assert.equal(debuggerCalls.length, callsBeforeNavigationBatch + 1, "user navigation stops the next batch mutation");
   commandDiagnostics.splice(0);
+  const openTabFrameReadsBefore = frameReadCounts.get(503) || 0;
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/", idempotency_key: "fixture:open-tab-12345" } });
   await new Promise(resolve => setTimeout(resolve, 0));
   const opened = native.sent.at(-1);
@@ -603,6 +685,8 @@ function message(payload) {
   assert.equal(opened.result.tab_id, "503");
   assert.equal(opened.result.url, "https://www.espn.com/");
   assert.equal(opened.result.document_id, "document-503-next");
+  assert.equal(frameReadCounts.get(503) - openTabFrameReadsBefore, 6,
+    "a navigation that already reached DOMContentLoaded must not repeat its frame identity check");
   assert.ok(attached.includes(503), "the opened tab joins the existing native session");
   native.hostMessage({ type: "command", id: "navigate-tab", target_id: "503", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/" } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -630,6 +714,7 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(native.sent.at(-1).error, /tab 504 for recovery/i, "a failed idempotent open returns its existing orphan instead of creating another tab");
   assert.equal(tabList.some(tab => tab.id === 505), false, "a failed idempotent open does not create a duplicate retry tab");
+  commandDiagnostics.splice(0);
   native.hostMessage({ type: "command", id: "dom", target_id: "41", method: "DOM.getDocument", params: {} });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(debuggerCalls.at(-1).method, "DOM.getDocument");
@@ -1360,6 +1445,94 @@ function message(payload) {
   assert.ok(restartPort.sent.find(message => message.id === "open-after-stale-complete")?.result,
     "navigation resolves after the new document reaches DOMContentLoaded");
 
+  overlapSameUrlNextNavigation = true;
+  restartPort.hostMessage({ ...openRequest, id: "open-overlapping-same-url", params: { url: "https://example.test/overlap-same-url", idempotency_key: "client-fixture:overlap-same-url-1234" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/,
+    "an older same-URL commit and DOMContentLoaded cannot satisfy a newer navigation attachment");
+  const overlappingTab = tabList.find(tab => tab.url === "https://example.test/overlap-same-url");
+  assert.ok(overlappingTab, "the failed open leaves the exact tab available for safe recovery");
+  assert.equal(await backgroundContext.__testHooks.pendingNavigationMatchesDocument(overlappingTab.id, `document-${overlappingTab.id}-stale-same-url`), false,
+    "an ambiguous navigation cannot attach while Chrome still reports it loading");
+  overlappingTab.status = "complete";
+  const recoveredDocumentId = `document-${overlappingTab.id}-recovered`;
+  tabDocumentOverrides.set(overlappingTab.id, recoveredDocumentId);
+  assert.equal(await backgroundContext.__testHooks.pendingNavigationMatchesDocument(overlappingTab.id, recoveredDocumentId), true,
+    "same-tab retry can recover once Chrome reports one stable current document identity");
+  assert.equal(await backgroundContext.__testHooks.pendingNavigationMatchesDocument(overlappingTab.id, `document-${overlappingTab.id}-stale-same-url`), false,
+    "a delayed same-URL callback cannot replace the recovered live document identity");
+  let recoveryRaceInjected = 0;
+  replacePendingOnFrameRead = {
+    tabId: overlappingTab.id,
+    remaining: 2,
+    replace() {
+      recoveryRaceInjected++;
+      navigationBefore?.({ tabId: overlappingTab.id, frameId: 0, url: "https://example.test/overlap-same-url", timeStamp: nextWebNavigationTimeStamp++ });
+    },
+  };
+  assert.equal(await backgroundContext.__testHooks.pendingNavigationMatchesDocument(overlappingTab.id, recoveredDocumentId), false,
+    "a newer same-URL navigation during the second frame read invalidates recovery");
+  assert.equal(recoveryRaceInjected, 1, "the test replaces the pending record during the second read");
+  assert.equal(replacePendingOnFrameRead, undefined, "the race fixture was consumed by the second frame read");
+  tabsRemoved(overlappingTab.id);
+
+  const redirectedTab = tabList.find(tab => tab.id === 74);
+  const redirectStartUrl = "https://example.test/redirect-start";
+  const redirectFinalUrl = "https://example.test/redirect-final";
+  const redirectDocumentId = "document-74-after-redirect";
+  navigationBefore({ tabId: redirectedTab.id, frameId: 0, url: redirectStartUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  navigationError({ tabId: redirectedTab.id, frameId: 0, url: redirectStartUrl, timeStamp: nextWebNavigationTimeStamp++, error: "net::ERR_ABORTED" });
+  navigationBefore({ tabId: redirectedTab.id, frameId: 0, url: redirectFinalUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  redirectedTab.url = redirectFinalUrl;
+  redirectedTab.status = "complete";
+  tabUrlOverrides.set(redirectedTab.id, redirectFinalUrl);
+  tabDocumentOverrides.set(redirectedTab.id, redirectDocumentId);
+  navigationCommitted({ tabId: redirectedTab.id, frameId: 0, documentId: redirectDocumentId, url: redirectFinalUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  navigationDomContentLoaded({ tabId: redirectedTab.id, frameId: 0, documentId: redirectDocumentId, url: redirectFinalUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  assert.equal(backgroundContext.__testHooks.pendingMainFrameNavigations.has(redirectedTab.id), false,
+    "a server redirect's committed destination clears its matching pending navigation");
+  assert.equal(await backgroundContext.__testHooks.pendingNavigationMatchesDocument(redirectedTab.id, redirectDocumentId), true,
+    "the final document in a navigation redirect sequence remains eligible for attachment");
+
+  const redirectRetryTab = tabList.find(tab => tab.id === 75);
+  const retryStartUrl = "https://example.test/retry-start";
+  const retryDestinationUrl = "https://example.test/retry-destination";
+  navigationBefore({ tabId: redirectRetryTab.id, frameId: 0, url: retryStartUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  navigationError({ tabId: redirectRetryTab.id, frameId: 0, url: retryStartUrl, timeStamp: nextWebNavigationTimeStamp++, error: "net::ERR_ABORTED" });
+  navigationBefore({ tabId: redirectRetryTab.id, frameId: 0, url: retryDestinationUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  redirectRetryTab.url = retryDestinationUrl;
+  tabUrlOverrides.set(redirectRetryTab.id, retryDestinationUrl);
+  tabDocumentOverrides.set(redirectRetryTab.id, "document-75-after-failed-redirect");
+  navigationError({ tabId: redirectRetryTab.id, frameId: 0, url: retryDestinationUrl, timeStamp: nextWebNavigationTimeStamp++, error: "net::ERR_NAME_NOT_RESOLVED" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  navigationBefore({ tabId: redirectRetryTab.id, frameId: 0, url: retryStartUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  const retriedNavigation = backgroundContext.__testHooks.pendingMainFrameNavigations.get(redirectRetryTab.id);
+  assert.equal(retriedNavigation.ambiguous, false,
+    "a failed redirect destination must release the chain so retrying the original URL is matchable");
+
+  const staleRedirectErrorTab = tabList.find(tab => tab.id === 76);
+  const chainStartUrl = "https://example.test/chain-start";
+  const chainMiddleUrl = "https://example.test/chain-middle";
+  const chainFinalUrl = "https://example.test/chain-final";
+  const chainStartAt = nextWebNavigationTimeStamp++;
+  navigationBefore({ tabId: staleRedirectErrorTab.id, frameId: 0, url: chainStartUrl, timeStamp: chainStartAt });
+  const middleNavigationAt = nextWebNavigationTimeStamp++;
+  navigationBefore({ tabId: staleRedirectErrorTab.id, frameId: 0, url: chainMiddleUrl, timeStamp: middleNavigationAt });
+  const finalNavigationAt = nextWebNavigationTimeStamp++;
+  navigationBefore({ tabId: staleRedirectErrorTab.id, frameId: 0, url: chainFinalUrl, timeStamp: finalNavigationAt });
+  navigationError({ tabId: staleRedirectErrorTab.id, frameId: 0, url: chainMiddleUrl, timeStamp: middleNavigationAt + 0.5, error: "net::ERR_ABORTED" });
+  assert.equal(Boolean(backgroundContext.__testHooks.pendingMainFrameNavigations.get(staleRedirectErrorTab.id).failed), false,
+    "a delayed error from an intermediate redirect must not fail the later navigation");
+  const chainDocumentId = "document-76-after-redirect-chain";
+  staleRedirectErrorTab.url = chainFinalUrl;
+  staleRedirectErrorTab.status = "complete";
+  tabUrlOverrides.set(staleRedirectErrorTab.id, chainFinalUrl);
+  tabDocumentOverrides.set(staleRedirectErrorTab.id, chainDocumentId);
+  navigationCommitted({ tabId: staleRedirectErrorTab.id, frameId: 0, documentId: chainDocumentId, url: chainFinalUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  navigationDomContentLoaded({ tabId: staleRedirectErrorTab.id, frameId: 0, documentId: chainDocumentId, url: chainFinalUrl, timeStamp: nextWebNavigationTimeStamp++ });
+  assert.equal(backgroundContext.__testHooks.pendingMainFrameNavigations.has(staleRedirectErrorTab.id), false,
+    "the continued redirect chain still commits and clears normally after a stale intermediate error");
+
   const backgroundKey = "client-fixture:background-1234";
   const backgroundParams = { url: "https://example.test/background", idempotency_key: backgroundKey, active: false };
   restartPort.hostMessage({ ...openRequest, id: "open-background", params: backgroundParams });
@@ -1375,6 +1548,42 @@ function message(payload) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(restartPort.sent.at(-1).error, /activation mode/i, "one idempotency key cannot change activation mode");
   assert.equal(tabList.filter(tab => tab.url === backgroundParams.url).length, 1, "a conflicting retry cannot create a second tab");
+
+  // A duplicate status notification after DOMContentLoaded must not invalidate
+  // a stable document, but a genuinely newer navigation start during attach
+  // must survive a stale DOMContentLoaded notification for the prior document.
+  const backgroundTabId = Number(backgroundOpen.tab_id);
+  reloadDuringAttach.add(backgroundTabId);
+  restartPort.hostMessage({ type: "command", id: "navigate-late-loading-event", target_id: String(backgroundTabId), method: "Controlla.navigate", params: { url: "https://example.test/background/stable" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(restartPort.sent.at(-1).result?.url, "https://example.test/background/stable",
+    "a late status event with stable URL/document identity does not fail navigation");
+  restartPort.hostMessage({ type: "command", id: "snapshot-after-late-loading-event", target_id: String(backgroundTabId), method: "DOM.getDocument", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(restartPort.sent.at(-1).id, "snapshot-after-late-loading-event",
+    "the tab remains paired after the benign late loading event");
+
+  const pendingRaceOpen = { ...openRequest, id: "open-for-pending-race", params: { url: "https://example.test/pending-race", idempotency_key: "client-fixture:pending-race-1234" } };
+  restartPort.hostMessage(pendingRaceOpen);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const pendingRaceTabId = Number(restartPort.sent.at(-1).result.tab_id);
+  navigationStartDuringAttach.add(pendingRaceTabId);
+  restartPort.hostMessage({ type: "command", id: "navigation-started-during-attach", target_id: String(pendingRaceTabId), method: "Controlla.navigate", params: { url: "https://example.test/pending-race/first" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/,
+    "a newer main-frame navigation survives an old-document DOMContentLoaded and fails closed");
+  tabsRemoved(pendingRaceTabId);
+
+  const identityRaceOpen = { ...openRequest, id: "open-for-identity-race", params: { url: "https://example.test/identity-race", idempotency_key: "client-fixture:identity-race-1234" } };
+  restartPort.hostMessage(identityRaceOpen);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const identityRaceTabId = Number(restartPort.sent.at(-1).result.tab_id);
+  identityChangeDuringAttach.add(identityRaceTabId);
+  restartPort.hostMessage({ type: "command", id: "navigation-identity-changed-during-attach", target_id: String(identityRaceTabId), method: "Controlla.navigate", params: { url: "https://example.test/identity-race/next" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/,
+    "a committed document identity change during debugger attach still fails closed");
+  assert.ok(detached.includes(identityRaceTabId), "a mismatched document is detached instead of paired to the stale navigation");
 
   localStorage.openReceipts["expired:receipt"] = { status: "complete", tab_id: "1", url: "https://example.test/old", document_id: "old", created_ms: -1_000_000_000_000, active: false };
   restartPort.hostMessage({ ...openRequest, id: "open-prunes-expired-receipts", params: { url: "https://example.test/pruned", idempotency_key: "client-fixture:prune-expired-1", active: false } });

@@ -63,10 +63,23 @@ export function buildClientHostInvocation(clientId, { executable, workDir, mcpCo
   if (!HOSTS[clientId] || typeof executable !== 'string' || typeof workDir !== 'string' || typeof prompt !== 'string') {
     throw new Error(`invalid host invocation context for ${clientId}`);
   }
-  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${JSON.stringify(mcpConfig.env)}`, prompt] };
+  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${codexTomlInlineTable(mcpConfig.env)}`, prompt] };
   if (clientId === 'opencode') return { command: executable, args: ['run', '--format', 'json', '--dir', workDir, prompt], env: { OPENCODE_CONFIG_DIR: mcpConfig.configDir } };
   if (clientId === 'claude-code') return { command: executable, args: ['-p', '--output-format', 'json', '--strict-mcp-config', '--mcp-config', mcpConfig.configPath, '--max-turns', '8', prompt] };
   throw new Error(`${clientId} has no supported non-interactive host invocation`);
+}
+
+function codexTomlInlineTable(environment) {
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    throw new Error('Codex MCP environment must be a map of string values');
+  }
+  const entries = Object.entries(environment).sort(([left], [right]) => left.localeCompare(right));
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string') {
+      throw new Error('Codex MCP environment keys must be identifiers and values must be strings');
+    }
+  }
+  return `{${entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ')}}`;
 }
 
 function collectToolEvents(value, events = []) {
@@ -82,14 +95,20 @@ function collectToolEvents(value, events = []) {
       for (const key of ['action', 'mode', 'provider']) if (typeof input[key] === 'string') safe[key] = input[key].slice(0, 80);
       if (Object.keys(safe).length) boundedInput = safe;
     }
-    events.push({ name, type, id: value.id ?? value.call_id ?? null, ...(boundedInput === undefined ? {} : { input: boundedInput }) });
+    events.push({ name, type, id: value.id ?? value.call_id ?? null,
+      ...(typeof value.server === 'string' ? { server: value.server } : {}),
+      ...(typeof value.status === 'string' ? { status: value.status } : {}),
+      ...(boundedInput === undefined ? {} : { input: boundedInput }) });
   }
   for (const [key, child] of Object.entries(value)) if (!['tool_input', 'arguments', 'input', 'params'].includes(key)) collectToolEvents(child, events);
   return events;
 }
 
 function collectToolEventsFromHost(events) {
-  return events.filter(event => /chrome-controlla[._-](act|browser|extract|snapshot|verify|workflow)|mcp__chrome-controlla__(act|browser|extract|snapshot|verify|workflow)/.test(event.name));
+  const controllaTools = new Set(['act', 'browser', 'extract', 'snapshot', 'verify', 'workflow']);
+  return events.filter(event => event.status !== 'in_progress'
+    && (event.server === 'chrome-controlla' && controllaTools.has(event.name)
+      || /chrome-controlla[._-](act|browser|extract|snapshot|verify|workflow)|mcp__chrome-controlla__(act|browser|extract|snapshot|verify|workflow)/.test(event.name)));
 }
 
 export async function runClientHostTask(clientId, { executable, workDir, mcpConfig, prompt, env = process.env, timeoutMs = 120_000, spawnProcess = spawn,

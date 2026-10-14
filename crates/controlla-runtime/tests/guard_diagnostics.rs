@@ -77,6 +77,7 @@ const capture = (html, opts={{}}) => {{
 }};
 results.snapshot_completeness = {{
   full: capture('<button>Go</button>'),
+  drag_drop: capture('<div draggable="true" aria-label="Drag item" style="width:40px;height:40px"><span>Drag item</span></div><div aria-dropeffect="move" aria-label="Drop zone" style="width:80px;height:80px"><span>Drop zone</span></div><div data-draggable="true" aria-label="Custom draggable" style="width:40px;height:40px"><span>Custom item</span></div>'),
   text: capture('<p>'+('long text '.repeat(20))+'</p>', {{max_text_chars:8}}),
   items: capture('<button>One</button><button>Two</button>', {{max_items:1}}),
   frame: capture('<iframe src="https://example.com/"></iframe>'),
@@ -259,6 +260,25 @@ fn snapshot_completeness_covers_text_items_and_unread_frames() {
     let cases = &run_cases()["snapshot_completeness"];
     assert_eq!(cases["full"]["complete"], true, "{}", cases["full"]);
     assert_eq!(cases["full"]["completeness"]["controls"], "complete");
+    let drag = cases["drag_drop"]["items"].as_array().unwrap();
+    assert!(
+        drag.iter()
+            .any(|item| item["name"] == "Drag item" && item["draggable"] == true),
+        "draggable controls must be discoverable: {}",
+        cases["drag_drop"]
+    );
+    assert!(
+        drag.iter()
+            .any(|item| item["name"] == "Drop zone" && item["drop_target"] == true),
+        "drop targets must be discoverable: {}",
+        cases["drag_drop"]
+    );
+    assert!(
+        drag.iter()
+            .any(|item| item["name"] == "Custom draggable" && item["draggable"] == true),
+        "custom draggable markers must agree with widget dispatch: {}",
+        cases["drag_drop"]
+    );
     assert_eq!(cases["text"]["text_truncated"], true, "{}", cases["text"]);
     assert_eq!(cases["text"]["complete"], false, "{}", cases["text"]);
     assert_eq!(cases["items"]["omitted_by_limit"].as_u64(), Some(1));

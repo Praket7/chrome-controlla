@@ -1,0 +1,540 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "selected_adapters": [
+      "agent-browser"
+    ],
+    "adapter_versions": {
+      "playwright_mcp": "0.0.83",
+      "chrome_devtools_mcp": "1.10.1",
+      "agent_browser": "0.39.1"
+    },
+    "controlla_binary_sha256": "1547fceae831fabc889db151bfe28b9f4533fd8589842ed3d54fe79d8f48b7f6",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64",
+    "timing_origin": "immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "agent-browser"
+      ],
+      "agent-browser": {
+        "adapter": "agent-browser",
+        "prompt_hash": "158a616b65eabe46a855097f27b5b754d8393709423fadd31e74dca84509df1a",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 11043.844708,
+        "process_spawn_to_independent_verification_ms": 16891.824416,
+        "process_spawn_to_final_ms": 15977.669333,
+        "first_browser_tool_started_ms": 7169.034375,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 98861,
+        "output_tokens": 326,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "agent-browser.agent_browser_open:completed",
+          "agent-browser.agent_browser_get_text:completed",
+          "agent-browser.agent_browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 9677.1665,
+            "server": "agent-browser",
+            "tool": "agent_browser_open",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "session": "example-read-mv7sjc3x",
+              "headed": false,
+              "restore": false,
+              "restoreSave": "never",
+              "extraArgs": [
+                "--engine",
+                "chrome",
+                "--executable-path",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              ]
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"targetId\":\"22AAEF5865A89D8D4F6EBE784A5DC02F\",\"title\":\"Example Domain\",\"url\":\"https://example.com/\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"targetId\\\":\\\"22AAEF5865A89D8D4F6EBE784A5DC02F\\\",\\\"title\\\":\\\"Example Domain\\\",\\\"url\\\":\\\"https://example.com/\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 11043.844708,
+            "server": "agent-browser",
+            "tool": "agent_browser_get_text",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-mv7sjc3x",
+              "selector": "p:first-of-type"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"origin\":\"https://example.com/\",\"text\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"origin\\\":\\\"https://example.com/\\\",\\\"text\\\":\\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 14583.0405,
+            "server": "agent-browser",
+            "tool": "agent_browser_close",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-mv7sjc3x"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"closed\":true,\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":false,\"engine\":\"chrome\",\"launchHash\":null},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":false,\"saveStatus\":\"not_configured\"},\"restoreStatus\":\"not_configured\",\"saveStatus\":\"not_configured\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"closed\\\":true,\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":false,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":null},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":false,\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"error\\\":null}\\n\"}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 6177,
+        "output_sha256": "e89d1c4974e6a64746bed56195d18b2e1f704172ae47a077960b1be0f5b86882",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "agent-browser",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 2,
+      "execution_order": [
+        "agent-browser"
+      ],
+      "agent-browser": {
+        "adapter": "agent-browser",
+        "prompt_hash": "158a616b65eabe46a855097f27b5b754d8393709423fadd31e74dca84509df1a",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 12843.146541,
+        "process_spawn_to_independent_verification_ms": 19709.595375,
+        "process_spawn_to_final_ms": 18149.919875,
+        "first_browser_tool_started_ms": 7685.013416,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 96335,
+        "output_tokens": 294,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "agent-browser.agent_browser_open:completed",
+          "agent-browser.agent_browser_get_text:completed",
+          "agent-browser.agent_browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 10095.434125,
+            "server": "agent-browser",
+            "tool": "agent_browser_open",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "session": "example-read-20261014-153712-4821",
+              "headed": false,
+              "restore": false,
+              "restoreSave": "never",
+              "extraArgs": [
+                "--engine",
+                "chrome",
+                "--executable-path",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              ]
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"targetId\":\"D3E6C81BD2184D46ECCC1814879F9C9C\",\"title\":\"Example Domain\",\"url\":\"https://example.com/\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"targetId\\\":\\\"D3E6C81BD2184D46ECCC1814879F9C9C\\\",\\\"title\\\":\\\"Example Domain\\\",\\\"url\\\":\\\"https://example.com/\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 12843.146541,
+            "server": "agent-browser",
+            "tool": "agent_browser_get_text",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-153712-4821",
+              "selector": "p:first-of-type"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"origin\":\"https://example.com/\",\"text\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"origin\\\":\\\"https://example.com/\\\",\\\"text\\\":\\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 16488.230666,
+            "server": "agent-browser",
+            "tool": "agent_browser_close",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-153712-4821"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"closed\":true,\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":false,\"engine\":\"chrome\",\"launchHash\":null},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":false,\"saveStatus\":\"not_configured\"},\"restoreStatus\":\"not_configured\",\"saveStatus\":\"not_configured\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"closed\\\":true,\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":false,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":null},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":false,\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"error\\\":null}\\n\"}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 6287,
+        "output_sha256": "6400af6114cfa83d2a0a2bde9d06e830b5a6b0e60c0ca58a6ddf9126fc4c1393",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "agent-browser",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 3,
+      "execution_order": [
+        "agent-browser"
+      ],
+      "agent-browser": {
+        "adapter": "agent-browser",
+        "prompt_hash": "158a616b65eabe46a855097f27b5b754d8393709423fadd31e74dca84509df1a",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 10172.102083,
+        "process_spawn_to_independent_verification_ms": 13297.720083,
+        "process_spawn_to_final_ms": 12446.965917,
+        "first_browser_tool_started_ms": 5248.028375,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 76134,
+        "output_tokens": 407,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "agent-browser.agent_browser_open:completed",
+          "agent-browser.agent_browser_get_text:completed",
+          "agent-browser.agent_browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 8006.618583,
+            "server": "agent-browser",
+            "tool": "agent_browser_open",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "session": "example-read-20261014-7f3c91",
+              "headed": false,
+              "restore": false,
+              "restoreSave": "never",
+              "extraArgs": [
+                "--engine",
+                "chrome",
+                "--executable-path",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              ]
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"targetId\":\"BA5A97830525E9DFDEFFA04C49A32F1D\",\"title\":\"Example Domain\",\"url\":\"https://example.com/\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"targetId\\\":\\\"BA5A97830525E9DFDEFFA04C49A32F1D\\\",\\\"title\\\":\\\"Example Domain\\\",\\\"url\\\":\\\"https://example.com/\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 10172.102083,
+            "server": "agent-browser",
+            "tool": "agent_browser_get_text",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-7f3c91",
+              "selector": "p:first-of-type"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"origin\":\"https://example.com/\",\"text\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"origin\\\":\\\"https://example.com/\\\",\\\"text\\\":\\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 11587.320417,
+            "server": "agent-browser",
+            "tool": "agent_browser_close",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-7f3c91"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"closed\":true,\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":false,\"engine\":\"chrome\",\"launchHash\":null},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":false,\"saveStatus\":\"not_configured\"},\"restoreStatus\":\"not_configured\",\"saveStatus\":\"not_configured\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"closed\\\":true,\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":false,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":null},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":false,\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"error\\\":null}\\n\"}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 6216,
+        "output_sha256": "414d920b51cb58a79d6473bca8e9e97c94222d11dc80845409275d3fd383f52b",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "agent-browser",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 4,
+      "execution_order": [
+        "agent-browser"
+      ],
+      "agent-browser": {
+        "adapter": "agent-browser",
+        "prompt_hash": "158a616b65eabe46a855097f27b5b754d8393709423fadd31e74dca84509df1a",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 11197.533709,
+        "process_spawn_to_independent_verification_ms": 15633.480834,
+        "process_spawn_to_final_ms": 14750.107084,
+        "first_browser_tool_started_ms": 5918.952917,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 79299,
+        "output_tokens": 377,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "agent-browser.agent_browser_open:completed",
+          "agent-browser.agent_browser_get_text:completed",
+          "agent-browser.agent_browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 8503.879584,
+            "server": "agent-browser",
+            "tool": "agent_browser_open",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "session": "example-read-20261014-0917",
+              "headed": false,
+              "restore": false,
+              "restoreSave": "never",
+              "extraArgs": [
+                "--engine",
+                "chrome",
+                "--executable-path",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              ]
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"targetId\":\"30AA3EA25AB29BDD24CD4DF8993B115D\",\"title\":\"Example Domain\",\"url\":\"https://example.com/\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"targetId\\\":\\\"30AA3EA25AB29BDD24CD4DF8993B115D\\\",\\\"title\\\":\\\"Example Domain\\\",\\\"url\\\":\\\"https://example.com/\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 11197.533709,
+            "server": "agent-browser",
+            "tool": "agent_browser_get_text",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-0917",
+              "selector": "p:first-of-type"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"origin\":\"https://example.com/\",\"text\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"origin\\\":\\\"https://example.com/\\\",\\\"text\\\":\\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 12894.381584,
+            "server": "agent-browser",
+            "tool": "agent_browser_close",
+            "status": "completed",
+            "arguments": {
+              "session": "example-read-20261014-0917"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"closed\":true,\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":false,\"engine\":\"chrome\",\"launchHash\":null},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":false,\"saveStatus\":\"not_configured\"},\"restoreStatus\":\"not_configured\",\"saveStatus\":\"not_configured\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"closed\\\":true,\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":false,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":null},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":false,\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"error\\\":null}\\n\"}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 6216,
+        "output_sha256": "d4f42e5fc9c4965944e8cc3f8349f26c4c27ec6f1cb46b76d439d0a5f142d950",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "agent-browser",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 5,
+      "execution_order": [
+        "agent-browser"
+      ],
+      "agent-browser": {
+        "adapter": "agent-browser",
+        "prompt_hash": "158a616b65eabe46a855097f27b5b754d8393709423fadd31e74dca84509df1a",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 9786.099333,
+        "process_spawn_to_independent_verification_ms": 13813.194542,
+        "process_spawn_to_final_ms": 13011.271667,
+        "first_browser_tool_started_ms": 5727.927958,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 113837,
+        "output_tokens": 424,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "agent-browser.agent_browser_open:completed",
+          "agent-browser.agent_browser_get_text:completed",
+          "agent-browser.agent_browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 8611.128542,
+            "server": "agent-browser",
+            "tool": "agent_browser_open",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "session": "example-com-read-20261014-a7f3c9",
+              "headed": false,
+              "restore": false,
+              "restoreSave": "never",
+              "extraArgs": [
+                "--engine",
+                "chrome",
+                "--executable-path",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+              ]
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"targetId\":\"3D58328C9C75D7F1DB858D294462A9AF\",\"title\":\"Example Domain\",\"url\":\"https://example.com/\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"targetId\\\":\\\"3D58328C9C75D7F1DB858D294462A9AF\\\",\\\"title\\\":\\\"Example Domain\\\",\\\"url\\\":\\\"https://example.com/\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 9786.099333,
+            "server": "agent-browser",
+            "tool": "agent_browser_get_text",
+            "status": "completed",
+            "arguments": {
+              "session": "example-com-read-20261014-a7f3c9",
+              "selector": "p:first-of-type"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":true,\"engine\":\"chrome\",\"launchHash\":7793695084271578000},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":true,\"saveStatus\":\"not_attempted\"},\"origin\":\"https://example.com/\",\"text\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":true,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":7793695084271578337},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":true,\\\"saveStatus\\\":\\\"not_attempted\\\"},\\\"origin\\\":\\\"https://example.com/\\\",\\\"text\\\":\\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"},\\\"error\\\":null}\\n\"}"
+          },
+          {
+            "elapsed_ms": 12221.522583,
+            "server": "agent-browser",
+            "tool": "agent_browser_close",
+            "status": "completed",
+            "arguments": {
+              "session": "example-com-read-20261014-a7f3c9"
+            },
+            "result_summary": {
+              "private_session_released": false
+            },
+            "result_preview": "{\"exitCode\":0,\"response\":{\"data\":{\"closed\":true,\"lifecycle\":{\"effectiveLaunch\":{\"browserLaunched\":false,\"engine\":\"chrome\",\"launchHash\":null},\"launched\":false,\"relaunchedBrowser\":false,\"restartedBackground\":false,\"restoreStatus\":\"not_configured\",\"reused\":false,\"saveStatus\":\"not_configured\"},\"restoreStatus\":\"not_configured\",\"saveStatus\":\"not_configured\"},\"error\":null,\"success\":true},\"stderr\":\"\",\"stdout\":\"{\\\"success\\\":true,\\\"data\\\":{\\\"closed\\\":true,\\\"lifecycle\\\":{\\\"effectiveLaunch\\\":{\\\"browserLaunched\\\":false,\\\"engine\\\":\\\"chrome\\\",\\\"launchHash\\\":null},\\\"launched\\\":false,\\\"relaunchedBrowser\\\":false,\\\"restartedBackground\\\":false,\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"reused\\\":false,\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"restoreStatus\\\":\\\"not_configured\\\",\\\"saveStatus\\\":\\\"not_configured\\\"},\\\"error\\\":null}\\n\"}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 6280,
+        "output_sha256": "9ebcea5d78ae2efcdd1baf4378ed6679d2be09a2fe10f62758781351fe940484",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "agent-browser",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

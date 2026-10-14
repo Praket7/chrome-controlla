@@ -32,6 +32,7 @@ const pairedTabUrls = new Map();
 const pairedTabDocumentIds = new Map();
 const domReadyDocuments = new Map();
 const tabNavigationGenerations = new Map();
+const pendingMainFrameNavigations = new Map();
 const navigatingTabs = new Set();
 const debuggerDetachedDuringNavigation = new Set();
 const committedNavigationTabs = new Map();
@@ -309,15 +310,33 @@ async function handleNativeMessage(port, portGeneration, message) {
   if (message.type === "ready") { nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false; void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {}); sendNative(port, portGeneration, { type: "capabilities", protocol_version: 2, multi_session_leases: true }); return; }
   if (message.type === "list_tabs") {
     try {
-      const tabs = await chrome.tabs.query({}); const eligible = tabs.filter(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//i.test(tab.url || ""));
-      const listed = await Promise.all(eligible.slice(0, 100).map(async tab => {
+      const tabs = await chrome.tabs.query({});
+      const focusedWindowTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+      const lastFocusedActive = focusedWindowTabs[0]?.id;
+      const lastFocusedWindowId = Number.isSafeInteger(focusedWindowTabs[0]?.windowId) ? focusedWindowTabs[0].windowId : undefined;
+      const eligible = tabs.filter(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//i.test(tab.url || ""));
+      // Preserve the focused browser context before applying the bounded inventory cap.
+      // Otherwise Chrome's query order can omit the active tab or every stable fallback
+      // in its window, causing native code to anchor a background open to another context.
+      const prioritized = [...eligible].sort((left, right) => {
+        const leftFocused = left.windowId === lastFocusedWindowId;
+        const rightFocused = right.windowId === lastFocusedWindowId;
+        if (leftFocused !== rightFocused) return rightFocused ? 1 : -1;
+        const leftActive = left.id === lastFocusedActive;
+        const rightActive = right.id === lastFocusedActive;
+        if (leftActive !== rightActive) return rightActive ? 1 : -1;
+        const accessDelta = (Number.isFinite(right.lastAccessed) ? right.lastAccessed : 0)
+          - (Number.isFinite(left.lastAccessed) ? left.lastAccessed : 0);
+        return accessDelta || left.id - right.id;
+      });
+      const listed = await Promise.all(prioritized.slice(0, 100).map(async tab => {
         const firstFrame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }).catch(() => undefined);
         const current = await chrome.tabs.get(tab.id).catch(() => undefined);
         const lastFrame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }).catch(() => undefined);
         const stableDocument = current?.status === "complete" && /^https?:\/\//i.test(current.url || "") && firstFrame?.documentId && firstFrame.documentId === lastFrame?.documentId && lastFrame.url === current.url;
-        return { id: tab.id, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
+        return { id: tab.id, window_id: current?.windowId, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
       }));
-      sendNative(port, portGeneration, { type: "tabs", request_id: message.request_id, truncated: eligible.length > 100, tabs: listed });
+      sendNative(port, portGeneration, { type: "tabs", request_id: message.request_id, last_focused_window_id: lastFocusedWindowId, truncated: eligible.length > listed.length, tabs: listed });
     } catch (error) { sendNative(port, portGeneration, { type: "tabs_error", request_id: message.request_id, error: String(error).slice(0, 512) }); }
     return;
   }
@@ -740,6 +759,31 @@ function waitForTabDocumentCommitted(tabId, afterDocumentId) {
 function nativeLeaseForGeneration(generation) { for (const lease of nativeLeases.values()) if (lease.generation === generation) return lease; return undefined; }
 function addNativeTab(tabId, generation) { const lease = nativeLeaseForGeneration(generation); if (!lease) throw new Error("Native browser lease has ended."); lease.tabs.add(tabId); nativeTabLeases.set(tabId, lease.id); nativeAttachedTabs.add(tabId); }
 function routeActive(native, generation) { return native ? nativeLeaseGenerations.has(generation) && !!nativePort : manualGeneration === generation && !!socket && socket.readyState === WebSocket.OPEN; }
+async function pendingNavigationMatchesDocument(tabId, documentId) {
+  const pending = pendingMainFrameNavigations.get(tabId);
+  if (!pending) return true;
+  if (pending.documentId === documentId) return true;
+  if (!pending.ambiguous || typeof documentId !== "string" || !documentId) return false;
+  // Event callbacks cannot identify which overlapping same-URL sequence
+  // committed. Permit recovery only when Chrome's live tab/frame inventory
+  // reports this exact document, URL, and complete state twice in succession.
+  const readCurrent = async () => {
+    const [tab, frame] = await Promise.all([
+      chrome.tabs.get(tabId).catch(() => undefined),
+      chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined),
+    ]);
+    return tab?.status === "complete" && frame?.documentId === documentId &&
+      frame.url === tab.url && frame.url === pending.url;
+  };
+  if (!await readCurrent()) return false;
+  await Promise.resolve();
+  const stableCurrent = await readCurrent();
+  return stableCurrent && pendingMainFrameNavigations.get(tabId) === pending;
+}
+async function clearFailedNavigationWhenStable(tabId, failedNavigation) {
+  const [tab, frame] = await Promise.all([chrome.tabs.get(tabId).catch(() => undefined), chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined)]);
+  if (!failedNavigation.ambiguous && pendingMainFrameNavigations.get(tabId) === failedNavigation && tab?.status === "complete" && frame?.documentId && frame.url === tab.url) pendingMainFrameNavigations.delete(tabId);
+}
 async function attachNewTab(tabId, url, native, generation, navigate = true, waitUntil = "dom_content_loaded") {
   if (navigate) {
     const before = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
@@ -749,9 +793,12 @@ async function attachNewTab(tabId, url, native, generation, navigate = true, wai
     await ready;
   }
   else if ((await chrome.tabs.get(tabId)).url !== url) throw new Error("Recovery tab no longer matches the requested destination.");
-  if (waitUntil !== "document_committed") await waitForTabDOMContentLoaded(tabId); if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
-  const navigationGeneration = tabNavigationGenerations.get(tabId) || 0; const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
-  if (!routeActive(native, generation) || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
+  // Navigation already awaited the requested readiness event above. Only
+  // recovery/reattach paths (navigate=false) need this additional readiness
+  // check before pairing the existing tab.
+  if (!navigate && waitUntil !== "document_committed") await waitForTabDOMContentLoaded(tabId); if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
+  const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
+  if (!routeActive(native, generation) || !await pendingNavigationMatchesDocument(tabId, attachedIdentity?.document_id) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId); return attachedIdentity;
 }
 async function returnExistingOpen(receipt, url, native, generation) {
@@ -884,8 +931,8 @@ async function navigatePairedTab(tabId, url, native, generation) {
   const ready = waitForTabDOMContentLoaded(tabId, before.documentId);
   (native ? nativeAttachedTabs : manualAttachedTabs).delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); await detachDebugger(tabId); await chrome.tabs.update(tabId, { url }); await ready;
   if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
-  const navigationGeneration = tabNavigationGenerations.get(tabId) || 0; const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
-  if (!routeActive(native, generation) || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
+  const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
+  if (!routeActive(native, generation) || !await pendingNavigationMatchesDocument(tabId, attachedIdentity?.document_id) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
 }
 function removeNativeTab(tabId) { const leaseId = nativeTabLeases.get(tabId); if (leaseId) nativeLeases.get(leaseId)?.tabs.delete(tabId); nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); }
@@ -950,23 +997,60 @@ async function reattachAfterNavigation(tabId, native, generation, expectedUrl, e
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") { clearFileChooserState(tabId, "Target navigated before the file chooser opened."); tabNavigationGenerations.set(tabId, (tabNavigationGenerations.get(tabId) || 0) + 1); if (pairedTabDocumentIds.has(tabId)) navigatingTabs.add(tabId); }
-  if (changeInfo.status === "complete" && !debuggerDetachedDuringNavigation.has(tabId)) navigatingTabs.delete(tabId);
+  if (changeInfo.status === "complete") { const pending = pendingMainFrameNavigations.get(tabId); if (pending?.failed) void clearFailedNavigationWhenStable(tabId, pending); if (!debuggerDetachedDuringNavigation.has(tabId)) navigatingTabs.delete(tabId); }
   const pairedUrl = pairedTabUrls.get(tabId); if (pairedUrl === undefined || !changeInfo.url || changeInfo.url === "about:blank" || navigatingTabs.has(tabId)) return;
   const changed = (() => { try { const before = new URL(pairedUrl), after = new URL(changeInfo.url); return before.origin !== after.origin || before.pathname !== after.pathname || before.search !== after.search; } catch { return changeInfo.url !== pairedUrl; } })(); if (changed) void detachPairedTab(tabId);
 });
-chrome.webNavigation.onBeforeNavigate.addListener(details => { if (details.frameId !== 0) return; tabNavigationGenerations.set(details.tabId, (tabNavigationGenerations.get(details.tabId) || 0) + 1); if (pairedTabDocumentIds.has(details.tabId)) navigatingTabs.add(details.tabId); });
+chrome.webNavigation.onBeforeNavigate.addListener(details => {
+  if (details.frameId !== 0) return;
+  const previous = pendingMainFrameNavigations.get(details.tabId);
+  const ambiguous = Boolean(previous && !previous.failed && previous.url === details.url);
+  pendingMainFrameNavigations.set(details.tabId, {
+    sequence: (previous?.sequence || 0) + 1,
+    startedAt: details.timeStamp,
+    url: details.url,
+    documentId: undefined,
+    ambiguous,
+  });
+  tabNavigationGenerations.set(details.tabId, (tabNavigationGenerations.get(details.tabId) || 0) + 1); if (pairedTabDocumentIds.has(details.tabId)) navigatingTabs.add(details.tabId);
+});
 chrome.webNavigation.onCommitted.addListener(details => {
-  if (details.frameId !== 0) return; domReadyDocuments.delete(details.tabId); tabNavigationGenerations.set(details.tabId, (tabNavigationGenerations.get(details.tabId) || 0) + 1); if (!pairedTabDocumentIds.has(details.tabId)) return;
+  if (details.frameId !== 0) return; domReadyDocuments.delete(details.tabId); tabNavigationGenerations.set(details.tabId, (tabNavigationGenerations.get(details.tabId) || 0) + 1);
+  const pending = pendingMainFrameNavigations.get(details.tabId);
+  // Event timestamps identify when each callback fired, not which navigation
+  // sequence emitted it. If same-URL sequences overlap, fail closed instead
+  // of letting a delayed older commit claim the newer pending navigation.
+  const isExpectedUrl = pending?.url === details.url;
+  if (pending && isExpectedUrl && !pending.ambiguous && Number.isFinite(details.timeStamp) && details.timeStamp >= pending.startedAt) {
+    pendingMainFrameNavigations.set(details.tabId, { ...pending, documentId: details.documentId });
+  }
+  if (!pairedTabDocumentIds.has(details.tabId)) return;
   let url; try { url = validateNavigationUrl(details.url); } catch { void detachPairedTab(details.tabId); return; } if (typeof details.documentId !== "string" || !details.documentId) { void detachPairedTab(details.tabId); return; }
   pairedTabUrls.set(details.tabId, url); pairedTabDocumentIds.set(details.tabId, details.documentId); const native = nativeAttachedTabs.has(details.tabId); const generation = native ? nativeLeases.get(nativeTabLeases.get(details.tabId))?.generation : manualGeneration;
   committedNavigationTabs.set(details.tabId, { native, generation, url, documentId: details.documentId }); setTimeout(() => { if (committedNavigationTabs.get(details.tabId)?.documentId === details.documentId) committedNavigationTabs.delete(details.tabId); }, 3000);
   if (!debuggerDetachedDuringNavigation.has(details.tabId)) { navigatingTabs.delete(details.tabId); return; }
   void reattachAfterNavigation(details.tabId, native, generation, url, details.documentId).then(() => { if (pairedTabDocumentIds.get(details.tabId) === details.documentId) { debuggerDetachedDuringNavigation.delete(details.tabId); navigatingTabs.delete(details.tabId); } }).catch(() => { if (pairedTabDocumentIds.get(details.tabId) === details.documentId) void detachPairedTab(details.tabId); });
 });
-chrome.webNavigation.onDOMContentLoaded.addListener(details => { if (details.frameId === 0 && typeof details.documentId === "string") domReadyDocuments.set(details.tabId, details.documentId); });
-chrome.webNavigation.onErrorOccurred.addListener(details => { if (details.frameId === 0 && navigatingTabs.has(details.tabId)) void detachPairedTab(details.tabId); });
+chrome.webNavigation.onDOMContentLoaded.addListener(details => {
+  if (details.frameId !== 0 || typeof details.documentId !== "string") return;
+  domReadyDocuments.set(details.tabId, details.documentId);
+  if (pendingMainFrameNavigations.get(details.tabId)?.documentId === details.documentId) pendingMainFrameNavigations.delete(details.tabId);
+});
+chrome.webNavigation.onErrorOccurred.addListener(details => {
+  if (details.frameId !== 0) return;
+  const pending = pendingMainFrameNavigations.get(details.tabId);
+  const isCurrentNavigationUrl = pending?.url === details.url;
+  if (pending && isCurrentNavigationUrl && !pending.ambiguous &&
+      (!Number.isFinite(details.timeStamp) || details.timeStamp >= pending.startedAt)) {
+    const failed = { ...pending, failed: true };
+    pendingMainFrameNavigations.set(details.tabId, failed);
+    void clearFailedNavigationWhenStable(details.tabId, failed);
+  }
+  if (navigatingTabs.has(details.tabId)) void detachPairedTab(details.tabId);
+});
 chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
-  tabNavigationGenerations.set(removedTabId, (tabNavigationGenerations.get(removedTabId) || 0) + 1); if (!pairedTabUrls.has(removedTabId)) return;
+  pendingMainFrameNavigations.delete(removedTabId); tabNavigationGenerations.set(removedTabId, (tabNavigationGenerations.get(removedTabId) || 0) + 1); if (!pairedTabUrls.has(removedTabId)) return;
   navigatingTabs.delete(removedTabId); debuggerDetachedDuringNavigation.delete(removedTabId); pairedTabUrls.delete(removedTabId); pairedTabDocumentIds.delete(removedTabId); manualAttachedTabs.delete(removedTabId); nativeAttachedTabs.delete(removedTabId); void detachDebugger(removedTabId);
 });
+chrome.tabs.onRemoved.addListener(tabId => { pendingMainFrameNavigations.delete(tabId); tabNavigationGenerations.delete(tabId); domReadyDocuments.delete(tabId); });
 void reconnectStateReady.then(() => { if (!reconnectExhausted) connectNative(); });

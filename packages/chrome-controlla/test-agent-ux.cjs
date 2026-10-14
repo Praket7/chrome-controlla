@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const browserSkill = fs.readFileSync(path.join(__dirname, 'plugin/skills/browser-control/SKILL.md'), 'utf8');
+const advancedBrowserSkill = fs.readFileSync(path.join(__dirname, 'plugin/skills/browser-control/references/advanced.md'), 'utf8');
 const {
   AgentUxRuntime,
   ContextRegistry,
@@ -49,6 +51,22 @@ function fakeTools() {
     }
   }));
 }
+
+test('headless guidance keeps browser lifecycle mode separate from page tools', () => {
+  for (const content of [browserSkill, advancedBrowserSkill]) {
+    assert.match(content, /action=task.*mode=.*headless/s);
+    assert.match(content, /no `session_id` or `chrome_tab_id`|no session or tab IDs/);
+    assert.match(content, /launches.*navigates.*verifies.*releases/s);
+    assert.match(content, /read-only `Research` task/);
+    assert.match(content, /Form drafts.*existing session/);
+    assert.match(content, /`action=launch`/);
+    assert.match(content, /`target_ids\[0\]` directly.*`action=task`/s);
+    assert.match(content, /skip `list` and standalone `snapshot`/);
+    assert.match(content, /`release_after_task: true`/);
+    assert.match(content, /accepts.*`foreground`.*`background`/s);
+    assert.match(content, /do not pass `mode` to `snapshot`|page tools take `session_id` and do not accept `mode`/);
+  }
+});
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'controlla-agent-ux-'));
@@ -211,6 +229,15 @@ test('background newest-story goals navigate to the selected href without activa
   assert.equal(calls[0].args.mode, 'background');
   assert.deepEqual(calls[0].args.ready_when, { selector: 'a[href*="/nfl/story/"]' });
   assert.deepEqual(calls[0].args.steps.map(step => step.kind), ['snapshot', 'find_all', 'choose', 'navigate_selected', 'verify']);
+});
+
+test('runtime instructions forbid schema probing for ordinary MCP browser tasks', () => {
+  const runtimeSource = fs.readFileSync(path.resolve(__dirname, '../../crates/controlla-runtime/src/mcp/v3_full.rs'), 'utf8');
+  const instructions = runtimeSource.match(/\.with_instructions\("([\s\S]*?)"\)/)?.[1] ?? '';
+  assert.match(instructions, /MCP already supplies the six tool schemas/i);
+  assert.match(instructions, /Do not call action=schema/i);
+  assert.match(instructions, /call browser action=open directly/i);
+  assert.doesNotMatch(instructions, /Read these tool schemas once per session/i);
 });
 
 test('follow-up tools can use only the opaque context handle', async () => {

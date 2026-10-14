@@ -70,9 +70,9 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .description
         .as_deref()
         .unwrap_or_default();
-    assert!(browser_description.contains("{\"kind\":\"research\""));
-    assert!(browser_description.contains("allow_password=true"));
-    assert!(browser_description.contains("ready_when"));
+    assert!(browser_description.contains("action=task"));
+    assert!(browser_description.contains("one-call private headless mode"));
+    assert!(browser_description.contains("read-only Research task without tab_ids"));
     assert!(
         browser["properties"]["ready_when"]["anyOf"].is_array()
             || browser["properties"]["ready_when"]["oneOf"].is_array(),
@@ -82,6 +82,18 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         browser["properties"]["task"]["description"]
             .as_str()
             .is_some_and(|description| description.contains("\"kind\":\"research\""))
+    );
+    assert!(
+        browser["properties"]["task"]["description"]
+            .as_str()
+            .is_some_and(|description| description
+                .to_lowercase()
+                .contains("read-only research tasks without tab_ids"))
+    );
+    assert!(
+        browser["properties"]["ready_when"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("post-DOMContentLoaded"))
     );
     assert!(
         browser["properties"].get("file_path").is_some(),
@@ -114,7 +126,7 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert!(
         browser["properties"]["idempotency_key"]["description"]
             .as_str()
-            .is_some_and(|value| value.contains("Required for action=open"))
+            .is_some_and(|value| value.contains("Required for open"))
     );
     assert_eq!(
         browser["allOf"][0]["if"]["properties"]["action"]["const"], "open",
@@ -184,8 +196,12 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         );
     }
     let schema_bytes = serde_json::to_vec(&tools.tools).unwrap().len();
+    eprintln!(
+        "default MCP tool schemas: {schema_bytes} bytes ({} KiB budget)",
+        (47 * 1024) / 1024
+    );
     assert!(
-        schema_bytes <= 48 * 1024,
+        schema_bytes <= 47 * 1024,
         "default tool schema budget is {schema_bytes} bytes"
     );
 
@@ -485,7 +501,7 @@ async fn private_headless_task_research_draft_and_repeat() {
                 "Fact B"
             };
             let body = format!(
-                "<main>{fact}</main><input aria-label='Name' value='before'><button type='button' onclick=\"document.querySelector('#saved').textContent='Saved'\">Save</button><span id='saved'></span>"
+                "<title>Fixture {fact}</title><main>{fact}</main><input aria-label='Name' value='before'><button type='button' onclick=\"document.querySelector('#saved').textContent='Saved'\">Save</button><span id='saved'></span>"
             );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -511,6 +527,22 @@ async fn private_headless_task_research_draft_and_repeat() {
     };
     let url_a = format!("http://{address}/a");
     let url_b = format!("http://{address}/b");
+    let one_call = client
+        .call_tool(call(
+            "browser",
+            serde_json::json!({"action":"task","mode":"headless","release_after_task":true,
+        "task":{"kind":"research","urls":[url_a.clone()],"selector":"main"}}),
+        ))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(one_call["status"], "completed", "{one_call}");
+    assert_eq!(
+        one_call["receipts"][1]["title"], "Fixture Fact A",
+        "{one_call}"
+    );
+    assert_eq!(one_call["private_session_released"], true, "{one_call}");
     let launch = client
         .call_tool(call(
             "browser",
@@ -520,6 +552,19 @@ async fn private_headless_task_research_draft_and_repeat() {
         .unwrap()
         .structured_content
         .unwrap();
+    assert!(
+        launch["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("action=task")),
+        "{launch}"
+    );
+    assert!(
+        !launch["next"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("action=list"),
+        "{launch}"
+    );
     let session_id = launch["session_id"].as_str().unwrap();
     let tab_id = launch["target_ids"][0].as_str().unwrap();
     let research = client
@@ -534,6 +579,10 @@ async fn private_headless_task_research_draft_and_repeat() {
         .unwrap();
     assert_eq!(research["status"], "completed", "{research}");
     assert_eq!(research["receipts"][1]["url"], url_a);
+    assert_eq!(
+        research["receipts"][1]["title"], "Fixture Fact A",
+        "{research}"
+    );
     assert_eq!(research["receipts"][1]["snippet"], "Fact A");
     assert_eq!(research["receipts"][3]["url"], url_b);
     assert_eq!(research["receipts"][3]["snippet"], "Fact B");
@@ -562,7 +611,7 @@ async fn private_headless_task_research_draft_and_repeat() {
     let repeat = client
         .call_tool(call(
             "browser",
-            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,"release_after_task":true,
         "task":{"kind":"repeat","references":[name,save],"action":"verify_visible"}}),
         ))
         .await
@@ -570,6 +619,85 @@ async fn private_headless_task_research_draft_and_repeat() {
         .structured_content
         .unwrap();
     assert_eq!(repeat["status"], "completed", "{repeat}");
+    assert_eq!(repeat["private_session_released"], true, "{repeat}");
+    client.cancel().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires installed Google Chrome and a private headless browser"]
+async fn private_headless_widget_drag_drop_verifies_exact_membership() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let body = r#"<!doctype html><meta charset="utf-8"><title>Drag fixture</title>
+<style>#drag,#drop{position:absolute;top:80px;height:80px}#drag{left:20px;width:80px}#drop{left:180px;width:120px}</style>
+<div id="drag" draggable="true" aria-label="Drag item"><span>Drag item</span></div><div id="drop" aria-dropeffect="move" aria-label="Drop target"><span>Drop target</span></div><div id="status" aria-live="polite"></div>
+<script>const source=document.querySelector('#drag'),target=document.querySelector('#drop');source.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','drag'));target.addEventListener('dragover',e=>e.preventDefault());target.addEventListener('drop',e=>{e.preventDefault();document.querySelector('#status').textContent='Dropped';target.appendChild(source)});</script>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let state_dir = state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_controlla-v2"));
+    command.env("CONTROLLA_STATE_DIR", &state_dir).env(
+        "COMPTROL_CHROME_EXECUTABLE",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    );
+    let client = Client
+        .serve(TokioChildProcess::new(command).unwrap())
+        .await
+        .unwrap();
+    let call = |name: &str, value: serde_json::Value| {
+        CallToolRequestParams::new(name.to_owned())
+            .with_arguments(value.as_object().unwrap().clone())
+    };
+    let launch = client
+        .call_tool(call(
+            "browser",
+            serde_json::json!({"action":"launch","mode":"headless","url":format!("http://{address}/fixture")}),
+        ))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    let session_id = launch["session_id"].as_str().unwrap();
+    let tab_id = launch["target_ids"][0].as_str().unwrap();
+    let workflow = client
+        .call_tool(call(
+            "workflow",
+            serde_json::json!({
+                "session_id":session_id,
+                "chrome_tab_id":tab_id,
+                "steps":[
+                    {"kind":"snapshot","max_items":8},
+                    {"kind":"widget","reference":"@c1","value":"Drop target"},
+                    {"kind":"verify","predicate":{"kind":"text_present","text":"Drag item"}}
+                ]
+            }),
+        ))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(workflow["status"], "completed", "{workflow}");
+    assert_eq!(workflow["receipts"][1]["status"], "verified", "{workflow}");
+    assert_eq!(workflow["receipts"][2]["status"], "passed", "{workflow}");
+
     let released = client
         .call_tool(call(
             "browser",

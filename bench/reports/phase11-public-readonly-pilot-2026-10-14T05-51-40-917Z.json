@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "playwright_mcp_version": "0.0.83",
+    "controlla_binary_sha256": "3ef2daba4c20c362e2f8476d9d2ba64d2bb13d2aeea9882d8f5cfdb86f43ba93",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla",
+        "playwright-mcp"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "1ee5809304618747544b372b2818054a2d4d59f6228399882533d57d181cb771",
+        "prompt_to_verified_ms": 16730.418708,
+        "prompt_to_final_ms": 15361.074333,
+        "first_browser_tool_ms": 10936.57025,
+        "model_turns": 1,
+        "model_tokens": 113392,
+        "external_tool_calls": 2,
+        "successful_browser_tool_calls": 1,
+        "tool_names": [
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.browser:failed"
+        ],
+        "failed_tool_errors": [
+          {
+            "tool": "chrome-controlla.browser",
+            "error": "{\"message\":\"tool call error: tool call failed for `chrome-controlla/browser`\\n\\nCaused by:\\n    Mcp error: -32602: session was not created in this V3 browser mode\"}"
+          }
+        ],
+        "output_bytes": 3601,
+        "output_sha256": "2bd1d4b25f144865a3b9a0a91a8da25142c92d2d4cc2d582b2cfbb4089e0ae73",
+        "exit_code": 0,
+        "error": null,
+        "answer": null,
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": false,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": false,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "544e47db653a37482e9e3e9d22ee43d4daf6fb57ecc4119a092a966966f130cc",
+        "prompt_to_verified_ms": 16834.684583,
+        "prompt_to_final_ms": 16058.517875,
+        "first_browser_tool_ms": 8460.964125,
+        "model_turns": 1,
+        "model_tokens": 112223,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_evaluate:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 3210,
+        "output_sha256": "57924673f5205becffc749bb87266a1f4c113165e4834c785a41d8dae81ee1b5",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

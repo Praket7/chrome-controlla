@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "selected_adapters": [
+      "browser-use"
+    ],
+    "adapter_versions": {
+      "playwright_mcp": "0.0.83",
+      "chrome_devtools_mcp": "1.10.1",
+      "agent_browser": "0.39.1",
+      "browser_use": "0.13.11",
+      "browser_use_mcp_source_commit": "c75e8476e26d18b7617643bc2ae082fae8eae431",
+      "browser_use_local_executable": "/Users/pcg/.local/share/chrome-controlla-bench/browser-use-venv/bin/browser-use"
+    },
+    "controlla_binary_sha256": "401c4a2a1a5d62247bbd478cae1c4e619ab2db9d2974d0a8e7041f619e0d3c67",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64",
+    "timing_origin": "immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "browser-use"
+      ],
+      "browser-use": {
+        "adapter": "browser-use",
+        "prompt_hash": "78c30e3754ed88a01103d080722c12cdb156dfef40e944db3cb60f6b0d7bd38b",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 12526.807667,
+        "process_spawn_to_independent_verification_ms": 20108.342958,
+        "process_spawn_to_final_ms": 19231.029708,
+        "first_browser_tool_started_ms": 5028.708875,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 88867,
+        "output_tokens": 240,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "browser-use.browser_navigate:completed",
+          "browser-use.browser_get_html:completed",
+          "browser-use.browser_close_all:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 10903.164958,
+            "server": "browser-use",
+            "tool": "browser_navigate",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/",
+              "new_tab": false
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"Navigated to: https://example.com/\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 12526.807667,
+            "server": "browser-use",
+            "tool": "browser_get_html",
+            "status": "completed",
+            "arguments": {},
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"<html lang=\\\"en\\\"><head><meta charset=\\\"utf-8\\\"><link rel=\\\"icon\\\" href=\\\"data:,\\\"><meta name=\\\"viewport\\\" content=\\\"width=device-width,initial-scale=1\\\"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style></head><body><style>svg{display:block;margin:-2.75em auto 0;opacity:.55}p+p{font-size:.875em;opacity:.6}</style><svg viewBox=\\\"0,0,20,20\\\" width=\\\"44\\\" height=\\\"44\\\" fill=\\\"currentColor\\\" aria-hidden=\\\"true\\\"><path fill=\\\"none\\\" stroke=\\\"currentColor\\\" stroke-width=\\\"1.3\\\" stroke-linejoin=\\\"round\\\" d=\\\"M6 4H3v12q4 0 7 1.5-1-3.5-4-4.5V2q3.5 1 4 3v12.5q3-1.5 7-1.5V4q-4.5 0-7 1\\\"></path><g transform=\\\"rotate(-6,13.6,8.3)\\\"><path id=\\\"q\\\" d=\\\"M11.5 6.6h1.8v1.8l-1 1.6-.6-.3.8-1.3h-1z\\\"></path><use href=\\\"#q\\\" x=\\\"2.4\\\"></use></g></svg><p lang=\\\"en\\\">This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.</p><p lang=\\\"ar\\\" dir=\\\"rtl\\\">هذا النطاق مُخصص للاستخدام في أمثلة التوثيق دون الحاجة إلى إذن. هذه ليست خدمة، يُرجى تجنب الاعتماد عليها لأغراض الاختبار والمراقبة.</p><p lang=\\\"zh\\\">该域名仅用于文档示例，无需获得许可。这并非一项服务，请勿将其用于测试和监控目的。</p><p lang=\\\"fr\\\">L’usage de ce domaine est réservé à des exemples de documentation, sans autorisation préalable.  Il ne s’agit pas d’un service ; son utilisation à des fins de test ou de surveillance est à éviter.</p><p lang=\\\"ru\\\">Данный домен предназначен для использования в примерах документации без необходимости получения предварительного разрешения. Это не сервис; не рекомендуется его использование для тестирования и мониторинга.</p><p lang=\\\"es\\\">Este dominio está destinado al uso en ejemplos de documentación sin necesidad de permiso. Esto no es un servicio; evitar utilizarlo para realizar pruebas o monitoreos.</p><a href=\\\"https://iana.org/help/example-domains\\\">Learn more</a><script src=\\\"/s.js\\\"></script>\\n</body></html>\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 18066.446708,
+            "server": "browser-use",
+            "tool": "browser_close_all",
+            "status": "completed",
+            "arguments": {},
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"Closed 1 sessions\"}],\"structured_content\":null}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 4750,
+        "output_sha256": "5467a0a1d933952ddcd649b5b809915845def91005a97a3e6c6f28b955ea32da",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "browser_outcome_matches_reference": true,
+        "final_answer_matches_reference": true,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "browser-use",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "browser_outcome_matches_reference": true,
+          "final_answer_matches_reference": true,
+          "cleanup_verification_method": "adapter_specific_close_result",
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

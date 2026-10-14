@@ -1,0 +1,631 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "playwright_mcp_version": "0.0.83",
+    "controlla_binary_sha256": "75db161d88e9255a6169d022b8d6bccd2aee8208362ad44fe3135fe475ef95ee",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla",
+        "playwright-mcp"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "c4bf80abd7578c53b2f9436f4420b6b8af3c1b2580e289795029868095e48e4e",
+        "prompt_to_browser_outcome_ms": 10829.073083,
+        "prompt_to_verified_ms": 12574.457542,
+        "prompt_to_independent_verification_ms": 12574.457542,
+        "prompt_to_final_ms": 11505.093333,
+        "first_browser_tool_started_ms": 5304.528917,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 91953,
+        "external_tool_calls": 2,
+        "successful_browser_tool_calls": 2,
+        "tool_names": [
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.browser:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 7727.049167,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "launch",
+              "mode": "headless",
+              "url": "about:blank"
+            },
+            "result_summary": {
+              "private_session_released": false,
+              "metrics": {
+                "elapsed_us": 756419,
+                "browser_commands_used": 9,
+                "host_round_trips": 9
+              }
+            },
+            "result_preview": "{\"launched\":true,\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":247,\"browser_commands_used\":9,\"budget_stop_reason\":null,\"cdp_bytes\":277,\"cdp_command_budget\":20000,\"cdp_commands\":9,\"cdp_commands_charged\":9,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19991,\"dom_nodes_scanned\":0,\"elapsed_us\":756419,\"execution_us\":225861,\"host_round_trips\":9,\"model_visible_calls\":1,\"observation_bytes\":0,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":0,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"mode\":\"headless\",\"next\":\"Use target_ids[0] directly with browser action=task for a bundled task, and skip list and standalone snapshot. For a standalone page action, use target_ids[0] and snapshot only when you need a fresh reference. Use list only to inventory tabs. Omit mode from action=task.\",\"page_content_is_untrusted\":true,\"provider\":\"dedicated_headless\",\"session_id\":\"session-1-1\",\"target_ids\":[\"70A795C3205F493A1277A09A354EE3FE\"],\"verified\":false}"
+          },
+          {
+            "elapsed_ms": 10829.073083,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "task",
+              "session_id": "session-1-1",
+              "chrome_tab_id": "70A795C3205F493A1277A09A354EE3FE",
+              "release_after_task": true,
+              "task": {
+                "kind": "research",
+                "urls": [
+                  "https://example.com/"
+                ],
+                "selector": "p:first-of-type",
+                "goal": "Read the document title and the first paragraph exactly as shown."
+              }
+            },
+            "result_summary": {
+              "status": "completed",
+              "private_session_released": true,
+              "route": "semantic_program",
+              "verification": "passed",
+              "metrics": {
+                "elapsed_us": 424305,
+                "browser_commands_used": 42,
+                "host_round_trips": 42
+              },
+              "receipts": [
+                {
+                  "kind": "navigate",
+                  "status": "verified",
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": null,
+                  "snippet": "",
+                  "item_count": null,
+                  "limited": null
+                },
+                {
+                  "kind": "extract",
+                  "status": null,
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": "Example Domain",
+                  "snippet": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
+                  "item_count": 1,
+                  "limited": false
+                }
+              ]
+            },
+            "result_preview": "{\"elapsed_ms\":220,\"execution_route\":{\"actual_cost\":{\"browser_command_budget_used\":42,\"browser_operations\":42,\"cdp_measurement_partial\":false,\"elapsed_ms\":220,\"external_model_calls\":null,\"external_model_cost_boundary\":\"caller model telemetry is outside the MCP process\",\"host_round_trips\":42,\"internal_model_call_count_source\":\"complete_step_receipts_or_unknown\",\"logical_task_step_receipts\":2,\"observation_bytes\":9025,\"reported_internal_model_calls\":null},\"cost_cohort\":{\"intent\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"origin_key\":\"origin-sha256:100680ad546ce6a577f42f52df33b4cfdca756859e664b8d7de329b150d09ce9\",\"task_size\":\"small\",\"warmth\":\"warm_browser_first_seen_site\"},\"cost_policy\":{\"cohort\":\"origin_intent_warmth_size\",\"historical_profile_selected\":false,\"kind\":\"static_qualified_priority\"},\"fallback_reason\":null,\"intent_fingerprint\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"model_budget\":{\"caller_model_telemetry_boundary\":\"external model turns and visible observations are not observable inside the MCP process; use a configured client adapter trace\",\"caller_model_turns\":null,\"caller_model_visible_observations\":null,\"internal_calls_allowed\":0,\"internal_calls_observed\":null,\"passed\":false,\"status\":\"inconclusive\"},\"page_action_memory_recorded\":true,\"predicted_cost\":{\"browser_operations\":2,\"external_model_tokens\":null,\"logical_task_steps\":2,\"model_calls\":0},\"predicted_model_calls\":0,\"reason\":\"a deterministic semantic program is available\",\"speculation_policy\":{\"enabled\":true,\"read_only_only\":true,\"reason\":\"no competing V3 task is active\"},\"tier\":\"semantic_program\",\"verification\":\"passed\",\"visual_evidence_required\":false},\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":214,\"browser_commands_used\":42,\"budget_stop_reason\":null,\"cdp_bytes\":124108,\"cdp_command_budget\":20000,\"cdp_commands\":42,\"cdp_commands_charged\":23,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19977,\"dom_nodes_scanned\":30,\"elapsed_us\":424305,\"execution_us\":230767,\"host_round_trips\":42,\"model_visible_calls\":1,\"observation_bytes\":9025,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":8726,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"page_content_is_untrusted\":true,\"private_session_released\":true,\"receipts\":[{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":true,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":208,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":null,\"kind\":\"navigate\",\"limited\":null,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"\",\"status\":\"verified\",\"targeted_visual_evidence\":null,\"title\":null,\"url\":\"https://example.com/\",\"verified\":true},{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":null,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":11,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":1,\"kind\":\"extract\",\"limited\":false,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\",\"status\":null,\"targeted_visual_evidence\":null,\"title\":\"Example Domain\",\"url\":\"https://example.com/\",\"verified\":true}],\"status\":\"c"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 12953,
+        "output_sha256": "7dbbffcacd35fc19af5c5e13b8219d0ca4430c6778293040040692da894f5414",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "61c6f4103f5865c8099d01bfbd90458d94c07ea99df868a8872facf369e61773",
+        "prompt_to_browser_outcome_ms": 13240.819375,
+        "prompt_to_verified_ms": 18437.22325,
+        "prompt_to_independent_verification_ms": 18437.22325,
+        "prompt_to_final_ms": 17252.093209,
+        "first_browser_tool_started_ms": 7641.95275,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 111745,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_evaluate:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 9585.3835,
+            "server": "playwright-mcp",
+            "tool": "browser_navigate",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Ran Playwright code\\n```js\\nawait page.goto('https://example.com/');\\n```\\n### Page\\n- Page URL: https://example.com/\\n- Page Title: Example Domain\\n### Snapshot\\n- [Snapshot](.playwright-mcp/page-2026-10-14T06-41-44-145Z.yml)\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 13240.819375,
+            "server": "playwright-mcp",
+            "tool": "browser_evaluate",
+            "status": "completed",
+            "arguments": {
+              "function": "() => ({title: document.title, paragraph: [...document.body.querySelectorAll('p')].map(p => p.innerText.trim()).find(t => /[A-Za-z]/.test(t)) || ''})"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\n{\\n  \\\"title\\\": \\\"Example Domain\\\",\\n  \\\"paragraph\\\": \\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"\\n}\\n### Ran Playwright code\\n```js\\nawait page.evaluate('() => ({title: document.title, paragraph: [...document.body.querySelectorAll(\\\\'p\\\\')].map(p => p.innerText.trim()).find(t => /[A-Za-z]/.test(t)) || \\\\'\\\\'})');\\n```\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 16138.278167,
+            "server": "playwright-mcp",
+            "tool": "browser_close",
+            "status": "completed",
+            "arguments": {},
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\nNo open tabs. Navigate to a URL to create one.\\n### Ran Playwright code\\n```js\\nawait page.close()\\n```\"}],\"structured_content\":null}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 3232,
+        "output_sha256": "55adbc0219c696103a88de4c04d9b4b9e5946da1c9fa3cc535975a191b25a728",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 2,
+      "execution_order": [
+        "playwright-mcp",
+        "controlla"
+      ],
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "61c6f4103f5865c8099d01bfbd90458d94c07ea99df868a8872facf369e61773",
+        "prompt_to_browser_outcome_ms": 10457.129833,
+        "prompt_to_verified_ms": 13459.710875,
+        "prompt_to_independent_verification_ms": 13459.710875,
+        "prompt_to_final_ms": 12462.315417,
+        "first_browser_tool_started_ms": 6042.4695,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 60498,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_evaluate:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 8485.600333,
+            "server": "playwright-mcp",
+            "tool": "browser_navigate",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Ran Playwright code\\n```js\\nawait page.goto('https://example.com/');\\n```\\n### Page\\n- Page URL: https://example.com/\\n- Page Title: Example Domain\\n### Snapshot\\n- [Snapshot](.playwright-mcp/page-2026-10-14T06-42-01-485Z.yml)\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 10457.129833,
+            "server": "playwright-mcp",
+            "tool": "browser_evaluate",
+            "status": "completed",
+            "arguments": {
+              "function": "() => ({title: document.title, paragraph: [...document.body.querySelectorAll('p')].map(p => p.innerText.trim()).find(t => t && /[A-Za-z]/.test(t)) || ''})"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\n{\\n  \\\"title\\\": \\\"Example Domain\\\",\\n  \\\"paragraph\\\": \\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"\\n}\\n### Ran Playwright code\\n```js\\nawait page.evaluate('() => ({title: document.title, paragraph: [...document.body.querySelectorAll(\\\\'p\\\\')].map(p => p.innerText.trim()).find(t => t && /[A-Za-z]/.test(t)) || \\\\'\\\\'})');\\n```\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 11475.719667,
+            "server": "playwright-mcp",
+            "tool": "browser_close",
+            "status": "completed",
+            "arguments": {},
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\nNo open tabs. Navigate to a URL to create one.\\n### Ran Playwright code\\n```js\\nawait page.close()\\n```\"}],\"structured_content\":null}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 3242,
+        "output_sha256": "f6c8bd39d84c8a5119c02108875b51641955c1c127f76cd77de33b0fe013ca41",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "c4bf80abd7578c53b2f9436f4420b6b8af3c1b2580e289795029868095e48e4e",
+        "prompt_to_browser_outcome_ms": 15543.232375,
+        "prompt_to_verified_ms": 17550.303542,
+        "prompt_to_independent_verification_ms": 17550.303542,
+        "prompt_to_final_ms": 16734.69275,
+        "first_browser_tool_started_ms": 7199.121958,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 113897,
+        "external_tool_calls": 2,
+        "successful_browser_tool_calls": 2,
+        "tool_names": [
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.browser:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 10468.180083,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "launch",
+              "mode": "headless",
+              "url": "about:blank"
+            },
+            "result_summary": {
+              "private_session_released": false,
+              "metrics": {
+                "elapsed_us": 355618,
+                "browser_commands_used": 9,
+                "host_round_trips": 9
+              }
+            },
+            "result_preview": "{\"launched\":true,\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":247,\"browser_commands_used\":9,\"budget_stop_reason\":null,\"cdp_bytes\":277,\"cdp_command_budget\":20000,\"cdp_commands\":9,\"cdp_commands_charged\":9,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19991,\"dom_nodes_scanned\":0,\"elapsed_us\":355618,\"execution_us\":154616,\"host_round_trips\":9,\"model_visible_calls\":1,\"observation_bytes\":0,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":0,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"mode\":\"headless\",\"next\":\"Use target_ids[0] directly with browser action=task for a bundled task, and skip list and standalone snapshot. For a standalone page action, use target_ids[0] and snapshot only when you need a fresh reference. Use list only to inventory tabs. Omit mode from action=task.\",\"page_content_is_untrusted\":true,\"provider\":\"dedicated_headless\",\"session_id\":\"session-1-1\",\"target_ids\":[\"4A93AE3E8F238CEB0DC0DCB1DC481124\"],\"verified\":false}"
+          },
+          {
+            "elapsed_ms": 15543.232375,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "task",
+              "session_id": "session-1-1",
+              "chrome_tab_id": "4A93AE3E8F238CEB0DC0DCB1DC481124",
+              "release_after_task": true,
+              "task": {
+                "kind": "research",
+                "urls": [
+                  "https://example.com/"
+                ],
+                "selector": "p:first-of-type",
+                "goal": "Read the document title and the first paragraph exactly as shown."
+              }
+            },
+            "result_summary": {
+              "status": "completed",
+              "private_session_released": true,
+              "route": "semantic_program",
+              "verification": "passed",
+              "metrics": {
+                "elapsed_us": 384792,
+                "browser_commands_used": 41,
+                "host_round_trips": 41
+              },
+              "receipts": [
+                {
+                  "kind": "navigate",
+                  "status": "verified",
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": null,
+                  "snippet": "",
+                  "item_count": null,
+                  "limited": null
+                },
+                {
+                  "kind": "extract",
+                  "status": null,
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": "Example Domain",
+                  "snippet": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
+                  "item_count": 1,
+                  "limited": false
+                }
+              ]
+            },
+            "result_preview": "{\"elapsed_ms\":214,\"execution_route\":{\"actual_cost\":{\"browser_command_budget_used\":41,\"browser_operations\":41,\"cdp_measurement_partial\":false,\"elapsed_ms\":214,\"external_model_calls\":null,\"external_model_cost_boundary\":\"caller model telemetry is outside the MCP process\",\"host_round_trips\":41,\"internal_model_call_count_source\":\"complete_step_receipts_or_unknown\",\"logical_task_step_receipts\":2,\"observation_bytes\":9025,\"reported_internal_model_calls\":null},\"cost_cohort\":{\"intent\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"origin_key\":\"origin-sha256:100680ad546ce6a577f42f52df33b4cfdca756859e664b8d7de329b150d09ce9\",\"task_size\":\"small\",\"warmth\":\"warm_browser_first_seen_site\"},\"cost_policy\":{\"cohort\":\"origin_intent_warmth_size\",\"historical_profile_selected\":false,\"kind\":\"static_qualified_priority\"},\"fallback_reason\":null,\"intent_fingerprint\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"model_budget\":{\"caller_model_telemetry_boundary\":\"external model turns and visible observations are not observable inside the MCP process; use a configured client adapter trace\",\"caller_model_turns\":null,\"caller_model_visible_observations\":null,\"internal_calls_allowed\":0,\"internal_calls_observed\":null,\"passed\":false,\"status\":\"inconclusive\"},\"page_action_memory_recorded\":true,\"predicted_cost\":{\"browser_operations\":2,\"external_model_tokens\":null,\"logical_task_steps\":2,\"model_calls\":0},\"predicted_model_calls\":0,\"reason\":\"a deterministic semantic program is available\",\"speculation_policy\":{\"enabled\":true,\"read_only_only\":true,\"reason\":\"no competing V3 task is active\"},\"tier\":\"semantic_program\",\"verification\":\"passed\",\"visual_evidence_required\":false},\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":215,\"browser_commands_used\":41,\"budget_stop_reason\":null,\"cdp_bytes\":124079,\"cdp_command_budget\":20000,\"cdp_commands\":41,\"cdp_commands_charged\":22,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19978,\"dom_nodes_scanned\":30,\"elapsed_us\":384792,\"execution_us\":231002,\"host_round_trips\":41,\"model_visible_calls\":1,\"observation_bytes\":9025,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":9018,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"page_content_is_untrusted\":true,\"private_session_released\":true,\"receipts\":[{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":true,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":200,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":null,\"kind\":\"navigate\",\"limited\":null,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"\",\"status\":\"verified\",\"targeted_visual_evidence\":null,\"title\":null,\"url\":\"https://example.com/\",\"verified\":true},{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":null,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":14,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":1,\"kind\":\"extract\",\"limited\":false,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\",\"status\":null,\"targeted_visual_evidence\":null,\"title\":\"Example Domain\",\"url\":\"https://example.com/\",\"verified\":true}],\"status\":\"c"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 12911,
+        "output_sha256": "60d1f3289ed578e7f3c980b8a3a8af2193c8143b378537a7013e645cccc2d453",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    },
+    {
+      "replicate": 3,
+      "execution_order": [
+        "controlla",
+        "playwright-mcp"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "c4bf80abd7578c53b2f9436f4420b6b8af3c1b2580e289795029868095e48e4e",
+        "prompt_to_browser_outcome_ms": 12647.419541,
+        "prompt_to_verified_ms": 15087.5155,
+        "prompt_to_independent_verification_ms": 15087.5155,
+        "prompt_to_final_ms": 14249.793,
+        "first_browser_tool_started_ms": 7022.219625,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 91833,
+        "external_tool_calls": 2,
+        "successful_browser_tool_calls": 2,
+        "tool_names": [
+          "chrome-controlla.browser:completed",
+          "chrome-controlla.browser:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 8783.8725,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "launch",
+              "mode": "headless",
+              "url": "about:blank"
+            },
+            "result_summary": {
+              "private_session_released": false,
+              "metrics": {
+                "elapsed_us": 358698,
+                "browser_commands_used": 9,
+                "host_round_trips": 9
+              }
+            },
+            "result_preview": "{\"launched\":true,\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":247,\"browser_commands_used\":9,\"budget_stop_reason\":null,\"cdp_bytes\":277,\"cdp_command_budget\":20000,\"cdp_commands\":9,\"cdp_commands_charged\":9,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19991,\"dom_nodes_scanned\":0,\"elapsed_us\":358698,\"execution_us\":168449,\"host_round_trips\":9,\"model_visible_calls\":1,\"observation_bytes\":0,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":0,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"mode\":\"headless\",\"next\":\"Use target_ids[0] directly with browser action=task for a bundled task, and skip list and standalone snapshot. For a standalone page action, use target_ids[0] and snapshot only when you need a fresh reference. Use list only to inventory tabs. Omit mode from action=task.\",\"page_content_is_untrusted\":true,\"provider\":\"dedicated_headless\",\"session_id\":\"session-1-1\",\"target_ids\":[\"FB718576E0CFEEE7F89A676EA664AFFD\"],\"verified\":false}"
+          },
+          {
+            "elapsed_ms": 12647.419541,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "task",
+              "session_id": "session-1-1",
+              "chrome_tab_id": "FB718576E0CFEEE7F89A676EA664AFFD",
+              "release_after_task": true,
+              "task": {
+                "kind": "research",
+                "urls": [
+                  "https://example.com/"
+                ],
+                "selector": "p:first-of-type",
+                "goal": "Read the document title and the first paragraph exactly as shown."
+              }
+            },
+            "result_summary": {
+              "status": "completed",
+              "private_session_released": true,
+              "route": "semantic_program",
+              "verification": "passed",
+              "metrics": {
+                "elapsed_us": 386100,
+                "browser_commands_used": 41,
+                "host_round_trips": 41
+              },
+              "receipts": [
+                {
+                  "kind": "navigate",
+                  "status": "verified",
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": null,
+                  "snippet": "",
+                  "item_count": null,
+                  "limited": null
+                },
+                {
+                  "kind": "extract",
+                  "status": null,
+                  "verified": true,
+                  "reason_code": null,
+                  "url": "https://example.com/",
+                  "title": "Example Domain",
+                  "snippet": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
+                  "item_count": 1,
+                  "limited": false
+                }
+              ]
+            },
+            "result_preview": "{\"elapsed_ms\":215,\"execution_route\":{\"actual_cost\":{\"browser_command_budget_used\":41,\"browser_operations\":41,\"cdp_measurement_partial\":false,\"elapsed_ms\":215,\"external_model_calls\":null,\"external_model_cost_boundary\":\"caller model telemetry is outside the MCP process\",\"host_round_trips\":41,\"internal_model_call_count_source\":\"complete_step_receipts_or_unknown\",\"logical_task_step_receipts\":2,\"observation_bytes\":9025,\"reported_internal_model_calls\":null},\"cost_cohort\":{\"intent\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"origin_key\":\"origin-sha256:100680ad546ce6a577f42f52df33b4cfdca756859e664b8d7de329b150d09ce9\",\"task_size\":\"small\",\"warmth\":\"warm_browser_first_seen_site\"},\"cost_policy\":{\"cohort\":\"origin_intent_warmth_size\",\"historical_profile_selected\":false,\"kind\":\"static_qualified_priority\"},\"fallback_reason\":null,\"intent_fingerprint\":\"20655262d16c9384879d17f168ec72122d0176639dc38832b873a018c8d6bd2c\",\"model_budget\":{\"caller_model_telemetry_boundary\":\"external model turns and visible observations are not observable inside the MCP process; use a configured client adapter trace\",\"caller_model_turns\":null,\"caller_model_visible_observations\":null,\"internal_calls_allowed\":0,\"internal_calls_observed\":null,\"passed\":false,\"status\":\"inconclusive\"},\"page_action_memory_recorded\":true,\"predicted_cost\":{\"browser_operations\":2,\"external_model_tokens\":null,\"logical_task_steps\":2,\"model_calls\":0},\"predicted_model_calls\":0,\"reason\":\"a deterministic semantic program is available\",\"speculation_policy\":{\"enabled\":true,\"read_only_only\":true,\"reason\":\"no competing V3 task is active\"},\"tier\":\"semantic_program\",\"verification\":\"passed\",\"visual_evidence_required\":false},\"metrics\":{\"browser_command_budget\":256,\"browser_commands_remaining\":215,\"browser_commands_used\":41,\"budget_stop_reason\":null,\"cdp_bytes\":124087,\"cdp_command_budget\":20000,\"cdp_commands\":41,\"cdp_commands_charged\":22,\"cdp_commands_partial\":false,\"cdp_commands_remaining\":19978,\"dom_nodes_scanned\":30,\"elapsed_us\":386100,\"execution_us\":233572,\"host_round_trips\":41,\"model_visible_calls\":1,\"observation_bytes\":9025,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"snapshot_us\":9654,\"verification_us\":0},\"queue_us\":0,\"retries\":0,\"screenshot_bytes\":0,\"unknown_deliveries\":0},\"page_content_is_untrusted\":true,\"private_session_released\":true,\"receipts\":[{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":true,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":200,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":null,\"kind\":\"navigate\",\"limited\":null,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"\",\"status\":\"verified\",\"targeted_visual_evidence\":null,\"title\":null,\"url\":\"https://example.com/\",\"verified\":true},{\"account_marker_matches\":null,\"affected_controls\":[],\"application_accepted\":null,\"artifact_handle\":null,\"chrome_selected_file\":null,\"dispatch_acknowledged\":null,\"dispatch_may_have_occurred\":null,\"elapsed_ms\":14,\"file_input_consumed_by_page\":null,\"filename\":null,\"internal_model_calls\":null,\"item_count\":1,\"kind\":\"extract\",\"limited\":false,\"network_events\":null,\"network_observation_window_ms\":null,\"persisted\":null,\"reason_code\":null,\"root_document_matches\":null,\"route\":null,\"selection_readback_verified\":null,\"sha256\":null,\"size\":null,\"skill_id\":null,\"skill_version\":null,\"snippet\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\",\"status\":null,\"targeted_visual_evidence\":null,\"title\":\"Example Domain\",\"url\":\"https://example.com/\",\"verified\":true}],\"status\":\"c"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 12939,
+        "output_sha256": "24cd40b320002dbb62e4f823a59640a9fa1317ffd21926bea8f2af5a6495d62f",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "61c6f4103f5865c8099d01bfbd90458d94c07ea99df868a8872facf369e61773",
+        "prompt_to_browser_outcome_ms": 10083.138708,
+        "prompt_to_verified_ms": 14099.318916,
+        "prompt_to_independent_verification_ms": 14099.318916,
+        "prompt_to_final_ms": 13225.690125,
+        "first_browser_tool_started_ms": 4702.1745,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "model_tokens": 92689,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_evaluate:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 6725.13975,
+            "server": "playwright-mcp",
+            "tool": "browser_navigate",
+            "status": "completed",
+            "arguments": {
+              "url": "https://example.com/"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Ran Playwright code\\n```js\\nawait page.goto('https://example.com/');\\n```\\n### Page\\n- Page URL: https://example.com/\\n- Page Title: Example Domain\\n### Snapshot\\n- [Snapshot](.playwright-mcp/page-2026-10-14T06-42-45-829Z.yml)\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 10083.138708,
+            "server": "playwright-mcp",
+            "tool": "browser_evaluate",
+            "status": "completed",
+            "arguments": {
+              "function": "() => ({title: document.title, paragraph: [...document.body.querySelectorAll('p')].find(p => /[A-Za-z]/.test(p.innerText))?.innerText ?? ''})"
+            },
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\n{\\n  \\\"title\\\": \\\"Example Domain\\\",\\n  \\\"paragraph\\\": \\\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\\\"\\n}\\n### Ran Playwright code\\n```js\\nawait page.evaluate('() => ({title: document.title, paragraph: [...document.body.querySelectorAll(\\\\'p\\\\')].find(p => /[A-Za-z]/.test(p.innerText))?.innerText ?? \\\\'\\\\'})');\\n```\"}],\"structured_content\":null}"
+          },
+          {
+            "elapsed_ms": 12332.851,
+            "server": "playwright-mcp",
+            "tool": "browser_close",
+            "status": "completed",
+            "arguments": {},
+            "result_summary": null,
+            "result_preview": "{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\nNo open tabs. Navigate to a URL to create one.\\n### Ran Playwright code\\n```js\\nawait page.close()\\n```\"}],\"structured_content\":null}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 3000,
+        "output_sha256": "bf97f825c6e8fdfb20d6b1e4e5b638ee4b4a49806b898531db0fff370aaeacc9",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

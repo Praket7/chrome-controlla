@@ -23,6 +23,8 @@ pub struct Observation {
     pub target_id: String,
     pub navigation_epoch: u64,
     pub observed_at_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub items: Vec<Value>,
     pub omissions: Vec<String>,
     pub truncated: bool,
@@ -325,7 +327,7 @@ fn extraction_page_script(config: &str) -> String {
 
 fn observation_page_script(config: &str) -> String {
     format!(
-        r#"(()=>{{const q={config},check=(s,field)=>{{try{{document.querySelector(s);return null}}catch(_){{return {{selector_error:{{field,reason:'invalid_selector'}}}}}}}},checks=[['selector',q.selector],...Object.entries(q.fields)];for(const [f,s] of checks){{const error=check(s,f);if(error)return error}}const walker=document.createTreeWalker(document,NodeFilter.SHOW_ELEMENT),items=[],missing=new Set(),encoder=new TextEncoder();let bytes=0,clipped=0,limited=false,scanned=0,count=0;while(scanned<q.maxScanNodes&&count<=q.limit){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.selector))continue;count++;if(count>q.limit){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missing.add(k);continue}}const t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.chars)clipped++;o[k]=t.slice(0,q.chars)}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.bytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;if(count===0&&!limited)return {{selector_error:{{field:'selector',reason:'no_match'}}}};const result={{items,count,missing:[...missing],clipped,limited}};while(encoder.encode(JSON.stringify(result)).length>q.bytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.bytes)return {{budgetError:true}};return result}})()"#,
+        r#"(()=>{{const q={config},check=(s,field)=>{{try{{document.querySelector(s);return null}}catch(_){{return {{selector_error:{{field,reason:'invalid_selector'}}}}}}}},checks=[['selector',q.selector],...Object.entries(q.fields)];for(const [f,s] of checks){{const error=check(s,f);if(error)return error}}const walker=document.createTreeWalker(document,NodeFilter.SHOW_ELEMENT),items=[],missing=new Set(),encoder=new TextEncoder();let bytes=0,clipped=0,limited=false,scanned=0,count=0;while(scanned<q.maxScanNodes&&count<=q.limit){{const e=walker.nextNode();if(!e)break;scanned++;if(!e.matches(q.selector))continue;count++;if(count>q.limit){{limited=true;break}}const o={{}};for(const [k,s] of Object.entries(q.fields)){{const n=e.matches(s)?e:e.querySelector(s);if(!n){{o[k]=null;missing.add(k);continue}}const t=(n.innerText||n.value||n.getAttribute('aria-label')||'').trim();if(t.length>q.chars)clipped++;o[k]=t.slice(0,q.chars)}}const size=encoder.encode(JSON.stringify(o)).length+1;if(bytes+size>q.bytes-512){{limited=true;break}}items.push(o);bytes+=size}}if(scanned>=q.maxScanNodes)limited=true;if(count===0&&!limited)return {{selector_error:{{field:'selector',reason:'no_match'}}}};const result={{title:document.title,items,count,missing:[...missing],clipped,limited}};while(encoder.encode(JSON.stringify(result)).length>q.bytes&&result.items.length){{result.items.pop();result.limited=true}}if(encoder.encode(JSON.stringify(result)).length>q.bytes)return {{budgetError:true}};return result}})()"#,
         config = config
     )
 }
@@ -442,6 +444,7 @@ pub fn parse_observation(
             target_id: target_id.to_owned(),
             navigation_epoch,
             observed_at_ms: now_ms(),
+            title: value["title"].as_str().map(str::to_owned),
             items,
             omissions,
             truncated: total > spec.max_items || clipped_fields > 0 || page_limited,
@@ -1278,6 +1281,7 @@ mod tests {
             target_id: "target".into(),
             navigation_epoch: 1,
             observed_at_ms: 2,
+            title: None,
             items: vec![json!({"value":"x".repeat(10_000)})],
             omissions: vec![],
             truncated: false,

@@ -509,7 +509,8 @@ async fn save_tabs_snapshot(message: &Value, host_id: &str) -> Result<(), String
         .as_secs();
     let bytes = serde_json::to_vec(&json!({
         "tabs":tabs,"last_seen_unix":now,"host_id":host_id,
-        "truncated":message["truncated"].as_bool().unwrap_or(false)
+        "truncated":message["truncated"].as_bool().unwrap_or(false),
+        "last_focused_window_id":message["last_focused_window_id"].as_u64()
     }))
     .map_err(|_| "cannot encode tabs snapshot".to_owned())?;
     if bytes.len() > 256_000 {

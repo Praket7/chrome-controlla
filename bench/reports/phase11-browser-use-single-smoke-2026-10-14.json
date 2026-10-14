@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "selected_adapters": [
+      "browser-use"
+    ],
+    "adapter_versions": {
+      "playwright_mcp": "0.0.83",
+      "chrome_devtools_mcp": "1.10.1",
+      "agent_browser": "0.39.1",
+      "browser_use_source_commit": "c75e8476e26d18b7617643bc2ae082fae8eae431"
+    },
+    "controlla_binary_sha256": "1547fceae831fabc889db151bfe28b9f4533fd8589842ed3d54fe79d8f48b7f6",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64",
+    "timing_origin": "immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "browser-use"
+      ],
+      "browser-use": {
+        "adapter": "browser-use",
+        "prompt_hash": "78c30e3754ed88a01103d080722c12cdb156dfef40e944db3cb60f6b0d7bd38b",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": null,
+        "process_spawn_to_independent_verification_ms": 7600.40975,
+        "process_spawn_to_final_ms": 6731.031792,
+        "first_browser_tool_started_ms": null,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 51874,
+        "output_tokens": 210,
+        "external_tool_calls": 0,
+        "successful_browser_tool_calls": 0,
+        "tool_names": [],
+        "tool_diagnostics": [],
+        "failed_tool_errors": [],
+        "output_bytes": 549,
+        "output_sha256": "8408d557a1126b8575a52464c58304abd765d5ac2d9ec1833e0cfd11e1ecdb9a",
+        "final_answer_excerpt": "{\"error\":\"browser failed\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": null,
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "browser_outcome_matches_reference": false,
+        "final_answer_matches_reference": false,
+        "independently_verified_success": false,
+        "evidence": {
+          "expected_server": "browser-use",
+          "expected_navigation_observed": false,
+          "read_tool_observed": false,
+          "cleanup_verified": false,
+          "browser_outcome_matches_reference": false,
+          "final_answer_matches_reference": false,
+          "cleanup_verification_method": "not_verified",
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

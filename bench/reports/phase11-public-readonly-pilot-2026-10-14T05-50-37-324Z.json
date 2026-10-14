@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.40",
+    "model": "gpt-6-luna",
+    "playwright_mcp_version": "0.0.83",
+    "controlla_binary_sha256": "3ef2daba4c20c362e2f8476d9d2ba64d2bb13d2aeea9882d8f5cfdb86f43ba93",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla",
+        "playwright-mcp"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "86f1112218680e63cbbb746404f120d5f911cf40cd7e1b2060b9af6d584d0872",
+        "prompt_to_verified_ms": 13853.381667,
+        "prompt_to_final_ms": 12945.015833,
+        "first_browser_tool_ms": null,
+        "model_turns": 1,
+        "model_tokens": 155002,
+        "external_tool_calls": 1,
+        "successful_browser_tool_calls": 0,
+        "tool_names": [
+          "chrome-controlla.browser:failed"
+        ],
+        "output_bytes": 1692,
+        "output_sha256": "109651a0a04d8b81f0f284f1825026d5afc5d55b0349baad2e7f7ae308386b28",
+        "exit_code": 0,
+        "error": null,
+        "answer": null,
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": false,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": false,
+          "read_tool_observed": false,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      },
+      "playwright-mcp": {
+        "adapter": "playwright-mcp",
+        "prompt_hash": "544e47db653a37482e9e3e9d22ee43d4daf6fb57ecc4119a092a966966f130cc",
+        "prompt_to_verified_ms": 16160.04775,
+        "prompt_to_final_ms": 15065.886167,
+        "first_browser_tool_ms": 9925.213083,
+        "model_turns": 1,
+        "model_tokens": 93098,
+        "external_tool_calls": 3,
+        "successful_browser_tool_calls": 3,
+        "tool_names": [
+          "playwright-mcp.browser_navigate:completed",
+          "playwright-mcp.browser_snapshot:completed",
+          "playwright-mcp.browser_close:completed"
+        ],
+        "output_bytes": 4125,
+        "output_sha256": "0d20238abcae0acb11c0a4340b55141549d2539fc4c420bfcc5c69b4d51e6042",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "playwright-mcp",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

@@ -14,7 +14,7 @@
     "smoke:clients": "node scripts/run-live-client-smokes.mjs",
     "smoke:client-mcp-contracts": "node scripts/run-client-mcp-contracts.mjs",
     "check:apps": "node apps/check-phase8-briefs.mjs && node apps/check-phase13-qualification.mjs",
-    "check:bench": "node --test bench/phase10-pilot.test.mjs bench/analysis/phase10-analysis.test.mjs bench/analysis/offline-task-harness.test.mjs bench/analysis/phase11-analysis.test.mjs bench/analysis/phase12-analysis.test.mjs bench/runners/phase11-runner.test.mjs bench/runners/phase11-suite.test.mjs bench/runners/stage2.5-agent-ux-score.test.mjs && node scripts/check-phase10-heldout.mjs && node scripts/check-phase11-realistic.mjs && node scripts/check-phase11-real-sites.mjs && node scripts/check-phase15-faults.mjs && python3 bench/phase6_compare.py",
+    "check:bench": "node --test bench/phase10-pilot.test.mjs bench/analysis/phase10-analysis.test.mjs bench/analysis/offline-task-harness.test.mjs bench/analysis/phase11-analysis.test.mjs bench/analysis/phase12-analysis.test.mjs bench/runners/phase11-runner.test.mjs bench/runners/phase11-suite.test.mjs bench/runners/phase11-public-readonly-pilot.test.mjs bench/runners/stage2.5-agent-ux-score.test.mjs && node scripts/check-phase10-heldout.mjs && node scripts/check-phase11-realistic.mjs && node scripts/check-phase11-real-sites.mjs && node scripts/check-phase15-faults.mjs && python3 bench/phase6_compare.py",
     "check:agent-ux": "node --test packages/chrome-controlla/test-agent-ux.cjs bench/runners/stage2.5-agent-ux-score.test.mjs",
     "bench:phase11:suite": "node bench/runners/phase11-suite.mjs",
     "bench:phase11:live-sites": "node scripts/run-real-browser-benchmarks.mjs --task-set=bench/tasks/phase11-real-sites.json",
