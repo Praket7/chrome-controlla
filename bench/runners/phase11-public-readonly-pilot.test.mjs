@@ -118,9 +118,9 @@ test('Stagehand cleanup requires a browser close request and no new server or Ch
   assert.equal(stagehandProcessCleanup([], [serverPath], serverPath), false);
   assert.equal(stagehandProcessCleanup([], [], serverPath), true);
   assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-old'],
-    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-new'], '/tmp/stagehand/server.mjs'), false);
+    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-new'], serverPath), false);
   assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'],
-    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'], '/tmp/stagehand/server.mjs'), true);
+    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'], serverPath), true);
   assert.equal(noNewStagehandProfiles([], ['stagehand-chrome-new']), false);
   assert.equal(noNewStagehandProfiles(['stagehand-chrome-existing'], ['stagehand-chrome-existing']), true);
   assert.deepEqual(newStagehandProfiles(['stagehand-chrome-existing'], ['stagehand-chrome-existing', 'stagehand-chrome-new']), ['stagehand-chrome-new']);
