@@ -71,10 +71,10 @@ async fn live_espn_open_newest(mode: &str) {
             }),
         ))
         .await
-        .expect("foreground open must use a live paired Controlla bridge");
+        .unwrap_or_else(|error| panic!("{mode} open must use a live paired Controlla bridge: {error}"));
     let opened = payload(opened);
     println!(
-        "foreground ESPN receipt: {}",
+        "{mode} ESPN receipt: {}",
         serde_json::to_string_pretty(&opened).unwrap()
     );
 

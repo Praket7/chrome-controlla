@@ -20,9 +20,12 @@ let reconnectAttempts = 0;
 const reconnectStateReady = chrome.storage.session.get(RECONNECT_STORAGE_KEY).then(state => {
   reconnectAttempts = Number.isSafeInteger(state[RECONNECT_STORAGE_KEY])
     ? Math.max(0, Math.min(state[RECONNECT_STORAGE_KEY], MAX_RECONNECT_ATTEMPTS)) : 0;
-  reconnectExhausted = reconnectAttempts >= MAX_RECONNECT_ATTEMPTS;
-  if (reconnectExhausted) nativeError = "Native host reconnect limit reached; reload the extension to retry.";
-}).catch(() => { reconnectExhausted = true; nativeError = "Native host reconnect state unavailable; reload the extension to retry."; });
+  reconnectExhausted = false;
+}).catch(() => {
+  reconnectAttempts = 0;
+  reconnectExhausted = false;
+  nativeError = "Native host reconnect state unavailable; retrying with bounded backoff.";
+});
 let manualAttachedTabs = new Set();
 let nativeAttachedTabs = new Set();
 const nativeLeases = new Map();
@@ -286,15 +289,14 @@ async function fastTypeProgram(tabId, params, isAuthorized) {
 }
 async function scheduleNativeReconnect() {
   if (reconnectTimer || nativePort) return;
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { reconnectExhausted = true; nativeError = "Native host reconnect limit reached; reload the extension to retry."; return; }
   const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
-  reconnectAttempts++;
+  reconnectAttempts = Math.min(reconnectAttempts + 1, MAX_RECONNECT_ATTEMPTS);
   try { await chrome.storage.session.set({ [RECONNECT_STORAGE_KEY]: reconnectAttempts }); }
-  catch { reconnectExhausted = true; nativeError = "Native host reconnect budget could not be saved; reload the extension to retry."; return; }
+  catch { nativeError = "Native host reconnect state could not be saved; retrying with bounded backoff."; }
   chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: Math.max(delay, 30000) / 60000 });
   reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connectNative(); }, delay);
 }
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM) return; void reconnectStateReady.then(() => { if (reconnectExhausted) return; if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = undefined; connectNative(); }); });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM) return; void reconnectStateReady.then(() => { if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = undefined; connectNative(); }); });
 function connectNative() {
   if (nativePort || reconnectExhausted) return;
   try {

@@ -378,23 +378,21 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(reconnectTimers.at(-1).delay, 2000,
       "service-worker restart preserves the bounded reconnect backoff attempt");
-    for (let attempt = 2; attempt <= 8; attempt++) {
+    for (let attempt = 2; attempt <= 12; attempt++) {
       reconnectTimers.at(-1).callback();
       candidate = nativePorts.at(-1);
       candidate.disconnect("native host unavailable");
       await new Promise(resolve => setTimeout(resolve, 0));
       const status = await message({ type: "native-status" });
-      if (attempt < 8) {
-        assert.equal(status.retry_exhausted, false, "native reconnect remains available within its bounded retry budget");
-      }
+      assert.equal(status.retry_exhausted, false, "native reconnect must keep retrying after the delay cap");
     }
-    const exhausted = await message({ type: "native-status" });
-    assert.equal(exhausted.retry_exhausted, true,
-      "native reconnect reports a terminal state after exhausting its bounded retry budget");
-    assert.match(exhausted.error, /reload the extension to retry/);
-    const portsAtExhaustion = nativePorts.length;
+    const retrying = await message({ type: "native-status" });
+    assert.equal(retrying.retry_exhausted, false, "a temporary host outage must not require an extension reload");
+    assert.equal(reconnectTimers.at(-1).delay, 60000, "reconnect delay remains capped after repeated failures");
+    const portsBeforeAlarm = nativePorts.length;
     chrome.alarms.onAlarm.fire({ name: "controlla-native-reconnect" });
-    assert.equal(nativePorts.length, portsAtExhaustion, "a stale service-worker alarm cannot restart exhausted reconnects");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(nativePorts.length, portsBeforeAlarm + 1, "alarm retries after worker suspension even after many failures");
     return;
   }
   native.hostMessage({ type: "list_tabs", request_id: "list-1" });
