@@ -104,6 +104,7 @@ test('Stagehand pilot uses one local MCP run call and asks its browser facade to
 });
 
 test('Stagehand cleanup requires a browser close request and no new server or Chrome processes', () => {
+  const serverPath = resolve('tmp', 'stagehand', 'server.mjs');
   const result = { title: 'Example Domain', paragraph: 'Current public fact.', url: 'https://example.com/', cleanup_requested: true };
   const event = { elapsed_ms: 20, event: { type: 'item.completed', item: { type: 'mcp_tool_call', server: 'stagehand', tool: 'run',
     status: 'completed', result: { content: [{ type: 'text', text: JSON.stringify(result) }] } } } };
@@ -112,10 +113,10 @@ test('Stagehand cleanup requires a browser close request and no new server or Ch
   const noCloseRequested = { ...event, event: { ...event.event, item: { ...event.event.item,
     result: { content: [{ type: 'text', text: JSON.stringify({ ...result, cleanup_requested: false }) }] } } } };
   assert.equal(verifiedCleanup([noCloseRequested], 'stagehand', 'stagehand', undefined, { process_cleanup: true }), false);
-  assert.equal(stagehandProcessCleanup(['/tmp/stagehand/server.mjs'], ['/tmp/stagehand/server.mjs'], '/tmp/stagehand/server.mjs'), false);
-  assert.equal(stagehandProcessCleanup(['/tmp/stagehand/server.mjs'], ['/tmp/stagehand/server.mjs', '/tmp/stagehand-chrome-x'], '/tmp/stagehand/server.mjs'), false);
-  assert.equal(stagehandProcessCleanup([], ['/tmp/stagehand/server.mjs'], '/tmp/stagehand/server.mjs'), false);
-  assert.equal(stagehandProcessCleanup([], [], '/tmp/stagehand/server.mjs'), true);
+  assert.equal(stagehandProcessCleanup([serverPath], [serverPath], serverPath), false);
+  assert.equal(stagehandProcessCleanup([serverPath], [serverPath, '/tmp/stagehand-chrome-x'], serverPath), false);
+  assert.equal(stagehandProcessCleanup([], [serverPath], serverPath), false);
+  assert.equal(stagehandProcessCleanup([], [], serverPath), true);
   assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-old'],
     ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-new'], '/tmp/stagehand/server.mjs'), false);
   assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'],
