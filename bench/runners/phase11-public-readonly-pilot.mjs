@@ -18,7 +18,10 @@ const browserUseVersion = '0.13.11';
 const browserUseCommit = 'c75e8476e26d18b7617643bc2ae082fae8eae431';
 const browserUseServerSha256 = '696aee232f331ca215bb6e5ed21d5400dda1e4e530a6af6ade923e928acb2bd3';
 const defaultBrowserUseExecutable = '/Users/pcg/.local/share/chrome-controlla-bench/browser-use-venv/bin/browser-use';
-const adapters = ['controlla', 'playwright-mcp', 'chrome-devtools-mcp', 'agent-browser', 'browser-use'];
+const stagehandCommit = 'cd7b230778cf92269e4cb90e80d97f5113781c51';
+const stagehandFacadeSha256 = '12333b5a0362833ab5175c28dc021d5e9b6061d4c3bab6ca5855c3144b4e4692';
+const defaultStagehandServer = '/Users/pcg/.local/share/chrome-controlla/comparison-mcps/stagehand-4.1.0/packages/integrations/core/dist/facade/stdio-server.mjs';
+const adapters = ['controlla', 'playwright-mcp', 'chrome-devtools-mcp', 'agent-browser', 'browser-use', 'stagehand'];
 const maxOutputBytes = 4_000_000;
 
 function option(name, fallback) {
@@ -57,7 +60,48 @@ export function inspectBrowserUseExecutable(executable) {
   return verifyBrowserUseIdentity(JSON.parse(output.trim()));
 }
 
-export function setup(adapter, browserPath, binaryPath, stateDir, browserUseExecutable = defaultBrowserUseExecutable) {
+export function inspectStagehandServer(serverPath) {
+  const absolutePath = resolve(serverPath);
+  const repo = execFileSync('git', ['-C', dirname(absolutePath), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  const commit = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const tag = execFileSync('git', ['-C', repo, 'describe', '--tags', '--exact-match'], { encoding: 'utf8' }).trim();
+  const dirty = execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }).trim();
+  const facade_sha256 = createHash('sha256').update(readFileSync(absolutePath)).digest('hex');
+  if (commit !== stagehandCommit) throw new Error(`Stagehand source commit mismatch: expected ${stagehandCommit}, got ${commit}`);
+  if (tag !== '@browserbasehq/stagehand@4.1.0') throw new Error(`Stagehand source tag mismatch: got ${tag}`);
+  if (dirty) throw new Error('Stagehand source checkout has uncommitted changes');
+  if (facade_sha256 !== stagehandFacadeSha256) throw new Error(`Stagehand facade hash mismatch: expected ${stagehandFacadeSha256}, got ${facade_sha256}`);
+  return { commit, tag, facade_sha256, server_path: absolutePath, identity_scope: 'exact git commit/tag plus built stdio facade hash' };
+}
+
+function processInventory() {
+  return execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+}
+
+export function stagehandProcessCleanup(before, after, serverPath) {
+  const normalizedServerPath = resolve(serverPath);
+  if (after.some(line => line.includes(normalizedServerPath))) return false;
+  const chromeProcesses = lines => lines.filter(line => /stagehand-chrome-|--user-data-dir=[^\s]*stagehand/i.test(line))
+    .map(line => line.replace(/^\s*\d+\s+/, '').trim());
+  const prior = new Map();
+  for (const signature of chromeProcesses(before)) prior.set(signature, (prior.get(signature) ?? 0) + 1);
+  for (const signature of chromeProcesses(after)) {
+    const count = prior.get(signature) ?? 0;
+    if (count === 0) return false;
+    prior.set(signature, count - 1);
+  }
+  return true;
+}
+
+export function stagehandSingleCall(events, server) {
+  const calls = events.filter(({ event }) => event.type === 'item.completed' && event.item?.type === 'mcp_tool_call'
+    && event.item.server === server);
+  return calls.length === 1 && calls[0].event.item.tool === 'run' && calls[0].event.item.status === 'completed'
+    && !calls[0].event.item.error;
+}
+
+export function setup(adapter, browserPath, binaryPath, stateDir, browserUseExecutable = defaultBrowserUseExecutable,
+  stagehandServerPath = defaultStagehandServer) {
   if (adapter === 'controlla') {
     return {
       server: 'chrome-controlla',
@@ -105,6 +149,15 @@ export function setup(adapter, browserPath, binaryPath, stateDir, browserUseExec
       keep_alive: true } }, llm: {}, agent: {} },
     prompt: `Use only the browser-use MCP direct browser tools. Make exactly three calls: browser_navigate with url ${targetUrl} and new_tab=false; browser_get_html with no selector to read the live document; then browser_close_all once to release the one isolated session. Read the document title and the first paragraph in the page body from the HTML result exactly. Do not use retry_with_browser_use_agent, browser_extract_content, shell commands, web search, prior knowledge, or any other browser tool. Return exactly one JSON object with string fields "title" and "paragraph", with no introduction or Markdown. Return {"error":"browser failed"} if the navigation or read fails or either value is missing.`,
   };
+  if (adapter === 'stagehand') return {
+    server: 'stagehand',
+    config: [
+      '-c', `mcp_servers.stagehand.command=${toml(process.execPath)}`,
+      '-c', `mcp_servers.stagehand.args=${toml([resolve(stagehandServerPath)])}`,
+      '-c', 'mcp_servers.stagehand.env={STAGEHAND_BROWSER = "local"}',
+    ],
+    prompt: `Use only the Stagehand MCP run tool. Make exactly one call with code that runs: await page.goto("${targetUrl}"); const url = page.url(); const title = await page.title(); const paragraph = (await page.locator("p:first-of-type").innerText()).trim(); await browser.close(); return JSON.stringify({title, paragraph, url, cleanup_requested: true}); Copy the values from the successful tool result exactly. Return exactly one JSON object with string fields "title" and "paragraph", with no introduction or Markdown. Do not use shell commands, web search, prior knowledge, another browser tool, or a second Stagehand call. Return {"error":"browser failed"} if any read or close request fails or a value is missing.`,
+  };
   throw new Error(`unknown Phase 11 pilot adapter: ${adapter}`);
 }
 
@@ -126,7 +179,8 @@ export function toolOutcomeMatchesReference(events, adapter, server, reference) 
     : adapter === 'playwright-mcp' ? 'browser_evaluate'
       : adapter === 'chrome-devtools-mcp' ? 'take_snapshot'
         : adapter === 'browser-use' ? 'browser_get_html' : 'agent_browser_open';
-  const relevantTools = adapter === 'agent-browser' ? new Set(['agent_browser_open', 'agent_browser_get_text'])
+  const relevantTools = adapter === 'stagehand' ? new Set(['run'])
+    : adapter === 'agent-browser' ? new Set(['agent_browser_open', 'agent_browser_get_text'])
     : new Set([expectedTool]);
   const successfulResults = events.filter(({ event }) => event.type === 'item.completed'
     && event.item?.type === 'mcp_tool_call' && event.item.server === server
@@ -149,11 +203,11 @@ function decodeToolResult(result) {
   try { return { value: JSON.parse(text), text }; } catch { return { value: null, text }; }
 }
 
-export function verifiedCleanup(events, adapter, server, targetUrl = 'https://example.com/') {
+export function verifiedCleanup(events, adapter, server, targetUrl = 'https://example.com/', runtimeEvidence = {}) {
   const closeTool = adapter === 'controlla' ? 'browser'
     : adapter === 'playwright-mcp' ? 'browser_close'
       : adapter === 'chrome-devtools-mcp' ? 'close_page'
-        : adapter === 'browser-use' ? 'browser_close_all' : 'agent_browser_close';
+        : adapter === 'browser-use' ? 'browser_close_all' : adapter === 'stagehand' ? 'run' : 'agent_browser_close';
   let closeIndex = -1;
   for (let index = events.length - 1; index >= 0; index--) {
     const item = events[index].event?.item;
@@ -168,6 +222,7 @@ export function verifiedCleanup(events, adapter, server, targetUrl = 'https://ex
   if (!closeEvent) return false;
   const { value, text } = decodeToolResult(closeEvent.result);
   if (adapter === 'controlla') return value?.private_session_released === true;
+  if (adapter === 'stagehand') return value?.cleanup_requested === true && runtimeEvidence.process_cleanup === true;
   if (adapter === 'agent-browser') return value?.response?.data?.closed === true || value?.data?.closed === true;
   if (adapter === 'playwright-mcp') return /No open tabs\b/i.test(text);
   if (adapter === 'browser-use') {
@@ -201,9 +256,10 @@ export function browserOutcomeElapsed(events, adapter, server, reference) {
     const relevant = adapter === 'controlla'
       ? tool === 'browser' && event.item.arguments?.action === 'task'
       : adapter === 'playwright-mcp' ? ['browser_snapshot', 'browser_evaluate'].includes(tool)
-        : adapter === 'chrome-devtools-mcp' ? ['take_snapshot', 'evaluate_script'].includes(tool)
+      : adapter === 'chrome-devtools-mcp' ? ['take_snapshot', 'evaluate_script'].includes(tool)
           : adapter === 'browser-use' ? tool === 'browser_get_html'
-            : ['agent_browser_open', 'agent_browser_get_text', 'agent_browser_get_title'].includes(tool);
+            : adapter === 'stagehand' ? tool === 'run'
+              : ['agent_browser_open', 'agent_browser_get_text', 'agent_browser_get_title'].includes(tool);
     if (!relevant) continue;
     if (!reference) return elapsed_ms ?? null;
     evidence += JSON.stringify(event.item.result ?? null);
@@ -247,11 +303,11 @@ export function summarizeToolEvents(events) {
     });
 }
 
-async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, browserUseExecutable, timeoutMs, parentDir }) {
+async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, browserUseExecutable, stagehandServerPath, timeoutMs, parentDir }) {
   const runDir = await mkdtemp(join(parentDir, `${adapter}-`));
   const stateDir = join(runDir, 'state');
   await mkdir(stateDir);
-  const { server, config, prompt, profileConfig } = setup(adapter, browserPath, binaryPath, stateDir, browserUseExecutable);
+  const { server, config, prompt, profileConfig } = setup(adapter, browserPath, binaryPath, stateDir, browserUseExecutable, stagehandServerPath);
   if (profileConfig) await writeFile(join(stateDir, 'config.json'), `${JSON.stringify(profileConfig)}\n`);
   const promptHash = createHash('sha256').update(prompt).digest('hex');
   const args = ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-m', model, '-C', runDir, ...config, prompt];
@@ -263,6 +319,7 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
   let buffer = '';
   let exitCode = null;
   let error = null;
+  const stagehandProcessesBefore = adapter === 'stagehand' ? processInventory() : null;
   const consume = line => {
     if (!line.trim()) return;
     try {
@@ -301,6 +358,9 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
     let verificationError = null;
     try { reference = await readReference(); } catch (cause) { verificationError = cause.message; }
     const verifiedAtMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    const stagehandResult = adapter === 'stagehand'
+      ? expectedTools.filter(({ event }) => event.item.tool === 'run').map(({ event }) => decodeToolResult(event.item.result).value).find(value => value && typeof value === 'object') ?? null
+      : null;
     const acted = adapter === 'controlla'
       ? expectedTools.some(({ event }) => event.item.tool === 'browser' && event.item.arguments?.action === 'task'
         && event.item.arguments?.mode === 'headless' && !event.item.arguments?.session_id)
@@ -311,6 +371,8 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
           : adapter === 'browser-use'
             ? expectedTools.some(({ event }) => event.item.tool === 'browser_navigate' && event.item.arguments?.url === targetUrl
               && decodeToolResult(event.item.result).text.includes(`Navigated to: ${targetUrl}`))
+            : adapter === 'stagehand'
+              ? stagehandResult?.url === targetUrl
             : expectedTools.some(({ event }) => event.item.tool === 'agent_browser_open' && event.item.arguments?.url === targetUrl
             && event.item.arguments?.headed === false && event.item.arguments?.restore === false);
     const observed = expectedTools.some(({ event }) => adapter === 'controlla'
@@ -318,8 +380,12 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
       : adapter === 'playwright-mcp' ? ['browser_snapshot', 'browser_evaluate'].includes(event.item.tool)
         : adapter === 'chrome-devtools-mcp' ? ['take_snapshot', 'evaluate_script'].includes(event.item.tool)
           : adapter === 'browser-use' ? event.item.tool === 'browser_get_html'
+            : adapter === 'stagehand' ? event.item.tool === 'run' && typeof stagehandResult?.title === 'string' && typeof stagehandResult?.paragraph === 'string'
             : ['agent_browser_get_text', 'agent_browser_get_title'].includes(event.item.tool));
-    const cleanupVerified = verifiedCleanup(events, adapter, server, targetUrl);
+    const processCleanup = adapter === 'stagehand'
+      ? stagehandProcessCleanup(stagehandProcessesBefore, processInventory(), stagehandServerPath)
+      : undefined;
+    const cleanupVerified = verifiedCleanup(events, adapter, server, targetUrl, { process_cleanup: processCleanup });
     const browserOutcomeVerified = toolOutcomeMatchesReference(events, adapter, server, reference);
     const finalAnswerMatchesReference = answer?.title === reference?.title && answer?.paragraph === reference?.paragraph;
     return {
@@ -350,11 +416,13 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
       final_answer_matches_reference: finalAnswerMatchesReference,
       independently_verified_success: verifiedRead({ exitCode, error, verificationError,
         otherActionCount: otherActions.length, acted, observed, cleanupVerified, answer, reference })
-        && browserOutcomeVerified,
+        && browserOutcomeVerified && (adapter !== 'stagehand' || stagehandSingleCall(events, server)),
       evidence: { expected_server: server, expected_navigation_observed: acted, read_tool_observed: observed,
         cleanup_verified: cleanupVerified, browser_outcome_matches_reference: browserOutcomeVerified,
         final_answer_matches_reference: finalAnswerMatchesReference,
-        cleanup_verification_method: cleanupVerified ? 'adapter_specific_close_result' : 'not_verified',
+        cleanup_verification_method: cleanupVerified ? adapter === 'stagehand' ? 'browser_close_request_plus_os_process_inventory' : 'adapter_specific_close_result' : 'not_verified',
+        ...(adapter === 'stagehand' ? { stagehand_process_cleanup_verified: processCleanup } : {}),
+        ...(adapter === 'stagehand' ? { stagehand_single_call_contract_met: stagehandSingleCall(events, server) } : {}),
         unrelated_actions: otherActions.map(({ event }) => event.item?.type), reference: reference && { title: reference.title, paragraph: reference.paragraph } },
     };
   } finally {
@@ -373,6 +441,8 @@ async function main() {
   const browserPath = option('chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
   const browserUsePath = option('browser-use-executable', process.env.CONTROLLA_BROWSER_USE_EXECUTABLE ?? defaultBrowserUseExecutable);
   const browserUseIdentity = selectedAdapters.includes('browser-use') ? inspectBrowserUseExecutable(browserUsePath) : null;
+  const stagehandServerPath = option('stagehand-server', process.env.CONTROLLA_STAGEHAND_SERVER ?? defaultStagehandServer);
+  const stagehandIdentity = selectedAdapters.includes('stagehand') ? inspectStagehandServer(stagehandServerPath) : null;
   const model = option('model', 'gpt-6-luna');
   const timeoutMs = Number(option('deadline-ms', '120000'));
   const output = resolve(option('output', join(root, 'bench/reports', `phase11-public-readonly-pilot-${new Date().toISOString().replaceAll(/[:.]/g, '-')}.json`)));
@@ -391,7 +461,10 @@ async function main() {
         ...(browserUseIdentity ? { browser_use: browserUseIdentity.version, browser_use_pinned_source_commit: browserUseCommit,
           browser_use_mcp_server_file_sha256: browserUseIdentity.server_sha256,
           browser_use_identity_scope: 'package version plus browser_use/mcp/server.py hash; full package Git commit not attested',
-          browser_use_executable: resolve(browserUsePath) } : {}) },
+          browser_use_executable: resolve(browserUsePath) } : {}),
+        ...(stagehandIdentity ? { stagehand_commit: stagehandIdentity.commit, stagehand_tag: stagehandIdentity.tag,
+          stagehand_facade_sha256: stagehandIdentity.facade_sha256, stagehand_server_path: stagehandIdentity.server_path,
+          stagehand_identity_scope: stagehandIdentity.identity_scope } : {}) },
       controlla_binary_sha256: createHash('sha256').update(await readFile(binaryPath)).digest('hex'),
       browser_path: browserPath, run_mode: 'cold_unknown', machine: process.platform + '-' + process.arch,
       timing_origin: 'immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch' },
@@ -400,7 +473,8 @@ async function main() {
     for (let i = 0; i < repetitions; i++) {
       const order = i % 2 === 0 ? selectedAdapters : [...selectedAdapters].reverse();
       const results = {};
-      for (const adapter of order) results[adapter] = await runAdapter(adapter, { codexPath, model, browserPath, binaryPath, browserUseExecutable: browserUsePath, timeoutMs, parentDir });
+      for (const adapter of order) results[adapter] = await runAdapter(adapter, { codexPath, model, browserPath, binaryPath,
+        browserUseExecutable: browserUsePath, stagehandServerPath: stagehandIdentity?.server_path ?? stagehandServerPath, timeoutMs, parentDir });
       report.pairs.push({ replicate: i + 1, execution_order: order, ...results });
     }
     await mkdir(dirname(output), { recursive: true });

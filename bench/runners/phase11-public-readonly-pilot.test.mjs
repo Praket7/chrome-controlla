@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity } from './phase11-public-readonly-pilot.mjs';
+import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall } from './phase11-public-readonly-pilot.mjs';
 
 test('Controlla pilot uses one private task call without a launch round trip', () => {
   const prompt = setup('controlla', '/chrome', '/controlla', '/state').prompt;
@@ -46,10 +46,11 @@ test('agent-browser pilot uses a fresh non-restored headless Chrome session and 
 test('Browser Use pilot uses its installed MCP executable and isolates local headless Chrome state', () => {
   const configured = setup('browser-use', '/chrome', '/controlla', '/tmp/pilot-state', '/custom/browser-use');
   assert.equal(configured.server, 'browser-use');
-  assert.match(configured.config.join(' '), /custom\/browser-use/);
-  assert.doesNotMatch(configured.config.join(' '), /uvx|git\+https/);
-  assert.match(configured.config.join(' '), /BROWSER_USE_HEADLESS/);
-  assert.match(configured.config.join(' '), /BROWSER_USE_CONFIG_DIR/);
+  const portableConfig = configured.config.join(' ').replaceAll(/\\+/g, '/');
+  assert.match(portableConfig, /custom\/browser-use/);
+  assert.doesNotMatch(portableConfig, /uvx|git\+https/);
+  assert.match(portableConfig, /BROWSER_USE_HEADLESS/);
+  assert.match(portableConfig, /BROWSER_USE_CONFIG_DIR/);
   assert.equal(configured.profileConfig.browser_profile.pilot.browser_binary_path, '/chrome');
   assert.equal(configured.profileConfig.browser_profile.pilot.user_data_dir, '/tmp/pilot-state/profile');
   assert.equal(configured.profileConfig.browser_profile.pilot.downloads_path, '/tmp/pilot-state/downloads');
@@ -59,7 +60,8 @@ test('Browser Use pilot uses its installed MCP executable and isolates local hea
   assert.match(configured.prompt, /browser_close_all once/);
   assert.match(configured.prompt, /Do not use retry_with_browser_use_agent/);
   const relative = setup('browser-use', '/chrome', '/controlla', '/state', './.venv/bin/browser-use');
-  assert.ok(relative.config.join(' ').includes(resolve('./.venv/bin/browser-use')));
+  const portableRelativeConfig = relative.config.join(' ').replaceAll(/\\+/g, '/');
+  assert.ok(portableRelativeConfig.includes(resolve('./.venv/bin/browser-use').replaceAll('\\', '/')));
 });
 
 test('Browser Use identity rejects a different installed version or MCP source hash', () => {
@@ -88,6 +90,54 @@ test('Browser Use outcome and cleanup require live HTML and one closed isolated 
   assert.equal(verifiedCleanup([read, close], 'browser-use', 'browser-use'), false);
   assert.equal(verifiedCleanup([event('browser_navigate', 'Error: navigation failed', 10, { url: 'https://example.com/' }), read, close],
     'browser-use', 'browser-use'), false);
+});
+
+test('Stagehand pilot uses one local MCP run call and asks its browser facade to close', () => {
+  const configured = setup('stagehand', '/chrome', '/controlla', '/state', undefined, '/tmp/stagehand/stdio-server.mjs');
+  assert.equal(configured.server, 'stagehand');
+  assert.match(configured.config.join(' '), /STAGEHAND_BROWSER = "local"/);
+  assert.match(configured.config.join(' '), /stdio-server\.mjs/);
+  assert.match(configured.prompt, /exactly one call/);
+  assert.match(configured.prompt, /await browser\.close\(\)/);
+  assert.match(configured.prompt, /cleanup_requested: true/);
+});
+
+test('Stagehand cleanup requires a browser close request and no new server or Chrome processes', () => {
+  const result = { title: 'Example Domain', paragraph: 'Current public fact.', url: 'https://example.com/', cleanup_requested: true };
+  const event = { elapsed_ms: 20, event: { type: 'item.completed', item: { type: 'mcp_tool_call', server: 'stagehand', tool: 'run',
+    status: 'completed', result: { content: [{ type: 'text', text: JSON.stringify(result) }] } } } };
+  assert.equal(verifiedCleanup([event], 'stagehand', 'stagehand', undefined, { process_cleanup: true }), true);
+  assert.equal(verifiedCleanup([event], 'stagehand', 'stagehand', undefined, { process_cleanup: false }), false);
+  const noCloseRequested = { ...event, event: { ...event.event, item: { ...event.event.item,
+    result: { content: [{ type: 'text', text: JSON.stringify({ ...result, cleanup_requested: false }) }] } } } };
+  assert.equal(verifiedCleanup([noCloseRequested], 'stagehand', 'stagehand', undefined, { process_cleanup: true }), false);
+  assert.equal(stagehandProcessCleanup(['/tmp/stagehand/server.mjs'], ['/tmp/stagehand/server.mjs'], '/tmp/stagehand/server.mjs'), false);
+  assert.equal(stagehandProcessCleanup(['/tmp/stagehand/server.mjs'], ['/tmp/stagehand/server.mjs', '/tmp/stagehand-chrome-x'], '/tmp/stagehand/server.mjs'), false);
+  assert.equal(stagehandProcessCleanup([], ['/tmp/stagehand/server.mjs'], '/tmp/stagehand/server.mjs'), false);
+  assert.equal(stagehandProcessCleanup([], [], '/tmp/stagehand/server.mjs'), true);
+  assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-old'],
+    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-new'], '/tmp/stagehand/server.mjs'), false);
+  assert.equal(stagehandProcessCleanup(['10 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'],
+    ['11 /Chrome --user-data-dir=/tmp/stagehand-chrome-existing'], '/tmp/stagehand/server.mjs'), true);
+});
+
+test('Stagehand outcome requires one successful run result with exact live page evidence', () => {
+  const reference = { title: 'Example Domain', paragraph: 'Current public fact.' };
+  const event = (value, status = 'completed') => ({ elapsed_ms: 25, event: { type: 'item.completed', item: {
+    type: 'mcp_tool_call', server: 'stagehand', tool: 'run', status,
+    result: { content: [{ type: 'text', text: JSON.stringify(value) }] },
+  } } });
+  const valid = [event({ ...reference, url: 'https://example.com/', cleanup_requested: true })];
+  assert.equal(toolOutcomeMatchesReference(valid, 'stagehand', 'stagehand', reference), true);
+  assert.equal(browserOutcomeElapsed(valid, 'stagehand', 'stagehand', reference), 25);
+  assert.equal(stagehandSingleCall(valid, 'stagehand'), true);
+  assert.equal(stagehandSingleCall([...valid, { event: { type: 'item.completed', item: {
+    type: 'mcp_tool_call', server: 'stagehand', tool: 'snapshot', status: 'completed',
+  } } }], 'stagehand'), false);
+  assert.equal(toolOutcomeMatchesReference([event({ ...reference, paragraph: 'stale content' })], 'stagehand', 'stagehand', reference), false);
+  assert.equal(toolOutcomeMatchesReference([event(reference, 'failed')], 'stagehand', 'stagehand', reference), false);
+  assert.equal(verifiedCleanup(valid, 'stagehand', 'stagehand', undefined, { process_cleanup: true }), true);
+  assert.equal(verifiedCleanup(valid, 'stagehand', 'stagehand', undefined, { process_cleanup: false }), false);
 });
 
 test('pilot retains bounded per-call receipts so transport completion cannot hide task failure', () => {
