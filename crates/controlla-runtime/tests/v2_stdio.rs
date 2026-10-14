@@ -93,7 +93,9 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     assert!(
         browser["properties"]["ready_when"]["description"]
             .as_str()
-            .is_some_and(|description| description.contains("post-DOMContentLoaded"))
+            .is_some_and(|description| {
+                description.contains("Tagged object") && description.contains("document_committed")
+            })
     );
     assert!(
         browser["properties"].get("file_path").is_some(),

@@ -68,6 +68,16 @@ jobs:
       - run: node --test packages/chrome-controlla/test-client.cjs
       - run: npm run check:agent-ux
       - run: npm run check:clients
+      - name: Verify packaged six-client MCP launch contracts
+        if: runner.os != 'Windows'
+        run: npm run smoke:client-mcp-contracts
+        env:
+          CONTROLLA_BINARY_PATH: ${{ github.workspace }}/packages/chrome-controlla/bin/controlla-v2-core
+      - name: Verify packaged six-client MCP launch contracts on Windows
+        if: runner.os == 'Windows'
+        run: npm run smoke:client-mcp-contracts
+        env:
+          CONTROLLA_BINARY_PATH: ${{ github.workspace }}/packages/chrome-controlla/bin/controlla-v2-core.exe
       - run: npm run check:apps
       - run: npm run check:bench
       - run: npm run check:release
