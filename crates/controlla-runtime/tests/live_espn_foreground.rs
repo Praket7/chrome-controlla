@@ -60,13 +60,12 @@ async fn live_espn_open_newest(mode: &str) {
                 "mode":mode,
                 "url":"https://www.espn.com/nfl/team/_/name/buf/buffalo-bills",
                 "idempotency_key":format!("espn-{mode}-{}", std::process::id()),
-                "ready_when":{"kind":"url_prefix","prefix":"https://www.espn.com/nfl/team/_/name/buf/buffalo-bills"},
+                "ready_when":{"kind":"dom_content_loaded"},
                 "steps":[
                     {"kind":"snapshot","goal":{"query":"Buffalo Bills newest story headlines publication dates","roles":["link"],"href_hint":"/nfl/story/","exhaustive":true},"max_items":20,"max_text_chars":0,"max_scan_nodes":20000},
                     {"kind":"find_all","role":"link","href_hint":"/nfl/story/","max_matches":20,"save_as":"stories"},
                     {"kind":"choose","from":"stories","key":"datetime","save_as":"story"},
-                    {"kind":"navigate_selected","from":"story"},
-                    {"kind":"verify","predicate":{"kind":"url","equals":"$story.href"}}
+                    {"kind":"navigate_selected","from":"story"}
                 ]
             }),
         ))
@@ -85,7 +84,9 @@ async fn live_espn_open_newest(mode: &str) {
         .to_owned();
     let result = workflow.clone();
     let actual_mode = opened["mode"].clone();
-    let verified = workflow["receipts"][4]["status"] == "passed";
+    let verified = workflow["receipts"][3]["status"] == "verified"
+        && workflow["receipts"][3]["destination_match"] == true
+        && workflow["receipts"][3]["postcondition"]["status"] == "passed";
     if let Some(session_id) = opened["session_id"].as_str() {
         let _ = client
             .call_tool(call(
