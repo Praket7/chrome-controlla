@@ -11,6 +11,10 @@ const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const OPEN_RECEIPT_MAX_COUNT = 256;
 const MAX_BATCH_ACTIONS = 64;
 const MAX_NATIVE_MESSAGE_BYTES = 900 * 1024;
+const MAX_DOWNLOAD_OBSERVERS_PER_TAB = 4;
+const MAX_DOWNLOAD_OBSERVERS = 64;
+function uploadInputPolicyFunction() { return "function(names){const e=this;if(!e||e.nodeName!=='INPUT'||e.type!=='file')return {ok:false,reason:'target_not_file_input'};const accept=(e.getAttribute('accept')||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);const mime=n=>({txt:'text/plain',csv:'text/csv',json:'application/json',pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',svg:'image/svg+xml',mp3:'audio/mpeg',mp4:'video/mp4',html:'text/html',xml:'application/xml'})[String(n).split('.').pop().toLowerCase()];if(names.length>1&&!e.multiple)return {ok:false,reason:'multiple_files_not_allowed'};for(const name of names){const lower=String(name).toLowerCase(),ext='.'+lower.split('.').pop(),type=mime(name);if(accept.length&&!accept.some(a=>a.startsWith('.')?lower.endsWith(a):a.endsWith('/*')?!!type&&type.startsWith(a.slice(0,-1)):a.includes('/')?a===type:false))return {ok:false,reason:'accept_filter_mismatch',filename:name};}return {ok:true,accept,multiple:!!e.multiple}}"; }
+const DOWNLOAD_OBSERVER_TTL_MS = 60000;
 const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
 const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
   const assets = await Promise.all(CONTROLLA_EXTENSION_BUILD_ASSETS.map(async name => {
@@ -29,8 +33,8 @@ const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
   return `controlla-chrome-extension:${chrome.runtime.getManifest().version}:${digest}`;
 })();
 const SCREENSHOT_CHUNK_CHARS = 512 * 1024;
-const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Page.captureScreenshot", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-  "Input.dispatchMouseEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
+const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Page.getLayoutMetrics", "Page.captureScreenshot", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+  "Input.dispatchMouseEvent", "Input.dispatchDragEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser", "Controlla.downloadLifecycle", "Controlla.scrollToTarget"]);
 let nativePort;
 let nativeReady = false;
 let nativeError;
@@ -53,6 +57,9 @@ const nativeTabLeases = new Map();
 const nativeLeaseGenerations = new Set();
 const pairedTabUrls = new Map();
 const pairedTabDocumentIds = new Map();
+const pairedTabTopologyGenerations = new Map();
+const pairedTabsInTransit = new Set();
+const tabLifecycleGenerations = new Map();
 const domReadyDocuments = new Map();
 const tabNavigationGenerations = new Map();
 const pendingMainFrameNavigations = new Map();
@@ -70,6 +77,7 @@ const tabPairReservations = new Map();
 const fileChooserEvents = new Map();
 const fileChooserWaiters = new Map();
 const fileChooserOperations = new Map();
+const downloadObservers = new Map();
 const recentlyCreatedTabs = new Map();
 let fileChooserEventSequence = 0;
 const frameSessions = new Map();
@@ -81,7 +89,38 @@ let openTabQueue = Promise.resolve();
 let activationEpoch = 0;
 let focusEpoch = 0;
 chrome.tabs.onActivated.addListener(() => { activationEpoch++; });
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (Object.prototype.hasOwnProperty.call(changeInfo || {}, "frozen")) {
+    tabLifecycleGenerations.set(tabId, (tabLifecycleGenerations.get(tabId) || 0) + 1);
+  }
+});
 chrome.tabs.onCreated.addListener(tab => { if (Number.isSafeInteger(tab.id)) { recentlyCreatedTabs.set(tab.id, { opener_tab_id: tab.openerTabId, window_id: tab.windowId, created_at_ms: Date.now() }); for (const [id, value] of recentlyCreatedTabs) if (value.created_at_ms < Date.now() - 60000) recentlyCreatedTabs.delete(id); } });
+function bumpPairedTabTopology(tabId) {
+  if (!pairedTabTopologyGenerations.has(tabId)) return;
+  pairedTabTopologyGenerations.set(tabId, (pairedTabTopologyGenerations.get(tabId) || 0) + 1);
+}
+function pairedTabTopologyStable(tabId, expectedGeneration) {
+  return !pairedTabsInTransit.has(tabId) && pairedTabTopologyGenerations.get(tabId) === expectedGeneration;
+}
+function bindPairedTabTopology(tabId) {
+  if (!pairedTabTopologyGenerations.has(tabId)) pairedTabTopologyGenerations.set(tabId, 0);
+  pairedTabsInTransit.delete(tabId);
+}
+function clearPairedTabTopology(tabId) {
+  pairedTabTopologyGenerations.delete(tabId);
+  pairedTabsInTransit.delete(tabId);
+}
+chrome.tabs.onDetached.addListener(tabId => {
+  if (!pairedTabTopologyGenerations.has(tabId)) return;
+  bumpPairedTabTopology(tabId);
+  pairedTabsInTransit.add(tabId);
+});
+chrome.tabs.onAttached.addListener(tabId => {
+  if (!pairedTabTopologyGenerations.has(tabId)) return;
+  bumpPairedTabTopology(tabId);
+  pairedTabsInTransit.delete(tabId);
+});
+chrome.tabs.onMoved.addListener(tabId => bumpPairedTabTopology(tabId));
 chrome.windows.onFocusChanged.addListener(() => { focusEpoch++; });
 function recordFrameSession(tabId, frameId, sessionId) {
   let frames = frameSessions.get(tabId);
@@ -131,36 +170,248 @@ function waitForFileChooser(tabId, documentId, timeoutMs, afterSequence = 0) {
     fileChooserWaiters.set(tabId, waiter);
   });
 }
+function validDownloadUrl(value) {
+  if (typeof value !== "string" || !value || value.length > 2048 || /\s/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) return false;
+    if (url.protocol === "http:" || url.protocol === "https:") return !!url.hostname;
+    if (url.protocol === "blob:") {
+      const inner = new URL(url.pathname);
+      return (inner.protocol === "http:" || inner.protocol === "https:") && !!inner.hostname;
+    }
+    return false;
+  } catch { return false; }
+}
+async function downloadUrlHash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+function safeDownloadFilename(value) {
+  if (typeof value !== "string" || !value) return null;
+  const name = value.split(/[\\/]/).at(-1).slice(0, 255);
+  return name || null;
+}
+function clearDownloadObserver(observerId, outcome) {
+  const observer = downloadObservers.get(observerId);
+  if (!observer) return false;
+  clearTimeout(observer.expiryTimer);
+  downloadObservers.delete(observerId);
+  if (observer.waiter) {
+    clearTimeout(observer.waiter.timer);
+    const waiter = observer.waiter;
+    observer.waiter = undefined;
+    waiter.resolve(outcome || { status: "interrupted", reason_code: "observer_cleared" });
+  }
+  return true;
+}
+function clearDownloadLifecycleState(tabId, reason = "target_detached") {
+  for (const [observerId, observer] of downloadObservers) {
+    if (observer.tabId === tabId) {
+      clearDownloadObserver(observerId, { status: "interrupted", reason_code: reason, filename: observer.filename || null,
+        bytes_received: observer.bytesReceived || 0, url_identity: observer.urlIdentity || null });
+    }
+  }
+}
+function refreshDownloadObserverExpiry(observer) {
+  clearTimeout(observer.expiryTimer);
+  observer.expiryTimer = setTimeout(() => {
+    clearDownloadObserver(observer.id, { status: "timed_out", reason_code: "observer_expired",
+      filename: observer.filename || null, bytes_received: observer.bytesReceived || 0,
+      url_identity: observer.urlIdentity || null, download_cancelled: false });
+  }, DOWNLOAD_OBSERVER_TTL_MS);
+}
+function nextDownloadLifecycleEvent(observer, timeoutMs) {
+  if (observer.events.length) return Promise.resolve(observer.events.shift());
+  if (observer.waiter) return Promise.reject(new Error("A download lifecycle wait is already active for this observer."));
+  return new Promise(resolve => {
+    const waiter = { resolve, timer: setTimeout(() => {
+      if (observer.waiter === waiter) observer.waiter = undefined;
+      resolve({ status: "timed_out", reason_code: "download_wait_expired",
+        filename: observer.filename || null, bytes_received: observer.bytesReceived || 0,
+        url_identity: observer.urlIdentity || null, download_cancelled: false });
+    }, timeoutMs) };
+    observer.waiter = waiter;
+  });
+}
+function publishDownloadEvent(observer, item, status, reasonCode) {
+  const publish = async () => {
+    if (downloadObservers.get(observer.id) !== observer || pairedTabDocumentIds.get(observer.tabId) !== observer.documentId) return;
+    const filename = safeDownloadFilename(item.filename) || observer.filename || null;
+    const bytesReceived = Number.isSafeInteger(item.bytesReceived) && item.bytesReceived >= 0 ? item.bytesReceived : observer.bytesReceived || 0;
+    const totalBytes = Number.isSafeInteger(item.totalBytes) && item.totalBytes >= 0 ? item.totalBytes : null;
+    const sourceUrl = typeof item.url === "string" ? item.url : "";
+    const finalUrl = typeof item.finalUrl === "string" ? item.finalUrl : "";
+    const urlIdentity = {
+      matches_expected: sourceUrl === observer.expectedUrl,
+      url_sha256: validDownloadUrl(sourceUrl) ? await downloadUrlHash(sourceUrl) : null,
+      final_url_sha256: validDownloadUrl(finalUrl) ? await downloadUrlHash(finalUrl) : null,
+    };
+    // Hashing is asynchronous. Navigation, cancellation, or detachment can
+    // retire this observer while it is in flight; never resurrect it.
+    if (downloadObservers.get(observer.id) !== observer || pairedTabDocumentIds.get(observer.tabId) !== observer.documentId) return;
+    observer.downloadId = item.id;
+    observer.filename = filename;
+    observer.bytesReceived = bytesReceived;
+    observer.totalBytes = totalBytes;
+    observer.urlIdentity = urlIdentity;
+    const event = { status, filename, bytes_received: bytesReceived,
+      total_bytes: totalBytes, url_identity: urlIdentity,
+      // Internal acquisition binding. The MCP runtime consumes these only
+      // after a completed event and strips them from the caller-facing receipt.
+      ...(status === "completed" && Number.isSafeInteger(item.id) ? { download_id: item.id } : {}),
+      ...(status === "completed" && typeof item.filename === "string" ? { file_path: item.filename } : {}),
+      ...(reasonCode ? { reason_code: reasonCode } : {}) };
+    observer.events.push(event);
+    if (observer.events.length > 3) observer.events.shift();
+    refreshDownloadObserverExpiry(observer);
+    if (observer.waiter) {
+      const waiter = observer.waiter;
+      observer.waiter = undefined;
+      clearTimeout(waiter.timer);
+      waiter.resolve(observer.events.shift());
+    }
+  };
+  observer.publishQueue = (observer.publishQueue || Promise.resolve()).then(publish, publish);
+  return observer.publishQueue;
+}
+chrome.downloads.onCreated.addListener(item => {
+  if (!Number.isSafeInteger(item?.tabId) || !Number.isSafeInteger(item?.id) || typeof item.url !== "string") return;
+  for (const observer of downloadObservers.values()) {
+    if (observer.tabId !== item.tabId || observer.documentId !== pairedTabDocumentIds.get(item.tabId) || item.url !== observer.expectedUrl) continue;
+    observer.item = item;
+    void publishDownloadEvent(observer, item, item.state === "complete" ? "completed" : item.state === "interrupted" ? "interrupted" : "started",
+      item.state === "interrupted" ? "download_interrupted" : undefined);
+  }
+});
+chrome.downloads.onChanged.addListener(delta => {
+  if (!Number.isSafeInteger(delta?.id)) return;
+  for (const observer of downloadObservers.values()) {
+    if (observer.downloadId !== delta.id) continue;
+    const previous = observer.item || {};
+    const item = { ...previous, id: delta.id };
+    for (const field of ["state", "filename", "bytesReceived", "totalBytes", "url", "finalUrl"]) {
+      if (delta[field] && Object.hasOwn(delta[field], "current")) item[field] = delta[field].current;
+    }
+    observer.item = item;
+    if (item.state === "complete" || item.state === "interrupted") {
+      void publishDownloadEvent(observer, item, item.state === "complete" ? "completed" : "interrupted",
+        item.state === "interrupted" ? (delta.error?.current || "download_interrupted") : undefined);
+    } else {
+      observer.filename = safeDownloadFilename(item.filename) || observer.filename || null;
+      observer.bytesReceived = Number.isSafeInteger(item.bytesReceived) && item.bytesReceived >= 0 ? item.bytesReceived : observer.bytesReceived || 0;
+    }
+  }
+});
 async function frameActionablePoint(route, objectId) {
-  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function __controllaFrameActionable(){const e=this,r=e.getBoundingClientRect(),v=e.ownerDocument.defaultView;if(!e.isConnected||!r.width||!r.height||r.left<0||r.top<0||r.right>v.innerWidth||r.bottom>v.innerHeight)return false;for(let n=e;n;n=n.parentElement){const s=v.getComputedStyle(n);if(n.disabled||n.getAttribute('aria-disabled')==='true'||n.hasAttribute('inert')||n.hasAttribute('hidden')||s.display==='none'||s.visibility!=='visible'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0)return false}const x=r.left+r.width/2,y=r.top+r.height/2,root=e.getRootNode(),h=(root.elementFromPoint?.(x,y)||e.ownerDocument.elementFromPoint(x,y));return !!h&&(h===e||e.contains(h))?{x,y,viewport:{width:v.innerWidth,height:v.innerHeight}}:false}", returnByValue: true });
+  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: frameActionableGuardFunction(), returnByValue: true });
   const point = result.result?.value;
   if (!(point?.x >= 0) || !(point?.y >= 0)) throw new Error("Frame control is disabled, outside the viewport, or obscured.");
   return point;
 }
+function frameActionableGuardFunction() {
+  return `function __controllaFrameActionable(){
+    const e=this,d=e?.ownerDocument,v=d?.defaultView,r=e?.getBoundingClientRect();
+    if(!e||!d||!v||!r||!e.isConnected||!r.width||!r.height||r.left<0||r.top<0||r.right>v.innerWidth||r.bottom>v.innerHeight)return false;
+    let root=e.getRootNode(),depth=0;
+    while(root!==d&&root?.host&&depth<8){root=root.host.getRootNode();depth++}
+    if(root!==d)return false;
+    for(let n=e;n;n=n.parentElement||n.getRootNode()?.host){
+      const s=v.getComputedStyle(n);
+      if(n.disabled||n.getAttribute('aria-disabled')==='true'||n.hasAttribute('inert')||n.hasAttribute('hidden')||s.display==='none'||s.visibility!=='visible'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0)return false
+    }
+    const x=r.left+r.width/2,y=r.top+r.height/2;
+    let h=d.elementFromPoint(x,y);
+    for(let i=0;h&&i<8;i++){
+      if(h===e||e.contains(h))return {x,y,viewport:{width:v.innerWidth,height:v.innerHeight}};
+      const shadow=h.shadowRoot;
+      if(!shadow)break;
+      h=shadow.elementFromPoint?.(x,y)
+    }
+    return false
+  }`;
+}
 async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) {
   const root = { tabId }, tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
-  const path = (node, ancestors = []) => node?.frame?.id === frameId ? ancestors : (node?.childFrames || []).map(child => path(child, [...ancestors, child.frame.id])).find(Boolean);
-  const frames = path(tree.frameTree);
-  if (!frames?.length || frames.length > 8) throw new Error("Same-process frame ancestry is unavailable or too deep.");
+  const path = (node, ancestors = []) => node?.frame?.id === frameId ? [...ancestors, node.frame] : (node?.childFrames || []).map(child => path(child, [...ancestors, node.frame])).find(Boolean);
+  const chain = path(tree.frameTree, []);
+  if (!chain?.length || chain.length < 2 || chain.length > 9) throw new Error("Frame ancestry is unavailable or too deep.");
+  if (chain.some(frame => !frame?.id || !frame?.loaderId)) throw new Error("Frame or loader identity is unavailable in the ancestry.");
+  const initialSessions = chain.slice(0, -1).map(frame => frameSessions.get(tabId)?.get(frame.id) || null);
+  const owners = [];
   let viewport = childViewport;
   if (!(viewport?.width > 0) || !(viewport?.height > 0)) {
-    const measured = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+    const measured = await chrome.debugger.sendCommand({ tabId, sessionId: frameSessions.get(tabId)?.get(frameId) }, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
     viewport = measured.result?.value;
   }
-  for (const childFrameId of frames.reverse()) {
-    const owner = await chrome.debugger.sendCommand(root, "DOM.getFrameOwner", { frameId: childFrameId });
-    const box = await chrome.debugger.sendCommand(root, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId });
+  // Each child owner belongs to its immediate parent document. Route that
+  // lookup through the parent's attached OOPIF session when one exists, then
+  // compose the resulting affine mapping into the next ancestor viewport.
+  for (let index = chain.length - 1; index > 0; index--) {
+    const childFrame = chain[index], parentFrame = chain[index - 1];
+    const parentSession = frameSessions.get(tabId)?.get(parentFrame.id);
+    const parentRoute = parentSession ? { tabId, sessionId: parentSession } : root;
+    const owner = await chrome.debugger.sendCommand(parentRoute, "DOM.getFrameOwner", { frameId: childFrame.id });
+    const ownerId = owner?.backendNodeId;
+    if (!Number.isSafeInteger(ownerId) || ownerId <= 0) throw new Error("Frame owner identity is unavailable in its parent session.");
+    const box = await chrome.debugger.sendCommand(parentRoute, "DOM.getBoxModel", { backendNodeId: ownerId });
     const q = box.model?.content;
-    if (!Array.isArray(q) || q.length !== 8 || !(viewport?.width > 0) || !(viewport?.height > 0)) throw new Error("Same-process frame geometry is unavailable.");
+    if (!Array.isArray(q) || q.length !== 8 || !q.every(Number.isFinite) || !(viewport?.width > 0) || !(viewport?.height > 0)) throw new Error("Frame owner geometry is unavailable.");
+    if (Math.abs(q[0] + q[4] - q[2] - q[6]) > 1 || Math.abs(q[1] + q[5] - q[3] - q[7]) > 1) throw new Error("Perspective or non-affine frame transforms are unsupported.");
     const u = x / viewport.width, v = y / viewport.height;
     x = q[0] + u * (q[2] - q[0]) + v * (q[6] - q[0]);
     y = q[1] + u * (q[3] - q[1]) + v * (q[7] - q[1]);
-    const parent = await chrome.debugger.sendCommand(root, "DOM.resolveNode", { backendNodeId: owner.backendNodeId });
-    if (!parent.object?.objectId) throw new Error("Same-process frame owner could not be resolved.");
-    const size = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId: parent.object.objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
-    viewport = size.result?.value;
+    const resolved = await chrome.debugger.sendCommand(parentRoute, "DOM.resolveNode", { backendNodeId: ownerId });
+    if (!resolved.object?.objectId) throw new Error("Frame owner could not be resolved in its parent session.");
+    try {
+      const hit = await chrome.debugger.sendCommand(parentRoute, "Runtime.callFunctionOn", {
+        objectId: resolved.object.objectId,
+        functionDeclaration: "function(x,y){const s=getComputedStyle(this);return this.isConnected&&s.display!=='none'&&s.visibility==='visible'&&s.pointerEvents!=='none'&&document.elementFromPoint(x,y)===this}",
+        arguments: [{ value: x }, { value: y }], returnByValue: true,
+      });
+      if (hit?.result?.value !== true) throw new Error("The transformed frame point is obscured or outside its owner.");
+      const size = await chrome.debugger.sendCommand(parentRoute, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+      const parentViewport = size.result?.value;
+      if (!(parentViewport?.width > 0) || !(parentViewport?.height > 0)) throw new Error("Parent frame viewport is unavailable.");
+      owners.push({ child: childFrame.id, childLoader: childFrame.loaderId, parent: parentFrame.id, parentLoader: parentFrame.loaderId, parentSession: parentSession || null, ownerId, quad: q });
+      viewport = parentViewport;
+    } finally {
+      await chrome.debugger.sendCommand(parentRoute, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+    }
   }
-  return { x, y };
+  const latestTree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+  const latestChain = path(latestTree.frameTree, []);
+  if (!latestChain || latestChain.length !== chain.length || latestChain.some((frame, index) => frame.id !== chain[index].id || frame.loaderId !== chain[index].loaderId)) throw new Error("Frame ancestry or loader changed during owner mapping.");
+  if (chain.slice(0, -1).some((frame, index) => (frameSessions.get(tabId)?.get(frame.id) || null) !== initialSessions[index])) throw new Error("Frame owner session changed during owner mapping.");
+  return { x, y, owner_signature: owners };
+}
+async function directFramePoint(tabId, frameId, loaderId, x, y, childViewport) {
+  const route = { tabId }, tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+  const root = tree?.frameTree, matches = (root?.childFrames || []).filter(child => child?.frame?.id === frameId);
+  if (matches.length !== 1 || matches[0].frame.loaderId !== loaderId) throw new Error("Only a fresh direct child frame can be mapped safely.");
+  const owner = await chrome.debugger.sendCommand(route, "DOM.getFrameOwner", { frameId });
+  const ownerNodeId = owner?.backendNodeId;
+  if (!Number.isSafeInteger(ownerNodeId) || ownerNodeId <= 0) throw new Error("Frame owner identity is unavailable.");
+  const box = await chrome.debugger.sendCommand(route, "DOM.getBoxModel", { backendNodeId: ownerNodeId });
+  const q = box?.model?.content;
+  if (!Array.isArray(q) || q.length !== 8 || !q.every(Number.isFinite) || !(childViewport?.width > 0) || !(childViewport?.height > 0)) throw new Error("Frame transform geometry is unavailable.");
+  // A parallelogram is the evidence that one affine transform maps this
+  // child viewport into the root viewport. Perspective transforms fail closed.
+  if (Math.abs(q[0] + q[4] - q[2] - q[6]) > 1 || Math.abs(q[1] + q[5] - q[3] - q[7]) > 1) throw new Error("Perspective or non-affine frame transforms are unsupported.");
+  const rootPoint = {
+    x: q[0] + x / childViewport.width * (q[2] - q[0]) + y / childViewport.height * (q[6] - q[0]),
+    y: q[1] + x / childViewport.width * (q[3] - q[1]) + y / childViewport.height * (q[7] - q[1]),
+  };
+  const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: ownerNodeId });
+  if (!resolved?.object?.objectId) throw new Error("Frame owner could not be resolved for hit testing.");
+  const hit = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", {
+    objectId: resolved.object.objectId,
+    functionDeclaration: "function(x,y){const s=getComputedStyle(this);return this.isConnected&&s.display!=='none'&&s.visibility==='visible'&&s.pointerEvents!=='none'&&document.elementFromPoint(x,y)===this}",
+    arguments: [{ value: rootPoint.x }, { value: rootPoint.y }], returnByValue: true,
+  });
+  await chrome.debugger.sendCommand(route, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+  if (hit?.result?.value !== true) throw new Error("The transformed frame point is obscured or outside its owner.");
+  return rootPoint;
 }
 function fileInputNodes(node, found = []) {
   if (!node || typeof node !== "object") return found;
@@ -276,6 +527,7 @@ async function sendScreenshotResponse(port, generation, response) {
   }
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data));
   const base64_sha256 = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const visualEvidence = response?.result?.visual_evidence;
   const transfer_id = crypto.randomUUID();
   const requestKey = `${response.lease_id || ""}:${response.id}`;
   if (cancelledScreenshotRequests.delete(requestKey)) {
@@ -288,7 +540,8 @@ async function sendScreenshotResponse(port, generation, response) {
       return false;
     }
     const chunk = { type: "result_chunk", id: response.id, lease_id: response.lease_id,
-      transfer_id, index, total_chunks: chunks.length, total_chars: data.length, base64_sha256, chunk: chunks[index] };
+      transfer_id, index, total_chunks: chunks.length, total_chars: data.length, base64_sha256,
+      ...(visualEvidence ? { visual_evidence: visualEvidence } : {}), chunk: chunks[index] };
     if (!sendNative(port, generation, chunk)) {
       sendNative(port, generation, { type: "result_chunk_abort", id: response.id, lease_id: response.lease_id, transfer_id });
       return false;
@@ -296,11 +549,23 @@ async function sendScreenshotResponse(port, generation, response) {
   }
   return true;
 }
+function decodeScreenshotPng(data) {
+  if (typeof data !== "string" || data.length > 8 * 1024 * 1024 || !data.startsWith("iVBOR")) throw new Error("Screenshot is empty or oversized.");
+  let binary;
+  try { binary = atob(data); } catch { throw new Error("Screenshot payload is not valid base64."); }
+  if (binary.length < 24 || binary.charCodeAt(0) !== 0x89 || binary.slice(1, 4) !== "PNG" || binary.slice(8, 12) !== "\x00\x00\x00\x0d" || binary.slice(12, 16) !== "IHDR") throw new Error("Screenshot payload is not a PNG image.");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = view.getUint32(16, false), height = view.getUint32(20, false);
+  if (!width || width > 4096 || !height || height > 4096 || width * height > 16_777_216) throw new Error("Screenshot dimensions exceeded the supported bounds.");
+  return { bytes, width, height };
+}
 function resolveNativeLease(leaseId, tabId) { if (leaseId) return nativeLeases.get(leaseId); const owner = nativeTabLeases.get(tabId); if (owner) return nativeLeases.get(owner); return nativeLeases.size === 1 ? nativeLeases.values().next().value : undefined; }
 function safeNativeError(value) { if (typeof value !== "string" || !value) return undefined; return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 256); }
 function safeErrorClass(error) { try { const name = error?.name; return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : "Error"; } catch { return "Error"; } }
 function traceSharedCommand(phase, request, tabId, startedAt, details = {}) {
-  if ((!SHARED_COMMAND_METHODS.has(request.method) && request.method !== "Controlla.fastType") || !Number.isSafeInteger(tabId)) return;
+  if ((!SHARED_COMMAND_METHODS.has(request.method) && request.method !== "Controlla.fastType" && request.method !== "Controlla.humanTypeCharacter") || !Number.isSafeInteger(tabId)) return;
   const commandId = typeof request.id === "string" || Number.isSafeInteger(request.id) ? String(request.id).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128) : "";
   try { console.debug("[Chrome Controlla] shared command", { phase, commandId, targetId: tabId, method: request.method, elapsedMs: Math.max(0, Date.now() - startedAt), ...details }); } catch {}
 }
@@ -352,6 +617,71 @@ async function fastTypeProgram(tabId, params, isAuthorized) {
   return final.ok === true
     ? { status: "verified", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress }
     : { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "final_editor_guard_failed", guard: final };
+}
+async function humanTypeCharacter(tabId, params, isAuthorized) {
+  const { object_id: objectId, index, expected, character, normalize_paragraphs: normalizeParagraphs } = params || {};
+  const scalar = typeof character === "string" && [...character].length === 1 ? character.codePointAt(0) : -1;
+  if (typeof objectId !== "string" || objectId.length < 1 || objectId.length > 1024 || !Number.isSafeInteger(index) || index < 0 || typeof expected !== "string" || expected.length > 16384 || scalar < 0 || scalar >= 0xd800 && scalar <= 0xdfff || typeof normalizeParagraphs !== "boolean" || character === "\r" || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(character)) throw new Error("human_type_character requires one bounded Unicode scalar (or normalized newline) and a retained editor.");
+  const deadline = performance.now() + Math.min(60000, Math.max(1000, Number.isSafeInteger(params.deadline_ms) ? params.deadline_ms : 30000));
+  const guard = async value => {
+    if (!isAuthorized(tabId) || performance.now() >= deadline) return { ok: false, reason: "deadline_or_session_changed" };
+    try {
+      const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", { objectId, functionDeclaration: FAST_TYPE_GUARD, arguments: [{ value: index }, { value }, { value: false }, { value: normalizeParagraphs }, { value: true }], returnByValue: true });
+      return response?.result?.value || { ok: false, reason: "guard_response_missing" };
+    } catch { return { ok: false, reason: "guard_read_failed" }; }
+  };
+  let keyDownAttempted = false, keyEvents = 0, cdpCommands = 0;
+  let result;
+  const enter = character === "\n", key = enter ? "Enter" : character;
+  const keyUp = enter ? { type: "keyUp", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 } : { type: "keyUp", key };
+  let progress = expected;
+  try {
+    if (!isAuthorized(tabId) || performance.now() >= deadline) return { status: "not_dispatched", completed_chars: 0, key_events: 0, cdp_commands: 0, readback: expected, reason: "deadline_or_session_changed" };
+    const before = await guard(expected); cdpCommands++;
+    if (before.ok !== true) return { status: "not_dispatched", completed_chars: 0, key_events: 0, cdp_commands: cdpCommands, readback: before.value, reason: before.reason || "editor_guard_rejected" };
+    if (scalar > 0x7f) {
+      if (!isAuthorized(tabId) || performance.now() >= deadline) return { status: "not_dispatched", completed_chars: 0, key_events: 0, cdp_commands: cdpCommands, readback: expected, reason: "deadline_or_session_changed" };
+      await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: character }); cdpCommands++;
+      progress += character;
+      const afterInsert = await guard(progress); cdpCommands++;
+      result = afterInsert.ok === true
+        ? { status: "verified", completed_chars: 1, key_events: 0, dispatches: 1, cdp_commands: cdpCommands, readback: progress, input_method: "insertText" }
+        : { status: "unknown", completed_chars: 0, key_events: 0, dispatches: 1, cdp_commands: cdpCommands, readback: afterInsert.value ?? progress, reason: "focus_or_value_changed_after_unicode_insert", guard: afterInsert, input_method: "insertText" };
+      return result;
+    }
+    const down = enter ? { type: "keyDown", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36, text: "\r", unmodifiedText: "\r" } : { type: "keyDown", key };
+    keyDownAttempted = true;
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", down); keyEvents++; cdpCommands++;
+    if (enter) progress += character;
+    const afterDown = await guard(progress); cdpCommands++;
+    if (afterDown.ok !== true) result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: afterDown.value ?? progress, reason: "focus_or_value_changed_after_keydown", guard: afterDown };
+    else {
+      if (!enter) {
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character }); keyEvents++; cdpCommands++;
+        progress += character;
+      }
+      const afterCharacter = enter ? afterDown : await guard(progress);
+      if (!enter) cdpCommands++;
+      result = afterCharacter.ok === true
+        ? { status: "verified", completed_chars: 1, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress }
+        : { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: afterCharacter.value ?? progress, reason: "focus_or_value_changed_after_character", guard: afterCharacter };
+    }
+  } catch (error) {
+    result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "key_event_delivery_unknown", error: safeNativeError(String(error)) };
+  } finally {
+    if (keyDownAttempted) {
+      // Only release to the retained editor while it is still the focused target.
+      // CDP keyUp is tab-scoped and would otherwise reach a newly focused control.
+      const focused = await guard(progress); cdpCommands++;
+      if (focused.ok === true) {
+        try { await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", keyUp); keyEvents++; cdpCommands++; }
+        catch (error) { result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "key_up_cleanup_delivery_unknown", error: safeNativeError(String(error)) }; }
+      } else {
+        result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "focus_changed_keyup_suppressed_cleanup_unconfirmed", guard: focused };
+      }
+    }
+  }
+  return result || { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "character_transaction_incomplete" };
 }
 async function scheduleNativeReconnect() {
   if (reconnectTimer || nativePort) return;
@@ -468,7 +798,7 @@ async function pairNative(port, portGeneration, message) {
       const beforeAttach = await chrome.tabs.get(tabId).catch(() => null);
       const beforeFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
       if (!beforeAttach || beforeAttach.status !== "complete" || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || !beforeFrame?.documentId || (!message.unrestricted && (!expectedUrls || typeof expectedUrls[tabId] !== "string" || !expectedDocumentIds || typeof expectedDocumentIds[tabId] !== "string")) || (typeof expectedUrls?.[tabId] === "string" && beforeAttach.url !== expectedUrls[tabId]) || (typeof expectedDocumentIds?.[tabId] === "string" && beforeFrame.documentId !== expectedDocumentIds[tabId])) throw new Error("Tab " + tabId + " changed during pairing or lacks a required discovery receipt.");
-      pairedTabUrls.set(tabId, beforeAttach.url); pairedTabDocumentIds.set(tabId, beforeFrame.documentId); await attachDebugger(tabId);
+      pairedTabUrls.set(tabId, beforeAttach.url); pairedTabDocumentIds.set(tabId, beforeFrame.documentId); bindPairedTabTopology(tabId); await attachDebugger(tabId);
       if (port !== nativePort || nativeLeases.get(leaseId) !== lease) { await detachDebugger(tabId); throw new Error("Pairing was released during attachment."); }
       lease.tabs.add(tabId); nativeTabLeases.set(tabId, leaseId); nativeAttachedTabs.add(tabId);
       const attached = await chrome.tabs.get(tabId).catch(() => null); const attachedFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
@@ -478,7 +808,7 @@ async function pairNative(port, portGeneration, message) {
     sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, lease_id: leaseId, targets: [...lease.tabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, extension_build_id: extensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true });
   } catch (error) {
     if (attemptGeneration !== undefined) await detachNativeLease(typeof message.lease_id === "string" && message.lease_id ? message.lease_id : message.request_id);
-    if (reservation) for (const tabId of requested || []) { if (manualAttachedTabs.has(tabId)) continue; pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); }
+    if (reservation) for (const tabId of requested || []) { if (manualAttachedTabs.has(tabId)) continue; pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); }
     sendNative(port, portGeneration, { type: "pair_error", request_id: message.request_id, error: String(error) });
   } finally { if (reservation) releasePairingTabs(requested, reservation); }
 }
@@ -486,12 +816,16 @@ async function dispatchBatch(request, isAuthorized, respond, nativeRoute = false
   const tabId = Number(request.target_id); const actions = request.actions; const startedAt = performance.now();
   const lease = nativeRoute ? nativeLeases.get(request.lease_id) : undefined;
   if (nativeRoute && lease?.unrestricted && !lease.tabs.has(tabId)) { try { await attachUnrestrictedNativeTab(tabId, lease.id); } catch (error) { respond({ type: "batch_result", id: request.id, error: String(error) }); return; } }
+  const topologyGeneration = pairedTabTopologyGenerations.get(tabId);
+  const topologyStable = () => topologyGeneration !== undefined && pairedTabTopologyStable(tabId, topologyGeneration);
   if (!Number.isSafeInteger(tabId) || !isAuthorized(tabId)) { respond({ type: "batch_result", id: request.id, error: "Target is not attached." }); return; }
+  if (!topologyStable()) { respond({ type: "batch_result", id: request.id, result: { status: "not_dispatched", reason_code: "tab_topology_unstable", dispatch_may_have_occurred: false }, error: "Paired tab is moving between windows; retry after its topology settles." }); return; }
   if (!Array.isArray(actions) || actions.length === 0 || actions.length > MAX_BATCH_ACTIONS) { respond({ type: "batch_result", id: request.id, error: "Batch requires 1..64 actions." }); return; }
   if (!Number.isSafeInteger(request.deadline_ms) || request.deadline_ms < 1 || request.deadline_ms > 60000) { respond({ type: "batch_result", id: request.id, error: "Batch deadline must be within 1..60000ms." }); return; }
   const receipts = [];
   const acknowledgedKeyEvent = () => receipts.some(receipt => receipt.method === "Input.dispatchKeyEvent" && !receipt.error);
   for (let index = 0; index < actions.length; index++) {
+    if (!topologyStable()) { respond({ type: "batch_result", id: request.id, result: { status: receipts.length ? "unknown" : "not_dispatched", reason_code: "tab_topology_changed", receipts, completed: index, stopped_before: index, dispatch_may_have_occurred: acknowledgedKeyEvent() || receipts.length > 0, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Paired tab topology changed; remaining batch actions were fenced." }); return; }
     if (performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, stopped_before: index, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
     const action = actions[index];
     if (!action || typeof action.method !== "string" || action.method.length > 128 || (action.target_id !== undefined && Number(action.target_id) !== tabId) || (action.stop_on_not_ok !== undefined && typeof action.stop_on_not_ok !== "boolean")) {
@@ -503,6 +837,7 @@ async function dispatchBatch(request, isAuthorized, respond, nativeRoute = false
     if (settled?.error) receipt.error = settled.error; else receipt.result = settled?.result;
     receipts.push(receipt);
     if (settled?.error) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index, failed_at: index, stopped_before: index, dispatch_may_have_occurred: action.method === "Input.dispatchKeyEvent" || acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: settled.error }); return; }
+    if (!topologyStable()) { respond({ type: "batch_result", id: request.id, result: { status: "unknown", reason_code: "tab_topology_changed", receipts, completed: index + 1, stopped_before: index + 1, dispatch_may_have_occurred: true, host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Paired tab topology changed; remaining batch actions were fenced." }); return; }
     if (action.stop_on_not_ok && settled?.result?.result?.value?.ok !== true) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch read guard rejected before the next action." }); return; }
     if (index + 1 < actions.length && performance.now() - startedAt >= request.deadline_ms) { respond({ type: "batch_result", id: request.id, result: { receipts, completed: index + 1, stopped_before: index + 1, dispatch_may_have_occurred: acknowledgedKeyEvent(), host_round_trips: 1, in_browser_actions: actions.length, elapsed_ms: performance.now() - startedAt }, error: "Batch deadline elapsed before the next action; inspect state and do not retry blindly." }); return; }
   }
@@ -525,13 +860,16 @@ function captureUploadNetworkEvent(tabId, source, method, params) {
     if (!url || !params.request?.method) return;
     request = { ...url, method: params.request.method, type: params.type };
     operation.networkRequests.set(params.requestId, request);
+    operation.networkOutcomes?.set(params.requestId, "pending");
   } else if (method === "Network.responseReceived") {
     request = operation.networkRequests.get(params.requestId);
     if (!request || !(params.type === "XHR" || params.type === "Fetch")) return;
+    operation.networkOutcomes?.set(params.requestId, "response");
     operation.networkEvents.push({ ...request, status: params.response?.status, status_text: params.response?.statusText, mime_type: params.response?.mimeType });
   } else if (method === "Network.loadingFailed") {
     request = operation.networkRequests.get(params.requestId);
     if (!request) return;
+    operation.networkOutcomes?.set(params.requestId, "failed");
     operation.networkEvents.push({ ...request, error: params.errorText, blocked_reason: params.blockedReason, cors_error: params.corsErrorStatus?.corsError });
   } else return;
   if (operation.networkEvents.length > 24) operation.networkEvents.shift();
@@ -541,27 +879,51 @@ function waitForUploadNetwork(operation, maxWaitMs = 10000) {
   return new Promise(resolve => {
     const started = Date.now();
     let quietTimer;
-    const finish = () => {
+    const finish = reason => {
       clearTimeout(maxTimer);
       clearTimeout(quietTimer);
       operation.networkChanged = undefined;
-      resolve(Date.now() - started);
+      const pendingRequests = [...(operation.networkOutcomes || new Map()).values()].filter(value => value === "pending").length;
+      resolve({ status: pendingRequests ? "stalled" : "observed", reason: pendingRequests ? reason || "upload_response_not_observed" : undefined,
+        pending_requests: pendingRequests, observation_bound_ms: maxWaitMs, observation_window_ms: Math.max(0, Date.now() - started) });
     };
-    const maxTimer = setTimeout(finish, maxWaitMs);
+    const maxTimer = setTimeout(() => finish("upload_observation_timeout"), maxWaitMs);
     operation.networkChanged = event => {
       if (event?.status != null || event?.error) return finish();
       clearTimeout(quietTimer);
-      quietTimer = setTimeout(finish, 1200);
+      quietTimer = setTimeout(() => finish("upload_response_not_observed"), 1200);
     };
     if (operation.networkEvents.some(event => event.status != null || event.error)) finish();
-    else quietTimer = setTimeout(finish, operation.networkRequests.size ? 1200 : 2500);
+    else quietTimer = setTimeout(() => finish("upload_response_not_observed"), operation.networkRequests.size ? 1200 : 2500);
   });
 }
 async function dispatchCommand(request, isAuthorized, respond, nativeMessage = false) {
   const tabId = Number(request.target_id); const startedAt = Date.now();
   const nativeLease = nativeMessage ? resolveNativeLease(request.lease_id, tabId) : undefined;
   if (nativeMessage && nativeLease?.unrestricted && !nativeLease.tabs.has(tabId)) { try { await attachUnrestrictedNativeTab(tabId, nativeLease.id); } catch (error) { respond({ type: "result", id: request.id, error: String(error) }); return; } }
-  if (!Number.isSafeInteger(tabId) || !isAuthorized(tabId)) { respond({ type: "result", id: request.id, error: "Target is not attached." }); return; }
+  const leaseAuthorized = isAuthorized;
+  const topologyGeneration = pairedTabTopologyGenerations.get(tabId);
+  const topologyStable = () => pairedTabTopologyStable(tabId, topologyGeneration);
+  isAuthorized = candidateTabId => leaseAuthorized(candidateTabId) && candidateTabId === tabId && topologyStable();
+  const sendResponse = respond;
+  let commandMayHaveDispatched = false;
+  respond = message => {
+    if (commandMayHaveDispatched && !topologyStable() && (message.result || message.reason_code === "tab_topology_changed")) {
+      sendResponse({ type: "result", id: request.id, result: {
+        status: "unknown", reason_code: "tab_topology_changed", dispatch_may_have_occurred: true,
+        reason: "Paired tab topology changed during the command; inspect current page state before retrying."
+      } });
+      return;
+    }
+    sendResponse(message);
+  };
+  if (!Number.isSafeInteger(tabId) || !leaseAuthorized(tabId)) { respond({ type: "result", id: request.id, error: "Target is not attached." }); return; }
+  if (pairedTabsInTransit.has(tabId) || topologyGeneration === undefined) {
+    respond({ type: "result", id: request.id, result: { status: "not_dispatched", reason_code: "tab_topology_unstable", dispatch_may_have_occurred: false,
+      reason: "Paired tab is moving between windows; retry after its topology settles." } });
+    return;
+  }
+  if (!isAuthorized(tabId)) { respond({ type: "result", id: request.id, error: "Target is no longer attached or its topology is unstable." }); return; }
   if (navigatingTabs.has(tabId)) { respond({ type: "result", id: request.id, error: "Tab is navigating; retry after the new document commits." }); return; }
   const nativeRoute = nativeMessage || nativeAttachedTabs.has(tabId); const routeGeneration = nativeRoute ? nativeLease?.generation ?? nativeGeneration : manualGeneration;
   if (request.method === "DOM.setFileInputFiles" && !(nativeRoute && nativeLease?.unrestricted)) { respond({ type: "result", id: request.id, error: "File selection requires local unrestricted mode." }); return; }
@@ -572,6 +934,12 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (navigatingTabs.has(tabId)) { respond({ type: "result", id: request.id, error: "Tab is navigating; retry after the new document commits." }); return; }
     if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId) { respond({ type: "result", id: request.id, error: "Target document identity changed; rediscover and pair again." }); return; }
     if (!frame?.documentId || frame.documentId !== expectedDocumentId) { await detachPairedTab(tabId); respond({ type: "result", id: request.id, error: "Target document identity changed; pair the tab again." }); return; }
+    if (!topologyStable()) {
+      respond({ type: "result", id: request.id, result: { status: "not_dispatched", reason_code: "tab_topology_changed", dispatch_may_have_occurred: false,
+        reason: "Paired tab topology changed during preflight; retry after reconciling its window." } });
+      return;
+    }
+    commandMayHaveDispatched = true;
     if (request.method === "Controlla.openTab") {
       const url = validateNavigationUrl(request.params?.url); const native = nativeRoute; const waitUntil = request.params?.wait_until ?? "dom_content_loaded";
       const active = request.params?.active ?? true;
@@ -679,7 +1047,12 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const event = recentlyCreatedTabs.get(tab.id);
         const openerMatch = event?.opener_tab_id === tabId;
         return event?.created_at_ms >= since && openerMatch && (!expectedUrl || tab.url === expectedUrl) && /^https?:\/\//i.test(tab.url || "");
-      }).slice(0, 8).map(tab => ({ tab_id: String(tab.id), url: String(tab.url).slice(0, 2048), opener_match: recentlyCreatedTabs.get(tab.id)?.opener_tab_id === tabId }));
+      }).slice(0, 8).map(tab => {
+        const event = recentlyCreatedTabs.get(tab.id);
+        return { tab_id: String(tab.id), url: String(tab.url).slice(0, 2048), window_id: event?.window_id,
+          created_at_ms: event?.created_at_ms, opener_tab_id: String(event?.opener_tab_id ?? ""),
+          opener_match: event?.opener_tab_id === tabId };
+      });
       respond({ type: "result", id: request.id, result: { tabs: created } }); return;
     }
     if (request.method === "Controlla.fastType") {
@@ -687,18 +1060,49 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       traceSharedCommand("settled", request, tabId, startedAt, { outcome: result.status, completedChars: result.completed_chars, keyEvents: result.key_events, cdpCommands: result.cdp_commands });
       respond({ type: "result", id: request.id, result }); return;
     }
+    if (request.method === "Controlla.humanTypeCharacter") {
+      const result = await humanTypeCharacter(tabId, request.params, isAuthorized);
+      traceSharedCommand("settled", request, tabId, startedAt, { outcome: result.status, completedChars: result.completed_chars, keyEvents: result.key_events, cdpCommands: result.cdp_commands });
+      respond({ type: "result", id: request.id, result }); return;
+    }
     if (request.method === "Controlla.navigate") { const url = validateNavigationUrl(request.params?.url); await navigatePairedTab(tabId, url, nativeRoute, routeGeneration); respond({ type: "result", id: request.id, result: { tab_id: String(tabId), ...(await nativePageIdentity(tabId)) } }); return; }
     if (request.method === "Controlla.presentationState") {
       const tab = await chrome.tabs.get(tabId);
       const win = await chrome.windows.get(tab.windowId);
-      respond({ type: "result", id: request.id, result: { tab_active: !!tab.active, window_focused: !!win.focused, window_id: tab.windowId, activation_epoch: activationEpoch, focus_epoch: focusEpoch } }); return;
+      let renderer = {};
+      let rendererFailure = "";
+      try {
+        const observed = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+          expression: "/*__controllaPresentationState*/({visibility_state:document.visibilityState,document_hidden:document.hidden,document_has_focus:document.hasFocus(),viewport:{width:innerWidth,height:innerHeight,device_scale_factor:devicePixelRatio},discarded:document.wasDiscarded===true,prerendering:document.prerendering===true})",
+          returnByValue: true,
+        });
+        const value = observed?.result?.value;
+        if (value && typeof value === "object") renderer = value;
+      } catch (error) { rendererFailure = safeNativeError(String(error)); }
+      const visibility = ["visible", "hidden", "prerender"].includes(renderer.visibility_state) ? renderer.visibility_state : "unknown";
+      const viewport = renderer.viewport && Number.isFinite(renderer.viewport.width) && Number.isFinite(renderer.viewport.height)
+        && Number.isFinite(renderer.viewport.device_scale_factor) && renderer.viewport.width > 0 && renderer.viewport.height > 0
+        ? { width: renderer.viewport.width, height: renderer.viewport.height, device_scale_factor: renderer.viewport.device_scale_factor }
+        : undefined;
+      const crashed = /(?:target|renderer).{0,24}(?:crash|gone)|(?:crash|gone).{0,24}(?:target|renderer)/i.test(rendererFailure);
+      const lifecycle = tab.discarded || renderer.discarded ? "discarded" : tab.status === "loading" ? "loading" : crashed ? "crashed" : tab.frozen === true ? "frozen" : tab.frozen === false ? "active" : "unknown";
+      respond({ type: "result", id: request.id, result: {
+        tab_active: !!tab.active, window_focused: !!win.focused, window_id: tab.windowId,
+        window_state: ["normal", "minimized", "maximized", "fullscreen"].includes(win.state) ? win.state : "unknown",
+        visibility_state: visibility, document_hidden: typeof renderer.document_hidden === "boolean" ? renderer.document_hidden : undefined,
+        document_has_focus: typeof renderer.document_has_focus === "boolean" ? renderer.document_has_focus : undefined,
+        lifecycle, renderer_unavailable: !!rendererFailure, prerendering: renderer.prerendering === true, viewport,
+        activation_epoch: activationEpoch, focus_epoch: focusEpoch,
+      } }); return;
     }
     if (request.method === "Controlla.pointerClick") {
       const params = request.params || {}, objectId = params.object_id, index = params.index, outcome = params.outcome;
+      const clickKind = params.click_kind || "click";
       const guard = params.function_declaration, expectedViewport = params.viewport;
       if (typeof objectId !== "string" || !objectId || objectId.length > 512 || !Number.isSafeInteger(index) || index < 0 ||
           typeof guard !== "string" || !guard.startsWith("function(index,") || guard.length > 12000 ||
-          (expectedViewport != null && (typeof expectedViewport !== "string" || expectedViewport.length > 256))) throw new Error("pointer click requires a bounded guarded target.");
+          !["click", "double_click", "context_click"].includes(clickKind) ||
+          (expectedViewport != null && (typeof expectedViewport !== "string" || expectedViewport.length > 256))) throw new Error("pointer click requires a bounded guarded target and supported click kind.");
       const target = await chrome.tabs.get(tabId), window = await chrome.windows.get(target.windowId);
       const wasActive = !!target.active;
       if (!wasActive) {
@@ -709,7 +1113,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const previous = wasActive ? target : (await chrome.tabs.query({ active:true, windowId:target.windowId }))[0];
       if (!previous?.id) { respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"active_tab_unavailable",reason:"Could not identify the tab to restore after pointer input."} }); return; }
       const documentId = pairedTabDocumentIds.get(tabId), generation = routeGeneration, activationEpochBefore = activationEpoch;
-      let activated = false, restoredPreviousTab = false, pressAttempted = false, acknowledged = false, finalChecked;
+      let activated = false, restoredPreviousTab = false, pressAttempted = false, acknowledged = false, finalChecked, activePress;
       try {
         if (!wasActive) {
           await chrome.tabs.update(tabId, { active:true });
@@ -728,12 +1132,34 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         }
         const point = {x:finalChecked.x,y:finalChecked.y};
         await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseMoved",...point});
-        pressAttempted = true;
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",button:"left",clickCount:1,...point});
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",button:"left",clickCount:1,...point});
+        const button = clickKind === "context_click" ? "right" : "left";
+        const clicks = clickKind === "double_click" ? 2 : 1;
+        for (let clickCount = 1; clickCount <= clicks; clickCount++) {
+          if (clickCount === 2) {
+            const currentTarget = await chrome.tabs.get(tabId);
+            if (!isAuthorized(tabId) || (nativeRoute && resolveNativeLease(request.lease_id, tabId)?.generation !== generation) ||
+                pairedTabDocumentIds.get(tabId) !== documentId || !currentTarget.active) {
+              respond({ type:"result", id:request.id, result:{status:"unknown",dispatch_acknowledged:false,dispatch_may_have_occurred:true,
+                completed_clicks:1,reason_code:"double_click_target_changed",reason:"The first click was sent, but target identity or active-tab state changed before the second click. Inspect before retrying."} }); return;
+            }
+            const secondCheck = await chrome.debugger.sendCommand({tabId}, "Runtime.callFunctionOn", {objectId,
+              functionDeclaration:guard, arguments:[{value:index},{value:outcome}], returnByValue:true});
+            const secondTarget = secondCheck?.result?.value;
+            if (!secondTarget?.ok || secondTarget.viewport !== finalChecked.viewport ||
+                secondTarget.x !== point.x || secondTarget.y !== point.y) {
+              respond({ type:"result", id:request.id, result:{status:"unknown",dispatch_acknowledged:false,dispatch_may_have_occurred:true,
+                completed_clicks:1,reason_code:"double_click_target_changed",reason:"The first click was sent, but the same target, viewport, or hit point could not be revalidated before the second click. Inspect before retrying."} }); return;
+            }
+          }
+          activePress = {button, clickCount, ...point};
+          pressAttempted = true;
+          await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",...activePress});
+          await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress});
+          activePress = undefined;
+        }
         acknowledged = true;
       } catch (error) {
-        if (pressAttempted) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",button:"left",clickCount:1,x:finalChecked?.x,y:finalChecked?.y}).catch(() => {});
+        if (activePress) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress}).catch(() => {});
         respond({ type:"result", id:request.id, result:{status:pressAttempted?"unknown":"not_dispatched",dispatch_acknowledged:false,reason_code:pressAttempted?"pointer_delivery_unknown":"pointer_dispatch_failed",reason:safeNativeError(String(error))} });
         return;
       } finally {
@@ -748,6 +1174,279 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         temporary_activation:activated,restored_previous_tab:restoredPreviousTab,
         reason:activated?(window.focused?"Pointer input used a brief tab activation in the focused Chrome window.":"Pointer input used a brief tab activation while Chrome remained behind another window."):undefined} }); return;
     }
+    if (request.method === "Controlla.pointerSwipe") {
+      const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
+      const sx=params.start_x,sy=params.start_y,ex=params.end_x,ey=params.end_y,viewport=params.viewport,timeoutMs=params.timeout_ms??3000;
+      const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
+      if(typeof objectId!=="string"||!objectId||objectId.length>512||!Number.isSafeInteger(index)||index<0||
+          typeof guard!=="string"||!guard.startsWith("function(index,sx,sy,ex,ey,expectedViewport,phase)")||guard.length>12000||
+          ![sx,sy,ex,ey].every(value=>Number.isFinite(value)&&value>=0&&value<=10000)||
+          Math.hypot(ex-sx,ey-sy)<20||Math.hypot(ex-sx,ey-sy)>1200||typeof viewport!=="string"||viewport.length>256||
+          !Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("pointer swipe requires bounded coordinates and a guarded fresh target.");
+      const target=await chrome.tabs.get(tabId),deadline=performance.now()+timeoutMs;
+      if(!target.active){respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target",dispatch_may_have_occurred:false,reason:"Touch input requires an active target tab; no activation was attempted."}});return;}
+      const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      let touchStartAttempted=false,dispatchAcknowledged=false,touchReleaseAcknowledged=false,before;
+      const guardCall=async phase=>{
+        const result=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+          arguments:[{value:index},{value:sx},{value:sy},{value:ex},{value:ey},{value:viewport},{value:phase}],returnByValue:true});
+        return result?.result?.value;
+      };
+      const stateValid=value=>value?.ok===true&&value.viewport===viewport&&
+        value.start?.x===sx&&value.start?.y===sy&&value.end?.x===ex&&value.end?.y===ey&&
+        [value.rect?.left,value.rect?.top,value.rect?.width,value.rect?.height].every(Number.isFinite);
+      try{
+        before=await guardCall("before");
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)||!stateValid(before)){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:before?.reason||"swipe_preflight_refused",dispatch_may_have_occurred:false}});return;
+        }
+        const final=await guardCall("before");
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)||!stateValid(final)||
+            JSON.stringify(final.rect)!==JSON.stringify(before.rect)||JSON.stringify(final.scroll)!==JSON.stringify(before.scroll)){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"swipe_target_changed_before_dispatch",dispatch_may_have_occurred:false}});return;
+        }
+        touchStartAttempted=true;
+        await chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:sx,y:sy,radiusX:1,radiusY:1,force:1}]});
+        await chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:ex,y:ey,radiusX:1,radiusY:1,force:1}]});
+        dispatchAcknowledged=true;
+      }catch(error){
+        respond({type:"result",id:request.id,result:{status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"touch_delivery_unknown":"swipe_preflight_failed",dispatch_acknowledged:false,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))}});return;
+      }finally{
+        if(touchStartAttempted){
+          touchReleaseAcknowledged=await Promise.race([chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+        }
+      }
+      try{
+        if(!touchReleaseAcknowledged){respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"touch_release_unconfirmed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;}
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"swipe_identity_changed_after_dispatch",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;
+        }
+        const after=await guardCall("after");
+        if(!stateValid(after)){
+          respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"swipe_readback_unavailable",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;
+        }
+        const meaningful=JSON.stringify(after.rect)!==JSON.stringify(before.rect)||JSON.stringify(after.scroll)!==JSON.stringify(before.scroll);
+        respond({type:"result",id:request.id,result:{status:meaningful?"verified":"inconclusive",reason_code:meaningful?undefined:"swipe_movement_not_observed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true,meaningful_movement_observed:meaningful,before:{rect:before.rect,scroll:before.scroll},after:{rect:after.rect,scroll:after.scroll}}});return;
+      }catch(error){
+        respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"swipe_readback_unknown",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true,reason:safeNativeError(String(error))}});return;
+      }
+    }
+    if (request.method === "Controlla.pointerScroll") {
+      const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
+      const dx=params.delta_x,dy=params.delta_y,expectedViewport=params.viewport,timeoutMs=params.timeout_ms??3000;
+      const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
+      if(typeof objectId!=="string"||!objectId||objectId.length>512||!Number.isSafeInteger(index)||index<0||
+          typeof guard!=="string"||!guard.startsWith("function(index,dx,dy,expectedViewport)")||guard.length>12000||
+          !Number.isSafeInteger(dx)||!Number.isSafeInteger(dy)||((dx===0)===(dy===0))||Math.abs(dx)>1200||Math.abs(dy)>1200||
+          typeof expectedViewport!=="string"||expectedViewport.length>256||!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("pointer scroll requires bounded one-axis deltas and a guarded fresh target.");
+      const target=await chrome.tabs.get(tabId),deadline=performance.now()+timeoutMs;
+      if(!target.active){respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target",dispatch_acknowledged:false,dispatch_may_have_occurred:false,reason:"Wheel input requires the target tab to be active; no tab activation was attempted."}});return;}
+      const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      let descriptorId,finalDescriptorId,containerId,dispatchAttempted=false,dispatchAcknowledged=false;
+      try{
+        const guarded=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+          arguments:[{value:index},{value:dx},{value:dy},{value:expectedViewport}],returnByValue:false});
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"guard_deadline_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        const remote=guarded?.result;
+        descriptorId=remote?.objectId;
+        if(!descriptorId||remote.type!=="object")throw new Error("scroll guard omitted its receipt object.");
+        const properties=await chrome.debugger.sendCommand({tabId},"Runtime.getProperties",{objectId:descriptorId,ownProperties:true,generatePreview:false});
+        const fields=new Map((properties?.result||[]).map(property=>[property.name,property.value]));
+        const scalar=name=>fields.get(name)?.value;
+        containerId=fields.get("container")?.objectId;
+        if(scalar("ok")!==true||scalar("viewport")!==expectedViewport||!Number.isFinite(scalar("x"))||!Number.isFinite(scalar("y"))||!containerId){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:scalar("reason")||"scroll_target_refused",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        const x=scalar("x"),y=scalar("y"),before={left:scalar("left"),top:scalar("top")};
+        if(!Number.isFinite(before.left)||!Number.isFinite(before.top))throw new Error("scroll guard omitted initial container offsets.");
+        const beforeRead=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
+          functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+        const beforeValue=beforeRead?.result?.value;
+        if(!beforeValue?.connected||beforeValue.left!==before.left||beforeValue.top!==before.top){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"scroll_container_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        const finalGuard=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+          arguments:[{value:index},{value:dx},{value:dy},{value:expectedViewport},{objectId:containerId}],returnByValue:false});
+        finalDescriptorId=finalGuard?.result?.objectId;
+        if(!finalDescriptorId||finalGuard?.result?.type!=="object")throw new Error("final scroll guard did not retain its receipt.");
+        const finalProperties=await chrome.debugger.sendCommand({tabId},"Runtime.getProperties",{objectId:finalDescriptorId,ownProperties:true,generatePreview:false});
+        const finalFields=new Map((finalProperties?.result||[]).map(property=>[property.name,property.value]));
+        const finalScalar=name=>finalFields.get(name)?.value;
+        if(finalScalar("ok")!==true||finalScalar("viewport")!==expectedViewport||finalScalar("x")!==x||finalScalar("y")!==y){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:finalScalar("reason")||"scroll_target_changed_before_dispatch",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"guard_deadline_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        dispatchAttempted=true;
+        await chrome.debugger.sendCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",x,y});
+        await chrome.debugger.sendCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseWheel",x,y,deltaX:dx,deltaY:dy});
+        dispatchAcknowledged=true;
+        const afterRead=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
+          functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+        const after=afterRead?.result?.value;
+        if(!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"target_identity_changed_after_scroll",dispatch_acknowledged:true,dispatch_may_have_occurred:true}});return;
+        }
+        if(!after?.connected||!Number.isFinite(after.left)||!Number.isFinite(after.top)){
+          respond({type:"result",id:request.id,result:{status:"inconclusive",reason_code:"scroll_container_readback_unavailable",dispatch_acknowledged:true,dispatch_may_have_occurred:true,before,after:null}});return;
+        }
+        const receipt={same_container:true,container_connected:true,before,after:{left:after.left,top:after.top},delta_x:dx,delta_y:dy};
+        const moved=dx? (dx<0?after.left<before.left:after.left>before.left):(dy<0?after.top<before.top:after.top>before.top);
+        respond({type:"result",id:request.id,result:{status:moved?"verified":"inconclusive",reason_code:moved?undefined:"scroll_offset_unchanged",dispatch_acknowledged:true,dispatch_may_have_occurred:true,...receipt}});return;
+      }catch(error){
+        respond({type:"result",id:request.id,result:{status:dispatchAttempted?"unknown":"not_dispatched",reason_code:dispatchAttempted?"wheel_delivery_unknown":"scroll_preflight_failed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:dispatchAttempted,reason:safeNativeError(String(error))}});return;
+      }finally{
+        if(containerId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
+        if(descriptorId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
+        if(finalDescriptorId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
+      }
+    }
+    if (request.method === "Controlla.scrollToTarget") {
+      const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
+      const timeoutMs=params.timeout_ms??3000,expectedActivationEpoch=params.expected_activation_epoch,expectedFocusEpoch=params.expected_focus_epoch;
+      if(typeof objectId!=="string"||!objectId||objectId.length>512||!Number.isSafeInteger(index)||index<0||
+          typeof guard!=="string"||!guard.startsWith("function(index,scrollRequest)")||guard.length>16000||
+          params.scroll_request!=="scroll-to-target-v1"||!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("scroll-to-target requires a bounded semantic guard and current target.");
+      const deadline=performance.now()+timeoutMs;
+      const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      let evaluationAttempted=false,evaluationAcknowledged=false;
+      try{
+        if(!documentId||!isAuthorized(tabId)||(nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"target_identity_changed_before_scroll",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        evaluationAttempted=true;
+        const response=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+          arguments:[{value:index},{value:"scroll-to-target-v1"}],returnByValue:true});
+        evaluationAcknowledged=true;
+        const receipt=response?.result?.value;
+        if(!receipt||typeof receipt!=="object")throw new Error("scroll-to-target guard returned no outcome evidence.");
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)){
+          respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"target_identity_changed_after_scroll",dispatch_acknowledged:evaluationAcknowledged,dispatch_may_have_occurred:receipt.dispatch_may_have_occurred!==false,postcondition:receipt}});return;
+        }
+        if(receipt.phase==="before"&&receipt.dispatch_may_have_occurred===false){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:receipt.reason||"scroll_target_refused",dispatch_acknowledged:false,dispatch_may_have_occurred:false,postcondition:receipt}});return;
+        }
+        if(receipt.ok===true&&receipt.target_visible===true&&receipt.center_hit===true){
+          respond({type:"result",id:request.id,result:{status:"verified",reason_code:undefined,dispatch_acknowledged:true,dispatch_may_have_occurred:true,...receipt}});return;
+        }
+        respond({type:"result",id:request.id,result:{status:"inconclusive",reason_code:receipt.reason||"target_visibility_not_verified",dispatch_acknowledged:true,dispatch_may_have_occurred:true,postcondition:receipt}});return;
+      }catch(error){
+        respond({type:"result",id:request.id,result:{status:evaluationAttempted?"unknown":"not_dispatched",reason_code:evaluationAttempted?"scroll_to_target_delivery_unknown":"scroll_to_target_preflight_failed",dispatch_acknowledged:evaluationAcknowledged,dispatch_may_have_occurred:evaluationAttempted,reason:safeNativeError(String(error))}});return;
+      }
+    }
+    if (request.method === "Controlla.frameScroll") {
+      const p=request.params||{},frameId=p.frame_id,loaderId=p.loader_id,backendNodeId=p.backend_node_id;
+      const dx=p.delta_x,dy=p.delta_y,timeoutMs=p.timeout_ms??3000;
+      const expectedActivationEpoch=p.expected_activation_epoch,expectedFocusEpoch=p.expected_focus_epoch;
+      if(typeof frameId!=="string"||!frameId||frameId.length>256||typeof loaderId!=="string"||!loaderId||loaderId.length>256||
+          !Number.isSafeInteger(backendNodeId)||backendNodeId<=0||!Number.isSafeInteger(dx)||!Number.isSafeInteger(dy)||
+          ((dx===0)===(dy===0))||Math.abs(dx)>1200||Math.abs(dy)>1200||!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("frame scroll requires bounded frame identity, one-axis wheel deltas, and timeout.");
+      const root={tabId},deadline=performance.now()+timeoutMs,documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      let containerId,descriptorId,finalDescriptorId,wheelAttempted=false,wheelAcknowledged=false;
+      const currentFrame=async()=>{
+        const tree=await chrome.debugger.sendCommand(root,"Page.getFrameTree",{});
+        const visit=(node,ancestors=[])=>node?.frame?.id===frameId?{frame:node.frame,depth:ancestors.length,chain:[...ancestors,node.frame]}:(node?.childFrames||[]).map(child=>visit(child,[...ancestors,node.frame])).find(Boolean);
+        return visit(tree.frameTree,[]);
+      };
+      const sameProcessChain=async(info)=>{
+        if(!info?.chain||info.depth<1||info.depth>8||info.chain.some(frame=>!frame?.id||!frame?.loaderId))return false;
+        const sessions=await Promise.all(info.chain.slice(1).map(frame=>waitForFrameSession(tabId,frame.id,400)));
+        return sessions.every(sessionId=>!sessionId);
+      };
+      const identityStillOwned=async()=>{
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||
+            (expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch))return false;
+        const tab=await chrome.tabs.get(tabId);
+        return tab.active===true;
+      };
+      try{
+        if(!documentId||!(await identityStillOwned())){
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        await chrome.debugger.sendCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
+        try{
+          const info=await currentFrame();
+          if(!info||info.frame.loaderId!==loaderId||!(await sameProcessChain(info)))throw new Error("Frame ancestry is stale, too deep, or includes an out-of-process frame.");
+          const expectedChain=info.chain.map(frame=>({id:frame.id,loaderId:frame.loaderId}));
+          const frameRoute=root;
+          const ax=await chrome.debugger.sendCommand(frameRoute,"Accessibility.getFullAXTree",{frameId});
+          if(!ax.nodes?.some(node=>node.backendDOMNodeId===backendNodeId))throw new Error("Frame scroll reference is stale or unavailable in this same-process frame.");
+          const resolved=await chrome.debugger.sendCommand(frameRoute,"DOM.resolveNode",{backendNodeId});
+          const objectId=resolved?.object?.objectId;
+          if(!objectId)throw new Error("Frame scroll target could not be resolved.");
+          const guard="function(dx,dy,expectedViewport,expectedContainer){const e=this,d=e?.ownerDocument,w=d?.defaultView;if(!e||!e.isConnected||!d||!w)return {ok:false,reason:'stale_reference'};const b=e.getBoundingClientRect(),s=w.getComputedStyle(e),vw=w.innerWidth,vh=w.innerHeight;if(s.display==='none'||s.visibility==='hidden'||Number.parseFloat(s.opacity||'1')<=0||b.width<=0||b.height<=0)return {ok:false,reason:'not_visible'};const x=Math.max(0,Math.min(vw-1,b.left+b.width/2)),y=Math.max(0,Math.min(vh-1,b.top+b.height/2)),hit=d.elementFromPoint(x,y);if(!hit||!(hit===e||e.contains(hit))||hit.getRootNode()!==d||hit instanceof HTMLIFrameElement)return {ok:false,reason:'obscured_or_nested_document'};const viewport=`${vw}x${vh}@${w.devicePixelRatio||1}`;if(expectedViewport&&viewport!==expectedViewport)return {ok:false,reason:'viewport_changed'};const axis=dy?'y':'x',scrollable=n=>{if(!(n instanceof Element))return false;const cs=w.getComputedStyle(n),overflow=axis==='y'?cs.overflowY:cs.overflowX;return ['auto','scroll','overlay'].includes(overflow)&&(axis==='y'?n.scrollHeight-n.clientHeight:n.scrollWidth-n.clientWidth)>1};let container=null;for(let n=hit;n&&n instanceof Element;n=n.parentElement){if(scrollable(n)){container=n;break}}if(!container&&scrollable(d.scrollingElement))container=d.scrollingElement;if(!container)return {ok:false,reason:'no_scrollable_ancestor'};if(expectedContainer&&container!==expectedContainer)return {ok:false,reason:'scroll_container_changed'};const left=container.scrollLeft,top=container.scrollTop,maxLeft=Math.max(0,container.scrollWidth-container.clientWidth),maxTop=Math.max(0,container.scrollHeight-container.clientHeight),pos=dy?top:left,max=dy?maxTop:maxLeft;if(dy<0?pos<=1:dy>0?pos>=max-1:dx<0?pos<=1:pos>=max-1)return {ok:false,reason:'nearest_scroll_container_at_boundary'};return {ok:true,x,y,width:vw,height:vh,viewport,container,left,top}}";
+          const readGuard=async(expectedContainer)=>{
+            const result=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,arguments:[{value:dx},{value:dy},{value:expectedContainer?.viewport??null},...(expectedContainer?[{objectId:expectedContainer.containerId}]:[])],returnByValue:false});
+            const id=result?.result?.objectId;if(!id||result.result.type!=="object")throw new Error("Frame scroll guard returned no retained state.");
+            const props=await chrome.debugger.sendCommand(frameRoute,"Runtime.getProperties",{objectId:id,ownProperties:true,generatePreview:false});
+            const fields=new Map((props?.result||[]).map(item=>[item.name,item.value])),scalar=name=>fields.get(name)?.value;
+            return {id,fields,scalar,containerId:fields.get("container")?.objectId};
+          };
+          const first=await readGuard();descriptorId=first.id;containerId=first.containerId;
+          const state=first.scalar;
+          if(state("ok")!==true||!containerId||!Number.isFinite(state("x"))||!Number.isFinite(state("y"))||!Number.isFinite(state("width"))||!Number.isFinite(state("height")))throw new Error(state("reason")||`Frame scroll target was refused (ok=${state("ok")}, container=${!!containerId}, point=${state("x")},${state("y")}, viewport=${state("width")}x${state("height")}).`);
+          const viewport=state("viewport"),before={left:state("left"),top:state("top")};
+          const beforeRead=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+          if(!beforeRead.result?.value?.connected||beforeRead.result.value.left!==before.left||beforeRead.result.value.top!==before.top)throw new Error("Frame scroll container changed before dispatch.");
+          const initialPoint=await rootPointForFrame(tabId,frameId,objectId,state("x"),state("y"),{width:state("width"),height:state("height")});
+          const final=await readGuard({viewport,containerId});finalDescriptorId=final.id;
+          if(final.scalar("ok")!==true||final.scalar("x")!==state("x")||final.scalar("y")!==state("y")||final.containerId!==containerId)throw new Error("Frame scroll target or nearest container changed before dispatch.");
+          let finalInfo=await currentFrame();
+          const sameChain=info=>info?.chain?.length===expectedChain.length&&info.chain.every((frame,index)=>frame.id===expectedChain[index].id&&frame.loaderId===expectedChain[index].loaderId);
+          if(!sameChain(finalInfo)||!(await sameProcessChain(finalInfo)))throw new Error("Frame ancestry changed or includes an out-of-process frame before wheel dispatch.");
+          finalInfo=await currentFrame();
+          if(!sameChain(finalInfo))throw new Error("Frame or loader identity changed during final scroll preflight.");
+          const finalPoint=await rootPointForFrame(tabId,frameId,objectId,final.scalar("x"),final.scalar("y"),{width:final.scalar("width"),height:final.scalar("height")});
+          const dispatchInfo=await currentFrame();
+          if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
+          await chrome.debugger.sendCommand(root,"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",...finalPoint});
+          wheelAttempted=true;
+          await chrome.debugger.sendCommand(root,"Input.dispatchMouseEvent",{type:"mouseWheel",...finalPoint,deltaX:dx,deltaY:dy});
+          wheelAcknowledged=true;
+          const afterRead=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+          const after=afterRead.result?.value;
+          if(!(await identityStillOwned())||(await currentFrame())?.frame?.loaderId!==loaderId){respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"frame_scroll_identity_changed_after_dispatch",dispatch_acknowledged:true,dispatch_may_have_occurred:true}});return;}
+          if(!after?.connected||!Number.isFinite(after.left)||!Number.isFinite(after.top)){respond({type:"result",id:request.id,result:{status:"inconclusive",reason_code:"frame_scroll_readback_unavailable",dispatch_acknowledged:true,dispatch_may_have_occurred:true,before,after:null}});return;}
+          const moved=dx?(dx<0?after.left<before.left:after.left>before.left):(dy<0?after.top<before.top:after.top>before.top);
+          respond({type:"result",id:request.id,result:{status:moved?"verified":"inconclusive",reason_code:moved?undefined:"scroll_offset_unchanged",dispatch_acknowledged:true,dispatch_may_have_occurred:true,frame_id:frameId,frame_loader_id:loaderId,root_point:finalPoint,same_container:true,before,after:{left:after.left,top:after.top},delta_x:dx,delta_y:dy}});return;
+        }finally{
+          if(containerId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
+          if(descriptorId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
+          if(finalDescriptorId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
+          await chrome.debugger.sendCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+        }
+      }catch(error){
+        respond({type:"result",id:request.id,result:{status:wheelAttempted?"unknown":"not_dispatched",reason_code:wheelAttempted?"wheel_delivery_unknown":"frame_scroll_preflight_rejected",dispatch_acknowledged:wheelAcknowledged,dispatch_may_have_occurred:wheelAttempted,reason:safeNativeError(String(error))}});return;
+      }
+    }
     if (request.method === "Controlla.securePasswordFill") {
       const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
       const label = typeof request.params?.label === "string" ? request.params.label.slice(0, 120) : "Password";
@@ -755,19 +1454,39 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 22000) throw new Error("secure password fill requires bounded frame identity and timeout.");
       const target = await chrome.tabs.get(tabId), window = await chrome.windows.get(target.windowId);
       if (!target.active || !window.focused) {
-        respond({ type: "result", id: request.id, result: { status: "not_dispatched", dispatch_may_have_occurred: false, reason_code: "secure_input_requires_active_target", reason: "Secure password entry requires the target tab to be active in the focused Chrome window." } }); return;
+        respond({ type: "result", id: request.id, result: { status: "not_dispatched", dispatch_may_have_occurred: false, reason_code: "secure_input_requires_active_target", reason: "Secure password entry requires the target tab to be active in the focused Chrome window.", observed: { target_active: !!target.active, window_focused: !!window.focused } } }); return;
       }
       const root = { tabId }, frameTree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
       const findFrame = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(findFrame).find(Boolean);
       const frame = findFrame(frameTree.frameTree);
       if (!frame || frame.loaderId !== loaderId) throw new Error("Password field frame changed since its fresh snapshot.");
+      const originForFrame = candidate => {
+        try {
+          const parsed = new URL(candidate?.securityOrigin);
+          return /^https?:$/.test(parsed.protocol) && parsed.origin !== "null" ? parsed.origin : undefined;
+        } catch { return undefined; }
+      };
+      const origin = originForFrame(frame);
+      if (!origin) throw new Error("Password field has no trustworthy HTTP(S) frame origin.");
       await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
-      let promptTab;
+      let promptTab, promptActivationEpoch;
+      const capturePromptActivation = info => {
+        if (promptTab?.id === info.tabId && promptActivationEpoch === undefined) promptActivationEpoch = activationEpoch;
+      };
+      chrome.tabs.onActivated.addListener(capturePromptActivation);
+      const ownsPromptActivation = async () => {
+        if (!promptTab?.id || promptActivationEpoch === undefined) return false;
+        const observedEpoch = activationEpoch;
+        if (observedEpoch !== promptActivationEpoch) return false;
+        const active = await chrome.tabs.query({ active: true, windowId: target.windowId });
+        return activationEpoch === observedEpoch && active[0]?.id === promptTab.id;
+      };
       const route = () => { const sessionId = frameSessions.get(tabId)?.get(frameId); return sessionId ? { tabId, sessionId } : root; };
       const checkPassword = async () => {
         if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || !isAuthorized(tabId)) throw new Error("Target document or Controlla lease changed during secure entry.");
         const current = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
-        if (findFrame(current.frameTree)?.loaderId !== loaderId) throw new Error("Password field frame navigated during secure entry.");
+        const currentFrame = findFrame(current.frameTree);
+        if (currentFrame?.loaderId !== loaderId || originForFrame(currentFrame) !== origin) throw new Error("Password field origin or frame identity changed during secure entry.");
         const resolved = await chrome.debugger.sendCommand(route(), "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Password field is no longer available.");
@@ -783,9 +1502,6 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const field = await checkPassword();
         const nonceBytes = new Uint8Array(32); crypto.getRandomValues(nonceBytes);
         const nonce = [...nonceBytes].map(value => value.toString(16).padStart(2, "0")).join("");
-        let origin;
-        try { origin = new URL(frame.securityOrigin).origin; } catch { throw new Error("Password field has no trustworthy HTTP(S) frame origin."); }
-        if (!/^https?:$/.test(new URL(origin).protocol)) throw new Error("Password field has no trustworthy HTTP(S) frame origin.");
         const hasChatPassword = Object.hasOwn(request.params || {}, "password");
         let chatPassword = hasChatPassword ? request.params.password : undefined;
         if (hasChatPassword) request.params.password = "";
@@ -804,7 +1520,9 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           });
           pending.tabId = tabId; pending.origin = origin; pending.label = label; pendingSecureInputs.set(nonce, pending);
           promptTab = await chrome.tabs.create({ url: chrome.runtime.getURL(`secure-input.html#${nonce}`), active: true, windowId: target.windowId });
+          promptActivationEpoch ??= activationEpoch;
           submitted = await input;
+          if (!(await ownsPromptActivation())) throw new Error("Active tab changed during secure entry; password was not dispatched.");
         }
         if (!submitted || typeof submitted.value !== "string" || submitted.value.length < 1 || submitted.value.length > 4096) throw new Error("Secure password entry was cancelled or exceeded its bound.");
         let password = submitted.value;
@@ -812,6 +1530,12 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         try {
           const latest = await checkPassword();
           if (latest.objectId !== field.objectId) throw new Error("Password field identity changed during secure entry.");
+          if (hasChatPassword) {
+            const currentTarget = await chrome.tabs.get(tabId), currentWindow = await chrome.windows.get(currentTarget.windowId);
+            if (!currentTarget.active || !currentWindow.focused) throw new Error("Target lost foreground ownership before password dispatch.");
+          } else if (!(await ownsPromptActivation())) {
+            throw new Error("Active tab changed during password field revalidation; password was not dispatched.");
+          }
           passwordDispatchStarted = true;
           const result = await chrome.debugger.sendCommand(latest.route, "Runtime.callFunctionOn", { objectId: latest.objectId,
             functionDeclaration: "function(value){const e=this;if(!(e instanceof HTMLInputElement)||e.type!=='password'||!e.isConnected||e.value.length!==0||e.disabled||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'field_changed'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'setter_unavailable'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value,length:e.value.length}}",
@@ -830,7 +1554,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       } finally {
         for (const [nonce, pending] of pendingSecureInputs) if (pending.tabId === tabId) { clearTimeout(pending.timer); pendingSecureInputs.delete(nonce); }
         if (promptTab?.id != null) await chrome.tabs.remove(promptTab.id).catch(() => {});
-        await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+        chrome.tabs.onActivated.removeListener(capturePromptActivation);
         await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
       return;
@@ -841,6 +1565,47 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 15000) throw new Error("File chooser timeout_ms must be 1..15000.");
       const event = await waitForFileChooser(tabId, expectedDocumentId, timeout);
       if (!routeActive(nativeRoute, routeGeneration) || pairedTabDocumentIds.get(tabId) !== event.document_id) throw new Error("File chooser belongs to a stale tab document.");
+      respond({ type: "result", id: request.id, result: event }); return;
+    }
+    if (request.method === "Controlla.downloadLifecycle") {
+      const params = request.params || {};
+      const action = params.action;
+      if (action === "arm") {
+        if ((params.expected_document_id !== undefined && params.expected_document_id !== expectedDocumentId) || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("Download observer requires the current paired document identity.");
+        if (!validDownloadUrl(params.expected_url)) throw new Error("Download observer requires an exact credential-free HTTP(S) or HTTP(S)-blob URL.");
+        const perTab = [...downloadObservers.values()].filter(observer => observer.tabId === tabId);
+        if (perTab.length >= MAX_DOWNLOAD_OBSERVERS_PER_TAB || downloadObservers.size >= MAX_DOWNLOAD_OBSERVERS) throw new Error("Download observer capacity is full.");
+        if (perTab.some(observer => observer.expectedUrl === params.expected_url)) throw new Error("A download observer for this URL is already active on the tab.");
+        const observerId = crypto.randomUUID();
+        const observer = { id: observerId, tabId, documentId: expectedDocumentId, expectedUrl: params.expected_url,
+          downloadId: undefined, filename: null, bytesReceived: 0, totalBytes: null, urlIdentity: null,
+          events: [], waiter: undefined, item: undefined, expiryTimer: undefined };
+        downloadObservers.set(observerId, observer);
+        refreshDownloadObserverExpiry(observer);
+        respond({ type: "result", id: request.id, result: { status: "armed", observer_id: observerId, document_id: expectedDocumentId } }); return;
+      }
+      if (typeof params.observer_id !== "string" || params.observer_id.length > 64) throw new Error("Download lifecycle action requires a bounded observer_id.");
+      const observer = downloadObservers.get(params.observer_id);
+      if (!observer || observer.tabId !== tabId || observer.documentId !== expectedDocumentId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("Download observer is stale or belongs to another target document.");
+      if (action === "cancel") {
+        let cancelAcknowledged = false;
+        if (Number.isSafeInteger(observer.downloadId)) {
+          try { await chrome.downloads.cancel(observer.downloadId); cancelAcknowledged = true; } catch {}
+        }
+        clearDownloadObserver(observer.id, { status: "interrupted", reason_code: "download_observer_cancelled",
+          filename: observer.filename, bytes_received: observer.bytesReceived, url_identity: observer.urlIdentity });
+        respond({ type: "result", id: request.id, result: { status: "observer_cancelled", download_cancel_acknowledged: cancelAcknowledged } }); return;
+      }
+      if (action !== "wait") throw new Error("Download lifecycle action must be arm, wait, or cancel.");
+      const timeout = params.timeout_ms;
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 30000) throw new Error("Download lifecycle timeout_ms must be 1..30000.");
+      const event = await nextDownloadLifecycleEvent(observer, timeout);
+      if (!isAuthorized(tabId) || !routeActive(nativeRoute, routeGeneration) || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) {
+        clearDownloadObserver(observer.id, { status: "interrupted", reason_code: "target_identity_changed" });
+        throw new Error("Download lifecycle event belongs to a detached or stale target.");
+      }
+      if (event.status === "timed_out" || event.status === "completed" || event.status === "interrupted") clearDownloadObserver(observer.id);
+      else refreshDownloadObserverExpiry(observer);
       respond({ type: "result", id: request.id, result: event }); return;
     }
     if (request.method === "Controlla.checkIdentityMarker") {
@@ -879,25 +1644,30 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.setFrameFileInputFiles") {
       if (!nativeRoute || !nativeLease?.tabs.has(tabId)) throw new Error("File selection requires an exact native lease for the target tab.");
-      const { frame_id: frameId, frame_loader_id: loaderId, backend_node_id: backendNodeId, file_path: filePath } = request.params || {};
-      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload target or local path is invalid.");
+      const { frame_id: frameId, frame_loader_id: loaderId, backend_node_id: backendNodeId } = request.params || {};
+      const filePaths = request.params?.file_paths ?? [request.params?.file_path];
+      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || !Array.isArray(filePaths) || filePaths.length < 1 || filePaths.length > 5 || filePaths.some(path => typeof path !== "string" || !path || path.length > 4096)) throw new Error("Frame upload target or bounded staged paths are invalid.");
       const readTree = () => chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
       const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
       if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated after the chooser opened.");
       const childSessionId = frameSessions.get(tabId)?.get(frameId);
       const route = childSessionId ? { tabId, sessionId: childSessionId } : { tabId };
-      await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: [filePath], backendNodeId });
       const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId });
+      if (!resolved.object?.objectId) throw new Error("Chooser input could not be resolved for accept-filter validation.");
+      const policy = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
+      if (policy.result?.value?.ok !== true) throw new Error(`File selection refused before dispatch: ${policy.result?.value?.reason || "accept_filter_unverified"}.`);
+      await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId });
       const objectId = resolved.object?.objectId;
       if (!objectId) throw new Error("Chooser input could not be resolved for file readback.");
       const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
       if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated during file selection.");
-      respond({ type: "result", id: request.id, result: { frame_id: frameId, frame_loader_id: loaderId, files: readback.result?.value } }); return;
+      respond({ type: "result", id: request.id, result: { frame_id: frameId, frame_loader_id: loaderId, files: readback.result?.value, input_policy: policy.result.value } }); return;
     }
     if (request.method === "Controlla.frameSelectFile") {
       if (!nativeRoute || !nativeLease?.tabs.has(tabId)) throw new Error("File selection requires an exact native lease for the target tab.");
-      const { frame_id: frameId, frame_loader_id: loaderId, trigger_backend_node_id: triggerId, file_path: filePath } = request.params || {};
-      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(triggerId) || triggerId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload trigger or local path is invalid.");
+      const { frame_id: frameId, frame_loader_id: loaderId, trigger_backend_node_id: triggerId } = request.params || {};
+      const filePaths = request.params?.file_paths ?? [request.params?.file_path];
+      if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(triggerId) || triggerId <= 0 || !Array.isArray(filePaths) || filePaths.length < 1 || filePaths.length > 5 || filePaths.some(path => typeof path !== "string" || !path || path.length > 4096)) throw new Error("Frame upload trigger or bounded staged paths are invalid.");
       const root = { tabId };
       const readFrame = async () => {
         const tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
@@ -906,7 +1676,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       };
       if ((await readFrame())?.loaderId !== loaderId) throw new Error("Upload frame changed before selection.");
       if (fileChooserOperations.has(tabId) || fileChooserWaiters.has(tabId)) throw new Error("Another file chooser operation is active for this tab.");
-      const operation = { frameId, pressing: false, conflicted: false, networkRequests: new Map(), networkEvents: [] };
+      const operation = { frameId, pressing: false, conflicted: false, networkRequests: new Map(), networkOutcomes: new Map(), networkEvents: [] };
       fileChooserOperations.set(tabId, operation);
       let route, interceptionEnabled = false, networkEnabled = false, pressAttempted = false, dispatched = false, selectionResult;
       try {
@@ -943,18 +1713,26 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         dispatched = true;
         const chooser = await waitForFileChooser(tabId, expectedDocumentId, 4000, operation.eventCursor);
         if (operation.conflicted || chooser.frame_id !== frameId || chooser.frame_loader_id !== loaderId || (await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("File chooser belongs to another frame, document, or overlapping operation.");
-        await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: [filePath], backendNodeId: chooser.backend_node_id });
-        const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: chooser.backend_node_id });
-        if (!resolved.object?.objectId) throw new Error("Chooser input could not be resolved for file readback.");
-        const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
+        const chooserNode = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: chooser.backend_node_id });
+        if (!chooserNode.object?.objectId) throw new Error("Chooser input could not be resolved for accept-filter validation.");
+        const policy = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
+        if (policy.result?.value?.ok !== true) throw new Error(`File selection refused before dispatch: ${policy.result?.value?.reason || "accept_filter_unverified"}.`);
+        await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId: chooser.backend_node_id });
+        const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
         if ((await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("Upload frame or root document changed during file selection.");
-        if (!Array.isArray(readback.result?.value) || readback.result.value.length !== 1 || !readback.result.value[0]?.name) throw new Error("File input did not retain one selected file for readback.");
-        selectionResult = { status: "selected", files: readback.result?.value, frame_id: frameId, frame_loader_id: loaderId, document_id: expectedDocumentId, dispatch_acknowledged: true };
+        if (!Array.isArray(readback.result?.value) || readback.result.value.length !== filePaths.length || readback.result.value.some(file => !file?.name)) throw new Error("File input did not retain the complete selected file set for readback.");
+        selectionResult = { status: "selected", files: readback.result?.value, input_policy: policy.result.value, frame_id: frameId, frame_loader_id: loaderId, document_id: expectedDocumentId, dispatch_acknowledged: true };
+        if ([...operation.networkOutcomes.values()].some(value => value === "pending")) {
+          const networkObservation = await waitForUploadNetwork(operation, 1500);
+          if (networkObservation.status === "stalled") {
+            selectionResult = { ...selectionResult, status: "unknown", reason_code: "upload_network_stalled", network_observation: networkObservation };
+          } else selectionResult.network_observation = networkObservation;
+        }
       } catch (error) {
         selectionResult = { status: pressAttempted ? "unknown" : "not_dispatched", dispatch_acknowledged: dispatched, reason: String(error) };
       } finally {
         if (networkEnabled && selectionResult?.reason?.includes("File input did not retain")) {
-          selectionResult.network_observation_window_ms = await waitForUploadNetwork(operation);
+          selectionResult.network_observation = await waitForUploadNetwork(operation);
         }
         if (networkEnabled) await chrome.debugger.sendCommand(route, "Network.disable", {}).catch(() => {});
         if (selectionResult) selectionResult.network_events = operation.networkEvents;
@@ -1001,8 +1779,11 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (!objectId) throw new Error("Frame click target could not be resolved for outcome verification.");
         const localPoint = await frameActionablePoint(child, objectId);
         let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-        ({ x, y } = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y, localPoint.viewport));
+        const initialMapping = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y, localPoint.viewport);
+        ({ x, y } = initialMapping);
         if (await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
+        const dispatchPoint = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y, localPoint.viewport);
+        if (Math.abs(dispatchPoint.x - x) > 0.5 || Math.abs(dispatchPoint.y - y) > 0.5 || JSON.stringify(dispatchPoint.owner_signature) !== JSON.stringify(initialMapping.owner_signature) || await frameLoader() !== loaderId) throw new Error("Frame owner geometry changed before dispatch.");
         let pressAttempted = false;
         try {
           if (inputMode === "mouse") await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
@@ -1105,22 +1886,79 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (!SHARED_COMMAND_METHODS.has(request.method)) throw new Error("Command is outside the shared observe/input allowlist.");
     if (request.method === "Page.captureScreenshot") {
       const p = request.params || {}, clip = p.clip;
-      if (p.format !== "png" || p.captureBeyondViewport !== false || p.fromSurface !== true ||
+      if (p.format !== "png" || typeof p.captureBeyondViewport !== "boolean" || p.fromSurface !== true ||
           !clip || ![clip.x, clip.y, clip.width, clip.height, clip.scale].every(Number.isFinite) ||
-          clip.x < 0 || clip.y < 0 || clip.width <= 0 || clip.height <= 0 || clip.width > 1600 || clip.height > 1200 ||
-          clip.scale <= 0 || clip.scale > 2 || clip.width * clip.height > 1_920_000) {
-        throw new Error("Shared screenshot requires a bounded PNG viewport crop (maximum 1600x1200 pixels).");
+          clip.x < 0 || clip.y < 0 || clip.width <= 0 || clip.height <= 0 || clip.width > 4096 || clip.height > 4096 ||
+          clip.scale <= 0 || clip.scale > 2 || clip.width * clip.height * clip.scale * clip.scale > 16_777_216) {
+        throw new Error("Shared screenshot requires a bounded PNG crop (maximum 4096x4096 CSS pixels and 16 megapixels).");
       }
     }
     const screenshotDocumentId = request.method === "Page.captureScreenshot" ? pairedTabDocumentIds.get(tabId) : undefined;
+    const screenshotStartedAt = request.method === "Page.captureScreenshot" ? Date.now() : undefined;
+    const screenshotLifecycleGeneration = request.method === "Page.captureScreenshot" ? (tabLifecycleGenerations.get(tabId) || 0) : undefined;
+    const screenshotTabBefore = request.method === "Page.captureScreenshot" ? await chrome.tabs.get(tabId) : undefined;
+    const screenshotLifecycleBefore = request.method === "Page.captureScreenshot" ? screenshotTargetLifecycle(screenshotTabBefore) : undefined;
+    if (request.method === "Page.captureScreenshot" && screenshotLifecycleBefore !== "active") {
+      const reasonCode = screenshotLifecycleBefore === "frozen" ? "target_frozen" : screenshotLifecycleBefore === "discarded" ? "target_discarded" : screenshotLifecycleBefore === "loading" ? "target_not_ready" : "target_lifecycle_unknown";
+      throw Object.assign(new Error(`Screenshot target lifecycle is ${screenshotLifecycleBefore}; capture requires an observed active, unfrozen renderer.`), { reason_code: reasonCode });
+    }
+    const screenshotFrameBefore = request.method === "Page.captureScreenshot"
+      ? await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined)
+      : undefined;
+    if (request.method === "Page.captureScreenshot" && (!screenshotDocumentId || screenshotFrameBefore?.documentId !== screenshotDocumentId)) {
+      throw Object.assign(new Error("Screenshot target document is not fresh and stable before capture."), { reason_code: "screenshot_document_changed" });
+    }
+    if (request.method === "Page.captureScreenshot" && (tabLifecycleGenerations.get(tabId) || 0) !== screenshotLifecycleGeneration) {
+      throw Object.assign(new Error("Screenshot target lifecycle changed before capture dispatch."), { reason_code: "target_lifecycle_changed" });
+    }
     const requestBytes = JSON.stringify({ method: request.method, params: request.params || {} }).length;
+    if (!topologyStable()) {
+      commandMayHaveDispatched = false;
+      respond({ type: "result", id: request.id, result: { status: "not_dispatched", reason_code: "tab_topology_changed", dispatch_may_have_occurred: false,
+        reason: "Paired tab topology changed before CDP dispatch; retry after reconciling its window." } });
+      return;
+    }
     traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes }); const result = await chrome.debugger.sendCommand({ tabId }, request.method, request.params || {});
+    if (!topologyStable()) throw Object.assign(new Error("Paired tab topology changed during CDP dispatch."), { reason_code: "tab_topology_changed" });
     if (screenshotDocumentId && pairedTabDocumentIds.get(tabId) !== screenshotDocumentId) {
       throw Object.assign(new Error("Target document changed during screenshot capture; image bytes were discarded."), { reason_code: "screenshot_document_changed" });
     }
-    if (request.method === "Page.captureScreenshot" && (typeof result?.data !== "string" || result.data.length > 8 * 1024 * 1024 || !result.data.startsWith("iVBOR"))) throw new Error("Screenshot was empty or exceeded the 6 MiB decoded image limit.");
+    const screenshotFrameAfter = request.method === "Page.captureScreenshot"
+      ? await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined)
+      : undefined;
+    if (request.method === "Page.captureScreenshot" && screenshotFrameAfter?.documentId !== screenshotDocumentId) {
+      throw Object.assign(new Error("Screenshot document changed during compositor capture; image bytes were discarded."), { reason_code: "screenshot_document_changed" });
+    }
+    if (request.method === "Page.captureScreenshot") decodeScreenshotPng(result?.data);
+    if (request.method === "Page.captureScreenshot") {
+      const image = decodeScreenshotPng(result.data);
+      const dataHash = await crypto.subtle.digest("SHA-256", image.bytes);
+      const imageSha256 = [...new Uint8Array(dataHash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+      const target = await chrome.tabs.get(tabId);
+      const lifecycleAfter = screenshotTargetLifecycle(target);
+      if (lifecycleAfter !== "active" || (tabLifecycleGenerations.get(tabId) || 0) !== screenshotLifecycleGeneration) {
+        const reasonCode = lifecycleAfter === "frozen" ? "target_frozen" : lifecycleAfter === "discarded" ? "target_discarded" : lifecycleAfter === "loading" ? "target_not_ready" : lifecycleAfter === "unknown" ? "target_lifecycle_unknown" : "target_lifecycle_changed";
+        throw Object.assign(new Error("Screenshot target lifecycle changed during capture; image bytes were discarded."), { reason_code: reasonCode });
+      }
+      const clip = request.params.clip;
+      result.visual_evidence = {
+        target_id: String(tabId), document_id: screenshotDocumentId,
+        url: String(target.url || "").slice(0, 2048), frame_url: String(screenshotFrameAfter.url || "").slice(0, 2048), captured_at_ms: Date.now(),
+        capture_started_at_ms: screenshotStartedAt, visual_revision: imageSha256, image_sha256: imageSha256,
+        render_revision: null, target_lifecycle: lifecycleAfter,
+        dimensions: { width: image.width, height: image.height },
+      };
+    }
     traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result", requestBytes, responseBytes: (() => { try { return JSON.stringify(result).length; } catch { return 0; } })() }); respond({ type: "result", id: request.id, result });
   } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error), ...(error?.reason_code ? { reason_code: error.reason_code } : {}) }); }
+}
+function screenshotTargetLifecycle(tab) {
+  if (!tab) return "unknown";
+  if (tab.discarded) return "discarded";
+  if (tab.status !== "complete") return "loading";
+  if (tab.frozen === true) return "frozen";
+  if (tab.frozen === false) return "active";
+  return "unknown";
 }
 function validateNavigationUrl(value) { if (typeof value !== "string" || value.length > 2048) throw new Error("URL must be a bounded HTTP(S) URL."); const url = new URL(value); if (!(url.protocol === "http:" || url.protocol === "https:") || !url.hostname || url.username || url.password) throw new Error("URL must be HTTP(S) and cannot contain credentials."); return url.href; }
 async function nativePageIdentity(tabId) {
@@ -1201,7 +2039,7 @@ async function attachNewTab(tabId, url, native, generation, navigate = true, wai
   if (!navigate && waitUntil !== "document_committed") await waitForTabDOMContentLoaded(tabId); if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
   const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!routeActive(native, generation) || !await pendingNavigationMatchesDocument(tabId, attachedIdentity?.document_id) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
-  pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId); return attachedIdentity;
+  pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); bindPairedTabTopology(tabId); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId); return attachedIdentity;
 }
 async function returnExistingOpen(receipt, url, native, generation) {
   if ((receipt.requested_url || receipt.url) !== url) throw new Error("Idempotency key is already bound to a different URL.");
@@ -1218,7 +2056,7 @@ async function returnExistingOpen(receipt, url, native, generation) {
     await attachDebugger(tabId);
     const after = await nativePageIdentity(tabId).catch(() => undefined);
     if (!routeActive(native, generation) || after?.url !== receipt.url || after?.document_id !== receipt.document_id) { await detachDebugger(tabId); throw new Error(`Open receipt ${receipt.tab_id} changed while reconnecting; no replacement tab was opened.`); }
-    pairedTabUrls.set(tabId, after.url); pairedTabDocumentIds.set(tabId, after.document_id); attached.add(tabId);
+    pairedTabUrls.set(tabId, after.url); pairedTabDocumentIds.set(tabId, after.document_id); bindPairedTabTopology(tabId); attached.add(tabId);
   }
   const tab = await chrome.tabs.get(tabId), window = await chrome.windows.get(tab.windowId);
   return { tab_id: receipt.tab_id, window_id: receipt.window_id ?? tab.windowId, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true, created_background_window: receipt.create_background_window === true, placement: receipt.placement || {}, tab_active: !!tab.active, window_focused: !!window.focused };
@@ -1242,7 +2080,7 @@ async function createControllaTab(url, native, generation, tab, markerUrl, reuse
     identity = await nativePageIdentity(tab.id);
   }
   catch (error) {
-    if (attachedIdentity && routeActive(native, generation) && pairedTabDocumentIds.get(tab.id) === attachedIdentity.document_id && (native ? nativeLeaseForGeneration(generation)?.tabs.has(tab.id) : manualAttachedTabs.has(tab.id))) { pairedTabUrls.delete(tab.id); pairedTabDocumentIds.delete(tab.id); if (native) removeNativeTab(tab.id); else manualAttachedTabs.delete(tab.id); await detachDebugger(tab.id); }
+    if (attachedIdentity && routeActive(native, generation) && pairedTabDocumentIds.get(tab.id) === attachedIdentity.document_id && (native ? nativeLeaseForGeneration(generation)?.tabs.has(tab.id) : manualAttachedTabs.has(tab.id))) { pairedTabUrls.delete(tab.id); pairedTabDocumentIds.delete(tab.id); clearPairedTabTopology(tab.id); if (native) removeNativeTab(tab.id); else manualAttachedTabs.delete(tab.id); await detachDebugger(tab.id); }
     const failure = new Error("Tab " + tab.id + " remains open after the failed open; rediscover and pair it before use. " + String(error));
     failure.controllaOrphanTabId = String(tab.id);
     throw failure;
@@ -1361,9 +2199,10 @@ async function attachUnrestrictedNativeTab(tabId, leaseId) {
   if (tab.status !== "complete" || !frame?.documentId) throw new Error("Chrome tab is not ready.");
   await attachDebugger(tabId);
   if (nativeLeases.get(leaseId) !== lease) { await detachDebugger(tabId); throw new Error("Native lease ended during attachment."); }
-  lease.tabs.add(tabId); nativeTabLeases.set(tabId, leaseId); nativeAttachedTabs.add(tabId); pairedTabUrls.set(tabId, tab.url); pairedTabDocumentIds.set(tabId, frame.documentId);
+  lease.tabs.add(tabId); nativeTabLeases.set(tabId, leaseId); nativeAttachedTabs.add(tabId); pairedTabUrls.set(tabId, tab.url); pairedTabDocumentIds.set(tabId, frame.documentId); bindPairedTabTopology(tabId);
 }
 async function navigatePairedTab(tabId, url, native, generation) {
+  clearDownloadLifecycleState(tabId, "tab_navigated");
   clearFileChooserState(tabId, "Target navigated before the file chooser opened.");
   const before = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
   if (!before?.documentId) throw new Error("Cannot navigate a paired tab without a current document identity.");
@@ -1372,12 +2211,12 @@ async function navigatePairedTab(tabId, url, native, generation) {
   if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
   const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!routeActive(native, generation) || !await pendingNavigationMatchesDocument(tabId, attachedIdentity?.document_id) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
-  pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
+  pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); bindPairedTabTopology(tabId); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
 }
 function removeNativeTab(tabId) { const leaseId = nativeTabLeases.get(tabId); if (leaseId) nativeLeases.get(leaseId)?.tabs.delete(tabId); nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); }
-async function detachNativeLease(leaseId) { const lease = nativeLeases.get(leaseId); if (!lease) return; nativeLeases.delete(leaseId); nativeLeaseGenerations.delete(lease.generation); const tabs = [...lease.tabs]; for (const tabId of tabs) { if (nativeTabLeases.get(tabId) !== leaseId) continue; nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(tabs.filter(tabId => !nativeTabLeases.has(tabId)).map(detachDebugger)); }
-async function detachPairedTab(tabId) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); manualAttachedTabs.delete(tabId); removeNativeTab(tabId); await detachDebugger(tabId); }
-async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
+async function detachNativeLease(leaseId) { const lease = nativeLeases.get(leaseId); if (!lease) return; nativeLeases.delete(leaseId); nativeLeaseGenerations.delete(lease.generation); const tabs = [...lease.tabs]; for (const tabId of tabs) { if (nativeTabLeases.get(tabId) !== leaseId) continue; nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); clearDownloadLifecycleState(tabId, "native_lease_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(tabs.filter(tabId => !nativeTabLeases.has(tabId)).map(detachDebugger)); }
+async function detachPairedTab(tabId) { clearDownloadLifecycleState(tabId); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); manualAttachedTabs.delete(tabId); removeNativeTab(tabId); await detachDebugger(tabId); }
+async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { clearDownloadLifecycleState(tabId, "manual_bridge_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
 async function detachNative(generation) { if (generation !== nativeGeneration) return; for (const leaseId of [...nativeLeases.keys()]) await detachNativeLease(leaseId); }
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   if (["secure-input-ready", "secure-input-submit", "secure-input-cancel"].includes(message?.type)) {
@@ -1413,11 +2252,11 @@ async function pairManual(endpointUrl, token, tabs) {
     for (const tabId of tabs) {
       const navigationGeneration = tabNavigationGenerations.get(tabId) || 0; const beforeAttach = await chrome.tabs.get(tabId).catch(() => null); const beforeFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
       if (!beforeAttach || beforeAttach.status !== "complete" || !beforeFrame?.documentId || navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0)) throw new Error("Tab " + tabId + " is navigating or its document identity is unavailable; wait for it to finish and pair again.");
-      pairedTabUrls.set(tabId, beforeAttach.url); pairedTabDocumentIds.set(tabId, beforeFrame.documentId); await attachDebugger(tabId); if (generation !== manualGeneration) { await detachDebugger(tabId); throw new Error("Pairing was replaced."); }
+      pairedTabUrls.set(tabId, beforeAttach.url); pairedTabDocumentIds.set(tabId, beforeFrame.documentId); bindPairedTabTopology(tabId); await attachDebugger(tabId); if (generation !== manualGeneration) { await detachDebugger(tabId); throw new Error("Pairing was replaced."); }
       manualAttachedTabs.add(tabId); const attached = await chrome.tabs.get(tabId).catch(() => null); const attachedFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
       if (navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || !attached || attached.status !== "complete" || attached.url !== beforeAttach.url || attachedFrame?.documentId !== beforeFrame.documentId) throw new Error("Tab " + tabId + " navigated during pairing; pair again.");
     }
-  } catch (error) { await detachManual(generation); for (const tabId of tabs) { pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); } throw error; }
+  } catch (error) { await detachManual(generation); for (const tabId of tabs) { pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } throw error; }
   const next = new WebSocket(endpointUrl.href); socket = next;
   try {
     await new Promise((resolve, reject) => { next.onopen = resolve; next.onerror = () => reject(new Error("Cannot connect to the loopback provider.")); next.onclose = () => reject(new Error("Loopback pairing was closed.")); }); if (generation !== manualGeneration) throw new Error("Pairing was replaced.");
@@ -1438,11 +2277,12 @@ async function pairManual(endpointUrl, token, tabs) {
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   if (!Number.isInteger(tabId)) return; const committed = committedNavigationTabs.get(tabId);
   if (reason === "target_closed" && (navigatingTabs.has(tabId) || committed) && pairedTabDocumentIds.has(tabId)) {
+    clearDownloadLifecycleState(tabId, "target_detached_during_navigation");
     debuggerDetachedDuringNavigation.add(tabId);
     if (committed && !navigatingTabs.has(tabId)) void reattachAfterNavigation(tabId, committed.native, committed.generation, committed.url, committed.documentId).then(() => { if (pairedTabDocumentIds.get(tabId) === committed.documentId) debuggerDetachedDuringNavigation.delete(tabId); }).catch(() => { if (pairedTabDocumentIds.get(tabId) === committed.documentId) void detachPairedTab(tabId); });
     return;
   }
-  manualAttachedTabs.delete(tabId); removeNativeTab(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
+  clearDownloadLifecycleState(tabId, "debugger_detached"); manualAttachedTabs.delete(tabId); removeNativeTab(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
 });
 async function reattachAfterNavigation(tabId, native, generation, expectedUrl, expectedDocumentId) {
   await waitForTabDOMContentLoaded(tabId); const navigationGeneration = tabNavigationGenerations.get(tabId); const current = () => navigationGeneration === tabNavigationGenerations.get(tabId) && pairedTabUrls.get(tabId) === expectedUrl && pairedTabDocumentIds.get(tabId) === expectedDocumentId;
@@ -1453,13 +2293,14 @@ async function reattachAfterNavigation(tabId, native, generation, expectedUrl, e
   pairedTabUrls.set(tabId, identity.url); pairedTabDocumentIds.set(tabId, identity.document_id);
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") { clearFileChooserState(tabId, "Target navigated before the file chooser opened."); tabNavigationGenerations.set(tabId, (tabNavigationGenerations.get(tabId) || 0) + 1); if (pairedTabDocumentIds.has(tabId)) navigatingTabs.add(tabId); }
+  if (changeInfo.status === "loading") { clearDownloadLifecycleState(tabId, "tab_navigated"); clearFileChooserState(tabId, "Target navigated before the file chooser opened."); tabNavigationGenerations.set(tabId, (tabNavigationGenerations.get(tabId) || 0) + 1); if (pairedTabDocumentIds.has(tabId)) navigatingTabs.add(tabId); }
   if (changeInfo.status === "complete") { const pending = pendingMainFrameNavigations.get(tabId); if (pending?.failed) void clearFailedNavigationWhenStable(tabId, pending); if (!debuggerDetachedDuringNavigation.has(tabId)) navigatingTabs.delete(tabId); }
   const pairedUrl = pairedTabUrls.get(tabId); if (pairedUrl === undefined || !changeInfo.url || changeInfo.url === "about:blank" || navigatingTabs.has(tabId)) return;
   const changed = (() => { try { const before = new URL(pairedUrl), after = new URL(changeInfo.url); return before.origin !== after.origin || before.pathname !== after.pathname || before.search !== after.search; } catch { return changeInfo.url !== pairedUrl; } })(); if (changed) void detachPairedTab(tabId);
 });
 chrome.webNavigation.onBeforeNavigate.addListener(details => {
   if (details.frameId !== 0) return;
+  clearDownloadLifecycleState(details.tabId, "tab_navigated");
   const previous = pendingMainFrameNavigations.get(details.tabId);
   const ambiguous = Boolean(previous && !previous.failed && previous.url === details.url);
   pendingMainFrameNavigations.set(details.tabId, {
@@ -1506,13 +2347,17 @@ chrome.webNavigation.onErrorOccurred.addListener(details => {
   if (navigatingTabs.has(details.tabId)) void detachPairedTab(details.tabId);
 });
 chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
+  recentlyCreatedTabs.delete(removedTabId);
+  clearDownloadLifecycleState(removedTabId, "tab_replaced");
   pendingMainFrameNavigations.delete(removedTabId); tabNavigationGenerations.set(removedTabId, (tabNavigationGenerations.get(removedTabId) || 0) + 1); if (!pairedTabUrls.has(removedTabId)) return;
-  navigatingTabs.delete(removedTabId); debuggerDetachedDuringNavigation.delete(removedTabId); pairedTabUrls.delete(removedTabId); pairedTabDocumentIds.delete(removedTabId); manualAttachedTabs.delete(removedTabId); nativeAttachedTabs.delete(removedTabId); void detachDebugger(removedTabId);
+  navigatingTabs.delete(removedTabId); debuggerDetachedDuringNavigation.delete(removedTabId); pairedTabUrls.delete(removedTabId); pairedTabDocumentIds.delete(removedTabId); clearPairedTabTopology(removedTabId); manualAttachedTabs.delete(removedTabId); nativeAttachedTabs.delete(removedTabId); void detachDebugger(removedTabId);
 });
 chrome.tabs.onRemoved.addListener(tabId => {
+  recentlyCreatedTabs.delete(tabId);
+  clearDownloadLifecycleState(tabId, "tab_closed");
   pendingMainFrameNavigations.delete(tabId); tabNavigationGenerations.delete(tabId); domReadyDocuments.delete(tabId);
   clearFrameSessions(tabId); clearFileChooserState(tabId, "Target tab was closed before the file chooser opened.");
   fileChooserEvents.delete(tabId); fileChooserOperations.delete(tabId); navigationDebuggerAttaches.delete(tabId);
-  pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
+  pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
 });
 void reconnectStateReady.then(() => { if (!reconnectExhausted) connectNative(); });

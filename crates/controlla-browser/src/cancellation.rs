@@ -105,6 +105,7 @@ pub fn may_mutate(method: &str) -> bool {
                 | "Runtime.callFunctionOn"
                 | "Runtime.evaluate"
                 | "Controlla.fastType"
+                | "Controlla.humanTypeCharacter"
                 | "Controlla.securePasswordFill"
                 | "Controlla.frameClick"
                 | "Controlla.frameFill"
@@ -177,5 +178,62 @@ mod tests {
             "the caller is told that a command may have taken effect"
         );
         operation.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn human_key_character_transaction_fences_queued_chars_until_cleanup_finishes() {
+        let cancellation = Arc::new(WorkflowCancellation::default());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release_cleanup = Arc::new(tokio::sync::Notify::new());
+        let operation_cancellation = cancellation.clone();
+        let operation_events = events.clone();
+        let command_entered = entered.clone();
+        let cleanup_release = release_cleanup.clone();
+        let operation = tokio::spawn(async move {
+            with_workflow_cancellation(operation_cancellation, async {
+                for character in ['a', 'b', 'c'] {
+                    let Ok(_permit) = admit_browser_command("Controlla.humanTypeCharacter").await
+                    else {
+                        break;
+                    };
+                    {
+                        let mut emitted = operation_events.lock().unwrap();
+                        emitted.push(format!("{character}:keydown"));
+                        emitted.push(format!("{character}:char"));
+                    }
+                    if character == 'a' {
+                        command_entered.notify_one();
+                        cleanup_release.notified().await;
+                    }
+                    // The bridge's one-character response is sent only after its
+                    // same-target keyUp cleanup (or explicit cleanup-limited result).
+                    operation_events
+                        .lock()
+                        .unwrap()
+                        .push(format!("{character}:cleanup_complete"));
+                }
+            })
+            .await;
+        });
+        entered.notified().await;
+        let cancel_cancellation = cancellation.clone();
+        let cancel = tokio::spawn(async move { cancel_cancellation.cancel().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_finished(),
+            "cancel waits for in-flight character cleanup"
+        );
+        release_cleanup.notify_one();
+        assert!(
+            cancel.await.unwrap(),
+            "an admitted character may have dispatched"
+        );
+        operation.await.unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["a:keydown", "a:char", "a:cleanup_complete"],
+            "only the in-flight character may finish; queued characters stay fenced"
+        );
     }
 }

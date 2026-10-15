@@ -194,11 +194,13 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 name = "controlla-browser"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dirs",
  "futures-util",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",

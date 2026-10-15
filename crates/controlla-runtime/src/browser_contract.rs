@@ -2,6 +2,77 @@
 //! Tool schemas remain generated from typed arguments; these rows constrain
 //! the cross-field rules that JSON Schema cannot express.
 
+use serde::{Deserialize, Serialize};
+
+/// Browser presentation evidence. This describes independent Chrome and page
+/// signals; `document_has_focus` is intentionally not a substitute for window
+/// or tab focus, and lifecycle `unknown` never implies a live renderer.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PresentationState {
+    pub window_focused: bool,
+    pub tab_active: bool,
+    #[serde(rename = "visibility_state")]
+    pub visibility: PageVisibility,
+    pub lifecycle: TargetLifecycle,
+    pub viewport: Option<PresentationViewport>,
+    pub activation_epoch: u64,
+    pub focus_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageVisibility {
+    Visible,
+    Hidden,
+    Prerender,
+    Unloaded,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetLifecycle {
+    Active,
+    Loading,
+    Frozen,
+    Discarded,
+    Crashed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresentationViewport {
+    pub width: f64,
+    pub height: f64,
+    pub device_scale_factor: f64,
+}
+
+/// Per-operation policy, supplied independently of the target's current
+/// presentation evidence. Background policies never grant permission to
+/// focus or activate a target as a side effect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub forbid_focus: bool,
+    pub forbid_activation: bool,
+    pub allow_scroll: bool,
+    pub allow_owned_window: bool,
+    pub deadline_ms: u64,
+}
+
+impl ExecutionPolicy {
+    pub const fn strict_background(allow_scroll: bool, deadline_ms: u64) -> Self {
+        Self {
+            forbid_focus: true,
+            forbid_activation: true,
+            allow_scroll,
+            allow_owned_window: false,
+            deadline_ms,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueRequirement {
     Forbidden,
@@ -13,11 +84,13 @@ pub const BROWSER_ACTION_CONTRACT_VERSION: u16 = 1;
 
 pub const SHARED_EXTENSION_AUTHORIZED_METHODS: &[&str] = &[
     "Page.getFrameTree",
+    "Page.getLayoutMetrics",
     "Page.captureScreenshot",
     "Runtime.evaluate",
     "Runtime.callFunctionOn",
     "Runtime.releaseObject",
     "Input.dispatchMouseEvent",
+    "Input.dispatchDragEvent",
     "Input.dispatchTouchEvent",
     "Input.dispatchKeyEvent",
     "Input.imeSetComposition",
@@ -33,6 +106,8 @@ pub const SHARED_EXTENSION_AUTHORIZED_METHODS: &[&str] = &[
     "Accessibility.getPartialAXTree",
     "Accessibility.getFullAXTree",
     "Controlla.waitForFileChooser",
+    "Controlla.downloadLifecycle",
+    "Controlla.scrollToTarget",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +239,38 @@ pub const BROWSER_OPERATIONS: &[BrowserOperationCapability] = &[
         effect: "navigation",
         evidence: "event_and_document_readiness",
         dispatch: "open",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "foreground",
+        action: "adopt_popup",
+        effect: "session_attach",
+        evidence: "unique_opener_creation_url_and_visible_account_marker",
+        dispatch: "adopt_popup",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "background",
+        action: "adopt_popup",
+        effect: "session_attach",
+        evidence: "unique_opener_creation_url_and_visible_account_marker",
+        dispatch: "adopt_popup",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "foreground",
+        action: "transition_presentation",
+        effect: "presentation_policy_transition",
+        evidence: "same_target_before_and_after_presentation_state",
+        dispatch: "transition_presentation",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "background",
+        action: "transition_presentation",
+        effect: "presentation_policy_transition",
+        evidence: "same_target_before_and_after_presentation_state",
+        dispatch: "transition_presentation",
     },
     BrowserOperationCapability {
         provider: "shared_extension",
@@ -491,6 +598,51 @@ const SHARED: &[BrowserActionCapability] = &[
     capability(
         "shared_extension",
         "foreground",
+        "double_click",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "application_readback",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
+        "context_click",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "application_readback",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
+        "hover",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "exact_css_hover_state",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
+        "scroll",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "same_container_scroll_readback",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
+        "scroll_to",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "target_visible_center_hit",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
         "fill",
         ValueRequirement::Required,
         true,
@@ -531,7 +683,7 @@ const SHARED: &[BrowserActionCapability] = &[
         ValueRequirement::Required,
         false,
         "input",
-        "selected_value_readback",
+        "native_select_exact_value_readback",
     ),
     capability(
         "shared_extension",
@@ -540,7 +692,7 @@ const SHARED: &[BrowserActionCapability] = &[
         ValueRequirement::Required,
         false,
         "input",
-        "value_readback",
+        "native_range_min_max_step_value_readback",
     ),
     capability(
         "shared_extension",
@@ -554,11 +706,11 @@ const SHARED: &[BrowserActionCapability] = &[
     capability(
         "shared_extension",
         "foreground",
-        "hover",
+        "swipe",
         ValueRequirement::Forbidden,
         false,
-        "observation",
-        "target_readback",
+        "input",
+        "guarded_touch_movement_readback",
     ),
     capability(
         "shared_extension",
@@ -577,6 +729,51 @@ const SHARED: &[BrowserActionCapability] = &[
         false,
         "input",
         "application_readback",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "double_click",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "application_readback",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "context_click",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "application_readback",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "hover",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "exact_css_hover_state",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "scroll",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "same_container_scroll_readback",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "scroll_to",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "target_visible_center_hit",
     ),
     capability(
         "shared_extension",
@@ -612,7 +809,7 @@ const SHARED: &[BrowserActionCapability] = &[
         ValueRequirement::Required,
         false,
         "input",
-        "selected_value_readback",
+        "native_select_exact_value_readback",
     ),
     capability(
         "shared_extension",
@@ -621,7 +818,7 @@ const SHARED: &[BrowserActionCapability] = &[
         ValueRequirement::Required,
         false,
         "input",
-        "value_readback",
+        "native_range_min_max_step_value_readback",
     ),
     capability(
         "shared_extension",
@@ -635,11 +832,11 @@ const SHARED: &[BrowserActionCapability] = &[
     capability(
         "shared_extension",
         "background",
-        "hover",
+        "swipe",
         ValueRequirement::Forbidden,
         false,
-        "observation",
-        "target_readback",
+        "input",
+        "guarded_touch_movement_readback",
     ),
     capability(
         "shared_extension",
@@ -683,20 +880,11 @@ const HEADLESS: &[BrowserActionCapability] = &[
     capability(
         "dedicated_headless",
         "headless",
-        "press",
-        ValueRequirement::Forbidden,
-        false,
-        "input",
-        "application_readback",
-    ),
-    capability(
-        "dedicated_headless",
-        "headless",
         "select",
         ValueRequirement::Required,
         false,
         "input",
-        "selected_value_readback",
+        "native_select_exact_value_readback",
     ),
     capability(
         "dedicated_headless",
@@ -705,16 +893,7 @@ const HEADLESS: &[BrowserActionCapability] = &[
         ValueRequirement::Required,
         false,
         "input",
-        "value_readback",
-    ),
-    capability(
-        "dedicated_headless",
-        "headless",
-        "hover",
-        ValueRequirement::Forbidden,
-        false,
-        "observation",
-        "target_readback",
+        "native_range_min_max_step_value_readback",
     ),
     capability(
         "dedicated_headless",
@@ -786,6 +965,27 @@ pub fn validate_capability_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_and_execution_contracts_keep_focus_and_activation_separate() {
+        let state: PresentationState = serde_json::from_value(serde_json::json!({
+            "window_focused":false,"tab_active":true,"visibility_state":"hidden",
+            "lifecycle":"unknown","viewport":{"width":1280.0,"height":720.0,"device_scale_factor":2.0},
+            "activation_epoch":7,"focus_epoch":11
+        })).unwrap();
+        assert!(!state.window_focused);
+        assert!(state.tab_active);
+        assert_eq!(state.visibility, PageVisibility::Hidden);
+        assert_eq!(state.lifecycle, TargetLifecycle::Unknown);
+        assert_eq!(state.activation_epoch, 7);
+        assert_eq!(state.focus_epoch, 11);
+        let policy = ExecutionPolicy::strict_background(true, 3_000);
+        assert!(policy.forbid_focus);
+        assert!(policy.forbid_activation);
+        assert!(policy.allow_scroll);
+        assert!(!policy.allow_owned_window);
+        assert_eq!(policy.deadline_ms, 3_000);
+    }
 
     #[test]
     fn browser_operation_inventory_matches_dispatch_and_agent_instructions() {
@@ -899,19 +1099,27 @@ mod tests {
     #[test]
     fn cross_field_action_contract_is_single_and_password_scoped() {
         for action in ["fill", "type", "select", "slider"] {
-            assert_eq!(
-                match resolve_action_capability(
-                    "shared_extension",
-                    "foreground",
-                    action,
-                    BROWSER_ACTION_CONTRACT_VERSION
-                ) {
-                    CapabilityResolution::Supported(capability) => capability.value,
-                    CapabilityResolution::Unsupported { .. } =>
-                        panic!("missing capability for {action}"),
-                },
-                ValueRequirement::Required
-            );
+            let capability = match resolve_action_capability(
+                "shared_extension",
+                "foreground",
+                action,
+                BROWSER_ACTION_CONTRACT_VERSION,
+            ) {
+                CapabilityResolution::Supported(capability) => capability,
+                CapabilityResolution::Unsupported { .. } => {
+                    panic!("missing capability for {action}")
+                }
+            };
+            assert_eq!(capability.value, ValueRequirement::Required);
+            if action == "select" {
+                assert_eq!(capability.evidence, "native_select_exact_value_readback");
+            }
+            if action == "slider" {
+                assert_eq!(
+                    capability.evidence,
+                    "native_range_min_max_step_value_readback"
+                );
+            }
             assert!(validate_action_value(action, Some("x"), None).is_ok());
             assert!(validate_action_value(action, None, None).is_err());
         }
@@ -922,6 +1130,91 @@ mod tests {
             resolve_action_capability("shared_extension", "foreground", "mystery", 1),
             CapabilityResolution::Unsupported { .. }
         ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "foreground", "scroll", BROWSER_ACTION_CONTRACT_VERSION),
+            CapabilityResolution::Supported(capability) if capability.evidence == "same_container_scroll_readback"
+        ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "foreground", "scroll_to", BROWSER_ACTION_CONTRACT_VERSION),
+            CapabilityResolution::Supported(capability) if capability.evidence == "target_visible_center_hit"
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "shared_extension",
+                "background",
+                "scroll_to",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Supported(_)
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "dedicated_headless",
+                "headless",
+                "scroll_to",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Unsupported { .. }
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "shared_extension",
+                "background",
+                "scroll",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Supported(_)
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "dedicated_headless",
+                "headless",
+                "scroll",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Unsupported { .. }
+        ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "foreground", "swipe", BROWSER_ACTION_CONTRACT_VERSION),
+            CapabilityResolution::Supported(capability) if capability.evidence == "guarded_touch_movement_readback"
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "shared_extension",
+                "background",
+                "swipe",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Supported(_)
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "dedicated_headless",
+                "headless",
+                "swipe",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Unsupported { .. }
+        ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "foreground", "hover", 1),
+            CapabilityResolution::Supported(capability) if capability.evidence == "exact_css_hover_state"
+        ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "background", "hover", 1),
+            CapabilityResolution::Supported(_)
+        ));
+        assert!(matches!(
+            resolve_action_capability("dedicated_headless", "headless", "hover", 1),
+            CapabilityResolution::Unsupported { .. }
+        ));
+        assert!(
+            matches!(
+                resolve_action_capability("dedicated_headless", "headless", "press", 1),
+                CapabilityResolution::Unsupported { .. }
+            ),
+            "press requires the shared guarded key-event route and is not advertised for headless"
+        );
     }
 
     #[test]

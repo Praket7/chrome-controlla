@@ -169,10 +169,13 @@ fn target_reference_capture_binds_target_frame_and_navigation_revision() {
         id: "root-frame".into(),
         parent_id: None,
         target_id: "tab".into(),
+        session_id: Some("cdp-session".into()),
         loader_id: Some("loader-1".into()),
+        origin: Some("https://example.test".into()),
         execution_context_ids: vec![12],
         generation: 3,
         revision: 11,
+        transform_revision: 5,
     };
     registry.bind_session_to_browser(&session, 10).unwrap();
     registry

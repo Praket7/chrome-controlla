@@ -1,5 +1,6 @@
 //! Chrome native-messaging transport for the shared extension provider.
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +23,8 @@ use tokio_tungstenite::{
 const MAX_MESSAGE: usize = 1_048_576;
 const MAX_SCREENSHOT_CHARS: usize = 8 * 1024 * 1024;
 const SCREENSHOT_CHUNK_CHARS: usize = 512 * 1024;
+const MAX_SCREENSHOT_EDGE: u64 = 4096;
+const MAX_SCREENSHOT_PIXELS: u64 = 16_777_216;
 const MAX_SCREENSHOT_CHUNKS: usize = 16;
 const MAX_SCREENSHOT_TRANSFERS: usize = 4;
 const SCREENSHOT_TRANSFER_TTL: Duration = Duration::from_secs(15);
@@ -31,6 +34,7 @@ struct ScreenshotTransfer {
     total_chunks: usize,
     total_chars: usize,
     base64_sha256: String,
+    visual_evidence: Value,
     chunks: Vec<Option<String>>,
     started_at: tokio::time::Instant,
 }
@@ -99,6 +103,52 @@ impl ScreenshotAssembler {
             .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or("screenshot transfer digest is invalid")?
             .to_ascii_lowercase();
+        let visual_evidence = message["visual_evidence"].clone();
+        let dimensions = &visual_evidence["dimensions"];
+        if !visual_evidence.is_object()
+            || visual_evidence["target_id"]
+                .as_str()
+                .is_none_or(str::is_empty)
+            || visual_evidence["target_id"]
+                .as_str()
+                .is_some_and(|value| value.len() > 32)
+            || visual_evidence["document_id"]
+                .as_str()
+                .is_none_or(str::is_empty)
+            || visual_evidence["document_id"]
+                .as_str()
+                .is_some_and(|value| value.len() > 256)
+            || visual_evidence["url"]
+                .as_str()
+                .is_none_or(|value| value.len() > 2048)
+            || visual_evidence["captured_at_ms"].as_u64().is_none()
+            || visual_evidence["capture_started_at_ms"].as_u64().is_none()
+            || visual_evidence["target_lifecycle"].as_str() != Some("active")
+            || !visual_evidence["render_revision"].is_null()
+            || dimensions["width"]
+                .as_u64()
+                .is_none_or(|value| value == 0 || value > MAX_SCREENSHOT_EDGE)
+            || dimensions["height"]
+                .as_u64()
+                .is_none_or(|value| value == 0 || value > MAX_SCREENSHOT_EDGE)
+            || dimensions["width"]
+                .as_u64()
+                .unwrap_or_default()
+                .saturating_mul(dimensions["height"].as_u64().unwrap_or_default())
+                > MAX_SCREENSHOT_PIXELS
+            || visual_evidence["visual_revision"]
+                .as_str()
+                .is_none_or(|value| {
+                    value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || visual_evidence["image_sha256"]
+                .as_str()
+                .is_none_or(|value| {
+                    value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            return Err("screenshot visual evidence is missing or inconsistent".into());
+        }
         let chunk = message["chunk"]
             .as_str()
             .filter(|value| !value.is_empty() && value.len() <= SCREENSHOT_CHUNK_CHARS)
@@ -127,12 +177,14 @@ impl ScreenshotAssembler {
                 total_chunks,
                 total_chars,
                 base64_sha256: base64_sha256.clone(),
+                visual_evidence: visual_evidence.clone(),
                 chunks: vec![None; total_chunks],
                 started_at: now,
             });
         if transfer.total_chunks != total_chunks
             || transfer.total_chars != total_chars
             || transfer.base64_sha256 != base64_sha256
+            || transfer.visual_evidence != visual_evidence
             || transfer.chunks[index].is_some()
         {
             self.transfers.remove(&key);
@@ -157,8 +209,42 @@ impl ScreenshotAssembler {
         if digest != transfer.base64_sha256 {
             return Err("screenshot transfer digest mismatch".into());
         }
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .map_err(|_| "screenshot payload is not valid base64")?;
+        if png.len() < 24
+            || png.get(..8) != Some(b"\x89PNG\r\n\x1a\n")
+            || png.get(8..12) != Some(13_u32.to_be_bytes().as_slice())
+            || png.get(12..16) != Some(b"IHDR")
+        {
+            return Err("screenshot payload is not a PNG image".into());
+        }
+        let image_digest = Sha256::digest(&png)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let width = u32::from_be_bytes(png[16..20].try_into().expect("PNG width header"));
+        let height = u32::from_be_bytes(png[20..24].try_into().expect("PNG height header"));
+        if image_digest
+            != transfer.visual_evidence["image_sha256"]
+                .as_str()
+                .unwrap_or_default()
+            || image_digest
+                != transfer.visual_evidence["visual_revision"]
+                    .as_str()
+                    .unwrap_or_default()
+            || width == 0
+            || u64::from(width) > MAX_SCREENSHOT_EDGE
+            || height == 0
+            || u64::from(height) > MAX_SCREENSHOT_EDGE
+            || u64::from(width).saturating_mul(u64::from(height)) > MAX_SCREENSHOT_PIXELS
+            || transfer.visual_evidence["dimensions"]["width"].as_u64() != Some(width.into())
+            || transfer.visual_evidence["dimensions"]["height"].as_u64() != Some(height.into())
+        {
+            return Err("screenshot image digest or dimensions mismatch".into());
+        }
         Ok(Some(
-            json!({"type":"result","id":id,"lease_id":transfer.lease_id,"result":{"data":data}}),
+            json!({"type":"result","id":id,"lease_id":transfer.lease_id,"result":{"data":data,"visual_evidence":transfer.visual_evidence}}),
         ))
     }
 }
@@ -1091,31 +1177,46 @@ mod tests {
 
     #[test]
     fn screenshot_chunks_reassemble_out_of_order_and_verify_digest() {
-        let data = format!("{}{}", "A".repeat(SCREENSHOT_CHUNK_CHARS), "BCDEFG");
-        let digest = Sha256::digest(data.as_bytes())
+        let mut png = vec![0; 393_219];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&4096_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&4096_u32.to_be_bytes());
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let base64_digest = Sha256::digest(data.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let chunk = |index: usize, value: &str, digest: &str| {
+        let image_digest = Sha256::digest(&png)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let evidence = || json!({"target_id":"41","document_id":"document-41","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":image_digest,"image_sha256":image_digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":4096,"height":4096}});
+        let chunk = |index: usize, value: &str| {
             json!({
                 "type":"result_chunk","id":7,"lease_id":"lease-a","transfer_id":"transfer-a",
-                "index":index,"total_chunks":2,"total_chars":data.len(),"base64_sha256":digest,"chunk":value
+                "index":index,"total_chunks":2,"total_chars":data.len(),"base64_sha256":base64_digest,"visual_evidence":evidence(),"chunk":value
             })
         };
         let mut assembler = ScreenshotAssembler::default();
         assert!(
             assembler
-                .push(&chunk(1, "BCDEFG", &digest))
+                .push(&chunk(1, &data[SCREENSHOT_CHUNK_CHARS..]))
                 .unwrap()
                 .is_none()
         );
         let complete = assembler
-            .push(&chunk(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest))
+            .push(&chunk(0, &data[..SCREENSHOT_CHUNK_CHARS]))
             .unwrap()
             .unwrap();
         assert_eq!(complete["type"], "result");
         assert_eq!(complete["id"], 7);
         assert_eq!(complete["result"]["data"], data);
+        assert_eq!(
+            complete["result"]["visual_evidence"]["document_id"],
+            "document-41"
+        );
     }
 
     #[test]
@@ -1126,7 +1227,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let first = json!({"id":19,"lease_id":"lease-x","transfer_id":"transfer-x","index":0,
-            "total_chunks":2,"total_chars":data.len(),"base64_sha256":digest,"chunk":"A".repeat(SCREENSHOT_CHUNK_CHARS)});
+            "total_chunks":2,"total_chars":data.len(),"base64_sha256":digest,"visual_evidence":{"target_id":"41","document_id":"doc","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":digest,"image_sha256":digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}},"chunk":"A".repeat(SCREENSHOT_CHUNK_CHARS)});
         let mut assembler = ScreenshotAssembler::default();
         assert!(assembler.push(&first).unwrap().is_none());
         assert_eq!(assembler.transfers.len(), 1);
@@ -1154,6 +1255,7 @@ mod tests {
                 total_chunks: 2,
                 total_chars: SCREENSHOT_CHUNK_CHARS + 1,
                 base64_sha256: "0".repeat(64),
+                visual_evidence: json!({}),
                 chunks: vec![Some("A".repeat(SCREENSHOT_CHUNK_CHARS)), None],
                 started_at: tokio::time::Instant::now()
                     - SCREENSHOT_TRANSFER_TTL
@@ -1177,9 +1279,25 @@ mod tests {
         let message = |index: usize, chunk: &str, hash: &str, total_chars: usize| {
             json!({
                 "type":"result_chunk","id":8,"lease_id":"lease-a","transfer_id":"transfer-b",
-                "index":index,"total_chunks":2,"total_chars":total_chars,"base64_sha256":hash,"chunk":chunk
+                "index":index,"total_chunks":2,"total_chars":total_chars,"base64_sha256":hash,
+                "visual_evidence":{"target_id":"41","document_id":"doc","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":hash,"image_sha256":hash,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}},"chunk":chunk
             })
         };
+        let mut max_supported = message(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest, data.len());
+        max_supported["visual_evidence"]["dimensions"] = json!({"width":4096,"height":4096});
+        assert!(
+            ScreenshotAssembler::default()
+                .push(&max_supported)
+                .unwrap()
+                .is_none(),
+            "the native bridge must accept captures within the shared 4096-edge/16-MP contract"
+        );
+        let mut oversized = message(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest, data.len());
+        oversized["visual_evidence"]["dimensions"] = json!({"width":4097,"height":1});
+        assert!(
+            ScreenshotAssembler::default().push(&oversized).is_err(),
+            "the native bridge must reject dimensions above the shared maximum before retaining chunks"
+        );
         let mut assembler = ScreenshotAssembler::default();
         let first = message(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest, data.len());
         assert!(assembler.push(&first).unwrap().is_none());

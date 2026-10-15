@@ -8,7 +8,11 @@ pub type SemanticLocator = super::Locator;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FileSelectionEvidence {
     pub filename: String,
+    pub mime: String,
     pub size: usize,
+    pub sha256: String,
+    pub source_identity: Option<serde_json::Value>,
+    pub expires_at_ms: u64,
     pub transaction: super::UploadTransaction,
 }
 
@@ -17,6 +21,40 @@ pub struct GuardedFileSelection<'a> {
     pub current: &'a GuardSnapshot,
     pub locator: &'a SemanticLocator,
     pub handle: &'a super::sessions::ArtifactHandle,
+}
+pub struct GuardedFileSelectionSet<'a> {
+    pub expected: &'a GuardSnapshot,
+    pub current: &'a GuardSnapshot,
+    pub locator: &'a SemanticLocator,
+    pub handles: &'a [super::sessions::ArtifactHandle],
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FileSelectionSetEvidence {
+    pub files: Vec<FileSelectionEvidence>,
+}
+
+fn valid_guarded_file_selection_handles(handles: &[super::sessions::ArtifactHandle]) -> bool {
+    !handles.is_empty()
+        && handles.len() <= 5
+        && handles
+            .iter()
+            .map(|handle| handle.opaque_id())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == handles.len()
+}
+
+fn guarded_file_selection_readback_matches(
+    expected: &[super::sessions::ArtifactMetadata],
+    selected: &serde_json::Value,
+) -> bool {
+    selected.as_array().is_some_and(|files| {
+        files.len() == expected.len()
+            && files.iter().zip(expected).all(|(actual, expected)| {
+                actual["name"] == expected.filename
+                    && actual["size"].as_u64() == Some(expected.size as u64)
+            })
+    })
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputAction {
@@ -175,6 +213,95 @@ fn validate_match_result(value: &serde_json::Value) -> Result<(), super::Browser
     }
 }
 
+#[cfg(test)]
+mod file_selection_set_tests {
+    use super::*;
+
+    #[test]
+    fn guarded_file_selection_sets_are_bounded_and_unique() {
+        let make = |id: &str| {
+            serde_json::from_value(serde_json::json!(format!(
+                "artifact_{id}@private_headless_session"
+            )))
+            .unwrap()
+        };
+        assert!(valid_guarded_file_selection_handles(&[make(
+            "00000000000000000000000000000001"
+        )]));
+        assert!(valid_guarded_file_selection_handles(&[
+            make("00000000000000000000000000000001"),
+            make("00000000000000000000000000000002"),
+        ]));
+        assert!(!valid_guarded_file_selection_handles(&[]));
+        assert!(!valid_guarded_file_selection_handles(&vec![
+            make(
+                "00000000000000000000000000000001"
+            );
+            6
+        ]));
+        assert!(!valid_guarded_file_selection_handles(&[
+            make("00000000000000000000000000000001"),
+            make("00000000000000000000000000000001"),
+        ]));
+    }
+
+    #[test]
+    fn guarded_file_selection_readback_requires_complete_ordered_name_and_size_match() {
+        let metadata = vec![
+            super::super::sessions::ArtifactMetadata {
+                handle: serde_json::from_value(serde_json::json!(
+                    "artifact_00000000000000000000000000000001@private_headless_session"
+                ))
+                .unwrap(),
+                filename: "first.txt".into(),
+                mime: "text/plain".into(),
+                size: 3,
+                sha256: String::new(),
+                source_identity: None,
+                expires_at_ms: u64::MAX,
+                scope: super::super::sessions::ArtifactScope::PrivateHeadlessSession,
+            },
+            super::super::sessions::ArtifactMetadata {
+                handle: serde_json::from_value(serde_json::json!(
+                    "artifact_00000000000000000000000000000002@private_headless_session"
+                ))
+                .unwrap(),
+                filename: "second.csv".into(),
+                mime: "text/csv".into(),
+                size: 7,
+                sha256: String::new(),
+                source_identity: None,
+                expires_at_ms: u64::MAX,
+                scope: super::super::sessions::ArtifactScope::PrivateHeadlessSession,
+            },
+        ];
+        assert!(guarded_file_selection_readback_matches(
+            &metadata,
+            &serde_json::json!([
+                {"name":"first.txt","size":3}, {"name":"second.csv","size":7}
+            ])
+        ));
+        assert!(!guarded_file_selection_readback_matches(
+            &metadata,
+            &serde_json::json!([
+                {"name":"second.csv","size":7}, {"name":"first.txt","size":3}
+            ])
+        ));
+        assert!(!guarded_file_selection_readback_matches(
+            &metadata,
+            &serde_json::json!([
+                {"name":"first.txt","size":3}
+            ])
+        ));
+        assert!(!guarded_file_selection_readback_matches(
+            &metadata,
+            &serde_json::json!([
+                {"name":"first.txt","size":4}, {"name":"second.csv","size":7}
+            ])
+        ));
+    }
+}
+
 fn replacement_value(before: &str, start: u64, end: u64, inserted: &str) -> Option<String> {
     let units: Vec<u16> = before.encode_utf16().collect();
     let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
@@ -202,12 +329,47 @@ impl super::BrowserConnection {
         revisions: super::sessions::IdentityRevisions,
         selection: GuardedFileSelection<'_>,
     ) -> Result<FileSelectionEvidence, super::BrowserError> {
-        let GuardedFileSelection {
+        let handle = selection.handle;
+        let result = self
+            .select_file_input_artifacts(
+                sessions,
+                reference,
+                principal,
+                revisions,
+                GuardedFileSelectionSet {
+                    expected: selection.expected,
+                    current: selection.current,
+                    locator: selection.locator,
+                    handles: std::slice::from_ref(handle),
+                },
+            )
+            .await?;
+        result.files.into_iter().next().ok_or_else(|| {
+            super::BrowserError::InvalidResponse("file selection evidence was empty".into())
+        })
+    }
+
+    /// Select an ordered bounded set of internally stored artifacts on one guarded input.
+    /// Evidence reports Chrome's readback only, not application acceptance or persistence.
+    pub async fn select_file_input_artifacts(
+        &self,
+        sessions: &super::sessions::SessionRegistry,
+        reference: &super::sessions::TargetRef,
+        principal: &str,
+        revisions: super::sessions::IdentityRevisions,
+        selection: GuardedFileSelectionSet<'_>,
+    ) -> Result<FileSelectionSetEvidence, super::BrowserError> {
+        let GuardedFileSelectionSet {
             expected,
             current,
             locator,
-            handle,
+            handles,
         } = selection;
+        if !valid_guarded_file_selection_handles(handles) {
+            return Err(super::BrowserError::InvalidResponse(
+                "file selection requires one to five unique artifact handles".into(),
+            ));
+        }
         if validate_step(expected, current) != GuardDecision::Allow {
             return Err(super::BrowserError::StaleReference(
                 "file selection guard changed".into(),
@@ -219,22 +381,34 @@ impl super::BrowserConnection {
             ));
         }
         locator.validate()?;
-        let metadata = sessions
-            .artifact_metadata_for(&reference.session_id, principal, handle)
-            .map_err(|_| {
-                super::BrowserError::StaleReference(
-                    "artifact handle is not authorized for this session".into(),
-                )
-            })?;
-        let path = sessions
-            .artifact_path_for(&reference.session_id, principal, handle)
-            .map_err(|_| {
-                super::BrowserError::StaleReference(
-                    "artifact handle is not authorized for this session".into(),
-                )
-            })?
-            .to_string_lossy()
-            .into_owned();
+        let mut metadata = Vec::with_capacity(handles.len());
+        let mut paths = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let artifact_metadata = sessions
+                .artifact_metadata_for(&reference.session_id, principal, handle)
+                .map_err(|_| {
+                    super::BrowserError::StaleReference(
+                        "artifact handle is not authorized for this session".into(),
+                    )
+                })?;
+            if artifact_metadata.scope != handle.scope() {
+                return Err(super::BrowserError::StaleReference(
+                    "artifact scope changed for this session".into(),
+                ));
+            }
+            metadata.push(artifact_metadata);
+            paths.push(
+                sessions
+                    .artifact_path_for(&reference.session_id, principal, handle)
+                    .map_err(|_| {
+                        super::BrowserError::StaleReference(
+                            "artifact handle is not authorized for this session".into(),
+                        )
+                    })?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         self.target_ref_command(
             sessions,
             reference,
@@ -295,7 +469,7 @@ impl super::BrowserConnection {
             principal,
             revisions,
             "DOM.setFileInputFiles",
-            serde_json::json!({"files":[path],"objectId":element_id}),
+            serde_json::json!({"files":paths,"objectId":element_id}),
         )
         .await?;
         let readback_function = format!(
@@ -308,21 +482,26 @@ impl super::BrowserConnection {
                 "file input was detached or replaced during selection".into(),
             ));
         }
-        let files = value["files"].as_array().ok_or_else(|| {
-            super::BrowserError::InvalidResponse("file selection readback missing".into())
-        })?;
-        if files.len() != 1
-            || files[0]["name"] != metadata.filename
-            || files[0]["size"].as_u64() != Some(metadata.size as u64)
-        {
+        let matches = guarded_file_selection_readback_matches(&metadata, &value["files"]);
+        if !matches {
             return Err(super::BrowserError::StaleReference(
                 "Chrome file selection did not match artifact metadata".into(),
             ));
         }
-        Ok(FileSelectionEvidence {
-            filename: metadata.filename,
-            size: metadata.size,
-            transaction: super::UploadTransaction::new(handle.opaque_id()),
+        Ok(FileSelectionSetEvidence {
+            files: metadata
+                .into_iter()
+                .zip(handles)
+                .map(|(metadata, handle)| FileSelectionEvidence {
+                    filename: metadata.filename,
+                    mime: metadata.mime,
+                    size: metadata.size,
+                    sha256: metadata.sha256,
+                    source_identity: metadata.source_identity,
+                    expires_at_ms: metadata.expires_at_ms,
+                    transaction: super::UploadTransaction::new(handle.opaque_id()),
+                })
+                .collect(),
         })
     }
 

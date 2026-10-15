@@ -156,6 +156,26 @@ struct SharedTabArgs {
     wait_until: Option<String>,
     create_background_window: Option<bool>,
     target_window_id: Option<u64>,
+    #[schemars(
+        description = "For action=adopt_popup, the exact tab ID returned by a verified new-tab outcome."
+    )]
+    candidate_tab_id: Option<String>,
+    #[schemars(
+        description = "For action=adopt_popup, the exact Chrome creation timestamp returned by the opener-bound candidate inventory."
+    )]
+    created_at_ms: Option<u64>,
+    #[schemars(
+        description = "For action=adopt_popup, the click-start timestamp used to bound the candidate inventory."
+    )]
+    since_ms: Option<u64>,
+    #[schemars(
+        description = "For action=adopt_popup, a CSS selector that scopes a fresh semantic snapshot to the visible account marker."
+    )]
+    account_marker_selector: Option<String>,
+    #[schemars(
+        description = "Exact caller-observed visible account marker text. This is UI evidence and does not prove authentication."
+    )]
+    account_marker_text: Option<String>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -461,6 +481,13 @@ impl PageSessionTransport {
                 .add_selected_target(target_id)
                 .map_err(|e| e.to_string()),
             Self::Dedicated(_) => Err("dedicated session target set is fixed at launch".into()),
+        }
+    }
+
+    fn remove_selected_target(&mut self, target_id: &str) -> bool {
+        match self {
+            Self::Shared(connection) => connection.remove_selected_target(target_id),
+            Self::Dedicated(_) => false,
         }
     }
 
@@ -820,6 +847,160 @@ struct SharedClickArgs {
     timeout_ms: Option<u64>,
     #[serde(default)]
     input_mode: Option<String>,
+    #[serde(default)]
+    click_kind: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SharedScrollArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    reference: String,
+    delta_x: i32,
+    delta_y: i32,
+    timeout_ms: Option<u64>,
+    expected_activation_epoch: Option<u64>,
+    expected_focus_epoch: Option<u64>,
+    #[serde(default)]
+    scroll_to_target: Option<bool>,
+}
+
+#[allow(dead_code)] // Used by the V3 CLI binary.
+struct SharedSwipeArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    reference: String,
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
+    timeout_ms: Option<u64>,
+    expected_activation_epoch: Option<u64>,
+    expected_focus_epoch: Option<u64>,
+}
+
+fn validate_wheel_delta(delta_x: i32, delta_y: i32) -> Result<(), &'static str> {
+    const MAX_DELTA: i32 = 1200;
+    if (delta_x == 0) == (delta_y == 0) {
+        return Err("exactly one of delta_x or delta_y must be nonzero");
+    }
+    if delta_x.unsigned_abs() > MAX_DELTA as u32 || delta_y.unsigned_abs() > MAX_DELTA as u32 {
+        return Err("wheel delta must be within -1200..=1200");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Used by the V3 CLI binary.
+fn validate_swipe_endpoints(
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
+) -> Result<(), &'static str> {
+    const MAX_COORD: f64 = 10_000.0;
+    const MIN_DISTANCE: f64 = 20.0;
+    const MAX_DISTANCE: f64 = 1_200.0;
+    if [start_x, start_y, end_x, end_y]
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=MAX_COORD).contains(value))
+    {
+        return Err("swipe coordinates must be finite and within 0..=10000");
+    }
+    let distance = (end_x - start_x).hypot(end_y - start_y);
+    if !(MIN_DISTANCE..=MAX_DISTANCE).contains(&distance) {
+        return Err("swipe path length must be within 20..=1200 CSS pixels");
+    }
+    Ok(())
+}
+
+fn shared_scroll_guard_script() -> &'static str {
+    r#"function(index,dx,dy,expectedViewport){
+      const expectedContainer=arguments[4];
+      const e=this.nodes[index];
+      if(!e||!e.isConnected)return {ok:false,reason:'stale_reference'};
+      const d=e.ownerDocument,w=d.defaultView,s=w.getComputedStyle(e),b=e.getBoundingClientRect(),vw=w.innerWidth,vh=w.innerHeight;
+      if(s.display==='none'||s.visibility==='hidden'||Number.parseFloat(s.opacity||'1')<=0||b.width<=0||b.height<=0)return {ok:false,reason:'not_visible'};
+      const x=Math.max(0,Math.min(vw-1,b.left+b.width/2)),y=Math.max(0,Math.min(vh-1,b.top+b.height/2)),hit=d.elementFromPoint(x,y);
+      if(!hit||!(hit===e||e.contains(hit)))return {ok:false,reason:'obscured'};
+      if(hit.getRootNode()!==d||hit instanceof HTMLIFrameElement)return {ok:false,reason:'nested_document_scroll_unsupported'};
+      const viewport=`${vw}x${vh}@${w.devicePixelRatio||1}`;
+      if(expectedViewport&&viewport!==expectedViewport)return {ok:false,reason:'viewport_changed'};
+      const axis=dy?'y':'x';
+      const isScrollable=n=>{
+        if(!(n instanceof Element))return false;
+        const cs=w.getComputedStyle(n),overflow=axis==='y'?cs.overflowY:cs.overflowX;
+        const extent=axis==='y'?n.scrollHeight:n.scrollWidth,client=axis==='y'?n.clientHeight:n.clientWidth;
+        return ['auto','scroll','overlay'].includes(overflow)&&extent-client>1;
+      };
+      let container=null;
+      for(let n=hit;n&&n instanceof Element;n=n.parentElement){if(isScrollable(n)){if(dx&&w.getComputedStyle(n).direction==='rtl')return {ok:false,reason:'rtl_horizontal_scroll_unsupported'};container=n;break}}
+      if(!container){const root=d.scrollingElement;if(root&&isScrollable(root)){if(dx&&w.getComputedStyle(root).direction==='rtl')return {ok:false,reason:'rtl_horizontal_scroll_unsupported'};container=root}}
+      if(!container)return {ok:false,reason:'no_scrollable_ancestor'};
+      if(expectedContainer&&container!==expectedContainer)return {ok:false,reason:'scroll_container_changed'};
+      const left=container.scrollLeft,top=container.scrollTop,maxLeft=Math.max(0,container.scrollWidth-container.clientWidth),maxTop=Math.max(0,container.scrollHeight-container.clientHeight);
+      const pos=axis==='y'?top:left,max=axis==='y'?maxTop:maxLeft;
+      if(dy<0?pos<=1:dy>0?pos>=max-1:dx<0?pos<=1:pos>=max-1)return {ok:false,reason:'nearest_scroll_container_at_boundary'};
+      return {ok:true,x,y,viewport,container,left,top,maxLeft,maxTop};
+    }"#
+}
+
+fn shared_scroll_to_target_guard_script() -> &'static str {
+    r#"function(index,scrollRequest){
+      const before=(reason)=>({ok:false,phase:'before',dispatch_may_have_occurred:false,reason});
+      if(scrollRequest!=='scroll-to-target-v1')return before('invalid_scroll_request');
+      const e=this.nodes[index],saved=this.items&&this.items[index];
+      if(!e||!saved||!e.isConnected)return before('stale_reference');
+      if(e.ownerDocument!==document||e.getRootNode()!==document)return before('non_root_document_unsupported');
+      const identity=()=>e.isConnected&&this.raw(e)===saved.raw_value&&this.name(e)===saved.name;
+      if(!identity())return before('semantic_identity_changed');
+      const w=document.defaultView,s=w.getComputedStyle(e),r=e.getBoundingClientRect();
+      if(s.display==='none'||s.visibility==='hidden'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0||r.width<=0||r.height<=0)return before('target_not_visible');
+      if(e.disabled||e.inert||e.matches('input[type=password],input[type=file]'))return before('target_not_scrollable');
+      try{e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});}catch(_){return {ok:false,phase:'after',dispatch_may_have_occurred:true,reason:'scroll_into_view_failed'};}
+      if(!identity())return {ok:false,phase:'after',dispatch_may_have_occurred:true,reason:'semantic_identity_changed_after_scroll'};
+      const after=e.getBoundingClientRect(),vw=w.innerWidth,vh=w.innerHeight;
+      const x=after.left+after.width/2,y=after.top+after.height/2;
+      const visible=after.width>0&&after.height>0&&x>=0&&y>=0&&x<vw&&y<vh;
+      const hit=visible?document.elementFromPoint(x,y):null;
+      const centerHit=!!hit&&(hit===e||e.contains(hit));
+      return {ok:visible&&centerHit,phase:'after',dispatch_may_have_occurred:true,target_visible:visible,center_hit:centerHit,viewport:{width:vw,height:vh},center:{x,y},reason:visible&&centerHit?undefined:'target_visibility_not_verified'};
+    }"#
+}
+
+#[allow(dead_code)] // Used by the V3 CLI binary.
+fn shared_swipe_guard_script() -> &'static str {
+    r#"function(index,sx,sy,ex,ey,expectedViewport,phase){
+      const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'stale_reference'};
+      const b=e.getBoundingClientRect(),vw=innerWidth,vh=innerHeight;
+      const viewport=JSON.stringify([vw,vh,devicePixelRatio||1]);
+      const point=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)&&x>=0&&y>=0&&x<vw&&y<vh;
+      const sxInside=sx>=b.left&&sx<=b.right&&sy>=b.top&&sy<=b.bottom;
+      const hit=document.elementFromPoint(sx,sy);
+      const style=getComputedStyle(e);
+      if(expectedViewport&&viewport!==expectedViewport)return {ok:false,reason:'viewport_changed'};
+      if(!point(sx,sy)||!point(ex,ey)||!sxInside||!(hit===e||e.contains(hit))||b.width<=0||b.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return {ok:false,reason:'swipe_target_or_endpoint_not_interactable'};
+      let scroll=null;
+      for(let n=e;n&&n instanceof Element;n=n.parentElement){const s=getComputedStyle(n);if((['auto','scroll','overlay'].includes(s.overflowY)&&n.scrollHeight>n.clientHeight+1)||(['auto','scroll','overlay'].includes(s.overflowX)&&n.scrollWidth>n.clientWidth+1)){scroll={left:n.scrollLeft,top:n.scrollTop};break}}
+      return {ok:true,viewport,start:{x:sx,y:sy},end:{x:ex,y:ey},rect:{left:b.left,top:b.top,width:b.width,height:b.height},scroll};
+    }"#
+}
+
+fn valid_scroll_readback(receipt: &Value, delta_x: i32, delta_y: i32) -> bool {
+    if receipt["same_container"] != true || receipt["container_connected"] != true {
+        return false;
+    }
+    let before_x = receipt["before"]["left"].as_f64();
+    let after_x = receipt["after"]["left"].as_f64();
+    let before_y = receipt["before"]["top"].as_f64();
+    let after_y = receipt["after"]["top"].as_f64();
+    match (delta_x, delta_y, before_x, after_x, before_y, after_y) {
+        (dx, 0, Some(bx), Some(ax), _, _) if dx < 0 => ax < bx,
+        (dx, 0, Some(bx), Some(ax), _, _) if dx > 0 => ax > bx,
+        (0, dy, _, _, Some(by), Some(ay)) if dy < 0 => ay < by,
+        (0, dy, _, _, Some(by), Some(ay)) if dy > 0 => ay > by,
+        _ => false,
+    }
 }
 
 fn shared_value(response: &Value) -> Result<Value, String> {
@@ -860,7 +1041,14 @@ fn shared_command_value(response: &Value) -> Value {
     }
 }
 
-fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String)), String> {
+struct SnapshotBatchReads {
+    value: Value,
+    identity: (String, String, String),
+    frame_handles: Vec<controlla_browser::FrameHandle>,
+    frame_handles_truncated: bool,
+}
+
+fn snapshot_batch_reads(batch: &Value, target_id: &str) -> Result<SnapshotBatchReads, String> {
     if batch["completed"] != 2 || batch.get("batch_error").is_some() {
         return Err(format!(
             "snapshot read batch failed: {}",
@@ -879,11 +1067,15 @@ fn snapshot_batch_reads(batch: &Value) -> Result<(Value, (String, String, String
     {
         return Err("snapshot read batch returned unexpected or failed commands".into());
     }
-    Ok((
-        shared_value(&receipts[0]["result"])
+    let frame_tree = &receipts[1]["result"];
+    let (frame_handles, frame_handles_truncated) = frame_handles_from_tree(frame_tree, target_id)?;
+    Ok(SnapshotBatchReads {
+        value: shared_value(&receipts[0]["result"])
             .map_err(|error| format!("snapshot public getter failed: {error}"))?,
-        frame_identity_from_tree(&receipts[1]["result"])?,
-    ))
+        identity: frame_identity_from_tree(frame_tree)?,
+        frame_handles,
+        frame_handles_truncated,
+    })
 }
 
 async fn capture_shared_snapshot(
@@ -974,40 +1166,54 @@ async fn capture_shared_snapshot(
         .and_then(Value::as_str)
         .ok_or("snapshot failed to retain target identities")?
         .to_owned();
-    let read = async { if matches!(connection, PageSessionTransport::Shared(shared) if shared.supports_batch_execution()) {
-        let batch = connection.command_batch(
-            registry,
-            &shared.handle,
-            &args.chrome_tab_id,
-            vec![
-                controlla_browser::providers::SharedBatchAction {
-                    method: "Runtime.callFunctionOn".into(),
-                    params: json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
-                    stop_on_not_ok: false,
-                },
-                controlla_browser::providers::SharedBatchAction {
-                    method: "Page.getFrameTree".into(),
-                    params: Value::Null,
-                    stop_on_not_ok: false,
-                },
-            ],
-            Duration::from_secs(10),
-        ).await?;
-        snapshot_batch_reads(&batch)
-    } else {
-        let response = connection.command(registry, &shared.handle, &args.chrome_tab_id,
-            "Runtime.callFunctionOn",
-            json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
-        ).await?;
-        let value = match shared_value(&response) {
-            Ok(value) => value,
-            Err(error) => return Err(format!("snapshot public getter failed: {error}")),
-        };
-        let after = shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await?;
-        Ok((value, after))
-    }}.await;
+    let read = async {
+        if matches!(connection, PageSessionTransport::Shared(shared) if shared.supports_batch_execution()) {
+            let batch = connection.command_batch(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                vec![
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Runtime.callFunctionOn".into(),
+                        params: json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
+                        stop_on_not_ok: false,
+                    },
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Page.getFrameTree".into(),
+                        params: Value::Null,
+                        stop_on_not_ok: false,
+                    },
+                ],
+                Duration::from_secs(10),
+            ).await?;
+            snapshot_batch_reads(&batch, &args.chrome_tab_id)
+        } else {
+            let response = connection.command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.callFunctionOn",
+                json!({"objectId":object_id,"functionDeclaration":"function(){return this.public}","returnByValue":true}),
+            ).await?;
+            let value = shared_value(&response)
+                .map_err(|error| format!("snapshot public getter failed: {error}"))?;
+            let tree = connection.command(registry, &shared.handle, &args.chrome_tab_id, "Page.getFrameTree", Value::Null).await?;
+            let (frame_handles, frame_handles_truncated) = frame_handles_from_tree(&tree, &args.chrome_tab_id)?;
+            Ok(SnapshotBatchReads {
+                value,
+                identity: frame_identity_from_tree(&tree)?,
+                frame_handles,
+                frame_handles_truncated,
+            })
+        }
+    }.await;
     let result = async {
-        let (mut value, after) = read?;
+        let SnapshotBatchReads {
+            mut value,
+            identity: after,
+            frame_handles,
+            frame_handles_truncated,
+        } = read?;
         if before != after {
             return Err("document changed during snapshot; discard and read once again".into());
         }
@@ -1022,9 +1228,28 @@ async fn capture_shared_snapshot(
         value["snapshot_id"] = json!(token);
         value["chrome_tab_id"] = json!(args.chrome_tab_id);
         value["document"] = json!({"frame_id":before.0,"loader_id":before.1,"url":before.2});
-        if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > args.max_bytes {
-            return Err("snapshot exceeded byte budget; reduce text/items".into());
+        value["frame_handles"] = public_frame_handles(&frame_handles)?;
+        value["frame_handles_truncated"] = json!(frame_handles_truncated);
+        if frame_handles_truncated {
+            value["truncated"] = json!(true);
+            value["complete"] = json!(false);
+            value["global_complete"] = json!(false);
+            value["scope_complete"] = json!(false);
+            value["completeness"]["frames"] = json!("partial");
+            if !value["incomplete_reasons"].is_array() {
+                value["incomplete_reasons"] = json!([]);
+            }
+            let reasons = value["incomplete_reasons"]
+                .as_array_mut()
+                .expect("array set above");
+            if !reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("frame_handles_truncated"))
+            {
+                reasons.push(json!("frame_handles_truncated"));
+            }
         }
+        ensure_snapshot_byte_budget(&value, args.max_bytes)?;
         Ok((value, interaction_epoch))
     }
     .await;
@@ -1100,20 +1325,117 @@ async fn evaluate_shared_outcome(
 }
 
 fn shared_new_tab_matches(response: &Value, expected_url: Option<&str>) -> bool {
-    response["tabs"].as_array().is_some_and(|tabs| {
-        tabs.iter()
-            .filter(|candidate| {
-                candidate["tab_id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty())
-                    && candidate["url"].as_str().is_some_and(|url| {
-                        candidate["opener_match"] == true
-                            && expected_url.is_none_or(|expected| url == expected)
-                    })
+    shared_new_tab_candidate(response, expected_url).is_some()
+}
+
+fn shared_new_tab_candidate(response: &Value, expected_url: Option<&str>) -> Option<Value> {
+    let tabs = response["tabs"].as_array()?;
+    let mut matching = tabs.iter().filter(|candidate| {
+        candidate["tab_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+            && candidate["url"].as_str().is_some_and(|url| {
+                candidate["opener_match"] == true
+                    && candidate["created_at_ms"].as_u64().is_some()
+                    && expected_url.is_none_or(|expected| url == expected)
             })
-            .count()
-            == 1
-    })
+    });
+    let candidate = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(json!({
+        "tab_id":candidate["tab_id"],
+        "url":candidate["url"],
+        "window_id":candidate["window_id"],
+        "created_at_ms":candidate["created_at_ms"],
+        "opener_match":true,
+        "evidence_scope":"recent_opener_bound_tab_candidate_not_account_authentication"
+    }))
+}
+
+fn popup_candidate_for_adoption(
+    response: &Value,
+    opener_tab_id: &str,
+    candidate_tab_id: &str,
+    expected_created_at_ms: u64,
+    since_ms: u64,
+    expected_url: &str,
+    now_ms: u64,
+) -> Result<Value, &'static str> {
+    if candidate_tab_id.is_empty()
+        || candidate_tab_id.parse::<u32>().is_err()
+        || expected_created_at_ms < since_ms
+        || expected_created_at_ms > now_ms
+        || now_ms.saturating_sub(expected_created_at_ms) > 60_000
+    {
+        return Err("popup candidate identity or creation time is invalid or stale");
+    }
+    let tabs = response["tabs"]
+        .as_array()
+        .ok_or("popup candidate inventory is unavailable")?;
+    if tabs.len() != 1 {
+        return Err("popup adoption requires exactly one recent opener-bound candidate");
+    }
+    let candidate = &tabs[0];
+    if candidate["tab_id"].as_str() != Some(candidate_tab_id)
+        || candidate["created_at_ms"].as_u64() != Some(expected_created_at_ms)
+        || candidate["created_at_ms"]
+            .as_u64()
+            .is_none_or(|created| created < since_ms || created > now_ms)
+        || candidate["url"].as_str() != Some(expected_url)
+        || candidate["opener_match"] != true
+        || candidate["opener_tab_id"].as_str() != Some(opener_tab_id)
+    {
+        return Err(
+            "popup candidate is stale, closed, unrelated, or not bound to the expected opener and URL",
+        );
+    }
+    Ok(
+        json!({"tab_id":candidate_tab_id,"created_at_ms":expected_created_at_ms,"url":expected_url,"window_id":candidate["window_id"],"opener_tab_id":candidate["opener_tab_id"],"opener_match":true}),
+    )
+}
+
+fn popup_account_marker_matches(
+    snapshot: &Value,
+    expected_url: &str,
+    expected_marker: &str,
+) -> bool {
+    if snapshot["url"].as_str() != Some(expected_url) || snapshot["scope_complete"] != true {
+        return false;
+    }
+    let Some(items) = snapshot["items"].as_array() else {
+        return false;
+    };
+    let mut matching = items.iter().filter(|item| {
+        (item["name"].as_str() == Some(expected_marker)
+            || item["text"].as_str() == Some(expected_marker))
+            && item["rendered"] == true
+            && item["in_viewport"] == true
+    });
+    matching.next().is_some() && matching.next().is_none()
+}
+
+async fn rollback_shared_popup_adoption(shared: &mut SharedLiveSession, target_id: &str) {
+    if let Some(snapshot) = shared.snapshots.remove(target_id)
+        && let (Some(connection), Ok(registry)) = (shared.connection.as_ref(), shared.registry())
+    {
+        let _ = connection
+            .command(
+                registry,
+                &shared.handle,
+                target_id,
+                "Runtime.releaseObject",
+                json!({"objectId":snapshot.object_id}),
+            )
+            .await;
+    }
+    if let Some(connection) = shared.connection.as_mut() {
+        connection.remove_selected_target(target_id);
+    }
+    if let Some(registry) = shared.registry.as_mut() {
+        let _ = registry.unregister_tab(&shared.handle.id, target_id);
+    }
 }
 
 fn shared_navigation_matches(
@@ -1150,6 +1472,25 @@ fn click_mouse_events(x: f64, y: f64) -> [Value; 2] {
         json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
         json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
     ]
+}
+
+fn pointer_click_events(x: f64, y: f64, kind: &str) -> Result<Vec<Value>, &'static str> {
+    let (button, count) = match kind {
+        "click" => ("left", 1),
+        "double_click" => ("left", 2),
+        "context_click" => ("right", 1),
+        _ => return Err("click_kind must be click, double_click, or context_click"),
+    };
+    let mut events = Vec::with_capacity(count as usize * 2);
+    for click_index in 1..=count {
+        events.push(
+            json!({"type":"mousePressed","button":button,"clickCount":click_index,"x":x,"y":y}),
+        );
+        events.push(
+            json!({"type":"mouseReleased","button":button,"clickCount":click_index,"x":x,"y":y}),
+        );
+    }
+    Ok(events)
 }
 
 fn pointer_events(x: f64, y: f64, mode: &str) -> Result<(&'static str, [Value; 2]), &'static str> {
@@ -2029,6 +2370,96 @@ fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String)
     Ok((id.to_owned(), loader.to_owned(), format!("{url}{fragment}")))
 }
 
+fn frame_handles_from_tree(
+    response: &Value,
+    target_id: &str,
+) -> Result<(Vec<controlla_browser::FrameHandle>, bool), String> {
+    const MAX_FRAME_HANDLES: usize = 256;
+    const MAX_FRAME_DEPTH: usize = 16;
+    let root = response
+        .get("frameTree")
+        .ok_or_else(|| "Page.getFrameTree omitted frameTree".to_owned())?;
+    let mut handles = Vec::new();
+    let mut truncated = false;
+    let mut pending = vec![(root, None::<String>, 0usize)];
+    while let Some((node, inherited_parent, depth)) = pending.pop() {
+        if depth > MAX_FRAME_DEPTH || handles.len() >= MAX_FRAME_HANDLES {
+            truncated = true;
+            continue;
+        }
+        let Some(frame) = node.get("frame") else {
+            truncated = true;
+            continue;
+        };
+        let Some(frame_id) = frame
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            truncated = true;
+            continue;
+        };
+        let parent_id = frame
+            .get("parentId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(inherited_parent);
+        handles.push(controlla_browser::FrameHandle {
+            // Page.getFrameTree reports frame ancestry but not OOPIF target
+            // ownership. Only the root is safely bound to the selected tab.
+            target_id: (depth == 0).then(|| target_id.to_owned()),
+            // The extension protocol exposes frame IDs, not its debugger session IDs.
+            session_id: None,
+            frame_id: frame_id.to_owned(),
+            loader_id: frame
+                .get("loaderId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            parent_id: parent_id.clone(),
+            origin: frame
+                .get("securityOrigin")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // Shared extension frame-tree reads do not expose transform measurements.
+            transform_revision: 0,
+            accessibility_state: "not_probed".to_owned(),
+        });
+        if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
+            pending.extend(
+                children
+                    .iter()
+                    .map(|child| (child, Some(frame_id.to_owned()), depth + 1)),
+            );
+        }
+    }
+    Ok((handles, truncated))
+}
+
+fn public_frame_handles(handles: &[controlla_browser::FrameHandle]) -> Result<Value, String> {
+    let mut values = serde_json::to_value(handles).map_err(|error| error.to_string())?;
+    if let Some(items) = values.as_array_mut() {
+        for handle in items {
+            // The shared extension exposes frame IDs, but not debugger
+            // session IDs or measured renderer transforms.
+            handle["route"] = json!("frame_id");
+            handle["transform_revision"] = Value::Null;
+            handle["transform_state"] = json!("unmeasured");
+        }
+    }
+    Ok(values)
+}
+
+fn ensure_snapshot_byte_budget(value: &Value, max_bytes: usize) -> Result<(), String> {
+    if serde_json::to_vec(value)
+        .map_err(|error| error.to_string())?
+        .len()
+        > max_bytes
+    {
+        return Err("snapshot exceeded byte budget; reduce text/items".into());
+    }
+    Ok(())
+}
+
 /// Bind the existing single-use snapshot token and live root-frame identity to the
 /// interaction-epoch contract. Element hit-test/readback guards still validate the
 /// target-specific and viewport dimensions immediately before input dispatch.
@@ -2277,10 +2708,8 @@ impl App {
         &self,
         Parameters(args): Parameters<ArtifactRegisterArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        if args.bytes.is_empty() || args.bytes.len() > 10 * 1024 * 1024 {
-            return Err(invalid(
-                "artifact bytes must be between 1 and 10485760 bytes",
-            ));
+        if args.bytes.len() > 10 * 1024 * 1024 {
+            return Err(invalid("artifact bytes must be at most 10485760 bytes"));
         }
         let s = self
             .sessions
@@ -3064,7 +3493,7 @@ impl App {
 
     #[tool(
         name = "shared_snapshot",
-        description = "Read a compact visible-page snapshot with actionable references, names, raw values, observed link URLs, readiness and coverage. Default scope is body. References retain DOM identity and expire on the next snapshot, document change or click. Use shared_click with a returned reference; never invent selectors or URLs. Text is an excerpt, not proof that all tasks were listed."
+        description = "Read a compact visible-page snapshot with actionable references, names, raw values, observed link URLs, readiness, coverage, and bounded frame_handles. A frame handle identifies a frame in this selected tab and includes its loader and parent; use its frame_id with shared_accessibility to read that frame. Shared extension handles do not expose debugger session IDs or measured transforms, so those fields are explicitly unavailable. Default scope is body. References retain DOM identity and expire on the next snapshot, document change or click. Use shared_click with a returned reference; never invent selectors or URLs. Text is an excerpt, not proof that all tasks were listed."
     )]
     async fn shared_snapshot(
         &self,
@@ -3092,6 +3521,467 @@ impl App {
     }
 
     #[tool(
+        name = "shared_scroll",
+        description = "Apply one bounded trusted wheel event at the center of exactly one fresh shared_snapshot reference, or set scroll_to_target=true to scroll a fresh root-document semantic target into view and verify its center hit-test. Scroll-to-target refuses child frames and unknown delivery is never retried."
+    )]
+    async fn shared_scroll(
+        &self,
+        Parameters(args): Parameters<SharedScrollArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let scroll_to_target = args.scroll_to_target == Some(true);
+        if scroll_to_target {
+            if args.delta_x != 0 || args.delta_y != 0 {
+                return Err(invalid("scroll_to_target requires zero wheel deltas"));
+            }
+            if args.reference.starts_with("@f:") {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","action":"scroll_to","reason_code":"frame_scroll_to_unsupported","dispatch_may_have_occurred":false,"reason":"scroll_to_target supports root-document semantic references only."}),
+                ));
+            }
+        } else {
+            validate_wheel_delta(args.delta_x, args.delta_y).map_err(invalid)?;
+        }
+        let timeout = args.timeout_ms.unwrap_or(3000);
+        if !(1000..=10000).contains(&timeout) {
+            return Err(invalid("timeout_ms must be 1000..10000"));
+        }
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let snapshot = shared
+            .snapshots
+            .get(&args.chrome_tab_id)
+            .cloned()
+            .ok_or_else(|| invalid("take shared_snapshot first"))?;
+        let frame_reference = if let Some(value) = args.reference.strip_prefix("@f:") {
+            let parts = value.splitn(3, ':').collect::<Vec<_>>();
+            if parts.len() != 3
+                || parts[0].is_empty()
+                || parts[0].len() > 256
+                || parts[1].is_empty()
+                || parts[1].len() > 256
+            {
+                return Err(invalid(
+                    "frame scroll requires @f:<frame>:<loader>:<backend-node>",
+                ));
+            }
+            let backend = parts[2]
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    invalid("frame scroll reference has an invalid backend node identity")
+                })?;
+            Some((parts[0].to_owned(), parts[1].to_owned(), backend))
+        } else {
+            None
+        };
+        let root_index = if frame_reference.is_none() {
+            let (token, index) = args.reference.rsplit_once(':').ok_or_else(|| {
+                invalid("invalid reference; use the returned reference unchanged")
+            })?;
+            let index = index
+                .parse::<usize>()
+                .map_err(|_| invalid("invalid reference index"))?;
+            if index >= snapshot.count
+                || (!crate::guard_reason::unrestricted_mode()
+                    && (token != snapshot.token || snapshot.consumed))
+            {
+                return Err(invalid(
+                    "stale or consumed reference; take one fresh snapshot before acting",
+                ));
+            }
+            Some(index)
+        } else {
+            if snapshot.consumed {
+                return Err(invalid(
+                    "stale or consumed frame reference; take one fresh shared snapshot before acting",
+                ));
+            }
+            None
+        };
+        let unrestricted = crate::guard_reason::unrestricted_mode();
+        if !unrestricted {
+            shared
+                .snapshots
+                .get_mut(&args.chrome_tab_id)
+                .unwrap()
+                .consumed = true;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("session not accepted"))?;
+        let registry = shared.registry()?;
+        let identity =
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                .await
+                .map_err(invalid)?;
+        let interaction = shared_interaction_epoch(
+            connection,
+            registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+            &snapshot.object_id,
+        )
+        .await
+        .map_err(invalid)?;
+        if !unrestricted
+            && !shared_epoch_matches(
+                &snapshot,
+                &args.chrome_tab_id,
+                &identity,
+                &interaction,
+                crate::v3::EpochUse::GuardedClick,
+            )
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":if scroll_to_target{"scroll_to"}else{"scroll"},"reason_code":"stale_document","dispatch_may_have_occurred":false,"reason":"The target document or viewport changed; take a fresh snapshot."}),
+            ));
+        }
+        if scroll_to_target {
+            let index = root_index.expect("scroll-to-target rejects frame references");
+            let guard = shared_scroll_to_target_guard_script();
+            let response = tokio::time::timeout_at(
+                deadline,
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Controlla.scrollToTarget",
+                    json!({
+                        "object_id": snapshot.object_id, "index": index, "guard_function": guard,
+                        "scroll_request": "scroll-to-target-v1", "timeout_ms": timeout,
+                        "expected_activation_epoch": args.expected_activation_epoch,
+                        "expected_focus_epoch": args.expected_focus_epoch
+                    }),
+                ),
+            )
+            .await;
+            let mut receipt = match response {
+                Ok(Ok(response)) => shared_command_value(&response),
+                _ => {
+                    json!({"status":"unknown","reason_code":"scroll_to_target_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})
+                }
+            };
+            let identity_after = tokio::time::timeout_at(
+                deadline,
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+            )
+            .await;
+            if !matches!(identity_after, Ok(Ok(ref current)) if *current == snapshot.identity)
+                && receipt["dispatch_may_have_occurred"] != false
+            {
+                receipt["status"] = json!("unknown");
+                receipt["reason_code"] = json!("document_changed_after_scroll_to_target");
+            }
+            receipt["action"] = json!("scroll_to");
+            receipt["reference"] = json!(args.reference);
+            return Ok(rmcp::handler::server::wrapper::Json(receipt));
+        }
+        if let Some((frame_id, frame_loader_id, backend_node_id)) = frame_reference {
+            let tree = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Page.getFrameTree",
+                    Value::Null,
+                )
+                .await
+                .map_err(|_| invalid("frame tree is unavailable before child-frame scroll"))?;
+            if find_cdp_frame(&tree, &frame_id).is_none_or(|(loader, _)| loader != frame_loader_id)
+            {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","action":"scroll","reason_code":"stale_frame_reference","dispatch_may_have_occurred":false,"reason":"Child frame navigated since its semantic reference was created."}),
+                ));
+            }
+            let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.frameScroll",json!({
+                "frame_id":frame_id,"loader_id":frame_loader_id,"backend_node_id":backend_node_id,
+                "delta_x":args.delta_x,"delta_y":args.delta_y,"timeout_ms":timeout,
+                "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+            })).await;
+            let mut receipt = match response {
+                Ok(response) => shared_command_value(&response),
+                Err(_) => {
+                    json!({"status":"unknown","reason_code":"frame_wheel_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})
+                }
+            };
+            let root_after =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await;
+            let frame_after = connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Page.getFrameTree",
+                    Value::Null,
+                )
+                .await
+                .ok()
+                .and_then(|tree| find_cdp_frame(&tree, &frame_id));
+            if (!matches!(root_after,Ok(ref current) if *current==snapshot.identity)
+                || frame_after.is_none_or(|(loader, _)| loader != frame_loader_id))
+                && receipt["dispatch_may_have_occurred"] != false
+            {
+                receipt["status"] = json!("unknown");
+                receipt["reason_code"] = json!("frame_identity_changed_after_scroll");
+            }
+            receipt["action"] = json!("scroll");
+            receipt["reference"] = json!(args.reference);
+            receipt["requested_delta_x"] = json!(args.delta_x);
+            receipt["requested_delta_y"] = json!(args.delta_y);
+            return Ok(rmcp::handler::server::wrapper::Json(receipt));
+        }
+        let index = root_index.expect("root scroll has a parsed item index");
+        let guard = shared_scroll_guard_script();
+        let preflight=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({
+            "objectId":snapshot.object_id,"functionDeclaration":guard,
+            "arguments":[{"value":index},{"value":args.delta_x},{"value":args.delta_y},{"value":Value::Null}],"returnByValue":true
+        }))).await;
+        let checked = match preflight {
+            Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
+            _ => {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","action":"scroll","reason_code":"scroll_preflight_failed","dispatch_may_have_occurred":false}),
+                ));
+            }
+        };
+        if checked["ok"] != true {
+            let mut refusal = crate::guard_reason::refusal(&checked);
+            refusal["action"] = json!("scroll");
+            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+        }
+        let Some(viewport) = checked["viewport"].as_str() else {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"scroll","reason_code":"invalid_scroll_guard","dispatch_may_have_occurred":false}),
+            ));
+        };
+        let fresh = tokio::time::timeout_at(deadline, async {
+            let identity =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await?;
+            let interaction = shared_interaction_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+            )
+            .await?;
+            Ok::<_, String>((identity, interaction))
+        })
+        .await;
+        if !matches!(fresh,Ok(Ok((ref id,ref epoch))) if shared_epoch_matches(&snapshot,&args.chrome_tab_id,id,epoch,crate::v3::EpochUse::GuardedClick))
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"scroll","reason_code":"changed_target","dispatch_may_have_occurred":false,"reason":"The document or viewport changed before wheel dispatch."}),
+            ));
+        }
+        let dispatch=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerScroll",json!({
+            "object_id":snapshot.object_id,"index":index,"delta_x":args.delta_x,"delta_y":args.delta_y,
+            "guard_function":guard,"viewport":viewport,"timeout_ms":timeout
+            ,"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+        }))).await;
+        let receipt = match dispatch {
+            Ok(Ok(value)) => shared_command_value(&value),
+            _ => {
+                json!({"status":"unknown","reason_code":"wheel_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})
+            }
+        };
+        if receipt["status"] == "verified"
+            && !valid_scroll_readback(&receipt, args.delta_x, args.delta_y)
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"inconclusive","action":"scroll","reason_code":"invalid_scroll_readback","dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"receipt":receipt}),
+            ));
+        }
+        let identity_after = tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+        )
+        .await;
+        let mut result = receipt;
+        if !matches!(identity_after,Ok(Ok(ref value)) if *value==snapshot.identity)
+            && result["dispatch_may_have_occurred"] != false
+        {
+            result["status"] = json!("unknown");
+            result["reason_code"] = json!("document_changed_after_scroll");
+            result["reason"] = json!(
+                "The target document changed after wheel dispatch; inspect state before retrying."
+            );
+        }
+        result["action"] = json!("scroll");
+        result["reference"] = json!(args.reference);
+        result["requested_delta_x"] = json!(args.delta_x);
+        result["requested_delta_y"] = json!(args.delta_y);
+        Ok(rmcp::handler::server::wrapper::Json(result))
+    }
+
+    #[allow(dead_code)] // Used by the V3 CLI binary.
+    async fn shared_swipe(
+        &self,
+        args: SharedSwipeArgs,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        validate_swipe_endpoints(args.start_x, args.start_y, args.end_x, args.end_y)
+            .map_err(invalid)?;
+        let timeout = args.timeout_ms.unwrap_or(3000);
+        if !(1000..=10000).contains(&timeout) {
+            return Err(invalid("timeout_ms must be 1000..10000"));
+        }
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let snapshot = shared
+            .snapshots
+            .get(&args.chrome_tab_id)
+            .cloned()
+            .ok_or_else(|| invalid("take shared_snapshot first"))?;
+        let (token, index) = args
+            .reference
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("invalid reference; use the returned reference unchanged"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid reference index"))?;
+        let unrestricted = crate::guard_reason::unrestricted_mode();
+        if index >= snapshot.count
+            || (!unrestricted && (token != snapshot.token || snapshot.consumed))
+        {
+            return Err(invalid(
+                "stale or consumed reference; take one fresh snapshot before acting",
+            ));
+        }
+        let timeout = Duration::from_millis(timeout);
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Consume before any potentially yielding browser call. A refused gesture
+        // still requires a fresh snapshot, while an uncertain delivery can never
+        // be replayed with the same semantic reference.
+        if !unrestricted {
+            shared
+                .snapshots
+                .get_mut(&args.chrome_tab_id)
+                .unwrap()
+                .consumed = true;
+        }
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("session not accepted"))?;
+        let registry = shared.registry()?;
+        let identity =
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                .await
+                .map_err(invalid)?;
+        let interaction = shared_interaction_epoch(
+            connection,
+            registry,
+            &shared.handle,
+            &args.chrome_tab_id,
+            &snapshot.object_id,
+        )
+        .await
+        .map_err(invalid)?;
+        if !unrestricted
+            && !shared_epoch_matches(
+                &snapshot,
+                &args.chrome_tab_id,
+                &identity,
+                &interaction,
+                crate::v3::EpochUse::GuardedClick,
+            )
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"swipe","reason_code":"stale_document","dispatch_may_have_occurred":false}),
+            ));
+        }
+        let guard = shared_swipe_guard_script();
+        let preflight=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":args.start_x},{"value":args.start_y},{"value":args.end_x},{"value":args.end_y},{"value":Value::Null},{"value":"before"}],"returnByValue":true}))).await;
+        let checked = match preflight {
+            Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
+            _ => {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","action":"swipe","reason_code":"swipe_preflight_failed","dispatch_may_have_occurred":false}),
+                ));
+            }
+        };
+        if checked["ok"] != true {
+            let mut refusal = crate::guard_reason::refusal(&checked);
+            refusal["action"] = json!("swipe");
+            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+        }
+        let Some(viewport) = checked["viewport"].as_str() else {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"swipe","reason_code":"invalid_swipe_guard","dispatch_may_have_occurred":false}),
+            ));
+        };
+        let fresh = tokio::time::timeout_at(deadline, async {
+            let id =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await?;
+            let epoch = shared_interaction_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+            )
+            .await?;
+            Ok::<_, String>((id, epoch))
+        })
+        .await;
+        if !matches!(fresh,Ok(Ok((ref id,ref epoch))) if shared_epoch_matches(&snapshot,&args.chrome_tab_id,id,epoch,crate::v3::EpochUse::GuardedClick))
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"swipe","reason_code":"changed_target","dispatch_may_have_occurred":false}),
+            ));
+        }
+        let dispatch=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerSwipe",json!({
+            "object_id":snapshot.object_id,"index":index,"guard_function":guard,"viewport":viewport,
+            "start_x":args.start_x,"start_y":args.start_y,"end_x":args.end_x,"end_y":args.end_y,"timeout_ms":timeout.as_millis(),
+            "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+        }))).await;
+        let mut receipt = match dispatch {
+            Ok(Ok(value)) => shared_command_value(&value),
+            _ => {
+                json!({"status":"unknown","reason_code":"touch_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})
+            }
+        };
+        let identity_after = tokio::time::timeout_at(
+            deadline,
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
+        )
+        .await;
+        if !matches!(identity_after,Ok(Ok(ref value)) if *value==snapshot.identity)
+            && receipt["dispatch_may_have_occurred"] != false
+        {
+            receipt["status"] = json!("unknown");
+            receipt["reason_code"] = json!("document_changed_after_swipe");
+        }
+        receipt["action"] = json!("swipe");
+        receipt["reference"] = json!(args.reference);
+        Ok(rmcp::handler::server::wrapper::Json(receipt))
+    }
+
+    #[tool(
         name = "shared_click",
         description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse clicks on inactive tabs briefly activate the tab inside its Chrome window, dispatch guarded CDP input, then restore the prior tab when safe; this does not focus a Chrome window behind another app. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
@@ -3101,8 +3991,19 @@ impl App {
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
         validate_shared_click_outcome(&args.outcome)?;
         let input_mode = args.input_mode.as_deref().unwrap_or("mouse");
+        let click_kind = args.click_kind.as_deref().unwrap_or("click");
         if !matches!(input_mode, "mouse" | "touch") {
             return Err(invalid("input_mode must be mouse or touch"));
+        }
+        if !matches!(click_kind, "click" | "double_click" | "context_click") {
+            return Err(invalid(
+                "click_kind must be click, double_click, or context_click",
+            ));
+        }
+        if input_mode == "touch" && click_kind != "click" {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","reason_code":"unsupported_pointer_variant","dispatch_may_have_occurred":false,"reason":"double and context click are mouse-only; no touch input was dispatched"}),
+            ));
         }
         let outcome = json!(args.outcome);
         if outcome
@@ -3320,6 +4221,7 @@ impl App {
             .as_millis()
             .min(u64::MAX as u128) as u64;
         let mut pointer_activation = Value::Null;
+        let mut pointer_terminal = None::<Value>;
         let (acknowledged, dispatch_failed) = if input_mode == "mouse"
             && shared.handle.mode == controlla_browser::sessions::SessionMode::Shared
         {
@@ -3331,7 +4233,7 @@ impl App {
                     &args.chrome_tab_id,
                     "Controlla.pointerClick",
                     json!({"object_id":snapshot.object_id,"index":index,"outcome":outcome,
-                    "function_declaration":guard,"viewport":prepared_viewport}),
+                    "function_declaration":guard,"viewport":prepared_viewport,"click_kind":click_kind}),
                 ),
             )
             .await;
@@ -3345,45 +4247,100 @@ impl App {
                         "temporary_activation":value["temporary_activation"],
                         "restored_previous_tab":value["restored_previous_tab"]
                     });
+                    // An extension can report that the first half of a multi-click was
+                    // delivered before it fenced the next click. Keep that receipt
+                    // terminal: a postcondition such as focus may already be true after
+                    // the first click and must not upgrade partial delivery to success.
+                    if value["status"] == "unknown" && value["dispatch_may_have_occurred"] == true {
+                        pointer_terminal = Some(value.clone());
+                    }
                     (
                         value["dispatch_acknowledged"] == true,
-                        value["status"] == "not_dispatched",
+                        value["status"] == "not_dispatched" || value["status"] == "unknown",
                     )
                 }
                 _ => (false, true),
             }
         } else {
-            let (input_method, [press_event, release_event]) =
-                pointer_events(x, y, input_mode).map_err(invalid)?;
-            let press = tokio::time::timeout_at(
-                deadline,
-                connection.command(
-                    registry,
-                    &shared.handle,
-                    &args.chrome_tab_id,
-                    input_method,
-                    press_event,
-                ),
-            )
-            .await;
-            // Release once even when the press reply was lost; never repeat the press.
-            let release = tokio::time::timeout(
-                Duration::from_secs(2),
-                connection.command(
-                    registry,
-                    &shared.handle,
-                    &args.chrome_tab_id,
-                    input_method,
-                    release_event,
-                ),
-            )
-            .await;
-            (
-                matches!(press, Ok(Ok(_))) && matches!(release, Ok(Ok(_))),
-                false,
-            )
+            let events = if input_mode == "mouse" {
+                pointer_click_events(x, y, click_kind).map_err(invalid)?
+            } else {
+                let (_, [press, release]) = pointer_events(x, y, input_mode).map_err(invalid)?;
+                vec![press, release]
+            };
+            let mut acknowledged = true;
+            let mut held_button = None::<(&str, u64)>;
+            let mut touch_active = false;
+            for event in &events {
+                let press = event["type"] == "mousePressed";
+                let touch_start = event["type"] == "touchStart";
+                let button = event["button"].as_str().unwrap_or("left");
+                let click_count = event["clickCount"].as_u64().unwrap_or(1);
+                let dispatch = tokio::time::timeout_at(
+                    deadline,
+                    connection.command(
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        if input_mode == "mouse" {
+                            "Input.dispatchMouseEvent"
+                        } else {
+                            "Input.dispatchTouchEvent"
+                        },
+                        event.clone(),
+                    ),
+                )
+                .await;
+                if press {
+                    held_button = Some((button, click_count));
+                }
+                if touch_start {
+                    touch_active = true;
+                }
+                if dispatch.is_err() || !matches!(dispatch, Ok(Ok(_))) {
+                    acknowledged = false;
+                    break;
+                }
+                if event["type"] == "mouseReleased" || event["type"] == "touchEnd" {
+                    held_button = None;
+                }
+                if event["type"] == "touchEnd" {
+                    touch_active = false;
+                }
+            }
+            if touch_active {
+                let (_, [_, release]) = pointer_events(x, y, "touch").map_err(invalid)?;
+                let cleaned = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    connection.command(
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        "Input.dispatchTouchEvent",
+                        release,
+                    ),
+                )
+                .await;
+                acknowledged &= matches!(cleaned, Ok(Ok(_)));
+            }
+            if let Some((button, click_count)) = held_button {
+                let release = json!({"type":"mouseReleased","button":button,"buttons":0,"clickCount":click_count,"x":x,"y":y});
+                let cleaned = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    connection.command(
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        "Input.dispatchMouseEvent",
+                        release,
+                    ),
+                )
+                .await;
+                acknowledged &= matches!(cleaned, Ok(Ok(_)));
+            }
+            (acknowledged, false)
         };
-        let mut result = json!({
+        let mut result = pointer_terminal.clone().unwrap_or_else(|| json!({
             "status":"unknown",
             "dispatch_acknowledged":acknowledged,
             "input_mode":input_mode,
@@ -3391,9 +4348,9 @@ impl App {
             "mutation_retry_policy":"reconcile_read_only_first",
             "next_action":"inspect_current_state_once_before_retrying",
             "reason":"outcome not verified before deadline; inspect state, do not automatically retry"
-        });
+        }));
         let mut verification_poll = SHARED_CLICK_VERIFY_INITIAL_POLL_INTERVAL;
-        while tokio::time::Instant::now() < deadline {
+        while pointer_terminal.is_none() && tokio::time::Instant::now() < deadline {
             let check = async {
                 let identity = shared_frame_identity(
                     connection,
@@ -3436,7 +4393,22 @@ impl App {
                 Ok::<_, String>((identity, verified))
             };
             if let Ok(Ok((identity, true))) = tokio::time::timeout_at(deadline, check).await {
-                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"input_mode":input_mode,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity,"new_tab_observed":matches!(&args.outcome, SharedClickOutcome::NewTab { .. })});
+                let new_tab_candidate = if let SharedClickOutcome::NewTab { url } = &args.outcome {
+                    connection
+                        .command(
+                            registry,
+                            &shared.handle,
+                            &args.chrome_tab_id,
+                            "Controlla.newTabs",
+                            json!({"since_ms":click_started_ms,"url":url}),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|response| shared_new_tab_candidate(&response, url.as_deref()))
+                } else {
+                    None
+                };
+                result = json!({"status":"verified","dispatch_acknowledged":acknowledged,"input_mode":input_mode,"outcome":outcome,"url":identity.2,"navigation_observed":identity!=snapshot.identity,"new_tab_observed":matches!(&args.outcome, SharedClickOutcome::NewTab { .. }),"new_tab_candidate":new_tab_candidate});
                 break;
             }
             let _ = tokio::time::timeout_at(deadline, tokio::time::sleep(verification_poll)).await;
@@ -3565,7 +4537,7 @@ impl App {
 
     #[tool(
         name = "shared_accessibility",
-        description = "Read one CSS-selected node's partial AX data or a bounded full AX tree for an explicit child frame in an explicitly paired Chrome tab. Child-frame reads use the same-target frameId path first and a bounded OOPIF child session fallback. Root and frame identity must remain unchanged."
+        description = "Read one CSS-selected node's partial AX data or a bounded full AX tree for an explicit child frame in an explicitly paired Chrome tab. Use frame_id from a shared_snapshot frame_handle. Child-frame reads use the same-target frameId path first and a bounded OOPIF child session fallback; returned items retain frame and loader identity for supported frame actions. Root and frame identity must remain unchanged."
     )]
     async fn shared_accessibility(
         &self,
@@ -4437,16 +5409,185 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open a Chrome tab in the foreground by default or leave it in the background with active=false, or navigate an explicitly paired tab through the native Controlla extension session. `open` requires a stable idempotency_key; reuse it only for the same logical open retry with the same activation mode. A different key creates a distinct tab. Accepts HTTP(S) URLs without credentials and returns the tab ID, URL, and fresh document ID."
+        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
     )]
     async fn shared_tab(
         &self,
         Parameters(args): Parameters<SharedTabArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        if matches!(args.action.as_str(), "open" | "navigate") {
+        if matches!(args.action.as_str(), "open" | "navigate" | "adopt_popup") {
             validate_shared_url(&args.url)?;
         } else if !args.url.is_empty() {
             return Err(invalid("lifecycle actions do not accept url"));
+        }
+        if args.action == "adopt_popup" {
+            let opener_tab_id = args.chrome_tab_id.as_deref().ok_or_else(|| {
+                invalid("adopt_popup requires the already paired opener chrome_tab_id")
+            })?;
+            if opener_tab_id.parse::<u32>().is_err() {
+                return Err(invalid(
+                    "adopt_popup opener chrome_tab_id must be a decimal Chrome tab ID",
+                ));
+            }
+            let candidate_tab_id = args.candidate_tab_id.as_deref().ok_or_else(|| {
+                invalid("adopt_popup requires candidate_tab_id from a verified new-tab outcome")
+            })?;
+            let created_at_ms = args.created_at_ms.ok_or_else(|| {
+                invalid("adopt_popup requires the observed candidate created_at_ms")
+            })?;
+            let since_ms = args
+                .since_ms
+                .ok_or_else(|| invalid("adopt_popup requires the originating click since_ms"))?;
+            let marker_selector = args
+                .account_marker_selector
+                .as_deref()
+                .filter(|selector| {
+                    !selector.trim().is_empty()
+                        && selector.len() <= 512
+                        && !selector.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    invalid("adopt_popup requires a bounded CSS account_marker_selector")
+                })?;
+            let marker_text = args
+                .account_marker_text
+                .as_deref()
+                .filter(|text| {
+                    !text.trim().is_empty()
+                        && text.len() <= 512
+                        && !text.chars().any(char::is_control)
+                })
+                .ok_or_else(|| invalid("adopt_popup requires exact visible account_marker_text"))?;
+            if args.idempotency_key.is_some()
+                || args.active.is_some()
+                || args.wait_until.is_some()
+                || args.create_background_window.is_some()
+                || args.target_window_id.is_some()
+            {
+                return Err(invalid(
+                    "adopt_popup accepts only session_id, opener chrome_tab_id, url, candidate identity/timing, and account-marker fields",
+                ));
+            }
+            let shared = self
+                .shared_sessions
+                .lock()
+                .await
+                .get(&args.session_id)
+                .cloned()
+                .ok_or_else(|| invalid("unknown shared session_id"))?;
+            let mut shared = shared.lock().await;
+            if shared.handle.principal != self.principal.as_ref() {
+                return Err(invalid("session is not owned by this server principal"));
+            }
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            if !connection
+                .selected_targets()
+                .iter()
+                .any(|target| target == opener_tab_id)
+            {
+                return Err(invalid(
+                    "popup opener is not part of this guarded shared session",
+                ));
+            }
+            let inventory = connection
+                .command(
+                    shared.registry()?,
+                    &shared.handle,
+                    opener_tab_id,
+                    "Controlla.newTabs",
+                    json!({"since_ms":since_ms}),
+                )
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| invalid("system clock is before Unix epoch"))?
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            let candidate = popup_candidate_for_adoption(
+                &inventory,
+                opener_tab_id,
+                candidate_tab_id,
+                created_at_ms,
+                since_ms,
+                &args.url,
+                now_ms,
+            )
+            .map_err(invalid)?;
+            if shared.connection.as_ref().is_some_and(|connection| {
+                connection
+                    .selected_targets()
+                    .iter()
+                    .any(|target| target == candidate_tab_id)
+            }) {
+                return Err(invalid(
+                    "popup candidate is already attached to this shared session",
+                ));
+            }
+            shared
+                .registry
+                .as_mut()
+                .ok_or_else(|| invalid("shared registry is unavailable"))?
+                .register_tab(
+                    &args.session_id,
+                    candidate_tab_id.to_owned(),
+                    Ownership::Borrowed,
+                )
+                .map_err(|error| invalid(format!("cannot register popup candidate: {error:?}")))?;
+            if let Err(error) = shared
+                .connection
+                .as_mut()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?
+                .add_selected_target(candidate_tab_id.to_owned())
+            {
+                let _ = shared.registry.as_mut().and_then(|registry| {
+                    registry
+                        .unregister_tab(&args.session_id, candidate_tab_id)
+                        .ok()
+                });
+                return Err(invalid(error));
+            }
+            let marker_snapshot = capture_shared_snapshot(
+                &mut shared,
+                &SharedSnapshotArgs {
+                    session_id: args.session_id.clone(),
+                    chrome_tab_id: candidate_tab_id.to_owned(),
+                    selector: marker_selector.to_owned(),
+                    max_items: 32,
+                    max_text_chars: 1024,
+                    max_bytes: 16384,
+                    href_hint: None,
+                    goal: None,
+                    max_scan_nodes: Some(4096),
+                },
+            )
+            .await;
+            let snapshot = match marker_snapshot {
+                Ok(snapshot) if popup_account_marker_matches(&snapshot, &args.url, marker_text) => {
+                    snapshot
+                }
+                Ok(_) => {
+                    rollback_shared_popup_adoption(&mut shared, candidate_tab_id).await;
+                    return Err(invalid(
+                        "popup was not adopted: exact destination URL and one fresh visible account marker were not verified",
+                    ));
+                }
+                Err(error) => {
+                    rollback_shared_popup_adoption(&mut shared, candidate_tab_id).await;
+                    return Err(invalid(format!(
+                        "popup was not adopted: fresh destination/account snapshot failed: {error}"
+                    )));
+                }
+            };
+            return Ok(rmcp::handler::server::wrapper::Json(json!({
+                "status":"adopted","chrome_tab_id":candidate["tab_id"],"url":snapshot["url"],"created_at_ms":candidate["created_at_ms"],
+                "opener_tab_id":candidate["opener_tab_id"],"account_marker_verified":true,
+                "evidence_scope":"unique_recent_opener_bound_candidate_and_fresh_visible_account_marker_ui_only",
+                "authentication":"not independently established; visible account marker only"
+            })));
         }
         if args.action == "close_owned" {
             let target = args
@@ -5493,15 +6634,47 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
-        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport, pointer_events,
-        shared_command_value, shared_epoch_matches, shared_typing_minimum_duration,
-        validate_loopback_ws,
+        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport,
+        pointer_click_events, pointer_events, shared_command_value, shared_epoch_matches,
+        shared_typing_minimum_duration, validate_loopback_ws, validate_swipe_endpoints,
+        validate_wheel_delta,
     };
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
         service::serve_directly,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn wheel_delta_requires_bounded_nonzero_integer_movement() {
+        assert!(validate_wheel_delta(0, 120).is_ok());
+        assert!(validate_wheel_delta(-120, 0).is_ok());
+        assert!(validate_wheel_delta(0, 0).is_err());
+        assert!(validate_wheel_delta(1201, 0).is_err());
+        assert!(validate_wheel_delta(0, -1201).is_err());
+        assert!(validate_wheel_delta(i32::MIN, 0).is_err());
+    }
+
+    #[test]
+    fn swipe_endpoints_require_finite_bounded_viewport_path_length() {
+        assert!(validate_swipe_endpoints(20.0, 40.0, 20.0, 10.0).is_ok());
+        assert!(validate_swipe_endpoints(0.0, 0.0, 20.0, 0.0).is_ok());
+        assert!(validate_swipe_endpoints(1.0, 1.0, 10.0, 10.0).is_err());
+        assert!(validate_swipe_endpoints(0.0, 0.0, 1201.0, 0.0).is_err());
+        assert!(validate_swipe_endpoints(f64::NAN, 0.0, 100.0, 0.0).is_err());
+        assert!(validate_swipe_endpoints(10_001.0, 1.0, 100.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn scroll_receipt_requires_same_connected_container_and_expected_direction() {
+        let receipt = json!({"same_container":true,"container_connected":true,
+            "before":{"left":0.0,"top":20.0},"after":{"left":0.0,"top":80.0}});
+        assert!(super::valid_scroll_readback(&receipt, 0, 60));
+        assert!(!super::valid_scroll_readback(&receipt, 0, -60));
+        let replaced = json!({"same_container":false,"container_connected":true,
+            "before":{"left":0.0,"top":20.0},"after":{"left":0.0,"top":80.0}});
+        assert!(!super::valid_scroll_readback(&replaced, 0, 60));
+    }
 
     #[test]
     fn custom_shared_command_receipts_are_not_parsed_as_cdp_runtime_values() {
@@ -5541,6 +6714,40 @@ mod tests {
         assert_eq!(events[1]["type"], "mouseReleased");
         assert_eq!(events[1]["x"], 12.0);
         assert_eq!(events[1]["y"], 34.0);
+    }
+
+    #[test]
+    fn double_and_context_clicks_emit_explicit_trusted_mouse_event_sequences() {
+        let double = pointer_click_events(12.0, 34.0, "double_click").unwrap();
+        assert_eq!(double.len(), 4);
+        assert_eq!(
+            double
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "mousePressed",
+                "mouseReleased",
+                "mousePressed",
+                "mouseReleased"
+            ]
+        );
+        assert_eq!(double[0]["button"], "left");
+        assert_eq!(double[0]["clickCount"], 1);
+        assert_eq!(double[2]["clickCount"], 2);
+        assert!(
+            double
+                .iter()
+                .all(|event| event["x"] == 12.0 && event["y"] == 34.0)
+        );
+        let context = pointer_click_events(8.0, 9.0, "context_click").unwrap();
+        assert_eq!(context.len(), 2);
+        assert!(
+            context
+                .iter()
+                .all(|event| event["button"] == "right" && event["clickCount"] == 1)
+        );
+        assert!(pointer_click_events(0.0, 0.0, "hover").is_err());
     }
 
     #[test]
@@ -5717,14 +6924,21 @@ mod tests {
 
     #[test]
     fn new_tab_outcome_requires_a_recent_child_tab_and_optional_exact_url() {
-        use super::shared_new_tab_matches;
-        let response =
-            json!({"tabs":[{"tab_id":"900","url":"https://site.test/story","opener_match":true}]});
+        use super::{shared_new_tab_candidate, shared_new_tab_matches};
+        let response = json!({"tabs":[{"tab_id":"900","url":"https://site.test/story","window_id":5,"created_at_ms":1200,"opener_match":true}]});
         assert!(shared_new_tab_matches(&response, None));
         assert!(shared_new_tab_matches(
             &response,
             Some("https://site.test/story")
         ));
+        let candidate = shared_new_tab_candidate(&response, Some("https://site.test/story"))
+            .expect("unique opener-bound candidate is exposed");
+        assert_eq!(candidate["tab_id"], "900");
+        assert_eq!(candidate["created_at_ms"], 1200);
+        assert_eq!(
+            candidate["evidence_scope"],
+            "recent_opener_bound_tab_candidate_not_account_authentication"
+        );
         assert!(!shared_new_tab_matches(
             &response,
             Some("https://site.test/other")
@@ -5742,6 +6956,23 @@ mod tests {
             &json!({"tabs":[{"tab_id":"1","url":"https://site.test/story"}]}),
             Some("https://site.test/story")
         ));
+        assert!(
+            !shared_new_tab_matches(
+                &json!({"tabs":[{"tab_id":"1","url":"https://site.test/story","opener_match":true}]}),
+                Some("https://site.test/story")
+            ),
+            "candidate without creation-time evidence cannot be adopted"
+        );
+        assert!(
+            !shared_new_tab_matches(
+                &json!({"tabs":[
+                    {"tab_id":"1","url":"https://site.test/story","created_at_ms":1200,"opener_match":true},
+                    {"tab_id":"2","url":"https://site.test/story","created_at_ms":1201,"opener_match":true}
+                ]}),
+                Some("https://site.test/story")
+            ),
+            "ambiguous opener-bound candidates cannot be adopted"
+        );
         assert!(!shared_new_tab_matches(
             &json!({"tabs":[{"tab_id":"1","url":"https://site.test/a"},{"tab_id":"2","url":"https://site.test/b"}]}),
             None
@@ -5749,6 +6980,136 @@ mod tests {
         assert!(!shared_new_tab_matches(
             &json!({"tabs":[{"url":"https://site.test/story"}]}),
             None
+        ));
+    }
+
+    #[test]
+    fn popup_adoption_requires_unique_fresh_candidate_and_visible_exact_account_marker() {
+        use super::{popup_account_marker_matches, popup_candidate_for_adoption};
+        let response = json!({"tabs":[{"tab_id":"900","url":"https://accounts.example.test/pick","window_id":5,"created_at_ms":1200,"opener_tab_id":"41","opener_match":true}]});
+        let candidate = popup_candidate_for_adoption(
+            &response,
+            "41",
+            "900",
+            1200,
+            1100,
+            "https://accounts.example.test/pick",
+            1250,
+        )
+        .unwrap();
+        assert_eq!(candidate["tab_id"], "900");
+        assert!(
+            popup_candidate_for_adoption(
+                &response,
+                "41",
+                "900",
+                1200,
+                1201,
+                "https://accounts.example.test/pick",
+                1250
+            )
+            .is_err(),
+            "candidate predating the click is stale"
+        );
+        assert!(
+            popup_candidate_for_adoption(
+                &response,
+                "41",
+                "900",
+                1200,
+                1100,
+                "https://accounts.example.test/pick",
+                62_000
+            )
+            .is_err(),
+            "candidate outside the short-lived extension event window is stale"
+        );
+        assert!(
+            popup_candidate_for_adoption(
+                &response,
+                "41",
+                "901",
+                1200,
+                1100,
+                "https://accounts.example.test/pick",
+                1250
+            )
+            .is_err(),
+            "closed or unknown candidate is rejected"
+        );
+        assert!(
+            popup_candidate_for_adoption(
+                &response,
+                "41",
+                "900",
+                1200,
+                1100,
+                "https://accounts.example.test/other",
+                1250
+            )
+            .is_err(),
+            "unrelated destination is rejected"
+        );
+        let ambiguous = json!({"tabs":[response["tabs"][0].clone(),{"tab_id":"901","url":"https://accounts.example.test/pick","created_at_ms":1201,"opener_tab_id":"41","opener_match":true}]});
+        assert!(
+            popup_candidate_for_adoption(
+                &ambiguous,
+                "41",
+                "900",
+                1200,
+                1100,
+                "https://accounts.example.test/pick",
+                1250
+            )
+            .is_err(),
+            "ambiguous popup set is rejected"
+        );
+        let wrong_opener = json!({"tabs":[{"tab_id":"900","url":"https://accounts.example.test/pick","created_at_ms":1200,"opener_tab_id":"99","opener_match":false}]});
+        assert!(
+            popup_candidate_for_adoption(
+                &wrong_opener,
+                "41",
+                "900",
+                1200,
+                1100,
+                "https://accounts.example.test/pick",
+                1250
+            )
+            .is_err()
+        );
+        let snapshot = json!({"url":"https://accounts.example.test/pick","scope_complete":true,"items":[{"name":"Signed in as test@example.test","text":"Signed in as test@example.test","rendered":true,"in_viewport":true}]});
+        assert!(popup_account_marker_matches(
+            &snapshot,
+            "https://accounts.example.test/pick",
+            "Signed in as test@example.test"
+        ));
+        assert!(!popup_account_marker_matches(
+            &snapshot,
+            "https://accounts.example.test/other",
+            "Signed in as test@example.test"
+        ));
+        assert!(!popup_account_marker_matches(
+            &snapshot,
+            "https://accounts.example.test/pick",
+            "Signed in as other@example.test"
+        ));
+        let hidden = json!({"url":"https://accounts.example.test/pick","scope_complete":true,"items":[{"name":"Signed in as test@example.test","rendered":false,"in_viewport":false}]});
+        assert!(!popup_account_marker_matches(
+            &hidden,
+            "https://accounts.example.test/pick",
+            "Signed in as test@example.test"
+        ));
+        let truncated = json!({"url":"https://accounts.example.test/pick","scope_complete":false,"items":snapshot["items"].clone()});
+        assert!(!popup_account_marker_matches(
+            &truncated,
+            "https://accounts.example.test/pick",
+            "Signed in as test@example.test"
+        ));
+        let duplicate = json!({"url":"https://accounts.example.test/pick","scope_complete":true,"items":[snapshot["items"][0].clone(),snapshot["items"][0].clone()]});
+        assert!(!popup_account_marker_matches(
+            &duplicate,
+            "https://accounts.example.test/pick",
+            "Signed in as test@example.test"
         ));
     }
 
@@ -5774,6 +7135,26 @@ mod tests {
                 .iter()
                 .any(|kind| kind == "boolean")
         );
+        for field in [
+            "candidate_tab_id",
+            "created_at_ms",
+            "since_ms",
+            "account_marker_selector",
+            "account_marker_text",
+        ] {
+            assert!(
+                schema["properties"].get(field).is_some(),
+                "shared_tab exposes the bounded {field} input for adopt_popup"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == field),
+                "adopt_popup-only input {field} stays optional for existing actions"
+            );
+        }
     }
 
     #[test]
@@ -5868,22 +7249,100 @@ mod tests {
     fn snapshot_batch_requires_both_successful_reads_and_a_root_identity() {
         let valid = json!({"completed":2,"receipts":[
             {"method":"Runtime.callFunctionOn","result":{"result":{"value":{"items":[]}}}},
-            {"method":"Page.getFrameTree","result":{"frameTree":{"frame":{"id":"f","loaderId":"l","url":"https://example.test/"}}}}
+            {"method":"Page.getFrameTree","result":{"frameTree":{"frame":{"id":"f","loaderId":"l","url":"https://example.test/","securityOrigin":"https://example.test"},"childFrames":[{"frame":{"id":"child","parentId":"f","loaderId":"cl","url":"https://child.example.test/","securityOrigin":"https://child.example.test"}}]}}}
         ]});
-        assert_eq!(
-            super::snapshot_batch_reads(&valid).unwrap().1.2,
-            "https://example.test/"
-        );
-        assert!(
-            super::snapshot_batch_reads(&json!({"completed":1,"receipts":[valid["receipts"][0]]}))
-                .is_err()
-        );
+        let reads = super::snapshot_batch_reads(&valid, "tab-1").unwrap();
+        assert_eq!(reads.identity.2, "https://example.test/");
+        assert_eq!(reads.frame_handles.len(), 2);
+        assert_eq!(reads.frame_handles[1].frame_id, "child");
+        assert_eq!(reads.frame_handles[0].target_id.as_deref(), Some("tab-1"));
+        assert_eq!(reads.frame_handles[1].target_id, None);
+        assert_eq!(reads.frame_handles[1].parent_id.as_deref(), Some("f"));
+        assert_eq!(reads.frame_handles[1].session_id, None);
         assert!(
             super::snapshot_batch_reads(
-                &json!({"completed":2,"batch_error":"navigation","receipts":valid["receipts"]})
+                &json!({"completed":1,"receipts":[valid["receipts"][0]]}),
+                "tab-1"
             )
             .is_err()
         );
+        assert!(
+            super::snapshot_batch_reads(
+                &json!({"completed":2,"batch_error":"navigation","receipts":valid["receipts"]}),
+                "tab-1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn frame_handles_are_bounded_and_do_not_invent_debugger_sessions_or_geometry() {
+        let tree = json!({"frameTree":{"frame":{"id":"root","loaderId":"root-load","url":"https://example.test/"},"childFrames":[{"frame":{"id":"opaque","parentId":"root","loaderId":"opaque-load","securityOrigin":"://","url":"about:blank"},"childFrames":[{"frame":{"id":"deep","loaderId":"deep-load","securityOrigin":"null"}}]}]}});
+        let (handles, truncated) = super::frame_handles_from_tree(&tree, "selected-tab").unwrap();
+        assert!(!truncated);
+        assert_eq!(handles.len(), 3);
+        assert_eq!(handles[2].parent_id.as_deref(), Some("opaque"));
+        assert_eq!(handles[1].origin.as_deref(), Some("://"));
+        assert_eq!(handles[1].session_id, None);
+        assert_eq!(handles[1].transform_revision, 0);
+        assert_eq!(handles[1].accessibility_state, "not_probed");
+        let public = super::public_frame_handles(&handles).unwrap();
+        assert_eq!(public[0]["target_id"], "selected-tab");
+        assert_eq!(
+            public[1]["target_id"],
+            Value::Null,
+            "frame-tree ancestry does not prove OOPIF target ownership"
+        );
+        assert_eq!(public[1]["route"], "frame_id");
+        assert_eq!(public[1]["session_id"], Value::Null);
+        assert_eq!(public[1]["transform_revision"], Value::Null);
+        assert_eq!(public[1]["transform_state"], "unmeasured");
+        let snapshot = json!({"items":[],"frame_handles":public});
+        super::ensure_snapshot_byte_budget(&snapshot, 4096).unwrap();
+        let many = (0..256)
+            .map(|index| controlla_browser::FrameHandle {
+                target_id: Some("tab".to_owned()),
+                session_id: None,
+                frame_id: format!("frame-{index:03}-abcdefghijklmnopqrstuvwxyz"),
+                loader_id: Some("loader-abcdefghijklmnopqrstuvwxyz".to_owned()),
+                parent_id: None,
+                origin: Some("https://example.test".to_owned()),
+                transform_revision: 0,
+                accessibility_state: "not_probed".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let oversized =
+            json!({"items":[],"frame_handles":super::public_frame_handles(&many).unwrap()});
+        assert!(super::ensure_snapshot_byte_budget(&oversized, 4096).is_err());
+    }
+
+    #[test]
+    fn frame_handle_collection_marks_missing_ids_depth_and_count_truncation() {
+        let missing_id = json!({"frameTree":{"frame":{"id":"root","loaderId":"l"},"childFrames":[{"frame":{"loaderId":"missing"}}]}});
+        let (handles, truncated) = super::frame_handles_from_tree(&missing_id, "tab").unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(truncated);
+
+        let mut deep = json!({"frame":{"id":"frame-0","loaderId":"l"}});
+        let mut cursor = &mut deep;
+        for index in 1..=18 {
+            cursor["childFrames"] =
+                json!([{"frame":{"id":format!("frame-{index}"),"loaderId":"l"}}]);
+            cursor = &mut cursor["childFrames"][0];
+        }
+        let (handles, truncated) =
+            super::frame_handles_from_tree(&json!({"frameTree":deep}), "tab").unwrap();
+        assert_eq!(handles.len(), 17);
+        assert!(truncated);
+
+        let children = (0..260)
+            .map(|index| json!({"frame":{"id":format!("child-{index}"),"loaderId":"l"}}))
+            .collect::<Vec<_>>();
+        let wide =
+            json!({"frameTree":{"frame":{"id":"root","loaderId":"l"},"childFrames":children}});
+        let (handles, truncated) = super::frame_handles_from_tree(&wide, "tab").unwrap();
+        assert_eq!(handles.len(), 256);
+        assert!(truncated);
     }
 
     #[test]
@@ -7292,6 +8751,58 @@ mod tests {
         assert_eq!(frame_ax["routing"], "root_frame_id");
         assert_eq!(frame_ax["frame_loader_id"], "child-doc");
 
+        let duplicate_name_frame_ax = client.call_tool(
+            CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
+                "session_id":session_id,"chrome_tab_id":"123","frame_id":"child-two","max_bytes":1_000_000
+            }))),
+        );
+        let duplicate_name_frame_ax_replies = async {
+            let tree = json!({"frameTree":{"frame":{"id":"root","loaderId":"doc-1","url":"https://fixture.test/"},"childFrames":[
+                {"frame":{"id":"child","loaderId":"child-doc","url":"https://picker.fixture.test/"}},
+                {"frame":{"id":"child-two","loaderId":"child-two-doc","url":"https://drive.fixture.test/"}}
+            ]}});
+            for (method, result) in [
+                ("Page.getFrameTree", tree.clone()),
+                ("Page.getFrameTree", tree.clone()),
+                (
+                    "Accessibility.getFullAXTree",
+                    json!({"nodes":[{"backendDOMNodeId":41,"role":{"value":"button"},"name":{"value":"Select account"}}]}),
+                ),
+                ("Page.getFrameTree", tree.clone()),
+                ("Page.getFrameTree", tree),
+            ] {
+                let request: Value = serde_json::from_str(
+                    extension.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], method);
+                extension
+                    .send(Message::Text(
+                        json!({"type":"result","id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (duplicate_name_frame_ax, ()) =
+            tokio::join!(duplicate_name_frame_ax, duplicate_name_frame_ax_replies);
+        let duplicate_name_frame_ax = duplicate_name_frame_ax.unwrap().structured_content.unwrap();
+        assert_eq!(
+            duplicate_name_frame_ax["items"][0]["name"],
+            frame_ax["items"][0]["name"]
+        );
+        assert_eq!(frame_ax["items"][0]["reference"], "@f:child:child-doc:41");
+        assert_eq!(
+            duplicate_name_frame_ax["items"][0]["reference"],
+            "@f:child-two:child-two-doc:41"
+        );
+        assert_ne!(
+            frame_ax["items"][0]["reference"], duplicate_name_frame_ax["items"][0]["reference"],
+            "same-name controls in separate frames remain bound to distinct frame/loader identities"
+        );
+
         let oversized_ax = client.call_tool(CallToolRequestParams::new("shared_accessibility").with_arguments(args(json!({
             "session_id":session_id,"chrome_tab_id":"123","selector":"#selected","max_bytes":4096
         }))));
@@ -8215,6 +9726,155 @@ mod tests {
         assert!(result.get("verified").is_none());
         assert_eq!(result["navigation"]["url"], "https://fixture.test/story");
         assert_eq!(result["navigation"]["loader_id"], "doc-after");
+        extension_task.abort();
+        client.cancel().await.unwrap();
+        let _ = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_double_click_does_not_promote_partial_delivery_from_focused_outcome() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let server = serve_directly::<RoleServer, _, _, _, _>(App::default(), server_io, None);
+        let server_task = tokio::spawn(async move { server.waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let args = |value: Value| value.as_object().unwrap().clone();
+        let paired = client
+            .call_tool(
+                CallToolRequestParams::new("session").with_arguments(args(json!({
+                    "action":"pair_shared","target_ids":["123"]
+                }))),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let endpoint = paired["endpoint"].as_str().unwrap().to_owned();
+        let token = paired["one_session_token"].as_str().unwrap().to_owned();
+        let session_id = paired["session_id"].as_str().unwrap().to_owned();
+        let accept = client.call_tool(CallToolRequestParams::new("session").with_arguments(args(
+            json!({"action":"accept_shared","session_id":session_id}),
+        )));
+        let extension = async move {
+            let (mut socket, _) = connect_async(endpoint).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"hello","token":token,
+                        "extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"targets":["123"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+        };
+        let (accepted, mut extension) = tokio::join!(accept, extension);
+        assert_eq!(
+            accepted.unwrap().structured_content.unwrap()["accepted"],
+            true
+        );
+
+        let interaction = json!({
+            "semantic_revision":1,
+            "focus":"",
+            "selection":"",
+            "viewport":"[1280,800,0,0,1280,800,0,0,1]"
+        });
+        let public_snapshot = json!({
+            "items":[{"name":"Search","role":"textbox","tag":"input","text":""}],
+            "interaction_epoch":interaction,
+            "complete":true,
+            "text":"Search"
+        });
+        let outcome_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls = outcome_polls.clone();
+        let extension_task = tokio::spawn(async move {
+            while let Some(Ok(message)) = extension.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let params = &request["params"];
+                let response = match method {
+                    "Page.getFrameTree" => {
+                        json!({"type":"result","id":request["id"],"result":{"frameTree":{"frame":{"id":"root","loaderId":"doc","url":"https://fixture.test/"}}}})
+                    }
+                    "Runtime.evaluate" => {
+                        json!({"type":"result","id":request["id"],"result":{"result":{"type":"object","objectId":"snapshot-object"}}})
+                    }
+                    "Runtime.releaseObject" => {
+                        json!({"type":"result","id":request["id"],"result":{}})
+                    }
+                    "Runtime.callFunctionOn"
+                        if params["functionDeclaration"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("this.public") =>
+                    {
+                        json!({"type":"result","id":request["id"],"result":{"result":{"type":"object","value":public_snapshot}}})
+                    }
+                    "Runtime.callFunctionOn"
+                        if params["functionDeclaration"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("interactionEpoch.v1") =>
+                    {
+                        json!({"type":"result","id":request["id"],"result":{"result":{"type":"object","value":interaction}}})
+                    }
+                    "Runtime.callFunctionOn"
+                        if params["functionDeclaration"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("q.kind === 'focused'") =>
+                    {
+                        let prior = polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        json!({"type":"result","id":request["id"],"result":{"result":{"type":"boolean","value":prior > 0}}})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        json!({"type":"result","id":request["id"],"result":{"result":{"type":"object","value":{"ok":true,"x":10.0,"y":20.0,"viewport":"[1280,800,0,0,1280,800,0,0,1]"}}}})
+                    }
+                    "Controlla.pointerClick" => {
+                        json!({"type":"result","id":request["id"],"result":{"status":"unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"completed_clicks":1,"reason_code":"double_click_target_changed","reason":"The first click was sent, but the target changed before the second click."}})
+                    }
+                    _ => panic!("unexpected shared command: {method}"),
+                };
+                extension
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let snapshot = client
+            .call_tool(CallToolRequestParams::new("shared_snapshot").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","max_text_chars":100,"max_bytes":8192
+            }))))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let reference = format!("{}:0", snapshot["snapshot_id"].as_str().unwrap());
+        let clicked = client
+            .call_tool(
+                CallToolRequestParams::new("shared_click").with_arguments(args(json!({
+                    "session_id":session_id,"chrome_tab_id":"123","reference":reference,
+                    "outcome":{"kind":"focused"},"click_kind":"double_click","timeout_ms":1000
+                }))),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+
+        assert_eq!(clicked["status"], "unknown");
+        assert_eq!(clicked["reason_code"], "double_click_target_changed");
+        assert_eq!(clicked["completed_clicks"], 1);
+        assert_eq!(
+            outcome_polls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the pre-dispatch already-satisfied check may evaluate the outcome"
+        );
         extension_task.abort();
         client.cancel().await.unwrap();
         let _ = server_task.await.unwrap();

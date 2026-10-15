@@ -30,10 +30,17 @@ pub enum TaskPrimitive {
     /// runtime-verifiable outcome; only fills and clicks are admitted.
     Mutation { steps: Vec<MutationStep> },
     Upload {
-        artifact_handle: String,
+        #[serde(default)]
+        artifact_handle: Option<String>,
+        /// Up to five registered artifacts selected together; mutually exclusive with artifact_handle.
+        #[serde(default)]
+        artifact_handles: Option<Vec<String>>,
         selector: Option<String>,
         trigger_reference: Option<String>,
         acceptance: Option<Value>,
+        /// Independent application persistence predicate, observed before and after selection.
+        #[serde(default)]
+        persisted: Option<Value>,
         account_marker: (String, String),
     },
     Download {
@@ -42,6 +49,10 @@ pub enum TaskPrimitive {
         #[serde(default)]
         #[schemars(description = "Absolute Unix path for a new file; no overwrite.")]
         destination_path: Option<String>,
+        /// Select browser-native lifecycle observation explicitly; default keeps
+        /// the existing authenticated page-fetch and artifact behavior.
+        #[serde(default)]
+        source: DownloadSource,
     },
     Repeat {
         references: Vec<String>,
@@ -49,6 +60,16 @@ pub enum TaskPrimitive {
         #[serde(default)]
         click_outcome: Option<Value>,
     },
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadSource {
+    #[default]
+    PageFetch,
+    BrowserLifecycle,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
@@ -104,15 +125,17 @@ pub enum ExpandedStep {
         value: String,
     },
     Upload {
-        artifact_handle: String,
+        artifact_handles: Vec<String>,
         selector: Option<String>,
         trigger_reference: Option<String>,
         acceptance: Option<Value>,
+        persisted: Option<Value>,
         account_marker: (String, String),
     },
     Download {
         reference: String,
         destination_path: Option<String>,
+        source: DownloadSource,
     },
     Click {
         reference: String,
@@ -289,9 +312,11 @@ impl TaskPrimitive {
             }
             Self::Upload {
                 artifact_handle,
+                artifact_handles,
                 selector,
                 trigger_reference,
                 acceptance,
+                persisted,
                 account_marker,
             } => {
                 let exactly_one_target = selector.is_some() ^ trigger_reference.is_some();
@@ -304,14 +329,36 @@ impl TaskPrimitive {
                 let valid_acceptance = acceptance.as_ref().is_none_or(|value| {
                     serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= 8192)
                 });
-                if artifact_handle.is_empty()
-                    || artifact_handle.len() > 256
-                    || artifact_handle.contains('/')
-                    || artifact_handle.contains('\\')
+                let valid_persisted = persisted.as_ref().is_none_or(|value| {
+                    serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= 8192)
+                });
+                let handles = match (artifact_handle, artifact_handles) {
+                    (Some(handle), None) => vec![handle.clone()],
+                    (None, Some(handles)) => handles.clone(),
+                    _ => {
+                        return Err(
+                            "upload requires exactly one artifact_handle or artifact_handles list",
+                        );
+                    }
+                };
+                if handles.is_empty()
+                    || handles.len() > 5
+                    || handles.iter().any(|handle| {
+                        handle.is_empty()
+                            || handle.len() > 256
+                            || handle.contains('/')
+                            || handle.contains('\\')
+                    })
+                    || handles
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != handles.len()
                     || !exactly_one_target
                     || !valid_selector
                     || !valid_reference
                     || !valid_acceptance
+                    || !valid_persisted
                     || account_marker.0.is_empty()
                     || account_marker.0.len() > 512
                     || account_marker.1.is_empty()
@@ -322,16 +369,18 @@ impl TaskPrimitive {
                     );
                 }
                 vec![ExpandedStep::Upload {
-                    artifact_handle: artifact_handle.clone(),
+                    artifact_handles: handles,
                     selector: selector.clone(),
                     trigger_reference: trigger_reference.clone(),
                     acceptance: acceptance.clone(),
+                    persisted: persisted.clone(),
                     account_marker: account_marker.clone(),
                 }]
             }
             Self::Download {
                 reference,
                 destination_path,
+                source,
             } => {
                 if reference.is_empty()
                     || destination_path.as_deref().is_some_and(|path| {
@@ -343,6 +392,7 @@ impl TaskPrimitive {
                 vec![ExpandedStep::Download {
                     reference: reference.clone(),
                     destination_path: destination_path.clone(),
+                    source: *source,
                 }]
             }
             Self::Repeat {
@@ -414,8 +464,48 @@ fn valid_http_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod task_expansion_tests {
-    use super::{ExpandedStep, FormField, MutationStep, RepeatAction, SaveControl, TaskPrimitive};
+    use super::{
+        DownloadSource, ExpandedStep, FormField, MutationStep, RepeatAction, SaveControl,
+        TaskPrimitive,
+    };
     use serde_json::Value;
+
+    #[test]
+    fn upload_expansion_preserves_single_file_and_accepts_bounded_artifact_lists() {
+        let one: TaskPrimitive = serde_json::from_value(serde_json::json!({
+            "kind":"upload","artifact_handle":"one","trigger_reference":"@c1",
+            "account_marker":["#account","fixture"]
+        }))
+        .unwrap();
+        assert!(
+            matches!(one.expand().unwrap().as_slice(), [ExpandedStep::Upload { artifact_handles, .. }] if artifact_handles == &["one"])
+        );
+
+        let many: TaskPrimitive = serde_json::from_value(serde_json::json!({
+            "kind":"upload","artifact_handles":["one","two"],"trigger_reference":"@c1",
+            "account_marker":["#account","fixture"]
+        }))
+        .unwrap();
+        assert!(
+            matches!(many.expand().unwrap().as_slice(), [ExpandedStep::Upload { artifact_handles, .. }] if artifact_handles == &["one", "two"])
+        );
+    }
+
+    #[test]
+    fn upload_expansion_refuses_duplicate_or_oversized_artifact_lists() {
+        for handles in [
+            serde_json::json!(["one", "one"]),
+            serde_json::json!(["a", "b", "c", "d", "e", "f"]),
+            serde_json::json!(["../outside"]),
+        ] {
+            let task: TaskPrimitive = serde_json::from_value(serde_json::json!({
+                "kind":"upload","artifact_handles":handles,"trigger_reference":"@c1",
+                "account_marker":["#account","fixture"]
+            }))
+            .unwrap();
+            assert!(task.expand().is_err());
+        }
+    }
 
     #[test]
     fn research_expansion_keeps_the_explicit_target_with_its_url() {
@@ -437,12 +527,35 @@ mod task_expansion_tests {
         let steps = TaskPrimitive::Download {
             reference: "@c4".into(),
             destination_path: Some("/tmp/report.pdf".into()),
+            source: DownloadSource::PageFetch,
         }
         .expand()
         .unwrap();
         assert!(matches!(&steps[0], ExpandedStep::Download {
-            reference, destination_path: Some(path)
+            reference, destination_path: Some(path), source: DownloadSource::PageFetch
         } if reference == "@c4" && path == "/tmp/report.pdf"));
+        let defaulted: TaskPrimitive = serde_json::from_value(serde_json::json!({
+            "kind":"download","reference":"@c4"
+        }))
+        .unwrap();
+        assert!(matches!(
+            defaulted,
+            TaskPrimitive::Download {
+                source: DownloadSource::PageFetch,
+                ..
+            }
+        ));
+        let native: TaskPrimitive = serde_json::from_value(serde_json::json!({
+            "kind":"download","reference":"@c4","source":"browser_lifecycle"
+        }))
+        .unwrap();
+        assert!(matches!(
+            native.expand().unwrap().as_slice(),
+            [ExpandedStep::Download {
+                source: DownloadSource::BrowserLifecycle,
+                ..
+            }]
+        ));
     }
 
     #[test]

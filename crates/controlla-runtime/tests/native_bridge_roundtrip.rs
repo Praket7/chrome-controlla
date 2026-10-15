@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -70,8 +71,19 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 socket.send(Message::Text(json!({"type":"command","id":9,"target_id":"42","method":"Page.captureScreenshot","params":{"format":"png","fromSurface":true,"captureBeyondViewport":false,"clip":{"x":0,"y":0,"width":320,"height":180,"scale":1}}}).to_string().into())).await.map_err(|e| e.to_string())?;
                 let screenshot = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "screenshot result timed out".to_owned())?.ok_or("provider socket closed before screenshot result")?.map_err(|e| e.to_string())?;
                 let screenshot: Value = serde_json::from_str(screenshot.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                let expected_data = format!("{}{}", "A".repeat(512 * 1024), "BCDE");
-                if screenshot != json!({"type":"result","id":9,"lease_id":"roundtrip-1","result":{"data":expected_data}}) {
+                let mut png = vec![0_u8; 393_219];
+                png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+                png[12..16].copy_from_slice(b"IHDR");
+                png[16..20].copy_from_slice(&320_u32.to_be_bytes());
+                png[20..24].copy_from_slice(&180_u32.to_be_bytes());
+                let expected_data = base64::engine::general_purpose::STANDARD.encode(&png);
+                let expected_image_digest = Sha256::digest(&png)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let expected_visual_evidence = json!({"target_id":"42","document_id":"document-42","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":expected_image_digest,"image_sha256":expected_image_digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}});
+                if screenshot != json!({"type":"result","id":9,"lease_id":"roundtrip-1","result":{"data":expected_data,"visual_evidence":expected_visual_evidence}}) {
                     return Err(format!("unexpected native-host screenshot assembly: id={}, data_len={}", screenshot["id"], screenshot["result"]["data"].as_str().map(str::len).unwrap_or(0)));
                 }
                 socket.send(Message::Text(json!({"type":"batch","id":8,"target_id":"42","actions":[{"method":"Input.dispatchKeyEvent","params":{"type":"keyDown","key":"x"}}],"deadline_ms":5000}).to_string().into())).await.map_err(|e| e.to_string())?;
@@ -198,24 +210,37 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
             }
         };
         assert_eq!(screenshot_command["method"], "Page.captureScreenshot");
-        let screenshot_data = format!("{}{}", "A".repeat(512 * 1024), "BCDE");
+        let mut png = vec![0_u8; 393_219];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&320_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&180_u32.to_be_bytes());
+        let screenshot_data = base64::engine::general_purpose::STANDARD.encode(&png);
         let digest = Sha256::digest(screenshot_data.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let image_digest = Sha256::digest(&png)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let visual_evidence = json!({"target_id":"42","document_id":"document-42","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":image_digest,"image_sha256":image_digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}});
         write_native(
             &mut input,
-            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":1,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"chunk":"BCDE"}),
+            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":1,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"visual_evidence":visual_evidence,"chunk":&screenshot_data[512 * 1024..]}),
         );
         write_native(
             &mut input,
-            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":0,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"chunk":"A".repeat(512 * 1024)}),
+            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":0,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"visual_evidence":visual_evidence,"chunk":&screenshot_data[..512 * 1024]}),
         );
         let batch_deadline = Instant::now() + TIMEOUT;
         let batch = loop {
             assert!(
                 Instant::now() < batch_deadline,
-                "native host did not forward provider batch"
+                "native host did not forward provider batch; provider error: {:?}; host stderr: {:?}",
+                err_rx.try_recv(),
+                stderr_rx.try_recv()
             );
             let msg = next();
             if msg["type"] == "batch" {

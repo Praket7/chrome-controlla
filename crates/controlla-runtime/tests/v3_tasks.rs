@@ -99,6 +99,7 @@ fn upload_requires_one_bounded_target_and_acceptance_is_explicit() {
     let trigger = serde_json::from_value::<TaskPrimitive>(json!({
         "kind":"upload","artifact_handle":"opaque-handle","trigger_reference":"@c4",
         "acceptance":{"kind":"text","reference":"@c5","equals":"attached"},
+        "persisted":{"kind":"text","reference":"@c6","equals":"saved"},
         "account_marker":["#account","school@example.test"]
     }))
     .unwrap();
@@ -108,6 +109,7 @@ fn upload_requires_one_bounded_target_and_acceptance_is_explicit() {
             selector: None,
             trigger_reference: Some(_),
             acceptance: Some(_),
+            persisted: Some(_),
             ..
         }]
     ));

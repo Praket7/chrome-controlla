@@ -15,8 +15,9 @@ pub mod sessions;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
 pub use input::{
-    FileSelectionEvidence, GuardDecision, GuardSnapshot, GuardedFileSelection, GuardedInput,
-    InputAction, InputOutcome, InvalidationSet, SemanticLocator, on_external_change, validate_step,
+    FileSelectionEvidence, FileSelectionSetEvidence, GuardDecision, GuardSnapshot,
+    GuardedFileSelection, GuardedFileSelectionSet, GuardedInput, InputAction, InputOutcome,
+    InvalidationSet, SemanticLocator, on_external_change, validate_step,
 };
 pub use manager::BrowserManager;
 pub use observe::{
@@ -791,38 +792,29 @@ impl BrowserConnection {
             .run_target(&target_id, async {
                 self.command(Some(session_id.clone()), "Page.enable", Value::Null)
                     .await?;
+                // Auto-attach is scoped to the target receiving this command.
+                // Re-arm it on each OOPIF session so nested OOPIFs are discovered.
+                if self.targets.read().await.targets.get(&target_id)
+                    .is_some_and(|target| target.target_type == "iframe")
+                {
+                    self.command(
+                        Some(session_id.clone()),
+                        "Target.setAutoAttach",
+                        serde_json::json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}),
+                    ).await?;
+                }
                 // Page.enable does not reliably replay an OOPIF's already
                 // committed root frame. Seed it from that target's own tree.
                 let tree = self
                     .command(Some(session_id.clone()), "Page.getFrameTree", Value::Null)
                     .await?;
-                let mut pending = vec![(&tree["frameTree"], None::<String>)];
-                let mut discovered = Vec::new();
-                while let Some((node, parent_id)) = pending.pop() {
-                    let frame = &node["frame"];
-                    let Some(frame_id) = frame["id"].as_str() else {
-                        continue;
-                    };
-                    discovered.push(FrameRecord {
-                        id: frame_id.to_owned(),
-                        parent_id: parent_id
-                            .clone()
-                            .or_else(|| frame["parentId"].as_str().map(str::to_owned))
-                            .or_else(|| parent_frame_id.clone()),
-                        target_id: target_id.clone(),
-                        loader_id: frame["loaderId"].as_str().map(str::to_owned),
-                        execution_context_ids: Vec::new(),
-                        generation: self.generation.load(Ordering::Acquire),
-                        revision: 0,
-                    });
-                    if let Some(children) = node["childFrames"].as_array() {
-                        pending.extend(
-                            children
-                                .iter()
-                                .map(|child| (child, Some(frame_id.to_owned()))),
-                        );
-                    }
-                }
+                let discovered = frame_records_from_tree(
+                    &tree["frameTree"],
+                    &target_id,
+                    &session_id,
+                    parent_frame_id.as_deref(),
+                    self.generation.load(Ordering::Acquire),
+                );
                 if !discovered.is_empty() {
                     let mut frames = self.frames.write().await;
                     for frame in discovered {
@@ -1113,6 +1105,11 @@ impl BrowserConnection {
             .get(frame_id)
             .map(|frame| frame.target_id.clone())
             .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
+        if target_id.is_empty() {
+            return Err(BrowserError::StaleReference(format!(
+                "frame {frame_id} has no proven CDP target owner"
+            )));
+        }
         self.scheduler
             .run_target(&target_id, async {
                 let (current_target_id, context_id) = {
@@ -1436,10 +1433,80 @@ pub struct FrameRecord {
     pub id: String,
     pub parent_id: Option<String>,
     pub target_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub loader_id: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
     pub execution_context_ids: Vec<u64>,
     pub generation: u64,
     pub revision: u64,
+    #[serde(default)]
+    pub transform_revision: u64,
+}
+
+fn frame_records_from_tree(
+    root: &Value,
+    target_id: &str,
+    session_id: &str,
+    parent_frame_id: Option<&str>,
+    generation: u64,
+) -> Vec<FrameRecord> {
+    let mut pending = vec![(root, None::<String>, true)];
+    let mut discovered = Vec::new();
+    while let Some((node, parent_id, target_root)) = pending.pop() {
+        let frame = &node["frame"];
+        let Some(frame_id) = frame["id"].as_str() else {
+            continue;
+        };
+        discovered.push(FrameRecord {
+            id: frame_id.to_owned(),
+            parent_id: parent_id
+                .clone()
+                .or_else(|| frame["parentId"].as_str().map(str::to_owned))
+                .or_else(|| parent_frame_id.map(str::to_owned)),
+            // Page.getFrameTree proves the owner of the root frame for the
+            // queried session. Descendants may be OOPIFs with other owners;
+            // debugger attach events bind those explicitly later.
+            target_id: if target_root {
+                target_id.to_owned()
+            } else {
+                String::new()
+            },
+            session_id: target_root.then(|| session_id.to_owned()),
+            loader_id: frame["loaderId"].as_str().map(str::to_owned),
+            origin: frame["securityOrigin"].as_str().map(str::to_owned),
+            execution_context_ids: Vec::new(),
+            generation,
+            revision: 0,
+            transform_revision: 0,
+        });
+        if let Some(children) = node["childFrames"].as_array() {
+            pending.extend(
+                children
+                    .iter()
+                    .map(|child| (child, Some(frame_id.to_owned()), false)),
+            );
+        }
+    }
+    discovered
+}
+
+/// A serializable address for routing work into a specific frame.
+/// `transform_revision` invalidates geometry; it does not assert that a
+/// renderer transform has been measured.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FrameHandle {
+    /// Target is known only when the provider can bind the frame to a CDP target.
+    /// A Page.getFrameTree child may be an OOPIF owned by a distinct target.
+    pub target_id: Option<String>,
+    pub session_id: Option<String>,
+    pub frame_id: String,
+    pub loader_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub origin: Option<String>,
+    pub transform_revision: u64,
+    pub accessibility_state: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1457,7 +1524,26 @@ impl FrameGraph {
 
     pub fn upsert(&mut self, mut frame: FrameRecord) {
         frame.revision = self.next_revision();
+        if frame.transform_revision == 0 {
+            frame.transform_revision = frame.revision;
+        }
         self.frames.insert(frame.id.clone(), frame);
+    }
+
+    pub fn handles(&self) -> Vec<FrameHandle> {
+        self.frames
+            .values()
+            .map(|frame| FrameHandle {
+                target_id: (!frame.target_id.is_empty()).then(|| frame.target_id.clone()),
+                session_id: frame.session_id.clone(),
+                frame_id: frame.id.clone(),
+                loader_id: frame.loader_id.clone(),
+                parent_id: frame.parent_id.clone(),
+                origin: frame.origin.clone(),
+                transform_revision: frame.transform_revision,
+                accessibility_state: "not_probed".to_owned(),
+            })
+            .collect()
     }
 
     pub fn remove(&mut self, id: &str) {
@@ -1500,9 +1586,9 @@ impl FrameGraph {
     pub fn apply_event_for_target(&mut self, event: &Value, generation: u64, target_id: &str) {
         let mut event = event.clone();
         if let Some(params) = event.get_mut("params").and_then(Value::as_object_mut) {
-            params
-                .entry("targetId")
-                .or_insert_with(|| Value::String(target_id.to_owned()));
+            // The authenticated flattened session lookup is authoritative;
+            // never let event payload metadata rebind it to another target.
+            params.insert("targetId".to_owned(), Value::String(target_id.to_owned()));
         }
         self.apply_event_at_generation(&event, generation);
     }
@@ -1513,22 +1599,48 @@ impl FrameGraph {
                 if let Some(params) = event.get("params")
                     && let Some(id) = params.get("frameId").and_then(Value::as_str)
                 {
-                    self.upsert(FrameRecord {
-                        id: id.to_owned(),
-                        parent_id: params
-                            .get("parentFrameId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        target_id: params
-                            .get("targetId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        loader_id: None,
-                        execution_context_ids: Vec::new(),
-                        generation,
-                        revision: 0,
-                    });
+                    let parent_id = params
+                        .get("parentFrameId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let target_id = params
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let session_id = event
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if self.frames.contains_key(id) {
+                        let changed = self.frames[id].parent_id != parent_id
+                            || (!target_id.is_empty() && self.frames[id].target_id != target_id);
+                        if changed {
+                            let revision = self.next_revision();
+                            let frame = self.frames.get_mut(id).expect("frame was checked above");
+                            frame.parent_id = parent_id;
+                            if !target_id.is_empty() {
+                                frame.target_id = target_id;
+                            }
+                            frame.session_id = session_id.or_else(|| frame.session_id.clone());
+                            frame.generation = generation;
+                            frame.revision = revision;
+                            frame.transform_revision = revision;
+                        }
+                    } else {
+                        self.upsert(FrameRecord {
+                            id: id.to_owned(),
+                            parent_id,
+                            target_id,
+                            session_id,
+                            loader_id: None,
+                            origin: None,
+                            execution_context_ids: Vec::new(),
+                            generation,
+                            revision: 0,
+                            transform_revision: 0,
+                        });
+                    }
                 }
             }
             Some("Page.frameNavigated") => {
@@ -1553,6 +1665,14 @@ impl FrameGraph {
                         .and_then(|value| value.get("loaderId"))
                         .and_then(Value::as_str)
                         .map(str::to_owned);
+                    let origin = info
+                        .and_then(|value| value.get("securityOrigin"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let session_id = event
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                     if self.frames.contains_key(&frame_id) {
                         let revision = self.next_revision();
                         let frame = self
@@ -1561,18 +1681,24 @@ impl FrameGraph {
                             .expect("frame was checked above");
                         frame.parent_id = parent_id;
                         frame.target_id = target_id;
+                        frame.session_id = session_id.or_else(|| frame.session_id.clone());
                         frame.loader_id = loader_id;
+                        frame.origin = origin;
                         frame.generation = generation;
                         frame.revision = revision;
+                        frame.transform_revision = revision;
                     } else {
                         self.upsert(FrameRecord {
                             id: frame_id,
                             parent_id,
                             target_id,
+                            session_id,
                             loader_id,
+                            origin,
                             execution_context_ids: Vec::new(),
                             generation,
                             revision: 0,
+                            transform_revision: 0,
                         });
                     }
                 }
@@ -1603,6 +1729,10 @@ impl FrameGraph {
                 }
             }
             Some("Runtime.executionContextCreated") => {
+                let event_target_id = event
+                    .get("params")
+                    .and_then(|params| params.get("targetId"))
+                    .and_then(Value::as_str);
                 if let Some(context) = event.get("params").and_then(|params| params.get("context"))
                     && let (Some(frame_id), Some(context_id)) = (
                         context
@@ -1612,6 +1742,8 @@ impl FrameGraph {
                         context.get("id").and_then(Value::as_u64),
                     )
                     && self.frames.contains_key(frame_id)
+                    && event_target_id
+                        .is_none_or(|target_id| self.frames[frame_id].target_id == target_id)
                 {
                     let should_add = !self.frames[frame_id]
                         .execution_context_ids
@@ -1629,6 +1761,10 @@ impl FrameGraph {
                 }
             }
             Some("Runtime.executionContextDestroyed") => {
+                let event_target_id = event
+                    .get("params")
+                    .and_then(|params| params.get("targetId"))
+                    .and_then(Value::as_str);
                 if let Some(context_id) = event
                     .get("params")
                     .and_then(|params| params.get("executionContextId"))
@@ -1637,7 +1773,11 @@ impl FrameGraph {
                     let affected = self
                         .frames
                         .values()
-                        .filter(|frame| frame.execution_context_ids.contains(&context_id))
+                        .filter(|frame| {
+                            frame.execution_context_ids.contains(&context_id)
+                                && event_target_id
+                                    .is_none_or(|target_id| frame.target_id == target_id)
+                        })
                         .map(|frame| frame.id.clone())
                         .collect::<Vec<_>>();
                     for frame_id in affected {
@@ -1650,6 +1790,31 @@ impl FrameGraph {
                         frame.generation = generation;
                         frame.revision = revision;
                     }
+                }
+            }
+            Some("Runtime.executionContextsCleared") => {
+                let event_target_id = event
+                    .get("params")
+                    .and_then(|params| params.get("targetId"))
+                    .and_then(Value::as_str);
+                let affected = self
+                    .frames
+                    .values()
+                    .filter(|frame| {
+                        !frame.execution_context_ids.is_empty()
+                            && event_target_id.is_none_or(|target_id| frame.target_id == target_id)
+                    })
+                    .map(|frame| frame.id.clone())
+                    .collect::<Vec<_>>();
+                for frame_id in affected {
+                    let revision = self.next_revision();
+                    let frame = self
+                        .frames
+                        .get_mut(&frame_id)
+                        .expect("affected frame remains present");
+                    frame.execution_context_ids.clear();
+                    frame.generation = generation;
+                    frame.revision = revision;
                 }
             }
             _ => {}
@@ -1957,10 +2122,13 @@ mod tests {
             id: "frame".to_owned(),
             parent_id: None,
             target_id: "tab".to_owned(),
+            session_id: None,
             loader_id: Some("loader-1".to_owned()),
+            origin: None,
             execution_context_ids: vec![1],
             generation: 0,
             revision: 0,
+            transform_revision: 0,
         };
         graph.upsert(frame.clone());
         let first_revision = graph.frames["frame"].revision;
@@ -1970,6 +2138,40 @@ mod tests {
             ..frame
         });
         assert!(graph.frames["frame"].revision > first_revision);
+    }
+
+    #[test]
+    fn frame_tree_does_not_assign_root_target_or_session_to_children() {
+        let tree = serde_json::json!({
+            "frame": {"id":"root","loaderId":"root-loader","securityOrigin":"https://example.test"},
+            "childFrames": [{
+                "frame": {"id":"child","parentId":"root","loaderId":"child-loader","securityOrigin":"https://other.test"},
+                "childFrames": [{
+                    "frame": {"id":"grandchild","parentId":"child","loaderId":"grandchild-loader"}
+                }]
+            }]
+        });
+        let records = frame_records_from_tree(&tree, "root-target", "root-session", None, 7);
+        let mut graph = FrameGraph::default();
+        for record in records {
+            graph.upsert(record);
+        }
+        assert_eq!(graph.frames["root"].target_id, "root-target");
+        assert_eq!(
+            graph.frames["root"].session_id.as_deref(),
+            Some("root-session")
+        );
+        for child_id in ["child", "grandchild"] {
+            assert!(graph.frames[child_id].target_id.is_empty());
+            assert_eq!(graph.frames[child_id].session_id, None);
+            let handle = graph
+                .handles()
+                .into_iter()
+                .find(|handle| handle.frame_id == child_id)
+                .unwrap();
+            assert_eq!(handle.target_id, None);
+            assert_eq!(handle.session_id, None);
+        }
     }
 
     #[test]
@@ -1984,10 +2186,13 @@ mod tests {
                 id: id.to_owned(),
                 parent_id: parent_id.map(str::to_owned),
                 target_id: "tab".to_owned(),
+                session_id: None,
                 loader_id: None,
+                origin: None,
                 execution_context_ids: Vec::new(),
                 generation: 0,
                 revision: 0,
+                transform_revision: 0,
             });
         }
         graph.remove("root");
@@ -2001,10 +2206,13 @@ mod tests {
             id: "frame".to_owned(),
             parent_id: None,
             target_id: "tab".to_owned(),
+            session_id: None,
             loader_id: Some("loader".to_owned()),
+            origin: None,
             execution_context_ids: vec![17],
             generation: 0,
             revision: 0,
+            transform_revision: 0,
         });
         let revision = graph.frames["frame"].revision;
         graph.apply_event_at_generation(
@@ -2023,6 +2231,7 @@ mod tests {
         let mut graph = FrameGraph::default();
         graph.apply_event_for_target(
             &serde_json::json!({
+                "sessionId": "oopif-session",
                 "method": "Page.frameAttached",
                 "params": {"frameId": "oopif-frame", "parentFrameId": "root"}
             }),
@@ -2030,6 +2239,94 @@ mod tests {
             "oopif-target",
         );
         assert_eq!(graph.frames["oopif-frame"].target_id, "oopif-target");
+        assert_eq!(
+            graph.frames["oopif-frame"].session_id.as_deref(),
+            Some("oopif-session")
+        );
+    }
+
+    #[test]
+    fn frame_handle_preserves_session_parent_origin_and_transform_revision() {
+        let mut graph = FrameGraph::default();
+        graph.apply_event_for_target(
+            &serde_json::json!({
+                "sessionId":"nested-session",
+                "method":"Page.frameNavigated",
+                "params":{"frame":{"id":"nested-frame","parentId":"outer-frame","loaderId":"nested-loader","url":"https://child.example.test/path","securityOrigin":"https://child.example.test"}}
+            }),
+            3,
+            "nested-target",
+        );
+        let handles = graph.handles();
+        assert_eq!(handles.len(), 1);
+        let handle = &handles[0];
+        assert_eq!(handle.target_id.as_deref(), Some("nested-target"));
+        assert_eq!(handle.session_id.as_deref(), Some("nested-session"));
+        assert_eq!(handle.frame_id, "nested-frame");
+        assert_eq!(handle.parent_id.as_deref(), Some("outer-frame"));
+        assert_eq!(handle.loader_id.as_deref(), Some("nested-loader"));
+        assert_eq!(handle.origin.as_deref(), Some("https://child.example.test"));
+        assert!(handle.transform_revision > 0);
+        assert_eq!(handle.accessibility_state, "not_probed");
+    }
+
+    #[test]
+    fn frame_reparenting_invalidates_handle_without_losing_context_identity() {
+        let mut graph = FrameGraph::default();
+        graph.apply_event_for_target(
+            &serde_json::json!({"sessionId":"frame-session","method":"Page.frameNavigated","params":{"frame":{"id":"child","parentId":"parent-a","loaderId":"loader-a","securityOrigin":"https://child.test"}}}),
+            1,
+            "child-target",
+        );
+        graph.apply_event_for_target(
+            &serde_json::json!({"sessionId":"frame-session","method":"Runtime.executionContextCreated","params":{"context":{"id":88,"auxData":{"frameId":"child"}}}}),
+            1,
+            "child-target",
+        );
+        let before = graph.frames["child"].transform_revision;
+        graph.apply_event_for_target(
+            &serde_json::json!({"sessionId":"frame-session","method":"Page.frameAttached","params":{"frameId":"child","parentFrameId":"parent-b"}}),
+            1,
+            "child-target",
+        );
+        let after = &graph.frames["child"];
+        assert_eq!(after.parent_id.as_deref(), Some("parent-b"));
+        assert_eq!(after.execution_context_ids, vec![88]);
+        assert!(after.transform_revision > before);
+    }
+
+    #[test]
+    fn execution_context_destruction_is_scoped_to_its_flattened_target() {
+        let mut graph = FrameGraph::default();
+        for (frame_id, target_id, session_id) in [
+            ("same-process-a", "target-a", "session-a"),
+            ("same-process-b", "target-b", "session-b"),
+        ] {
+            graph.apply_event_for_target(
+                &serde_json::json!({"sessionId":session_id,"method":"Page.frameNavigated","params":{"frame":{"id":frame_id,"loaderId":"loader"}}}),
+                1,
+                target_id,
+            );
+            graph.apply_event_for_target(
+                &serde_json::json!({"sessionId":session_id,"method":"Runtime.executionContextCreated","params":{"context":{"id":5,"auxData":{"frameId":frame_id}}}}),
+                1,
+                target_id,
+            );
+        }
+        graph.apply_event_for_target(
+            &serde_json::json!({"sessionId":"session-a","method":"Runtime.executionContextDestroyed","params":{"executionContextId":5}}),
+            1,
+            "target-a",
+        );
+        assert!(
+            graph.frames["same-process-a"]
+                .execution_context_ids
+                .is_empty()
+        );
+        assert_eq!(
+            graph.frames["same-process-b"].execution_context_ids,
+            vec![5]
+        );
     }
 
     #[test]
@@ -3298,6 +3595,98 @@ mod tests {
                 "Accessibility.enable"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn nested_iframe_session_recursively_enables_flattened_auto_attach() {
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (recursive_tx, recursive_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"nested-frame-target","type":"iframe","url":"https://nested.example.test/"}}}),
+                serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"nested-frame-session","targetInfo":{"targetId":"nested-frame-target","type":"iframe","url":"https://nested.example.test/"}}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let mut recursive_tx = Some(recursive_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(&message.to_string()).unwrap();
+                if request["method"] == "Target.setAutoAttach" {
+                    assert_eq!(request["params"]["autoAttach"], true);
+                    assert_eq!(request["params"]["flatten"], true);
+                    if request["sessionId"] == "nested-frame-session" {
+                        let event = serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"deep-frame-session","targetInfo":{"targetId":"deep-frame-target","type":"iframe","parentFrameId":"nested-frame","url":"https://deep.example.test/"}}});
+                        socket
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                    if request["sessionId"] == "deep-frame-session"
+                        && let Some(tx) = recursive_tx.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                }
+                let result = if request["method"] == "Page.getFrameTree" {
+                    let frame = if request["sessionId"] == "deep-frame-session" {
+                        serde_json::json!({"id":"deep-frame","loaderId":"deep-loader","securityOrigin":"https://deep.example.test"})
+                    } else {
+                        serde_json::json!({"id":"nested-frame","parentId":"outer-frame","loaderId":"nested-loader","securityOrigin":"https://nested.example.test"})
+                    };
+                    serde_json::json!({"frameTree":{"frame":frame}})
+                } else {
+                    serde_json::json!({})
+                };
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if request["method"] == "Accessibility.enable"
+                    && request["sessionId"] == "deep-frame-session"
+                {
+                    break;
+                }
+            }
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), recursive_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(handle) = connection
+                    .frames
+                    .read()
+                    .await
+                    .handles()
+                    .into_iter()
+                    .find(|handle| handle.frame_id == "deep-frame")
+                {
+                    break handle;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.session_id.as_deref(), Some("deep-frame-session"));
+        assert_eq!(handle.parent_id.as_deref(), Some("nested-frame"));
+        assert_eq!(handle.origin.as_deref(), Some("https://deep.example.test"));
+        server.await.unwrap();
     }
 
     #[test]

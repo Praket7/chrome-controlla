@@ -3,6 +3,16 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const { webcrypto, createHash } = require("node:crypto");
 
+function makePngBase64(byteLength = 825000, width = 320, height = 180) {
+  const png = Buffer.alloc(byteLength);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+  png.writeUInt32BE(13, 8);
+  png.write("IHDR", 12, "ascii");
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png.toString("base64");
+}
+
 const runtimeScreenshotParams = process.env.CONTROLLA_SCREENSHOT_PARAMS_JSON
   ? JSON.parse(process.env.CONTROLLA_SCREENSHOT_PARAMS_JSON)
   : { format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 } };
@@ -23,10 +33,18 @@ const reconnectTimers = [];
 const alarms = [];
 const sessionStorage = {};
 const localStorage = {};
-const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete" }));
+const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete", frozen: false }));
 let focusedWindowActiveTabId = 42;
 let focusedWindowFocused = false;
 let pointerGuardValue = { ok: true, x: 10, y: 20, viewport: "fixture-viewport" };
+let fixtureScrollTop = 20;
+let fixtureScrollAllowed = true;
+let fixtureScrollMoves = true;
+let fixtureScrollGuardCalls = 0;
+let fixtureScrollHitChangesOnRecheck = false;
+let fixtureSwipeMoved = true;
+let scrollToGuardReceipt = { ok: true, phase: "after", dispatch_may_have_occurred: true, target_visible: true, center_hit: true, viewport: { width: 100, height: 80 }, center: { x: 50, y: 40 } };
+let changePointerAfterFirstClickRelease = false;
 tabList.push({ id: 102, title: "Extension page", url: "chrome://extensions" });
 tabList.push({ title: "Invalid tab", url: "https://example.test/invalid" });
 let listener;
@@ -46,9 +64,19 @@ const failAttach = new Set();
 let tabsUpdated;
 let tabsReplaced;
 let tabsRemoved;
-let tabsActivated;
+let tabsMoved;
+let tabsAttached;
+let tabsDetached;
+const tabsActivatedListeners = new Set();
+const downloadCreatedListeners = new Set();
+const downloadChangedListeners = new Set();
+const cancelledDownloads = [];
+const emitDownloadCreated = item => { for (const callback of downloadCreatedListeners) callback(item); };
+const emitDownloadChanged = delta => { for (const callback of downloadChangedListeners) callback(delta); };
+const emitTabsActivated = event => { for (const callback of tabsActivatedListeners) callback(event); };
 let emitActivationEvents = false;
 let afterNextTabActivation;
+let onNextActiveWindowQuery;
 let tabsCreated;
 let windowFocusChanged;
 let navigationBefore;
@@ -64,14 +92,18 @@ let nextWebNavigationTimeStamp = 10_000;
 let navigationError;
 let screenshotDataOverride;
 let navigateDuringScreenshot;
+let freezeDuringScreenshot;
+let failPresentationEvaluation;
 let debuggerDetached;
 let debuggerEvent;
 let nextCreatedTab = 500;
+const createdTabPreviousActive = new Map();
 let loseNextCreatedTabReply = false;
 let mockNow = 1_000;
 let advanceClockOnNextDebuggerCall = 0;
 let afterNextDebuggerCall;
 let attachOopifOnNextAutoAttach = false;
+let attachNestedOopifParentOnNextAutoAttach = false;
 let fallbackFileInputDocument;
 let fallbackFrameFileInputDocument;
 let identityAxNodes = [];
@@ -80,18 +112,34 @@ let rejectFrameMouseType;
 let emitFileChooserOnFrameRelease = false;
 let emitFileChooserOnRootRelease = false;
 let frameOutcomeVerified = false;
+let nestedFrameScrollFixture = false;
+let staleNestedAncestorFixture = false;
+let reparentNestedFrameFixture = false;
+let fixtureFrameScrollGuardCalls = 0;
+let nestedFrameTreeReads = 0;
+let nonAffineNestedTransformFixture = false;
+let changingNestedTransformFixture = false;
+let nestedOwnerBoxReads = 0;
 let frameActionable = true;
+let frameShadowRootFixture = false;
 let frameFillMockEvidence;
 let childFrameLoaderId = "fixture-loader";
 let navigateFrameDuringFileReadback = false;
 let fileReadbackEmpty = false;
+let fileReadbackFiles;
+let fileInputPolicyFixture;
 let childFrameUrl = "https://picker.example.test/";
+let rootFrameSecurityOrigin = "https://example.test";
+let changeRootOriginOnPasswordCheck = false;
+let switchTabDuringPasswordRevalidation = false;
 let navigateFrameOnClick = false;
 let networkEventsOnEnable = [];
 let fastTypeValue = "";
 let fastTypeFocused = true;
 let stealFocusAfterKeydown = false;
 let stealFocusAfterKeyup = false;
+let blockNextHumanKeydown;
+let blockNextTopologyCommand;
 const expectedUrls = ids => Object.fromEntries(ids.map(id => [id, `https://example.test/${id}`]));
 const expectedDocuments = ids => Object.fromEntries(ids.map(id => [id, `document-${id}`]));
 class FakeWebSocket {
@@ -139,12 +187,13 @@ const chrome = {
   },
   tabs: {
     async query(query = {}) {
+      if (query.active && Number.isSafeInteger(query.windowId) && onNextActiveWindowQuery) { const callback = onNextActiveWindowQuery; onNextActiveWindowQuery = undefined; callback(); }
       if (query.active && query.lastFocusedWindow) return tabList.filter(tab => tab.id === focusedWindowActiveTabId);
       if (query.active && Number.isSafeInteger(query.windowId)) return tabList.filter(tab => tab.active && tab.windowId === query.windowId);
       return tabList;
     },
-    async create({ url, active = true, windowId }) { const tab = { id: nextCreatedTab++, windowId: windowId ?? 1, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (active) focusedWindowActiveTabId = tab.id; if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
-    async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) tabList.splice(index, 1); },
+    async create({ url, active = true, windowId }) { const id = nextCreatedTab++; const tab = { id, windowId: windowId ?? 1, title: "New tab", url, status: "complete", frozen: false, active }; if (active) createdTabPreviousActive.set(id, focusedWindowActiveTabId); tabList.push(tab); if (active) { for (const sibling of tabList) if (sibling.windowId === tab.windowId && sibling.id !== tab.id) sibling.active = false; tab.active = true; focusedWindowActiveTabId = tab.id; if (emitActivationEvents) emitTabsActivated({ tabId: tab.id, windowId: tab.windowId }); } if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
+    async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) { const [removed] = tabList.splice(index, 1); if (removed.active && focusedWindowActiveTabId === tabId) { const previous = tabList.find(tab => tab.id === createdTabPreviousActive.get(tabId) && tab.windowId === removed.windowId); if (previous) { for (const sibling of tabList) if (sibling.windowId === removed.windowId) sibling.active = false; previous.active = true; focusedWindowActiveTabId = previous.id; if (emitActivationEvents) emitTabsActivated({ tabId: previous.id, windowId: previous.windowId }); } } } createdTabPreviousActive.delete(tabId); },
     async move(tabId, { windowId }) {
       const tab = tabList.find(item => item.id === tabId);
       if (!tab) throw new Error("missing tab");
@@ -154,7 +203,7 @@ const chrome = {
     async update(tabId, { url, active }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
-      if (active !== undefined) { tab.active = active; if (active) { focusedWindowActiveTabId = tabId; if (emitActivationEvents) { for (const sibling of tabList) if (sibling.windowId === tab.windowId) sibling.active = false; tab.active = true; tabsActivated?.({ tabId, windowId: tab.windowId }); } if (afterNextTabActivation) { const callback = afterNextTabActivation; afterNextTabActivation = undefined; callback(tabId); } } }
+      if (active !== undefined) { tab.active = active; if (active) { focusedWindowActiveTabId = tabId; if (emitActivationEvents) { for (const sibling of tabList) if (sibling.windowId === tab.windowId) sibling.active = false; tab.active = true; emitTabsActivated({ tabId, windowId: tab.windowId }); } if (afterNextTabActivation) { const callback = afterNextTabActivation; afterNextTabActivation = undefined; callback(tabId); } } }
       if (url === undefined) return tab;
       const delayedCommit = delayedNextCommitMs;
       delayedNextCommitMs = 0;
@@ -204,9 +253,12 @@ const chrome = {
       return { ...tab, url: tabUrlOverrides.has(tabId) ? tabUrlOverrides.get(tabId) : tab.url };
     },
     onUpdated: { addListener(callback) { tabsUpdated = callback; }, removeListener() {} },
+    onMoved: { addListener(callback) { tabsMoved = callback; } },
+    onAttached: { addListener(callback) { tabsAttached = callback; } },
+    onDetached: { addListener(callback) { tabsDetached = callback; } },
     onReplaced: { addListener(callback) { tabsReplaced = callback; } },
     onRemoved: { addListener(callback) { tabsRemoved = callback; } },
-    onActivated: { addListener(callback) { tabsActivated = callback; } },
+    onActivated: { addListener(callback) { tabsActivatedListeners.add(callback); }, removeListener(callback) { tabsActivatedListeners.delete(callback); } },
     onCreated: { addListener(callback) { tabsCreated = callback; } },
   },
   windows: {
@@ -282,7 +334,23 @@ const chrome = {
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
+      if (method === "Runtime.evaluate" && blockNextTopologyCommand) {
+        const blocked = blockNextTopologyCommand;
+        blockNextTopologyCommand = undefined;
+        blocked.entered();
+        await blocked.release;
+      }
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && changePointerAfterFirstClickRelease) {
+        changePointerAfterFirstClickRelease = false;
+        pointerGuardValue = { ...pointerGuardValue, x: pointerGuardValue.x + 1 };
+      }
       if (method === "Page.captureScreenshot") {
+        if (freezeDuringScreenshot) {
+          freezeDuringScreenshot = false;
+          const tab = tabList.find(item => item.id === target.tabId);
+          tab.frozen = true;
+          tabsUpdated(target.tabId, { frozen: true });
+        }
         if (navigateDuringScreenshot) {
           const { tabId, documentId, url } = navigateDuringScreenshot;
           navigateDuringScreenshot = undefined;
@@ -297,9 +365,44 @@ const chrome = {
         if (prepare) fastTypeFocused = true;
         return { result: { value: { ok: fastTypeFocused && fastTypeValue === expected, reason: fastTypeFocused ? "stale_value" : "focus_or_selection_changed", value: fastTypeValue, rich: false } } };
       }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,scrollRequest)")) {
+        assert.equal(params.arguments?.[1]?.value, "scroll-to-target-v1");
+        return { result: { value: structuredClone(scrollToGuardReceipt) } };
+      }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("__fixturePointerGuard")) {
         return { result: { value: pointerGuardValue } };
       }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("nearest_scroll_container_at_boundary") && !params?.functionDeclaration?.startsWith("function(dx,dy,expectedViewport,expectedContainer)")) {
+        fixtureScrollGuardCalls += 1;
+        return { result: { type: "object", objectId: `fixture-scroll-descriptor-${fixtureScrollGuardCalls}` } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(dx,dy,expectedViewport,expectedContainer)")) {
+        fixtureFrameScrollGuardCalls += 1;
+        return { result: { type: "object", objectId: `fixture-frame-scroll-descriptor-${fixtureFrameScrollGuardCalls}` } };
+      }
+      if (method === "Runtime.getProperties" && params?.objectId?.startsWith("fixture-frame-scroll-descriptor-")) {
+        const property = (name, value) => ({ name, value: typeof value === "object" ? value : { type: typeof value, value } });
+        return { result: [property("ok", true), property("x", 25), property("y", 20), property("width", 100), property("height", 60), property("viewport", "100x60@1"), property("left", 0), property("top", fixtureScrollTop), property("container", { type: "object", subtype: "node", objectId: "fixture-frame-scroll-container" })] };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-scroll-container") {
+        return { result: { value: { connected: true, left: 0, top: fixtureScrollTop } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,sx,sy,ex,ey,expectedViewport,phase)")) {
+        const [, sx, sy, ex, ey, viewport, phase] = params.arguments.map(argument => argument.value);
+        return { result: { value: { ok: true, viewport, start: { x: sx, y: sy }, end: { x: ex, y: ey },
+          scroll: { top: phase === "after" && fixtureSwipeMoved ? 40 : 0 }, rect: { left: 0, top: 0, width: 100, height: 100 } } } };
+      }
+      if (method === "Input.dispatchTouchEvent" && params?.type === "touchMove" && fixtureSwipeMoved) fixtureScrollTop += 20;
+      if (method === "Runtime.getProperties" && params?.objectId?.startsWith("fixture-scroll-descriptor-")) {
+        const guardCall = Number(params.objectId.split("-").at(-1));
+        const property = (name, value) => ({ name, value: typeof value === "object" ? value : { type: typeof value, value } });
+        return { result: [property("ok", fixtureScrollAllowed), property("x", 15 + (fixtureScrollHitChangesOnRecheck && guardCall % 2 === 0 ? 1 : 0)), property("y", 25), property("viewport", "fixture-viewport"),
+          property("left", 0), property("top", fixtureScrollTop), property("container", { type: "object", subtype: "node", objectId: "fixture-scroll-container" })] };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-scroll-container") {
+        return { result: { value: { connected: true, left: 0, top: fixtureScrollTop } } };
+      }
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseWheel" && fixtureScrollMoves) fixtureScrollTop += params.deltaY;
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")) {
         const [expected, value] = params.arguments.map(argument => argument.value);
         if (frameFillMockEvidence) return { result: { value: frameFillMockEvidence } };
@@ -309,15 +412,24 @@ const chrome = {
       if (method === "DOM.resolveNode" && params?.backendNodeId === 990) return { object: { objectId: "fixture-password-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-password-object") {
         if (params.functionDeclaration.includes("credential_filled")) return { result: { value: { ok: true, credential_filled: true, length: params.arguments?.[0]?.value?.length || 0 } } };
+        if (switchTabDuringPasswordRevalidation) { switchTabDuringPasswordRevalidation = false; await chrome.tabs.update(42, { active: true }); }
+        if (changeRootOriginOnPasswordCheck) { changeRootOriginOnPasswordCheck = false; rootFrameSecurityOrigin = "https://attacker.example"; }
         return { result: { value: { ok: true } } };
       }
       if (method === "Input.dispatchKeyEvent") {
+        if (params.type === "keyDown" && blockNextHumanKeydown) {
+          const blocked = blockNextHumanKeydown;
+          blockNextHumanKeydown = undefined;
+          blocked.entered();
+          await blocked.release;
+        }
         if (params.type === "keyDown" && stealFocusAfterKeydown) { stealFocusAfterKeydown = false; fastTypeFocused = false; }
         if (params.type === "keyUp" && stealFocusAfterKeyup) { stealFocusAfterKeyup = false; fastTypeFocused = false; }
         if (params.type === "char") fastTypeValue += params.text;
         if (params.type === "keyDown" && params.key === "Enter") fastTypeValue += "\n";
         return {};
       }
+      if (method === "Input.insertText") { fastTypeValue += params.text; return {}; }
       if (method === "Network.enable" && networkEventsOnEnable.length) {
         const events = networkEventsOnEnable;
         networkEventsOnEnable = [];
@@ -330,14 +442,23 @@ const chrome = {
         };
         return { result: { value: vm.runInNewContext(params.expression, { document, getComputedStyle: element => element.style }) } };
       }
+      if (method === "Runtime.evaluate" && params?.expression?.includes("__controllaPresentationState")) {
+        if (failPresentationEvaluation) { const failure = failPresentationEvaluation; failPresentationEvaluation = undefined; throw new Error(failure); }
+        return { result: { value: { visibility_state: "visible", document_hidden: false, document_has_focus: true,
+          viewport: { width: 1280, height: 720, device_scale_factor: 2 }, lifecycle: "active" } } };
+      }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("__controllaFrameOutcome")) {
         return { result: { value: frameOutcomeVerified } };
       }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("__controllaFrameActionable")) {
+        assert.ok(params.functionDeclaration.includes("root=root.host.getRootNode()"), "frame action guard validates the open shadow-root chain to its owning document");
+        assert.ok(params.functionDeclaration.includes("shadow.elementFromPoint?.(x,y)"), "frame action guard hit-tests through open shadow roots");
         return { result: { value: frameActionable ? { x: 20, y: 30, viewport: { width: 100, height: 100 } } : false } };
       }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("document.elementFromPoint(x,y)===this")) return { result: { value: true } };
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("ownerDocument.defaultView.innerWidth")) {
-        return { result: { value: params.objectId === "fixture-frame-owner" ? { width: 800, height: 600 } : { width: 100, height: 100 } } };
+        const dimensions = { "fixture-frame-owner": { width: 800, height: 600 }, "fixture-parent-owner": { width: 100, height: 100 }, "fixture-nested-owner": { width: 200, height: 150 } };
+        return { result: { value: dimensions[params.objectId] || { width: 100, height: 100 } } };
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === rejectFrameMouseType) {
         rejectFrameMouseType = undefined;
@@ -353,26 +474,54 @@ const chrome = {
         queueMicrotask(() => debuggerEvent?.({ tabId: target.tabId }, "Page.fileChooserOpened", { backendNodeId: 908, frameId: "frame-oopif", mode: "selectSingle" }));
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && navigateFrameOnClick) { navigateFrameOnClick = false; childFrameUrl = "https://picker.example.test/next"; }
-      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: "https://example.test" }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl, securityOrigin: "https://frame.example" } }] } };
+      if (method === "Page.getFrameTree") {
+        if (nestedFrameScrollFixture) {
+          nestedFrameTreeReads += 1;
+          const parentFrameId = reparentNestedFrameFixture && nestedFrameTreeReads > 1 ? "frame-other-parent" : "frame-parent";
+          return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: rootFrameSecurityOrigin }, childFrames: [{ frame: { id: parentFrameId, loaderId: staleNestedAncestorFixture && nestedFrameTreeReads > 1 ? "changed-parent-loader" : "parent-loader", url: "https://example.test/parent", securityOrigin: "https://example.test" }, childFrames: [{ frame: { id: "frame-nested", loaderId: "nested-loader", url: "https://example.test/nested", securityOrigin: "https://example.test" } }] }] } };
+        }
+        return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: rootFrameSecurityOrigin }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl, securityOrigin: "https://frame.example" } }] } };
+      }
       if (method === "DOM.getDocument" && target.sessionId === "fixture-oopif-session") return fallbackFrameFileInputDocument || { root: { nodeName: "#document" } };
       if (method === "DOM.getDocument" && fallbackFileInputDocument) return fallbackFileInputDocument;
       if (method === "Target.setAutoAttach" && params?.autoAttach && attachOopifOnNextAutoAttach) {
         attachOopifOnNextAutoAttach = false;
         queueMicrotask(() => debuggerEvent?.({ tabId: target.tabId }, "Target.attachedToTarget", { sessionId: "fixture-oopif-session", targetInfo: { type: "iframe", targetId: "frame-oopif", url: "https://picker.example.test/" } }));
       }
-      if (method === "Accessibility.getFullAXTree" && target.sessionId === "fixture-oopif-session") {
+      if (method === "Target.setAutoAttach" && params?.autoAttach && attachNestedOopifParentOnNextAutoAttach) {
+        attachNestedOopifParentOnNextAutoAttach = false;
+        queueMicrotask(() => {
+          debuggerEvent?.({ tabId: target.tabId }, "Target.attachedToTarget", { sessionId: "fixture-parent-oopif-session", targetInfo: { type: "iframe", targetId: "frame-parent", url: "https://frame.example.test/" } });
+          debuggerEvent?.({ tabId: target.tabId }, "Target.attachedToTarget", { sessionId: "fixture-nested-oopif-session", targetInfo: { type: "iframe", targetId: "frame-nested", url: "https://nested.example.test/" } });
+        });
+      }
+      if (method === "Accessibility.getFullAXTree" && ["fixture-oopif-session", "fixture-nested-oopif-session"].includes(target.sessionId)) {
         return { nodes: identityAxNodes.length ? identityAxNodes : [{ nodeId: "1", role: { value: "option" }, name: { value: "School account" }, backendDOMNodeId: 91 }] };
       }
-      if (method === "Accessibility.getFullAXTree" && params?.frameId === "frame-oopif") return { nodes: identityAxNodes };
+      if (method === "Accessibility.getFullAXTree" && ["frame-oopif", "frame-nested"].includes(params?.frameId)) return { nodes: identityAxNodes };
+      if (method === "DOM.getFrameOwner" && params?.frameId === "frame-parent") return { backendNodeId: 998 };
+      if (method === "DOM.getFrameOwner" && params?.frameId === "frame-nested") return { backendNodeId: 997 };
       if (method === "DOM.getFrameOwner") return { backendNodeId: 999 };
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 999) return { model: { content: [100, 200, 300, 200, 300, 400, 100, 400] } };
+      if (method === "DOM.getBoxModel" && params?.backendNodeId === 998) return { model: { content: [50, 60, 250, 60, 250, 210, 50, 210] } };
+      if (method === "DOM.getBoxModel" && params?.backendNodeId === 997) {
+        nestedOwnerBoxReads += 1;
+        if (nonAffineNestedTransformFixture) return { model: { content: [20, 30, 120, 30, 130, 90, 20, 90] } };
+        const shift = changingNestedTransformFixture && nestedOwnerBoxReads >= 2 ? 12 : 0;
+        return { model: { content: [20 + shift, 30, 120 + shift, 30, 120 + shift, 90, 20 + shift, 90] } };
+      }
       if (method === "DOM.getBoxModel" && target.sessionId === "fixture-oopif-session") return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
-      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 999 ? "fixture-frame-owner" : "fixture-file-object" } };
+      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
+      if (method === "DOM.setFileInputFiles" && target.sessionId === "fixture-oopif-session") {
+        fileReadbackFiles = (params?.files || []).map(path => ({ name: String(path).split("/").at(-1), size: 12 }));
+        return {};
+      }
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-file-object") {
+        if (params?.functionDeclaration?.startsWith("function(names){const e=this")) return { result: { value: fileInputPolicyFixture || { ok: true, accept: [], multiple: true } } };
         if (navigateFrameDuringFileReadback) { navigateFrameDuringFileReadback = false; childFrameLoaderId = "navigated-loader"; }
         if (fileReadbackEmpty) { fileReadbackEmpty = false; return { result: { value: [] } }; }
-        return { result: { value: [{ name: "example", size: 12 }] } };
+        return { result: { value: fileReadbackFiles || [{ name: "example", size: 12 }] } };
       }
       const afterCall = afterNextDebuggerCall;
       afterNextDebuggerCall = undefined;
@@ -388,6 +537,11 @@ const chrome = {
     onDetach: { addListener(callback) { debuggerDetached = callback; } },
     onEvent: { addListener(callback) { debuggerEvent = callback; } },
   },
+  downloads: {
+    onCreated: { addListener(callback) { downloadCreatedListeners.add(callback); } },
+    onChanged: { addListener(callback) { downloadChangedListeners.add(callback); } },
+    async cancel(downloadId) { cancelledDownloads.push(downloadId); },
+  },
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
 const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
@@ -398,7 +552,7 @@ const expectedExtensionBuildId = `controlla-chrome-extension:0.1.0:${expectedExt
 let backgroundContext;
 function runBackground() {
   backgroundContext = {
-    chrome, WebSocket: FakeWebSocket, URL, TextEncoder, Set, Number, Array, String, Error, Promise, JSON,
+    chrome, WebSocket: FakeWebSocket, URL, TextEncoder, Uint8Array, DataView, atob, Set, Number, Array, String, Error, Promise, JSON,
     Date: { now() { return mockNow; } }, crypto: webcrypto,
     fetch: async url => {
       const assetName = extensionBuildAssets.find(name => String(url).endsWith(`/${name}`));
@@ -414,9 +568,35 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
+
+function testOpenShadowFrameActionGuard() {
+  const guard = vm.runInNewContext(`(${backgroundContext.__testHooks.frameActionableGuardFunction()})`);
+  const doc = { defaultView: { innerWidth: 100, innerHeight: 80, getComputedStyle: () => ({
+    display: "block", visibility: "visible", pointerEvents: "auto", opacity: "1"
+  }) } };
+  const target = {
+    ownerDocument: doc, isConnected: true, disabled: false, parentElement: null,
+    getBoundingClientRect() { return { left: 10, top: 12, right: 40, bottom: 32, width: 30, height: 20 }; },
+    getRootNode() { return shadow; }, getAttribute() { return null; }, hasAttribute() { return false; }, contains(node) { return node === this; }
+  };
+  const host = {
+    shadowRoot: null, parentElement: null, disabled: false,
+    getRootNode() { return doc; }, getAttribute() { return null; }, hasAttribute() { return false; }
+  };
+  const shadow = { host, elementFromPoint(x, y) { assert.equal(x, 25); assert.equal(y, 22); return target; } };
+  host.shadowRoot = shadow;
+  doc.elementFromPoint = () => host;
+  const observed = guard.call(target);
+  assert.equal(observed.x, 25, "open-shadow hit test retains the exact child-frame point");
+  assert.equal(observed.y, 22);
+
+  target.getRootNode = () => ({ host: { getRootNode: () => ({ host: { getRootNode: () => ({}) } }) } });
+  assert.equal(guard.call(target), false, "shadow ancestry beyond the bounded root chain fails closed");
+}
+testOpenShadowFrameActionGuard();
 
 function message(payload) {
   return new Promise(resolve => listener(payload, {}, resolve));
@@ -433,6 +613,21 @@ async function waitFor(predicate, description) {
 (async () => {
   assert.equal(await backgroundContext.__testHooks.extensionBuildId, expectedExtensionBuildId,
     "extension computes the same deterministic digest over every packaged runtime asset");
+  const filePolicy = new Function(`return (${backgroundContext.__testHooks.uploadInputPolicyFunction()})`)();
+  const inputPolicy = (accept, multiple, names) => filePolicy.call({
+    nodeName: "INPUT", type: "file", multiple,
+    getAttribute: name => name === "accept" ? accept : null,
+  }, names);
+  assert.equal(inputPolicy(".bin", false, ["acceptance-fixture.bin"]).ok, true,
+    "extension accept tokens match the complete filename suffix");
+  assert.equal(inputPolicy("application/pdf", false, ["report.pdf"]).ok, true,
+    "MIME accept tokens match a known filename MIME type");
+  assert.equal(inputPolicy("image/*", false, ["picture.png"]).ok, true,
+    "wildcard MIME accept tokens match a known image type");
+  assert.equal(inputPolicy(".bin", false, ["malware.exe"]).reason, "accept_filter_mismatch",
+    "a file outside the accept filter is refused");
+  assert.equal(inputPolicy("", false, ["one.bin", "two.bin"]).reason, "multiple_files_not_allowed",
+    "multi-file selection is refused when the input lacks the multiple attribute");
   await new Promise(resolve => setTimeout(resolve, 0));
   const nativeStatus = await message({ type: "native-status" });
   assert.equal(nativeStatus.transport, "native", "the background worker registers its message handler using supported Chrome events");
@@ -519,31 +714,111 @@ async function waitFor(predicate, description) {
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
   assert.equal(JSON.stringify(native.sent.find(message => message.request_id === "pair-1")), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", extension_build_id: expectedExtensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
-  screenshotDataOverride = "iVBORw0KGgo" + "A".repeat(1_100_000);
+  const discardedTab = tabList.find(tab => tab.id === 41);
+  discardedTab.discarded = true;
+  const captureCountBeforeDiscarded = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
+  native.hostMessage({ type: "command", id: "discarded-screenshot", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).reason_code, "target_discarded");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, captureCountBeforeDiscarded, "discarded target is rejected before screenshot dispatch");
+  delete discardedTab.discarded;
+  discardedTab.frozen = true;
+  native.hostMessage({ type: "command", id: "frozen-screenshot", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).reason_code, "target_frozen");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, captureCountBeforeDiscarded, "frozen target is refused before screenshot dispatch");
+  discardedTab.frozen = undefined;
+  native.hostMessage({ type: "command", id: "unknown-lifecycle-screenshot", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).reason_code, "target_lifecycle_unknown", "missing frozen-state evidence fails closed");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, captureCountBeforeDiscarded, "unknown lifecycle is refused before screenshot dispatch");
+  discardedTab.frozen = false;
+  const waitForCommandResult = async id => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const message = native.sent.findLast(item => item.id === id);
+      if (message) return message;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    throw new Error(`Timed out waiting for command result ${id}`);
+  };
+  let topologyCommandEntered, releaseTopologyCommand;
+  const topologyCommandBlocked = new Promise(resolve => { topologyCommandEntered = resolve; });
+  const topologyCommandRelease = new Promise(resolve => { releaseTopologyCommand = resolve; });
+  blockNextTopologyCommand = { entered: topologyCommandEntered, release: topologyCommandRelease };
+  native.hostMessage({ type: "command", id: "paired-window-move-inflight", target_id: "41", method: "Runtime.evaluate", params: { expression: "1", returnByValue: true } });
+  await topologyCommandBlocked;
+  tabsDetached(41, { oldWindowId: 1, oldPosition: 0 });
+  tabList.find(tab => tab.id === 41).windowId = 9;
+  tabsAttached(41, { newWindowId: 9, newPosition: 0 });
+  releaseTopologyCommand();
+  const movedCommand = await waitForCommandResult("paired-window-move-inflight");
+  assert.equal(movedCommand.result.status, "unknown", JSON.stringify(movedCommand));
+  assert.equal(movedCommand.result.reason_code, "tab_topology_changed");
+  assert.equal(movedCommand.result.dispatch_may_have_occurred, true);
+  let reorderedCommandEntered, releaseReorderedCommand;
+  const reorderedCommandBlocked = new Promise(resolve => { reorderedCommandEntered = resolve; });
+  const reorderedCommandRelease = new Promise(resolve => { releaseReorderedCommand = resolve; });
+  blockNextTopologyCommand = { entered: reorderedCommandEntered, release: reorderedCommandRelease };
+  native.hostMessage({ type: "command", id: "paired-tab-reorder-inflight", target_id: "41", method: "Runtime.evaluate", params: { expression: "2", returnByValue: true } });
+  await reorderedCommandBlocked;
+  tabsMoved(41, { windowId: 9, fromIndex: 0, toIndex: 2 });
+  releaseReorderedCommand();
+  const reorderedCommand = await waitForCommandResult("paired-tab-reorder-inflight");
+  assert.equal(reorderedCommand.result.status, "unknown", JSON.stringify(reorderedCommand));
+  assert.equal(reorderedCommand.result.reason_code, "tab_topology_changed");
+  screenshotDataOverride = makePngBase64();
   native.hostMessage({ type: "command", id: 97001, target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
   await new Promise(resolve => setTimeout(resolve, 25));
   const screenshotChunks = native.sent.filter(reply => reply.type === "result_chunk" && reply.id === 97001);
-  assert.equal(screenshotChunks.length, 3, "large screenshot responses are split into bounded native-message chunks");
+  assert.equal(screenshotChunks.length, 3, `large screenshot responses are split into bounded native-message chunks: ${JSON.stringify(native.sent.filter(reply => reply.id === 97001))}`);
   assert.deepEqual(screenshotChunks.map(reply => reply.index), [0, 1, 2]);
   assert.ok(screenshotChunks.every(reply => new TextEncoder().encode(JSON.stringify(reply)).byteLength < 900 * 1024));
   assert.equal(new Set(screenshotChunks.map(reply => reply.transfer_id)).size, 1);
   assert.ok(screenshotChunks.every(reply => reply.base64_sha256 === screenshotChunks[0].base64_sha256));
+  assert.ok(screenshotChunks.every(reply => reply.visual_evidence?.document_id === "document-41"), "every screenshot chunk carries its target document identity");
+  assert.ok(screenshotChunks.every(reply => reply.visual_evidence?.image_sha256 === screenshotChunks[0].visual_evidence.image_sha256), "chunked pixels share one integrity-bound visual revision");
+  const screenshotBytes = Buffer.from(screenshotDataOverride, "base64");
+  assert.equal(screenshotChunks[0].visual_evidence.image_sha256, createHash("sha256").update(screenshotBytes).digest("hex"), "image hash covers decoded PNG bytes");
+  assert.equal(screenshotChunks[0].visual_evidence.dimensions.width, 320, "dimensions come from the PNG header");
+  assert.notEqual(screenshotChunks[0].visual_evidence.image_sha256, createHash("sha256").update(screenshotDataOverride).digest("hex"), "image hash is distinct from the base64 transfer hash");
+  assert.equal(screenshotChunks[0].base64_sha256, createHash("sha256").update(screenshotDataOverride).digest("hex"), "chunk hash covers the exact base64 transfer payload");
+  assert.ok(Number.isSafeInteger(screenshotChunks[0].visual_evidence?.captured_at_ms), "screenshot evidence carries a capture timestamp");
   assert.deepEqual(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params, runtimeScreenshotParams,
     "the exact runtime-generated screenshot parameters reach the extension's bounded validator and Chrome dispatch");
+  assert.equal(screenshotChunks[0].visual_evidence.target_lifecycle, "active");
+  assert.equal(screenshotChunks[0].visual_evidence.render_revision, null, "pixel integrity is not mislabeled as renderer freshness");
   screenshotDataOverride = undefined;
-  for (const [id, clip, description] of [
-    [97003, { x: 0, y: 0, width: 1600, height: 1200, scale: 1 }, "maximum crop"],
-    [97004, { x: 0, y: 0, width: 800, height: 600, scale: 2 }, "high-DPI crop"],
+  const capturesBeforeTransition = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
+  freezeDuringScreenshot = true;
+  native.hostMessage({ type: "command", id: "freeze-during-screenshot", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  const frozenDuringCapture = await waitForCommandResult("freeze-during-screenshot");
+  assert.equal(frozenDuringCapture.reason_code, "target_frozen", JSON.stringify(frozenDuringCapture));
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, capturesBeforeTransition + 1, "transition fixture freezes after screenshot dispatch");
+  assert.equal(native.sent.some(reply => reply.type === "result_chunk" && reply.id === "freeze-during-screenshot"), false, "pixels are discarded after an observed freeze transition");
+  discardedTab.frozen = false;
+  tabsUpdated(41, { frozen: false });
+  for (const [id, clip, captureBeyondViewport, description] of [
+    [97003, { x: 0, y: 0, width: 4096, height: 4096, scale: 1 }, false, "maximum crop"],
+    [97004, { x: 0, y: 0, width: 800, height: 600, scale: 2 }, false, "high-DPI crop"],
+    [97005, { x: 0, y: 0, width: 1200, height: 3000, scale: 1 }, true, "bounded full-page crop"],
   ]) {
     native.hostMessage({ type: "command", id, target_id: "41", method: "Page.captureScreenshot", params: {
-      format: "png", fromSurface: true, captureBeyondViewport: false, clip
+      format: "png", fromSurface: true, captureBeyondViewport, clip
     } });
     await new Promise(resolve => setTimeout(resolve, 25));
     assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params.clip.scale, clip.scale,
       `${description} remains inside the shared screenshot contract`);
     assert.ok(native.sent.some(reply => reply.type === "result" && reply.id === id), `${description} returns a result`);
   }
-  screenshotDataOverride = "iVBORw0KGgo" + "A".repeat(1_100_000);
+  const screenshotsBeforeOversize = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
+  native.hostMessage({ type: "command", id: 97006, target_id: "41", method: "Page.captureScreenshot", params: {
+    format: "png", fromSurface: true, captureBeyondViewport: true,
+    clip: { x: 0, y: 0, width: 1200, height: 5000, scale: 1 }
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, screenshotsBeforeOversize,
+    "oversized full-page captures are refused before Chrome dispatch");
+  screenshotDataOverride = makePngBase64();
   native.hostMessage({ type: "command", id: 97002, target_id: "41", lease_id: "pair-1", method: "Page.captureScreenshot", params: {
     format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 }
   } });
@@ -571,6 +846,72 @@ async function waitFor(predicate, description) {
   assert.equal(focusTheftReceipt.completed_chars, 0);
   assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length - eventsBeforeFocusTheft, 1,
     "focus movement after keyDown must stop before char and keyUp are sent to a new target");
+  fastTypeValue = ""; fastTypeFocused = true; stealFocusAfterKeydown = true;
+  const humanEventsBeforeFocusTheft = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "human-type-character-focus-theft", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "", character: "x", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const humanFocusTheft = native.sent.find(message => message.id === "human-type-character-focus-theft")?.result;
+  assert.equal(humanFocusTheft.status, "unknown");
+  assert.equal(humanFocusTheft.reason, "focus_changed_keyup_suppressed_cleanup_unconfirmed");
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").slice(humanEventsBeforeFocusTheft).map(call => call.params.type), ["keyDown"],
+    "single-character bridge transaction must suppress char and stale-target keyUp after focus theft");
+  fastTypeValue = ""; fastTypeFocused = true;
+  native.hostMessage({ type: "command", id: "human-type-character-cleanup", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "", character: "y", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const humanCleanup = native.sent.find(message => message.id === "human-type-character-cleanup")?.result;
+  assert.equal(humanCleanup.status, "verified", JSON.stringify(humanCleanup));
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").slice(-3).map(call => call.params.type), ["keyDown", "char", "keyUp"],
+    "same-target character transaction must complete and release its pressed key before replying");
+  fastTypeValue = ""; fastTypeFocused = true;
+  const unicodeKeyEventsBefore = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "human-type-unicode-scalar", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "", character: "é", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const unicodeHumanReceipt = native.sent.find(message => message.id === "human-type-unicode-scalar")?.result;
+  assert.equal(unicodeHumanReceipt.status, "verified", JSON.stringify(unicodeHumanReceipt));
+  assert.equal(unicodeHumanReceipt.input_method, "insertText");
+  assert.equal(unicodeHumanReceipt.readback, "é");
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.insertText").at(-1)?.params?.text, "é");
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length, unicodeKeyEventsBefore,
+    "Unicode insertText transaction must not leave any key down or send a later keyUp");
+  const callsBeforeControl = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "human-type-control-rejected", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "é", character: "\u0001", normalize_paragraphs: false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(native.sent.find(message => message.id === "human-type-control-rejected")?.error);
+  assert.equal(debuggerCalls.length, callsBeforeControl, "unsupported control scalar is rejected before CDP dispatch");
+  fastTypeValue = ""; fastTypeFocused = true;
+  let enteredHumanKeydown;
+  let releaseHumanKeydown;
+  const humanKeydownEntered = new Promise(resolve => { enteredHumanKeydown = resolve; });
+  const humanKeydownRelease = new Promise(resolve => { releaseHumanKeydown = resolve; });
+  blockNextHumanKeydown = { entered: enteredHumanKeydown, release: humanKeydownRelease };
+  const humanCancelEventsStart = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  let cancellationRequested = false, cancellationAcknowledged = false;
+  const readNativeResult = async id => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const message = native.sent.findLast(item => item.id === id);
+      if (message) return message.result;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    throw new Error(`Timed out waiting for native result ${id}`);
+  };
+  const pacedOperation = (async () => {
+    native.hostMessage({ type: "command", id: "human-cancel-char-a", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "", character: "a", normalize_paragraphs: false } });
+    const firstCharacter = await readNativeResult("human-cancel-char-a");
+    if (cancellationRequested) { cancellationAcknowledged = true; return [firstCharacter]; }
+    native.hostMessage({ type: "command", id: "human-cancel-char-b", target_id: "41", method: "Controlla.humanTypeCharacter", params: { object_id: "fixture-editor", index: 0, expected: "a", character: "b", normalize_paragraphs: false } });
+    return [firstCharacter, await readNativeResult("human-cancel-char-b")];
+  })();
+  await humanKeydownEntered;
+  cancellationRequested = true;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(cancellationAcknowledged, false, "cancellation acknowledgement waits for the actual extension transaction cleanup");
+  releaseHumanKeydown();
+  const cancelledCharacters = await pacedOperation;
+  assert.equal(cancellationAcknowledged, true);
+  assert.equal(cancelledCharacters.length, 1, "the queued second character must not be submitted after cancellation");
+  assert.equal(cancelledCharacters[0].status, "verified");
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").slice(humanCancelEventsStart).map(call => call.params.type), ["keyDown", "char", "keyUp"],
+    "the in-flight extension transaction finishes key release before cancellation acknowledgement");
   fastTypeValue = ""; fastTypeFocused = true; stealFocusAfterKeyup = true;
   const eventsBeforeKeyupFocusTheft = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
   native.hostMessage({ type: "command", id: "fast-type-keyup-focus-theft", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "ab", normalize_paragraphs: false } });
@@ -591,12 +932,30 @@ async function waitFor(predicate, description) {
   tabList.push(popupTab, unrelatedSameWindowTab, unrelatedTab); tabsCreated(popupTab); tabsCreated(unrelatedSameWindowTab); tabsCreated(unrelatedTab);
   native.hostMessage({ type: "command", id: "verify-click-new-tab", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt, url: "https://example.test/story" } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(JSON.parse(JSON.stringify(native.sent.find(message => message.id === "verify-click-new-tab")?.result?.tabs)),
-    [{ tab_id: "900", url: "https://example.test/story", opener_match: true }], "only Chrome's opener relationship attributes a tab to the click, excluding same-URL tabs opened independently");
+  const openerBoundCandidate = native.sent.find(message => message.id === "verify-click-new-tab")?.result?.tabs?.[0];
+  assert.deepEqual({ tab_id: openerBoundCandidate?.tab_id, url: openerBoundCandidate?.url, window_id: openerBoundCandidate?.window_id,
+    opener_tab_id: openerBoundCandidate?.opener_tab_id, opener_match: openerBoundCandidate?.opener_match },
+    { tab_id: "900", url: "https://example.test/story", window_id: 7, opener_tab_id: "41", opener_match: true },
+    "only Chrome's opener relationship attributes a tab to the click, excluding same-URL tabs opened independently");
+  assert.ok(Number.isSafeInteger(openerBoundCandidate?.created_at_ms), "candidate includes its Chrome creation event timestamp");
   native.hostMessage({ type: "command", id: "verify-click-new-tab-no-url", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(JSON.parse(JSON.stringify(native.sent.find(message => message.id === "verify-click-new-tab-no-url")?.result?.tabs)),
-    [{ tab_id: "900", url: "https://example.test/story", opener_match: true }], "without a selected href, only Chrome's opener relationship is used");
+  const noUrlCandidate = native.sent.find(message => message.id === "verify-click-new-tab-no-url")?.result?.tabs?.[0];
+  assert.equal(noUrlCandidate?.tab_id, "900", "without a selected href, only Chrome's opener relationship is used");
+  assert.equal(noUrlCandidate?.created_at_ms, openerBoundCandidate?.created_at_ms, "candidate creation timestamp is stable across bounded re-observation");
+  const ambiguousPopupTab = { id: 903, windowId: 7, openerTabId: 41, url: "https://example.test/second", status: "complete" };
+  tabList.push(ambiguousPopupTab); tabsCreated(ambiguousPopupTab);
+  native.hostMessage({ type: "command", id: "verify-popup-adoption-ambiguity", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.find(message => message.id === "verify-popup-adoption-ambiguity")?.result?.tabs?.length, 2,
+    "the extension preserves every recent opener-bound candidate so runtime adoption can reject ambiguity");
+  tabsRemoved(903); tabList.splice(tabList.findIndex(tab => tab.id === 903), 1);
+  tabsRemoved(900);
+  tabList.splice(tabList.findIndex(tab => tab.id === 900), 1);
+  native.hostMessage({ type: "command", id: "verify-closed-popup-not-reused", target_id: "41", method: "Controlla.newTabs", params: { since_ms: clickStartedAt } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(native.sent.find(message => message.id === "verify-closed-popup-not-reused")?.result?.tabs)), [],
+    "closed popup/opener candidates are removed from the short-lived target lifecycle registry");
   const failedFastTypeReceipt = native.sent.find(message => message.id === "fast-type-delivery-unknown")?.result;
   assert.equal(failedFastTypeReceipt.status, "unknown");
   assert.equal(failedFastTypeReceipt.cdp_commands, 2, "unknown partial delivery reports the preflight and attempted key command");
@@ -689,7 +1048,7 @@ async function waitFor(predicate, description) {
   } });
   for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
   const secureTab = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
-  assert.ok(secureTab, "password input uses a one-use extension-owned page");
+  assert.ok(secureTab, `password input uses a one-use extension-owned page: ${JSON.stringify(native.sent.find(item => item.id === "secure-password"))}`);
   const secureNonce = secureTab.url.split("#")[1];
   assert.equal((await messageFrom({ type: "secure-input-ready", nonce: secureNonce }, { url: `chrome-extension://fixture/secure-input.html.evil#${secureNonce}` })).ok, false,
     "lookalike extension page cannot read or submit a pending secret");
@@ -708,6 +1067,62 @@ async function waitFor(predicate, description) {
   assert.equal(JSON.stringify(sessionStorage).includes(passwordSentinel), false, "password is never persisted in extension session storage");
   assert.equal(tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")), false, "one-use prompt tab is closed");
   assert.equal(focusedWindowActiveTabId, 41, "original target tab is restored after secure entry");
+  emitActivationEvents = true;
+  focusedWindowActiveTabId = 41;
+  const secureTargetWindowId = tabList.find(tab => tab.id === 41).windowId;
+  for (const tab of tabList) if (tab.windowId === secureTargetWindowId) tab.active = tab.id === 41;
+  focusedWindowFocused = true;
+  const switchDispatchStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "secure-password-user-switch", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, timeout_ms: 20000,
+  } });
+  for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+  const switchedPrompt = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+  assert.ok(switchedPrompt, "secure input prompt opens before the user switches tabs");
+  await chrome.tabs.update(42, { active: true });
+  const switchedNonce = switchedPrompt.url.split("#")[1];
+  await messageFrom({ type: "secure-input-submit", nonce: switchedNonce, password: "switch-must-not-send-this" }, { url: switchedPrompt.url });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(debuggerCalls.slice(switchDispatchStart).some(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled")), false,
+    "switching to another tab during secure entry prevents password dispatch");
+  assert.equal(focusedWindowActiveTabId, 42, "secure-entry cleanup preserves the user's newer tab choice");
+  assert.equal(tabList.find(tab => tab.id === 41).active, false, "cleanup does not reactivate the original target after user interference");
+  assert.equal(tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")), false, "interrupted one-use prompt is still closed");
+  focusedWindowActiveTabId = 41;
+  for (const tab of tabList) if (tab.windowId === secureTargetWindowId) tab.active = tab.id === 41;
+  const revalidationDispatchStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "secure-password-revalidation-switch", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, timeout_ms: 20000,
+  } });
+  for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+  const revalidationPrompt = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+  assert.ok(revalidationPrompt, "secure prompt opens before password-field revalidation");
+  switchTabDuringPasswordRevalidation = true;
+  await messageFrom({ type: "secure-input-submit", nonce: revalidationPrompt.url.split("#")[1], password: "revalidation-switch-must-not-send" }, { url: revalidationPrompt.url });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(debuggerCalls.slice(revalidationDispatchStart).some(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled")), false,
+    "a tab switch during field revalidation is checked at the password dispatch boundary");
+  assert.equal(focusedWindowActiveTabId, 42, "closing the now-inactive prompt preserves a tab selected during revalidation");
+  assert.equal(tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")), false, "revalidation interruption still closes the prompt");
+  focusedWindowActiveTabId = 41;
+  for (const tab of tabList) if (tab.windowId === secureTargetWindowId) tab.active = tab.id === 41;
+  const ownershipRaceDispatchStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "secure-password-activation-race", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, timeout_ms: 20000,
+  } });
+  for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+  const ownershipRacePrompt = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+  assert.ok(ownershipRacePrompt, "secure prompt opens before activation ownership is checked");
+  onNextActiveWindowQuery = () => { void chrome.tabs.update(42, { active: true }); void chrome.tabs.update(ownershipRacePrompt.id, { active: true }); };
+  await messageFrom({ type: "secure-input-submit", nonce: ownershipRacePrompt.url.split("#")[1], password: "activation-race-must-not-send" }, { url: ownershipRacePrompt.url });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(debuggerCalls.slice(ownershipRaceDispatchStart).some(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled")), false,
+    "activation away and back during the ownership query invalidates the one-use prompt");
+  assert.equal(tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")), false, "activation-raced prompt still closes");
+  emitActivationEvents = false;
+  focusedWindowActiveTabId = 41;
+  for (const tab of tabList) if (tab.windowId === secureTargetWindowId) tab.active = tab.id === 41;
+  focusedWindowFocused = true;
   const createdTabsBeforeChatPassword = nextCreatedTab;
   const debuggerCallsBeforeChatPassword = debuggerCalls.length;
   const chatPasswordSentinel = "CHAT-PASSWORD-TEST-SENTINEL";
@@ -721,7 +1136,7 @@ async function waitFor(predicate, description) {
     await new Promise(resolve => setTimeout(resolve, 0));
   }
   const chatPasswordReceipt = native.sent.find(item => item.id === "secure-password-chat-value")?.result;
-  assert.equal(chatPasswordReceipt?.status, "verified", "chat-provided password is dispatched once and verified");
+  assert.equal(chatPasswordReceipt?.status, "verified", `chat-provided password is dispatched once and verified: ${JSON.stringify(chatPasswordReceipt)}`);
   assert.equal(chatPasswordReceipt?.readback?.credential_filled, true);
   assert.equal(Object.hasOwn(chatPasswordReceipt?.readback || {}, "length"), false, "receipt does not expose password length");
   assert.equal(JSON.stringify(chatPasswordReceipt).includes(chatPasswordSentinel), false, "chat secret is excluded from the receipt");
@@ -729,6 +1144,21 @@ async function waitFor(predicate, description) {
   assert.equal(nextCreatedTab, createdTabsBeforeChatPassword, "chat-provided password does not open a second password prompt");
   const chatPasswordDispatch = debuggerCalls.slice(debuggerCallsBeforeChatPassword).find(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled"));
   assert.equal(chatPasswordDispatch?.params.arguments?.[0]?.value, chatPasswordSentinel, "the one-shot value reaches only the guarded password-field dispatch");
+  rootFrameSecurityOrigin = "https://example.test";
+  changeRootOriginOnPasswordCheck = true;
+  const originMismatchCallStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "secure-password-origin-change", target_id: "41", method: "Controlla.securePasswordFill", params: {
+    frame_id: "root-frame", loader_id: "root-loader", backend_node_id: 990, timeout_ms: 20000,
+  } });
+  for (let attempt = 0; attempt < 50 && !tabList.some(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#")); attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+  const originPrompt = tabList.find(tab => tab.url?.startsWith("chrome-extension://fixture/secure-input.html#"));
+  assert.ok(originPrompt, "origin binding is rechecked after the secure prompt");
+  const originNonce = originPrompt.url.split("#")[1];
+  await messageFrom({ type: "secure-input-submit", nonce: originNonce, password: "origin-bound-sentinel" }, { url: originPrompt.url });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(debuggerCalls.slice(originMismatchCallStart).some(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.includes("credential_filled")), false,
+    "a frame that changes origin during secure entry receives no password");
+  rootFrameSecurityOrigin = "https://example.test";
   focusedWindowActiveTabId = 42;
   focusedWindowFocused = false;
   tabList.find(tab => tab.id === 41).active = false;
@@ -854,14 +1284,147 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.at(-1).result.tab_active, false, "presentation telemetry reports the tab without activating it");
   assert.equal(native.sent.at(-1).result.window_focused, false, "presentation telemetry reports the window without focusing it");
+  assert.equal(native.sent.at(-1).result.visibility_state, "visible", "DOM visibility is reported independently from Chrome tab/window focus");
+  assert.equal(native.sent.at(-1).result.document_has_focus, true, "page focus is reported as a distinct signal, not used as window focus");
+  assert.equal(JSON.stringify(native.sent.at(-1).result.viewport), JSON.stringify({ width: 1280, height: 720, device_scale_factor: 2 }), "presentation includes the page capture geometry");
+  assert.equal(native.sent.at(-1).result.lifecycle, "active", "presentation reports the explicit unfrozen tab lifecycle separately from window and page focus");
   const activationEpoch = native.sent.at(-1).result.activation_epoch;
   const focusEpoch = native.sent.at(-1).result.focus_epoch;
   assert.ok(Number.isSafeInteger(activationEpoch) && Number.isSafeInteger(focusEpoch), "presentation telemetry includes transient event counters");
+  failPresentationEvaluation = "Target crashed while reading renderer presentation state";
+  native.hostMessage({ type: "command", id: "presentation-crashed-renderer", target_id: "41", method: "Controlla.presentationState", params: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.lifecycle, "crashed", "recognized debugger crash errors are not reported as an unknown live renderer");
+  assert.equal(native.sent.at(-1).result.renderer_unavailable, true);
   focusedWindowFocused = true;
   tabList.find(tab => tab.id === 42).windowId = tabList.find(tab => tab.id === 41).windowId;
   tabList.find(tab => tab.id === 42).active = true;
   tabList.find(tab => tab.id === 41).active = false;
   emitActivationEvents = true;
+  // Exercise the guarded native route with a foreground owned fixture target.
+  tabList.find(tab => tab.id === 42).active = false;
+  tabList.find(tab => tab.id === 41).active = true;
+  pointerGuardValue = { ok: true, x: 10, y: 20, viewport: "fixture-viewport" };
+  const doubleSuccessStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "double-pointer-click-success", target_id: "41", method: "Controlla.pointerClick", params: {
+    object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
+    index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport", click_kind: "double_click"
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const successfulDoubleEvents = debuggerCalls.slice(doubleSuccessStart).filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent");
+  assert.deepEqual(successfulDoubleEvents.map(call => [call.params.type, call.params.button, call.params.clickCount]), [
+    ["mouseMoved", undefined, undefined], ["mousePressed", "left", 1], ["mouseReleased", "left", 1],
+    ["mousePressed", "left", 2], ["mouseReleased", "left", 2],
+  ], "double click is two trusted guarded mouse pairs with distinct click counts");
+  pointerGuardValue = { ok: true, x: 10, y: 20, viewport: "fixture-viewport" };
+  changePointerAfterFirstClickRelease = true;
+  const doubleStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "double-pointer-click-changed", target_id: "41", method: "Controlla.pointerClick", params: {
+    object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
+    index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport", click_kind: "double_click"
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const doubleEvents = debuggerCalls.slice(doubleStart).filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent");
+  assert.deepEqual(doubleEvents.map(call => [call.params.type, call.params.button, call.params.clickCount]), [
+    ["mouseMoved", undefined, undefined], ["mousePressed", "left", 1], ["mouseReleased", "left", 1],
+  ], "a changed hit point stops a double click before its second trusted pair");
+  const stoppedDouble = native.sent.find(message => message.id === "double-pointer-click-changed")?.result;
+  assert.equal(stoppedDouble?.status, "unknown", "the first click may have taken effect even when the second is fenced");
+  assert.equal(stoppedDouble?.reason_code, "double_click_target_changed");
+  assert.equal(stoppedDouble?.completed_clicks, 1);
+  pointerGuardValue = { ok: true, x: 10, y: 20, viewport: "fixture-viewport" };
+  const contextStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "context-pointer-click", target_id: "41", method: "Controlla.pointerClick", params: {
+    object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
+    index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport", click_kind: "context_click"
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const contextEvents = debuggerCalls.slice(contextStart).filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent");
+  assert.deepEqual(contextEvents.filter(call => call.params.type === "mousePressed" || call.params.type === "mouseReleased")
+    .map(call => [call.params.type, call.params.button, call.params.clickCount]), [
+      ["mousePressed", "right", 1], ["mouseReleased", "right", 1],
+    ], "context click uses the trusted right mouse button");
+  const scrollStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "guarded-wheel-scroll", target_id: "41", method: "Controlla.pointerScroll", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,dx,dy,expectedViewport){return {ok:true,nearest_scroll_container_at_boundary:false}}",
+    viewport: "fixture-viewport", delta_x: 0, delta_y: 60, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const scrollResult = native.sent.findLast(message => message.id === "guarded-wheel-scroll")?.result;
+  assert.equal(scrollResult?.status, "verified", JSON.stringify(scrollResult));
+  assert.equal(scrollResult?.same_container, true, "wheel readback is bound to the same retained DOM node");
+  const wheelEvent = debuggerCalls.slice(scrollStart).find(call => call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel");
+  assert.deepEqual([wheelEvent?.params.x, wheelEvent?.params.y, wheelEvent?.params.deltaX, wheelEvent?.params.deltaY], [15, 25, 0, 60]);
+  fixtureScrollAllowed = false;
+  const refusedScrollStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "wheel-at-boundary", target_id: "41", method: "Controlla.pointerScroll", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,dx,dy,expectedViewport){return {ok:true,nearest_scroll_container_at_boundary:false}}",
+    viewport: "fixture-viewport", delta_x: 0, delta_y: 60, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "wheel-at-boundary")?.result?.status, "not_dispatched");
+  assert.equal(debuggerCalls.slice(refusedScrollStart).some(call => call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel"), false,
+    "nearest nested scroller at its edge refuses before wheel dispatch");
+  fixtureScrollAllowed = true;
+  fixtureScrollMoves = false;
+  native.hostMessage({ type: "command", id: "wheel-no-movement", target_id: "41", method: "Controlla.pointerScroll", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,dx,dy,expectedViewport){return {ok:true,nearest_scroll_container_at_boundary:false}}",
+    viewport: "fixture-viewport", delta_x: 0, delta_y: 30, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const noMovement=native.sent.findLast(message=>message.id==="wheel-no-movement")?.result;
+  assert.equal(noMovement?.status,"inconclusive","acknowledged wheel delivery without same-container movement is inconclusive");
+  assert.equal(noMovement?.dispatch_acknowledged,true);
+  fixtureScrollMoves = true;
+  fixtureScrollHitChangesOnRecheck = true;
+  const changedScrollTargetStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "wheel-target-changed-before-dispatch", target_id: "41", method: "Controlla.pointerScroll", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,dx,dy,expectedViewport){return {ok:true,nearest_scroll_container_at_boundary:false}}",
+    viewport: "fixture-viewport", delta_x: 0, delta_y: 30, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message=>message.id==="wheel-target-changed-before-dispatch")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.slice(changedScrollTargetStart).some(call => call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel"), false,
+    "changed hit point is fenced by a second target guard before wheel dispatch");
+  fixtureScrollHitChangesOnRecheck = false;
+
+  const swipeStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "guarded-touch-swipe", target_id: "41", method: "Controlla.pointerSwipe", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,sx,sy,ex,ey,expectedViewport,phase){return {ok:true,viewport:'fixture-viewport',start:{x:sx,y:sy},end:{x:ex,y:ey},scroll:{top:phase==='after'?40:0},rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", start_x: 20, start_y: 40, end_x: 20, end_y: 10, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const swipeResult = native.sent.findLast(message => message.id === "guarded-touch-swipe")?.result;
+  assert.equal(swipeResult?.status, "verified", JSON.stringify(swipeResult));
+  const touchEvents = debuggerCalls.slice(swipeStart).filter(call => call.method === "Input.dispatchTouchEvent");
+  assert.deepEqual(touchEvents.map(call => call.params.type), ["touchStart", "touchMove", "touchEnd"]);
+  assert.deepEqual(touchEvents.map(call => call.params.touchPoints[0] && [call.params.touchPoints[0].x, call.params.touchPoints[0].y]), [[20, 40], [20, 10], undefined]);
+  fixtureSwipeMoved = false;
+  native.hostMessage({ type: "command", id: "guarded-touch-swipe-no-movement", target_id: "41", method: "Controlla.pointerSwipe", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,sx,sy,ex,ey,expectedViewport,phase){return {ok:true,viewport:'fixture-viewport',start:{x:sx,y:sy},end:{x:ex,y:ey},scroll:{top:phase==='after'&&fixtureSwipeMoved?40:0},rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", start_x: 20, start_y: 40, end_x: 20, end_y: 10, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "guarded-touch-swipe-no-movement")?.result?.status, "inconclusive");
+  fixtureSwipeMoved = true;
+  rejectNextCommand = "Input.dispatchTouchEvent";
+  const failedSwipeStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "guarded-touch-swipe-release-cleanup", target_id: "41", method: "Controlla.pointerSwipe", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,sx,sy,ex,ey,expectedViewport,phase){return {ok:true,viewport:'fixture-viewport',start:{x:sx,y:sy},end:{x:ex,y:ey},scroll:{top:0},rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", start_x: 20, start_y: 40, end_x: 20, end_y: 10, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "guarded-touch-swipe-release-cleanup")?.result?.status, "unknown");
+  assert.ok(debuggerCalls.slice(failedSwipeStart).some(call => call.method === "Input.dispatchTouchEvent" && call.params.type === "touchEnd"), "failed touch delivery still attempts touchEnd cleanup");
+  tabList.find(tab => tab.id === 42).active = true;
+  tabList.find(tab => tab.id === 41).active = false;
   const pointerCommandsBeforeInactiveAttempt = debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").length;
   native.hostMessage({ type: "command", id: "inactive-pointer-click", target_id: "41", method: "Controlla.pointerClick", params: {
     object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
@@ -891,7 +1454,7 @@ async function waitFor(predicate, description) {
   assert.equal(focusedWindowFocused, false, "background pointer click does not focus the Chrome window");
   assert.equal(tabList.find(tab => tab.id === 41).active, false, "background pointer click restores the prior active tab");
   afterNextDebuggerCall = () => {
-    tabsActivated({ tabId: 42 }); tabsActivated({ tabId: 41 });
+    emitTabsActivated({ tabId: 42 }); emitTabsActivated({ tabId: 41 });
     windowFocusChanged(9); windowFocusChanged(-1);
   };
   native.hostMessage({ type: "command", id: "background-mutation", target_id: "41", method: "DOM.getDocument", params: {} });
@@ -966,7 +1529,7 @@ async function waitFor(predicate, description) {
   ] });
   await new Promise(resolve => setTimeout(resolve, 0));
   const staleBatch = native.sent.at(-1);
-  assert.match(staleBatch.error, /document identity changed/);
+  assert.match(staleBatch.error, /document identity changed/, JSON.stringify(staleBatch));
   assert.equal(debuggerCalls.length, callsBeforeStaleBatch + 1, "a changed document stops the next batch mutation");
   const callsBeforeNavigationBatch = debuggerCalls.length;
   afterNextDebuggerCall = () => navigationBefore({ tabId: 47, frameId: 0, url: "https://example.test/47/changed" });
@@ -1138,6 +1701,14 @@ async function waitFor(predicate, description) {
   assert.equal(native.sent.find(message => message.request_id === "codex-a" && message.type === "paired")?.lease_id, "codex-a");
   assert.equal(native.sent.find(message => message.request_id === "codex-b" && message.type === "paired")?.lease_id, "codex-b");
   assert.equal(detached.includes(60), false, "a second Codex lease must preserve the first lease's tab");
+  const overlapAttachCount = attached.filter(tabId => tabId === 60).length;
+  native.hostMessage({ type: "pair", request_id: "codex-c-overlap", lease_id: "codex-c", tab_ids: [60], expected_urls: expectedUrls([60]), expected_document_ids: expectedDocuments([60]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.find(message => message.request_id === "codex-c-overlap")?.error || "", /already leased/i,
+    "a second client cannot acquire a target already owned by another client");
+  assert.equal(attached.filter(tabId => tabId === 60).length, overlapAttachCount,
+    "overlapping ownership is rejected without a duplicate debugger attach");
+  assert.equal(detached.includes(60), false, "a rejected overlapping lease cannot detach the existing owner's target");
   native.hostMessage({ type: "release", lease_id: "codex-a" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(detached.includes(60), "releasing one Codex lease detaches only its tab");
@@ -1189,7 +1760,7 @@ async function waitFor(predicate, description) {
   reconnectTimers.at(-1).callback();
   const newNative = nativePorts[4];
   newNative.hostMessage({ type: "ready" });
-  newNative.hostMessage({ type: "pair", request_id: "pair-after-disconnect", tab_ids: [53], expected_urls: expectedUrls([53]), expected_document_ids: expectedDocuments([53]) });
+  newNative.hostMessage({ type: "pair", request_id: "pair-after-disconnect", lease_id: "lease-after-disconnect", tab_ids: [53], expected_urls: expectedUrls([53]), expected_document_ids: expectedDocuments([53]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(attached.includes(53), false, "reconnected host waits for old disconnect cleanup");
   blockedDetach.resolve();
@@ -1197,6 +1768,11 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(newNative.sent.at(-1).request_id, "pair-after-disconnect");
   assert.deepEqual([...newNative.sent.at(-1).targets], ["53"]);
+  const reconnectAttachCount = attached.filter(tabId => tabId === 53).length;
+  newNative.hostMessage({ type: "pair", request_id: "pair-after-disconnect", lease_id: "lease-after-disconnect", tab_ids: [53], expected_urls: expectedUrls([53]), expected_document_ids: expectedDocuments([53]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(newNative.sent.at(-1).type, "pair_error", "replayed pairing after reconnect cannot create a duplicate lease");
+  assert.equal(attached.filter(tabId => tabId === 53).length, reconnectAttachCount, "replayed pairing does not attach the target a second time");
   pendingCommands.at(-1)({ value: "late result" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(newNative.sent.some(reply => reply.id === "late"), false, "late async replies are not sent to the replacement native host");
@@ -1234,6 +1810,11 @@ async function waitFor(predicate, description) {
   }) });
   assert.equal(debuggerCalls.length, callsBeforeBlocked + 2);
   assert.equal(debuggerCalls.at(-1).method, "Input.dispatchMouseEvent");
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "allowed-html5-drag", target_id: "18", method: "Input.dispatchDragEvent",
+    params: { type: "dragEnter", x: 20, y: 30, data: { items: [{ mimeType: "text/plain", data: "fixture" }], files: [], dragOperationsMask: 16 } }
+  }) });
+  assert.equal(debuggerCalls.at(-1).method, "Input.dispatchDragEvent", "bounded semantic HTML5 drag events are routed through the explicit CDP input allowlist");
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed-touch", target_id: "18", method: "Input.dispatchTouchEvent", params: { type: "touchStart", touchPoints: [{ id: 1, x: 1, y: 1 }] }
   }) });
@@ -1298,7 +1879,12 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   liveNative.hostMessage({ type: "command", id: "guarded-file-frame-set", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_path: "/tmp/staged-artifact" } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(JSON.parse(JSON.stringify(liveNative.sent.at(-1).result.files)), [{ name: "example", size: 12 }], "guarded sessions may select only through the validated staged-artifact upload route");
+  assert.deepEqual(JSON.parse(JSON.stringify(liveNative.sent.at(-1).result.files)), [{ name: "staged-artifact", size: 12 }], "guarded sessions may select only through the validated staged-artifact upload route");
+  liveNative.hostMessage({ type: "command", id: "guarded-multi-file-set", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_paths: ["/tmp/a.txt", "/tmp/b.csv"] } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(liveNative.sent.at(-1).result.files)), [{ name: "a.txt", size: 12 }, { name: "b.csv", size: 12 }], "guarded staged route selects and reports the complete ordered multi-file set");
+  assert.deepEqual(debuggerCalls.findLast(call => call.method === "DOM.setFileInputFiles" && call.target.sessionId === "fixture-oopif-session")?.params.files, ["/tmp/a.txt", "/tmp/b.csv"]);
+  fileReadbackFiles = undefined;
   liveNative.hostMessage({ type: "command", id: "guarded-raw-file-refused", target_id: "66", method: "DOM.setFileInputFiles", params: { files: ["/tmp/arbitrary"] } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(liveNative.sent.at(-1).error, /local unrestricted mode/, "guarded sessions cannot use the unrestricted raw file-selection command");
@@ -1312,6 +1898,18 @@ async function waitFor(predicate, description) {
   liveNative.hostMessage({ type: "command", id: "file-frame-set", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_path: "/tmp/example" } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(JSON.parse(JSON.stringify(liveNative.sent.at(-1).result.files)), [{ name: "example", size: 12 }], "frame-scoped upload sets the selected input and returns a file readback");
+  fileInputPolicyFixture = { ok: false, reason: "accept_filter_mismatch" };
+  const filteredSelectionCount = debuggerCalls.filter(call => call.method === "DOM.setFileInputFiles").length;
+  liveNative.hostMessage({ type: "command", id: "file-frame-filter-refused", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_path: "/tmp/example.exe" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(liveNative.sent.at(-1).error, /accept_filter_mismatch/, "accept filter mismatch is refused before file selection");
+  assert.equal(debuggerCalls.filter(call => call.method === "DOM.setFileInputFiles").length, filteredSelectionCount, "a filtered file never reaches CDP selection");
+  fileInputPolicyFixture = { ok: false, reason: "multiple_files_not_allowed" };
+  liveNative.hostMessage({ type: "command", id: "file-frame-multiple-refused", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_paths: ["/tmp/a.txt", "/tmp/b.csv"] } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(liveNative.sent.at(-1).error, /multiple_files_not_allowed/, "multiple paths are refused when the input lacks multiple support");
+  assert.equal(debuggerCalls.filter(call => call.method === "DOM.setFileInputFiles").length, filteredSelectionCount, "multiple-file refusal happens before CDP selection");
+  fileInputPolicyFixture = undefined;
   assert.ok(debuggerCalls.some(call => call.method === "DOM.setFileInputFiles" && call.target.sessionId === "fixture-oopif-session"), "upload selection routes to the exact frame CDP session");
   const fileSetCalls = debuggerCalls.filter(call => call.method === "DOM.setFileInputFiles").length;
   liveNative.hostMessage({ type: "command", id: "file-frame-stale", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "stale-loader", backend_node_id: 91, file_path: "/tmp/example" } });
@@ -1464,6 +2062,29 @@ async function waitFor(predicate, description) {
     "lazy input fallback refuses ambiguous file controls rather than selecting the wrong upload");
   fallbackFileInputDocument = undefined;
 
+  nestedFrameScrollFixture = true;
+  identityAxNodes = [{ nodeId: "nested-oopif-control", role: { value: "button" }, name: { value: "Nested control" }, backendDOMNodeId: 777 }];
+  attachNestedOopifParentOnNextAutoAttach = true;
+  let nestedSessionWaitCursor = reconnectTimers.length;
+  const nestedOopifPressCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length;
+  liveNative.hostMessage({ type: "command", id: "nested-oopif-frame-click-composed", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-oopif-frame-click-composed"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  const nestedClick = liveNative.sent.findLast(message => message.id === "nested-oopif-frame-click-composed")?.result;
+  assert.equal(nestedClick?.verified, true, JSON.stringify(liveNative.sent.findLast(message => message.id === "nested-oopif-frame-click-composed")));
+  const nestedPress = debuggerCalls.findLast(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed");
+  assert.equal(nestedPress?.params.x, 90, "nested OOPIF click composes nested owner and parent owner affine transforms");
+  assert.equal(nestedPress?.params.y, 108);
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length, nestedOopifPressCount + 1);
+  assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-parent-oopif-session" && call.method === "DOM.getFrameOwner" && call.params.frameId === "frame-nested"), "nested frame owner is resolved through its immediate OOPIF parent session");
+  debuggerEvent?.({ tabId: 95 }, "Target.detachedFromTarget", { sessionId: "fixture-parent-oopif-session" });
+  debuggerEvent?.({ tabId: 95 }, "Target.detachedFromTarget", { sessionId: "fixture-nested-oopif-session" });
+  nestedFrameScrollFixture = false;
+  identityAxNodes = [{ nodeId: "nested-scroll", role: { value: "generic" }, name: { value: "Nested scroll region" }, backendDOMNodeId: 777 }];
+
   identityAxNodes = [{ nodeId: "browse", role: { value: "button" }, name: { value: "Browse" }, backendDOMNodeId: 777 }];
   attachOopifOnNextAutoAttach = true;
   emitFileChooserOnFrameRelease = true;
@@ -1482,6 +2103,29 @@ async function waitFor(predicate, description) {
   frameActionable = true;
   liveNative.hostMessage({ type: "pair", request_id: "same-process-upload", tab_ids: [95], unrestricted: true, expected_urls: expectedUrls([95]), expected_document_ids: expectedDocuments([95]) });
   await new Promise(resolve => setTimeout(resolve, 0));
+  const scrollToDispatchStart = debuggerCalls.length;
+  scrollToGuardReceipt = { ok: true, phase: "after", dispatch_may_have_occurred: true, target_visible: true, center_hit: true, viewport: { width: 100, height: 80 }, center: { x: 50, y: 40 } };
+  liveNative.hostMessage({ type: "command", id: "scroll-to-target-verified", target_id: "95", method: "Controlla.scrollToTarget", params: {
+    object_id: "paired-document-object", index: 3, guard_function: "function(index,scrollRequest){return {ok:true}}",
+    scroll_request: "scroll-to-target-v1", timeout_ms: 1500
+  } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const scrollToResult = liveNative.sent.findLast(message => message.id === "scroll-to-target-verified")?.result;
+  assert.equal(scrollToResult?.status, "verified", JSON.stringify(scrollToResult));
+  assert.equal(scrollToResult?.target_visible, true);
+  assert.equal(scrollToResult?.center_hit, true);
+  assert.equal(debuggerCalls.slice(scrollToDispatchStart).some(call => call.method === "Input.dispatchMouseEvent"), false,
+    "semantic scroll-to-target uses guarded in-page scrolling and emits no pointer/wheel input");
+  scrollToGuardReceipt = { ok: false, phase: "before", dispatch_may_have_occurred: false, reason: "target_not_visible" };
+  liveNative.hostMessage({ type: "command", id: "scroll-to-target-refused", target_id: "95", method: "Controlla.scrollToTarget", params: {
+    object_id: "paired-document-object", index: 3, guard_function: "function(index,scrollRequest){return {ok:false}}",
+    scroll_request: "scroll-to-target-v1", timeout_ms: 1500
+  } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const scrollToRefusal = liveNative.sent.findLast(message => message.id === "scroll-to-target-refused")?.result;
+  assert.equal(scrollToRefusal?.status, "not_dispatched", JSON.stringify(scrollToRefusal));
+  assert.equal(scrollToRefusal?.dispatch_may_have_occurred, false);
+  scrollToGuardReceipt = { ok: true, phase: "after", dispatch_may_have_occurred: true, target_visible: true, center_hit: true };
   emitFileChooserOnRootRelease = true;
   liveNative.hostMessage({ type: "command", id: "same-process-frame-upload", target_id: "95", method: "Controlla.frameSelectFile", params: { frame_id: "frame-oopif", frame_loader_id: childFrameLoaderId, trigger_backend_node_id: 777, file_path: "/tmp/example" } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -1491,6 +2135,108 @@ async function waitFor(predicate, description) {
   const rootPress = debuggerCalls.findLast(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed");
   assert.equal(rootPress?.params.x, 140, "same-process frame click includes iframe offset and scale");
   assert.equal(rootPress?.params.y, 260);
+  attachOopifOnNextAutoAttach = true;
+  const frameWheelCountBeforeOopif = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
+  liveNative.hostMessage({ type: "command", id: "oopif-frame-scroll-refused", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-oopif", loader_id: childFrameLoaderId, backend_node_id: 777, delta_x: 0, delta_y: 120, timeout_ms: 1500 } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  reconnectTimers.findLast(timer => timer.delay === 400)?.callback();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const oopifScrollResult = liveNative.sent.findLast(message => message.id === "oopif-frame-scroll-refused")?.result;
+  assert.equal(oopifScrollResult?.status, "not_dispatched", JSON.stringify(oopifScrollResult));
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, frameWheelCountBeforeOopif, "OOPIF child-frame scroll fails closed before wheel delivery");
+  nestedFrameScrollFixture = true;
+  await chrome.tabs.update(95, { active: true });
+  identityAxNodes = [{ nodeId: "nested-scroll", role: { value: "generic" }, name: { value: "Nested scroll region" }, backendDOMNodeId: 777 }];
+  fixtureScrollTop = 20;
+  const nestedWheelStart = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
+  nestedSessionWaitCursor = reconnectTimers.length;
+  liveNative.hostMessage({ type: "command", id: "nested-same-process-frame-scroll", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, delta_x: 0, delta_y: 20, timeout_ms: 1500 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-same-process-frame-scroll"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  const nestedScrollResult = liveNative.sent.findLast(message => message.id === "nested-same-process-frame-scroll")?.result;
+  assert.equal(nestedScrollResult?.status, "verified", JSON.stringify(nestedScrollResult));
+  const nestedWheel = debuggerCalls.findLast(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel");
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, nestedWheelStart + 1);
+  assert.equal(nestedWheel?.params.x, 95, "nested affine frame point is composed through both owner transforms");
+  assert.equal(nestedWheel?.params.y, 110);
+  staleNestedAncestorFixture = true;
+  nestedFrameTreeReads = 0;
+  const staleNestedWheelCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
+  nestedSessionWaitCursor = reconnectTimers.length;
+  liveNative.hostMessage({ type: "command", id: "nested-stale-loader-refused", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, delta_x: 0, delta_y: 20, timeout_ms: 1500 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-stale-loader-refused"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  const staleNestedResult = liveNative.sent.findLast(message => message.id === "nested-stale-loader-refused")?.result;
+  assert.equal(staleNestedResult?.status, "not_dispatched", JSON.stringify(staleNestedResult));
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, staleNestedWheelCount, "stale nested loader refuses before wheel delivery");
+  staleNestedAncestorFixture = false;
+  reparentNestedFrameFixture = true;
+  nestedFrameTreeReads = 0;
+  const reparentClickCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length;
+  nestedSessionWaitCursor = reconnectTimers.length;
+  liveNative.hostMessage({ type: "command", id: "nested-reparent-refused", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-reparent-refused"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  assert.ok(liveNative.sent.some(message => message.id === "nested-reparent-refused"), "reparented frame action settles with an explicit refusal");
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length, reparentClickCount, "dynamic frame reparenting refuses before trusted input");
+  reparentNestedFrameFixture = false;
+  changingNestedTransformFixture = true;
+  nestedOwnerBoxReads = 0;
+  nestedSessionWaitCursor = reconnectTimers.length;
+  const changedTransformWheelCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
+  liveNative.hostMessage({ type: "command", id: "nested-transform-change-refused", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, delta_x: 0, delta_y: 20, timeout_ms: 1500 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-transform-change-refused"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  assert.equal(liveNative.sent.findLast(message => message.id === "nested-transform-change-refused")?.result?.status, "not_dispatched");
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, changedTransformWheelCount, "owner transform drift refuses before wheel delivery");
+  identityAxNodes = [{ nodeId: "nested-control", role: { value: "button" }, name: { value: "Nested control" }, backendDOMNodeId: 777 }];
+  nestedOwnerBoxReads = 0;
+  const changedTransformClickCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length;
+  liveNative.hostMessage({ type: "command", id: "nested-transform-click-refused", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-transform-click-refused"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  assert.match(liveNative.sent.findLast(message => message.id === "nested-transform-click-refused")?.error || "", /geometry changed before dispatch/i);
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length, changedTransformClickCount, "frame click refuses owner transform drift before trusted input");
+  identityAxNodes = [{ nodeId: "nested-scroll", role: { value: "generic" }, name: { value: "Nested scroll region" }, backendDOMNodeId: 777 }];
+  changingNestedTransformFixture = false;
+  nonAffineNestedTransformFixture = true;
+  nestedOwnerBoxReads = 0;
+  nestedSessionWaitCursor = reconnectTimers.length;
+  liveNative.hostMessage({ type: "command", id: "nested-non-affine-refused", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, delta_x: 0, delta_y: 20, timeout_ms: 1500 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-non-affine-refused"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  assert.equal(liveNative.sent.findLast(message => message.id === "nested-non-affine-refused")?.result?.status, "not_dispatched");
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, changedTransformWheelCount, "non-affine owner geometry refuses before wheel delivery");
+  nonAffineNestedTransformFixture = false;
+  nestedFrameScrollFixture = false;
+  identityAxNodes = [{ nodeId: "browse", role: { value: "button" }, name: { value: "Browse" }, backendDOMNodeId: 777 }];
+  frameShadowRootFixture = true;
+  const shadowRoutePressCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length;
+  liveNative.hostMessage({ type: "command", id: "shadow-root-frame-click", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-oopif", loader_id: childFrameLoaderId, backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(liveNative.sent.findLast(message => message.id === "shadow-root-frame-click")?.result?.verified, true,
+    "fresh, visible open-shadow controls in an attached frame can be clicked through the composed hit-test guard");
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length, shadowRoutePressCount + 1,
+    "open-shadow frame action dispatches one trusted click after the shadow-chain guard");
+  frameShadowRootFixture = false;
   frameOutcomeVerified = true;
   liveNative.hostMessage({ type: "command", id: "same-process-frame-click", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-oopif", loader_id: childFrameLoaderId, backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -1530,6 +2276,27 @@ async function waitFor(predicate, description) {
   assert.equal(emptyReadback?.network_events?.[0]?.status, 403, "failed picker upload response is retained with the selection error");
   assert.equal(emptyReadback?.network_events?.[0]?.host, "www.googleapis.com");
   assert.doesNotMatch(JSON.stringify(emptyReadback?.network_events), /fixture-secret|uploadType/);
+  networkEventsOnEnable = [
+    ["Network.requestWillBeSent", { requestId: "upload-stalled-request", type: "XHR", request: { url: uploadUrl, method: "POST" } }],
+  ];
+  emitFileChooserOnRootRelease = true;
+  const uploadStallWaitCursor = reconnectTimers.length;
+  liveNative.hostMessage({ type: "command", id: "upload-progress-stalled", target_id: "95", method: "Controlla.frameSelectFile", params: { frame_id: "frame-oopif", frame_loader_id: childFrameLoaderId, trigger_backend_node_id: 777, file_path: "/tmp/example" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  reconnectTimers.slice(uploadStallWaitCursor).findLast(timer => timer.delay === 400)?.callback();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  reconnectTimers.findLast(timer => timer.delay === 1200)?.callback();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const stalledUpload = liveNative.sent.findLast(message => message.id === "upload-progress-stalled")?.result;
+  assert.equal(stalledUpload?.status, "unknown", JSON.stringify(stalledUpload));
+  assert.equal(stalledUpload?.reason_code, "upload_network_stalled");
+  assert.equal(stalledUpload?.network_observation?.status, "stalled");
+  assert.equal(stalledUpload?.network_observation?.reason, "upload_response_not_observed");
+  assert.equal(stalledUpload?.network_observation?.pending_requests, 1);
+  assert.equal(stalledUpload?.network_observation?.observation_bound_ms, 1500);
+  assert.ok(stalledUpload?.network_observation?.observation_window_ms <= 1500);
+  assert.notEqual(stalledUpload?.status, "selected", "a pending upload request cannot be reported as selection success");
+  assert.doesNotMatch(JSON.stringify(stalledUpload?.network_events), /fixture-secret|uploadType/);
   navigateFrameDuringFileReadback = true;
   emitFileChooserOnRootRelease = true;
   liveNative.hostMessage({ type: "command", id: "navigating-frame-upload", target_id: "95", method: "Controlla.frameSelectFile", params: { frame_id: "frame-oopif", frame_loader_id: childFrameLoaderId, trigger_backend_node_id: 777, file_path: "/tmp/example" } });
@@ -1784,7 +2551,7 @@ async function waitFor(predicate, description) {
   overlapSameUrlNextNavigation = true;
   restartPort.hostMessage({ ...openRequest, id: "open-overlapping-same-url", params: { url: "https://example.test/overlap-same-url", idempotency_key: "client-fixture:overlap-same-url-1234" } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/,
+  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/, JSON.stringify(restartPort.sent.at(-1)) +
     "an older same-URL commit and DOMContentLoaded cannot satisfy a newer navigation attachment");
   const overlappingTab = tabList.find(tab => tab.url === "https://example.test/overlap-same-url");
   assert.ok(overlappingTab, "the failed open leaves the exact tab available for safe recovery");
@@ -1906,8 +2673,9 @@ async function waitFor(predicate, description) {
   navigationStartDuringAttach.add(pendingRaceTabId);
   restartPort.hostMessage({ type: "command", id: "navigation-started-during-attach", target_id: String(pendingRaceTabId), method: "Controlla.navigate", params: { url: "https://example.test/pending-race/first" } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.match(restartPort.sent.at(-1).error, /Tab changed during attachment/,
-    "a newer main-frame navigation survives an old-document DOMContentLoaded and fails closed");
+  const navigationAttachResult = restartPort.sent.findLast(message => message.id === "navigation-started-during-attach");
+  assert.match(navigationAttachResult.error, /Tab changed during attachment/, JSON.stringify(navigationAttachResult) +
+    " a newer main-frame navigation survives an old-document DOMContentLoaded and fails closed");
   tabsRemoved(pendingRaceTabId);
 
   const identityRaceOpen = { ...openRequest, id: "open-for-identity-race", params: { url: "https://example.test/identity-race", idempotency_key: "client-fixture:identity-race-1234" } };
@@ -1985,5 +2753,139 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(restartPort.sent.at(-1).reason_code, "screenshot_document_changed", "capture bytes from a replaced document are discarded");
 
-  console.log("Extension version handshake, pairing cleanup, chooser event routing, and command allowlist tests passed.");
+  restartPort.hostMessage({ type: "pair", request_id: "download-observer-pair", tab_ids: [98], unrestricted: true,
+    expected_urls: expectedUrls([98]), expected_document_ids: expectedDocuments([98]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const downloadUrl = "https://example.test/files/report.csv?fixture=1";
+  const sendDownloadCommand = async (id, params, tabId = 98) => {
+    restartPort.hostMessage({ type: "command", id, target_id: String(tabId), method: "Controlla.downloadLifecycle", params });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    return restartPort.sent.findLast(message => message.id === id);
+  };
+  const waitForNativeMessage = id => new Promise((resolve, reject) => {
+    const deadline = Date.now() + 3000;
+    const poll = () => {
+      const message = restartPort.sent.findLast(candidate => candidate.id === id);
+      if (message) resolve(message);
+      else if (Date.now() >= deadline) reject(new Error(`Timed out waiting for fixture message ${id}: ${JSON.stringify(restartPort.sent.filter(candidate => candidate.id === id))}`));
+      else setTimeout(poll, 1);
+    };
+    poll();
+  });
+  const staleDownloadArm = await sendDownloadCommand("download-stale-arm", {
+    action: "arm", expected_url: downloadUrl, expected_document_id: "wrong-document"
+  });
+  assert.match(staleDownloadArm.error, /current paired document identity/);
+  const armedDownload = await sendDownloadCommand("download-arm", {
+    action: "arm", expected_url: downloadUrl, expected_document_id: expectedDocuments([98])[98]
+  });
+  assert.equal(armedDownload.result.status, "armed");
+  const runtimeBoundArm = await sendDownloadCommand("download-runtime-bound-arm", {
+    action: "arm", expected_url: "https://example.test/files/runtime-bound.csv"
+  });
+  assert.equal(runtimeBoundArm.result.status, "armed");
+  assert.equal(runtimeBoundArm.result.document_id, expectedDocuments([98])[98],
+    "runtime can ask the extension to bind to its current paired document identity");
+  await sendDownloadCommand("download-runtime-bound-cleanup", {
+    action: "cancel", observer_id: runtimeBoundArm.result.observer_id
+  });
+  const observerId = armedDownload.result.observer_id;
+  const crossTargetWait = await sendDownloadCommand("download-cross-target", {
+    action: "wait", observer_id: observerId, timeout_ms: 100
+  }, 99);
+  assert.match(crossTargetWait.error, /stale or belongs to another target document/);
+  void sendDownloadCommand("download-wait-start", { action: "wait", observer_id: observerId, timeout_ms: 1000 });
+  emitDownloadCreated({ id: 9101, tabId: 98, url: downloadUrl, finalUrl: downloadUrl,
+    filename: "/Users/fixture/Downloads/report.csv", state: "in_progress", bytesReceived: 0, totalBytes: -1 });
+  const startedDownload = await waitForNativeMessage("download-wait-start");
+  assert.equal(startedDownload.result.status, "started");
+  assert.equal(startedDownload.result.filename, "report.csv", "download path is reduced to a safe basename");
+  assert.equal(startedDownload.result.bytes_received, 0);
+  assert.equal(startedDownload.result.file_path, undefined, "in-progress events never expose a file path for acquisition");
+  assert.equal(startedDownload.result.url_identity.matches_expected, true);
+  assert.equal(startedDownload.result.url_identity.url_sha256.length, 64);
+  assert.doesNotMatch(JSON.stringify(startedDownload.result), /fixture=1/, "signed/query URL text is not exposed");
+  void sendDownloadCommand("download-wait-complete", { action: "wait", observer_id: observerId, timeout_ms: 1000 });
+  emitDownloadChanged({ id: 9101, state: { current: "complete" }, bytesReceived: { current: 18 },
+    totalBytes: { current: 18 }, filename: { current: "/Users/fixture/Downloads/report.csv" } });
+  const completedDownload = await waitForNativeMessage("download-wait-complete");
+  assert.equal(completedDownload.result.status, "completed");
+  assert.equal(completedDownload.result.bytes_received, 18);
+  assert.equal(completedDownload.result.total_bytes, 18);
+  assert.equal(completedDownload.result.download_id, 9101, "completion is bound to the matched Chrome download ID");
+  assert.equal(completedDownload.result.file_path, "/Users/fixture/Downloads/report.csv",
+    "only the internally consumed completed event carries Chrome's file path");
+
+  const interruptedArm = await sendDownloadCommand("download-interrupted-arm", {
+    action: "arm", expected_url: "https://example.test/files/fail.bin", expected_document_id: expectedDocuments([98])[98]
+  });
+  const interruptedObserver = interruptedArm.result.observer_id;
+  void sendDownloadCommand("download-interrupted-wait", {
+    action: "wait", observer_id: interruptedObserver, timeout_ms: 1000
+  });
+  emitDownloadCreated({ id: 9102, tabId: 98, url: "https://example.test/files/fail.bin", finalUrl: "https://example.test/files/fail.bin",
+    filename: "/tmp/fail.bin", state: "in_progress", bytesReceived: 4, totalBytes: 12 });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await waitForNativeMessage("download-interrupted-wait");
+  void sendDownloadCommand("download-interrupted-terminal-wait", {
+    action: "wait", observer_id: interruptedObserver, timeout_ms: 1000
+  });
+  emitDownloadChanged({ id: 9102, state: { current: "interrupted" }, error: { current: "NETWORK_FAILED" }, bytesReceived: { current: 4 } });
+  assert.equal((await waitForNativeMessage("download-interrupted-terminal-wait")).result.status, "interrupted");
+
+  const timeoutArm = await sendDownloadCommand("download-timeout-arm", {
+    action: "arm", expected_url: "https://example.test/files/never.bin", expected_document_id: expectedDocuments([98])[98]
+  });
+  await sendDownloadCommand("download-timeout-wait", {
+    action: "wait", observer_id: timeoutArm.result.observer_id, timeout_ms: 50
+  });
+  reconnectTimers.findLast(timer => timer.delay === 50)?.callback();
+  const timedOut = await waitForNativeMessage("download-timeout-wait");
+  assert.equal(timedOut.result?.status, "timed_out", JSON.stringify(timedOut));
+  const timedOutObserverReuse = await sendDownloadCommand("download-timeout-cleanup", {
+    action: "wait", observer_id: timeoutArm.result.observer_id, timeout_ms: 5
+  });
+  assert.match(timedOutObserverReuse.error, /stale or belongs to another target document/);
+  const cancelArm = await sendDownloadCommand("download-cancel-arm", {
+    action: "arm", expected_url: "https://example.test/files/cancel.bin", expected_document_id: expectedDocuments([98])[98]
+  });
+  emitDownloadCreated({ id: 9103, tabId: 98, url: "https://example.test/files/cancel.bin", finalUrl: "https://example.test/files/cancel.bin",
+    filename: "/tmp/cancel.bin", state: "in_progress", bytesReceived: 0, totalBytes: 20 });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const cancelled = await sendDownloadCommand("download-cancel", { action: "cancel", observer_id: cancelArm.result.observer_id });
+  assert.equal(cancelled.result.status, "observer_cancelled");
+  assert.ok(cancelledDownloads.includes(9103));
+
+  const detachArm = await sendDownloadCommand("download-detach-arm", {
+    action: "arm", expected_url: "https://example.test/files/detach.bin", expected_document_id: expectedDocuments([98])[98]
+  });
+  void sendDownloadCommand("download-detach-wait", { action: "wait", observer_id: detachArm.result.observer_id, timeout_ms: 1000 });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  emitDownloadCreated({ id: 9104, tabId: 98, url: "https://example.test/files/detach.bin", finalUrl: "https://example.test/files/detach.bin",
+    filename: "/tmp/detach.bin", state: "in_progress", bytesReceived: 1, totalBytes: 9 });
+  debuggerDetached?.({ tabId: 98 }, "canceled_by_user");
+  const detachResult = await waitForNativeMessage("download-detach-wait");
+  assert.match(detachResult.error, /stale target/);
+  const detachedObserverReuse = await sendDownloadCommand("download-detach-reuse", {
+    action: "wait", observer_id: detachArm.result.observer_id, timeout_ms: 5
+  });
+  assert.match(detachedObserverReuse.error, /stale or belongs to another target document/, "an in-flight URL hash cannot resurrect an observer after detach");
+
+  restartPort.hostMessage({ type: "pair", request_id: "download-close-pair", tab_ids: [97], unrestricted: true,
+    expected_urls: expectedUrls([97]), expected_document_ids: expectedDocuments([97]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  restartPort.hostMessage({ type: "command", id: "download-close-arm", target_id: "97", method: "Controlla.downloadLifecycle", params: {
+    action: "arm", expected_url: "https://example.test/files/close.bin", expected_document_id: expectedDocuments([97])[97]
+  } });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const closeObserver = restartPort.sent.findLast(message => message.id === "download-close-arm").result.observer_id;
+  restartPort.hostMessage({ type: "command", id: "download-close-wait", target_id: "97", method: "Controlla.downloadLifecycle", params: {
+    action: "wait", observer_id: closeObserver, timeout_ms: 1000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  tabsRemoved?.(97);
+  const closeResult = await waitForNativeMessage("download-close-wait");
+  assert.match(closeResult.error, /stale target/);
+
+  console.log("Extension version handshake, pairing cleanup, chooser/download event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

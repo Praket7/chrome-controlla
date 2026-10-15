@@ -6,14 +6,14 @@ const MAX_LOCAL_ARTIFACT_BYTES: u64 = 10 * 1024 * 1024;
 
 pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
-    if input.is_empty() || input.len() > 14 * 1024 * 1024 {
-        return Err("base64 artifact must be between 1 and 10 MiB when decoded".into());
+    if input.len() > 14 * 1024 * 1024 {
+        return Err("base64 artifact must be at most 10 MiB when decoded".into());
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|_| "bytes_base64 must use standard padded Base64".to_owned())?;
-    if bytes.is_empty() || bytes.len() > MAX_LOCAL_ARTIFACT_BYTES as usize {
-        return Err("artifact bytes must be between 1 and 10485760 bytes".into());
+    if bytes.len() > MAX_LOCAL_ARTIFACT_BYTES as usize {
+        return Err("artifact bytes must be at most 10485760 bytes".into());
     }
     Ok(bytes)
 }
@@ -25,8 +25,8 @@ fn read_bounded<R: Read>(reader: R) -> Result<Vec<u8>, String> {
         .take(MAX_LOCAL_ARTIFACT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "artifact file_path could not be read".to_owned())?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_LOCAL_ARTIFACT_BYTES {
-        return Err("artifact file must be a regular file between 1 and 10485760 bytes".into());
+    if bytes.len() as u64 > MAX_LOCAL_ARTIFACT_BYTES {
+        return Err("artifact file must be a regular file no larger than 10485760 bytes".into());
     }
     Ok(bytes)
 }
@@ -50,8 +50,10 @@ pub fn read_local_file(path: &str) -> Result<Vec<u8>, String> {
         let metadata = file
             .metadata()
             .map_err(|_| "artifact file_path could not be opened".to_owned())?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
-            return Err("artifact file must be a regular file between 1 and 10485760 bytes".into());
+        if !metadata.is_file() || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
+            return Err(
+                "artifact file must be a regular file no larger than 10485760 bytes".into(),
+            );
         }
         read_bounded(file)
     }
@@ -69,8 +71,8 @@ pub fn persist_local_file(path: &str, bytes: &[u8]) -> Result<ArtifactExpectatio
         os::fd::{AsRawFd, FromRawFd},
     };
 
-    if bytes.is_empty() || bytes.len() as u64 > MAX_LOCAL_ARTIFACT_BYTES {
-        return Err("artifact bytes must be between 1 and 10485760 bytes".into());
+    if bytes.len() as u64 > MAX_LOCAL_ARTIFACT_BYTES {
+        return Err("artifact bytes must be no larger than 10485760 bytes".into());
     }
     let (directory, filename) = open_local_destination_parent(path)?;
 
@@ -378,6 +380,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn zero_byte_artifact_can_be_registered_and_persisted() {
+        let directory = temporary_directory("empty-artifact");
+        let source = directory.join("empty-source.bin");
+        let destination = directory.join("empty-download.bin");
+        std::fs::write(&source, b"").unwrap();
+
+        assert_eq!(
+            super::read_local_file(source.to_str().unwrap()).unwrap(),
+            b""
+        );
+        let receipt = super::persist_local_file(destination.to_str().unwrap(), b"").unwrap();
+        assert_eq!(receipt.byte_length, 0);
+        assert!(receipt.matches(b""));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn downloaded_artifact_rejects_relative_parent_and_symlink_paths() {
         assert!(persist_local_file("relative.bin", b"data").is_err());
         assert!(persist_local_file("/tmp/../tmp/traversal.bin", b"data").is_err());
@@ -456,13 +477,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn downloaded_artifact_enforces_nonempty_ten_mib_bound() {
+    fn downloaded_artifact_enforces_ten_mib_bound() {
         let directory = temporary_directory("download-size");
         let destination = directory.join("too-large.bin");
         let too_large = vec![0; 10 * 1024 * 1024 + 1];
         assert!(persist_local_file(destination.to_str().unwrap(), &too_large).is_err());
         assert!(!destination.exists());
-        assert!(persist_local_file(directory.join("empty.bin").to_str().unwrap(), b"").is_err());
+        let empty = directory.join("empty.bin");
+        let empty_receipt = persist_local_file(empty.to_str().unwrap(), b"").unwrap();
+        assert_eq!(empty_receipt.byte_length, 0);
+        assert_eq!(std::fs::read(empty).unwrap(), b"");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -574,7 +598,7 @@ mod tests {
         assert!(
             read_bounded(input)
                 .unwrap_err()
-                .contains("between 1 and 10485760 bytes")
+                .contains("no larger than 10485760 bytes")
         );
     }
 

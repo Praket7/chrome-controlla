@@ -36,7 +36,11 @@ fn fast_type_cdp_bound(params: &Value) -> u64 {
 }
 
 fn cdp_command_count_is_partial(method: &str, response_received: bool) -> bool {
-    method.starts_with("Controlla.") && (method != "Controlla.fastType" || !response_received)
+    method.starts_with("Controlla.")
+        && (!matches!(
+            method,
+            "Controlla.fastType" | "Controlla.humanTypeCharacter"
+        ) || !response_received)
 }
 #[cfg(all(test, unix))]
 use tokio_tungstenite::accept_async;
@@ -890,6 +894,10 @@ impl SharedExtensionSession {
         Ok(())
     }
 
+    pub fn remove_selected_target(&mut self, target_id: &str) -> bool {
+        self.selected_targets.remove(target_id)
+    }
+
     pub async fn command(
         &self,
         registry: &SessionRegistry,
@@ -1025,6 +1033,10 @@ impl SharedExtensionSession {
         let started = Instant::now();
         let cdp_budget_charge = if method == "Controlla.fastType" {
             fast_type_cdp_bound(&params)
+        } else if method == "Controlla.humanTypeCharacter" {
+            // One character reserves preflight, keydown, character, keyup and
+            // all retained-target guards before the bridge dispatches anything.
+            7
         } else {
             1
         };
@@ -1118,7 +1130,7 @@ impl SharedExtensionSession {
         pending_guard.disarm();
         crate::scheduler::telemetry::record_browser_command(
             1,
-            if method == "Controlla.fastType" {
+            if method == "Controlla.fastType" || method == "Controlla.humanTypeCharacter" {
                 result
                     .get("cdp_commands")
                     .and_then(Value::as_u64)
@@ -1134,7 +1146,11 @@ impl SharedExtensionSession {
         if let Some(error) = result.get("error") {
             return Err(ProviderError::Extension(error.to_string()));
         }
-        Ok(result.get("result").cloned().unwrap_or(Value::Null))
+        let value = result.get("result").cloned().unwrap_or(Value::Null);
+        if method == "Page.captureScreenshot" {
+            validate_screenshot_evidence(target_id, &value)?;
+        }
+        Ok(value)
     }
 
     async fn batch_wire(
@@ -1254,6 +1270,66 @@ impl SharedExtensionSession {
     }
 }
 
+fn validate_screenshot_evidence(target_id: &str, result: &Value) -> Result<(), ProviderError> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let data = result
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|data| data.starts_with("iVBOR") && data.len() <= 8 * 1024 * 1024)
+        .ok_or_else(|| {
+            ProviderError::Extension("screenshot payload is empty or oversized".into())
+        })?;
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| ProviderError::Extension("screenshot payload is not valid base64".into()))?;
+    let png_dimensions = png_dimensions(&png_bytes).ok_or_else(|| {
+        ProviderError::Extension("screenshot payload is not a bounded PNG image".into())
+    })?;
+    let evidence = result.get("visual_evidence").ok_or_else(|| {
+        ProviderError::Extension("screenshot omitted document-bound visual evidence".into())
+    })?;
+    let digest = Sha256::digest(&png_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let dimensions = evidence.get("dimensions").unwrap_or(&Value::Null);
+    if evidence["target_id"].as_str() != Some(target_id)
+        || evidence["document_id"].as_str().is_none_or(str::is_empty)
+        || evidence["captured_at_ms"].as_u64().is_none()
+        || evidence["capture_started_at_ms"].as_u64().is_none()
+        || evidence["image_sha256"].as_str() != Some(digest.as_str())
+        || evidence["visual_revision"].as_str() != Some(digest.as_str())
+        || evidence["target_lifecycle"].as_str() != Some("active")
+        || !evidence["render_revision"].is_null()
+        || dimensions["width"].as_u64() != Some(png_dimensions.0.into())
+        || dimensions["height"].as_u64() != Some(png_dimensions.1.into())
+    {
+        return Err(ProviderError::Extension(
+            "screenshot payload integrity or target identity did not match visual evidence".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24
+        || bytes.get(..8)? != b"\x89PNG\r\n\x1a\n"
+        || bytes.get(8..12)? != 13_u32.to_be_bytes()
+        || bytes.get(12..16)? != b"IHDR"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    (width > 0
+        && width <= 4096
+        && height > 0
+        && height <= 4096
+        && u64::from(width) * u64::from(height) <= 16_777_216)
+        .then_some((width, height))
+}
+
 impl Drop for SharedExtensionSession {
     fn drop(&mut self) {
         if let Some(task) = self.reader_task.take() {
@@ -1291,6 +1367,52 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_integrity_requires_matching_document_target_and_pixels() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAUAAAAC0";
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        let digest = Sha256::digest(&png_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let response = json!({"data":data,"visual_evidence":{"target_id":"41","document_id":"document-41","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":digest,"image_sha256":digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}}});
+        assert!(validate_screenshot_evidence("41", &response).is_ok());
+        assert!(
+            validate_screenshot_evidence("42", &response).is_err(),
+            "a hash-valid image cannot be rebound to another target"
+        );
+        let mut corrupt = response.clone();
+        corrupt["data"] = json!("iVBOR-corrupt-image");
+        assert!(
+            validate_screenshot_evidence("41", &corrupt).is_err(),
+            "changed pixels fail the independently recomputed digest"
+        );
+        let mut false_dimensions = response.clone();
+        false_dimensions["visual_evidence"]["dimensions"]["width"] = json!(1);
+        assert!(validate_screenshot_evidence("41", &false_dimensions).is_err());
+        let mut false_lifecycle = response.clone();
+        false_lifecycle["visual_evidence"]["target_lifecycle"] = json!("frozen");
+        assert!(validate_screenshot_evidence("41", &false_lifecycle).is_err());
+        let mut forged_render_revision = response.clone();
+        forged_render_revision["visual_evidence"]["render_revision"] = json!(digest);
+        assert!(validate_screenshot_evidence("41", &forged_render_revision).is_err());
+        let mut malformed_png = response.clone();
+        malformed_png["data"] = json!("iVBORw0KGgoAAAANSUhEUgAA");
+        assert!(validate_screenshot_evidence("41", &malformed_png).is_err());
+        let mut forged_text_hash = response.clone();
+        let text_digest = Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        forged_text_hash["visual_evidence"]["image_sha256"] = json!(text_digest.clone());
+        forged_text_hash["visual_evidence"]["visual_revision"] = json!(text_digest);
+        assert!(validate_screenshot_evidence("41", &forged_text_hash).is_err());
+    }
 
     #[test]
     fn shared_protocol_version_rejects_numeric_overflow_and_non_integer_values() {

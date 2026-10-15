@@ -287,3 +287,141 @@ pub fn resolve_widget(item: &Value) -> Option<&'static WidgetAdapter> {
 pub fn classify_widget(item: &Value) -> Option<WidgetKind> {
     resolve_widget(item).map(|adapter| adapter.kind)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn generic_value_widgets_have_bounded_plans_and_exact_postconditions() {
+        let cases = [
+            (
+                json!({"role":"textbox","name":"Date","control_type":"date"}),
+                WidgetKind::DatePicker,
+                "2026-10-14",
+                vec![
+                    WidgetCommand::Focus,
+                    WidgetCommand::SetNativeValue,
+                    WidgetCommand::ReadValue,
+                ],
+            ),
+            (
+                json!({"role":"textbox","name":"Time","control_type":"time"}),
+                WidgetKind::TimePicker,
+                "14:30",
+                vec![
+                    WidgetCommand::Focus,
+                    WidgetCommand::SetNativeValue,
+                    WidgetCommand::ReadValue,
+                ],
+            ),
+            (
+                json!({"role":"slider","name":"Volume","raw_value":"3","min":"0","max":"10","step":"1"}),
+                WidgetKind::Slider,
+                "5",
+                vec![WidgetCommand::SetNativeValue, WidgetCommand::ReadValue],
+            ),
+            (
+                json!({"role":"group","name":"Date range","widget_kind":"date_range"}),
+                WidgetKind::DateRange,
+                "2026-10-14/2026-10-15",
+                vec![
+                    WidgetCommand::SetRangeStart,
+                    WidgetCommand::SetRangeEnd,
+                    WidgetCommand::ReadValue,
+                ],
+            ),
+            (
+                json!({"role":"combobox","name":"Tags","multiple":true}),
+                WidgetKind::MultiSelect,
+                "Tag A",
+                vec![WidgetCommand::ClickOption, WidgetCommand::ReadSelected],
+            ),
+            (
+                json!({"role":"combobox","name":"Search","tag":"input"}),
+                WidgetKind::SearchableCombobox,
+                "Option A",
+                vec![
+                    WidgetCommand::Focus,
+                    WidgetCommand::TypeText,
+                    WidgetCommand::ClickOption,
+                    WidgetCommand::ReadSelected,
+                ],
+            ),
+            (
+                json!({"role":"treeitem","name":"Folder"}),
+                WidgetKind::TreeSelect,
+                "Folder",
+                vec![WidgetCommand::ClickOption, WidgetCommand::ReadSelected],
+            ),
+            (
+                json!({"role":"button","name":"Details","expanded":false}),
+                WidgetKind::Disclosure,
+                "true",
+                vec![WidgetCommand::ClickOption, WidgetCommand::ReadSelected],
+            ),
+            (
+                json!({"role":"tab","name":"Overview"}),
+                WidgetKind::TabSet,
+                "Overview",
+                vec![WidgetCommand::ClickOption, WidgetCommand::ReadSelected],
+            ),
+        ];
+        for (item, kind, desired, commands) in cases {
+            let plan =
+                plan_widget(&item, desired).unwrap_or_else(|| panic!("missing plan for {item}"));
+            assert_eq!(plan.kind, kind, "{item}");
+            assert_eq!(plan.commands, commands, "{item}");
+            assert_eq!(plan.max_commands, commands.len(), "{item}");
+            assert!(postcondition_matches(&plan, desired, true));
+            assert!(!postcondition_matches(&plan, "mismatch", true));
+            assert!(!postcondition_matches(&plan, desired, false));
+        }
+        assert!(
+            plan_widget(
+                &json!({"role":"group","name":"Date range","widget_kind":"date_range"}),
+                "2026-02-30/2026-03-01"
+            )
+            .is_none()
+        );
+        assert!(
+            plan_widget(
+                &json!({"role":"group","name":"Date range","widget_kind":"date_range"}),
+                "2026-03-02/2026-03-01"
+            )
+            .is_none()
+        );
+        assert!(
+            plan_widget(
+                &json!({"role":"textbox","name":"Date","control_type":"date"}),
+                &"x".repeat(4097)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn untrusted_or_unbounded_widget_shapes_fail_closed_with_routing_fallbacks() {
+        for item in [
+            json!({"role":"combobox","name":"Upload","control_type":"file"}),
+            json!({"role":"button","name":"Reveal","hover_reveals":true}),
+            json!({"role":"generic","name":"Canvas","widget_kind":"map"}),
+            json!({"role":"generic","name":"Drop","widget_kind":"drag_drop"}),
+            json!({"role":"generic","name":"Mystery","widget_kind":"unknown"}),
+            json!({"role":"tab","name":"  "}),
+        ] {
+            assert!(
+                plan_widget(&item, "value").is_none(),
+                "unsupported shape got a mutation plan: {item}"
+            );
+        }
+        assert!(
+            resolve_widget(&json!({"role":"treeitem","name":"Folder"})).is_some(),
+            "tree selection is a routing hint; the runtime still requires a fresh exact subtarget"
+        );
+        assert!(!uses_action_outcome_verification(WidgetKind::TreeSelect));
+        assert!(uses_action_outcome_verification(WidgetKind::Disclosure));
+        assert!(uses_action_outcome_verification(WidgetKind::TabSet));
+    }
+}

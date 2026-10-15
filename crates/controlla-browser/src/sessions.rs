@@ -6,6 +6,7 @@
 
 use crate::{FrameRecord, TargetRecord};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -187,8 +188,44 @@ impl ArtifactHandle {
 pub struct ArtifactMetadata {
     pub handle: ArtifactHandle,
     pub filename: String,
+    pub mime: String,
     pub size: usize,
+    pub sha256: String,
+    pub source_identity: Option<serde_json::Value>,
+    pub expires_at_ms: u64,
     pub scope: ArtifactScope,
+}
+
+const ARTIFACT_TTL_MS: u64 = 60 * 60 * 1000;
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn artifact_mime(filename: &str) -> &'static str {
+    match filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+    {
+        Some(extension) => match extension.as_str() {
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "txt" => "text/plain",
+            "csv" => "text/csv",
+            "json" => "application/json",
+            "html" | "htm" => "text/html",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            _ => "application/octet-stream",
+        },
+        None => "application/octet-stream",
+    }
 }
 
 #[derive(Debug)]
@@ -469,12 +506,20 @@ impl SessionRegistry {
         bytes: &[u8],
         scope: ArtifactScope,
     ) -> Result<ArtifactMetadata, SessionError> {
+        self.put_artifact_bytes_scoped_with_source(session, filename, bytes, scope, None)
+    }
+
+    pub fn put_artifact_bytes_scoped_with_source(
+        &mut self,
+        session: &SessionHandle,
+        filename: &str,
+        bytes: &[u8],
+        scope: ArtifactScope,
+        source_identity: Option<serde_json::Value>,
+    ) -> Result<ArtifactMetadata, SessionError> {
         self.validate_clipboard_session(session)?;
         if !valid_artifact_filename(filename) {
             return Err(SessionError::ArtifactInvalidFilename);
-        }
-        if bytes.is_empty() {
-            return Err(SessionError::ArtifactEmpty);
         }
         if bytes.len() > MAX_ARTIFACT_BYTES {
             return Err(SessionError::ArtifactTooLarge);
@@ -530,7 +575,14 @@ impl SessionRegistry {
             let metadata = ArtifactMetadata {
                 handle: handle.clone(),
                 filename: filename.to_owned(),
+                mime: artifact_mime(filename).to_owned(),
                 size: bytes.len(),
+                sha256: sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                source_identity,
+                expires_at_ms: unix_epoch_ms().saturating_add(ARTIFACT_TTL_MS),
                 scope,
             };
             self.artifacts
@@ -557,6 +609,7 @@ impl SessionRegistry {
         self.artifacts
             .get(&session.id)
             .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .filter(|item| item.metadata.expires_at_ms > unix_epoch_ms())
             .map(|item| item.metadata.clone())
             .ok_or(SessionError::ArtifactNotFound)
     }
@@ -574,6 +627,7 @@ impl SessionRegistry {
             .artifacts
             .get(&session.id)
             .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .filter(|item| item.metadata.expires_at_ms > unix_epoch_ms())
             .ok_or(SessionError::ArtifactNotFound)?;
         let mut file = std::fs::File::open(&item.path).map_err(|_| SessionError::ArtifactIo)?;
         let mut bytes = Vec::with_capacity(item.metadata.size);
@@ -582,9 +636,6 @@ impl SessionRegistry {
             .take((MAX_ARTIFACT_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| SessionError::ArtifactIo)?;
-        if bytes.is_empty() {
-            return Err(SessionError::ArtifactEmpty);
-        }
         if bytes.len() > MAX_ARTIFACT_BYTES {
             return Err(SessionError::ArtifactTooLarge);
         }
@@ -608,6 +659,7 @@ impl SessionRegistry {
         self.artifacts
             .get(session_id)
             .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .filter(|item| item.metadata.expires_at_ms > unix_epoch_ms())
             .map(|item| item.path.as_path())
             .ok_or(SessionError::ArtifactNotFound)
     }
@@ -629,6 +681,7 @@ impl SessionRegistry {
         self.artifacts
             .get(session_id)
             .and_then(|items| items.values().find(|item| item.metadata.handle == *handle))
+            .filter(|item| item.metadata.expires_at_ms > unix_epoch_ms())
             .map(|item| item.metadata.clone())
             .ok_or(SessionError::ArtifactNotFound)
     }
@@ -973,6 +1026,18 @@ impl SessionRegistry {
             },
         );
         Ok(())
+    }
+
+    pub fn unregister_tab(
+        &mut self,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<bool, SessionError> {
+        let tabs = self
+            .tabs
+            .get_mut(session_id)
+            .ok_or(SessionError::UnknownSession)?;
+        Ok(tabs.remove(target_id).is_some())
     }
 
     /// Record ownership from a provider-created target receipt.
@@ -1376,10 +1441,6 @@ mod tests {
             Err(SessionError::ArtifactInvalidFilename)
         );
         assert_eq!(
-            registry.put_artifact_bytes(&alice, "empty", b""),
-            Err(SessionError::ArtifactEmpty)
-        );
-        assert_eq!(
             registry.put_artifact_bytes(&alice, "large", &vec![0; MAX_ARTIFACT_BYTES + 1]),
             Err(SessionError::ArtifactTooLarge)
         );
@@ -1421,6 +1482,94 @@ mod tests {
         assert_eq!(
             registry.artifact_metadata(&alice, &artifact.handle),
             Err(SessionError::UnknownSession)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_metadata_binds_mime_hash_source_and_expiry() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..Default::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: vec![],
+                },
+                "alice",
+            )
+            .unwrap();
+        let source = serde_json::json!({"kind":"browser_download","tab_id":"tab-a"});
+        let artifact = registry
+            .put_artifact_bytes_scoped_with_source(
+                &session,
+                "report.pdf",
+                b"verified bytes",
+                ArtifactScope::PrivateHeadlessSession,
+                Some(source.clone()),
+            )
+            .unwrap();
+        assert_eq!(artifact.mime, "application/pdf");
+        assert_eq!(artifact.size, 14);
+        assert_eq!(
+            artifact.sha256,
+            sha2::Sha256::digest(b"verified bytes")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(artifact.source_identity, Some(source));
+        assert!(artifact.expires_at_ms > unix_epoch_ms());
+        assert_eq!(
+            registry
+                .artifact_metadata(&session, &artifact.handle)
+                .unwrap(),
+            artifact
+        );
+        let stored = registry
+            .artifacts
+            .get_mut(&session.id)
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        stored.metadata.expires_at_ms = 0;
+        assert_eq!(
+            registry.artifact_metadata(&session, &artifact.handle),
+            Err(SessionError::ArtifactNotFound)
+        );
+        assert_eq!(
+            registry.read_artifact_bytes(&session, &artifact.handle),
+            Err(SessionError::ArtifactNotFound)
+        );
+    }
+
+    #[test]
+    fn zero_byte_artifact_can_be_staged_and_read_as_an_empty_file() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headless: true,
+            ..Default::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headless,
+                    selected_target_ids: vec![],
+                },
+                "zero-byte-artifact-fixture",
+            )
+            .unwrap();
+        let artifact = registry
+            .put_artifact_bytes(&session, "empty.bin", b"")
+            .expect("empty file is a valid artifact");
+        assert_eq!(artifact.size, 0);
+        assert_eq!(
+            registry
+                .read_artifact_bytes(&session, &artifact.handle)
+                .unwrap(),
+            b""
         );
     }
 
@@ -1573,10 +1722,13 @@ mod tests {
             id: format!("frame-{target_id}"),
             parent_id: None,
             target_id: target_id.to_owned(),
+            session_id: None,
             loader_id: Some("loader-1".to_owned()),
+            origin: None,
             execution_context_ids: vec![1],
             generation: 1,
             revision: 1,
+            transform_revision: 1,
         }
     }
 
@@ -1757,6 +1909,29 @@ mod tests {
         assert_eq!(closed, vec!["owned-2"]);
         assert_eq!(receipt.preserved.len(), 2);
         assert!(receipt.remaining.is_empty());
+    }
+
+    #[test]
+    fn popup_adoption_rollback_unregisters_only_the_borrowed_candidate() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            shared_extension: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Shared,
+                    selected_target_ids: vec!["opener".into()],
+                },
+                "alice",
+            )
+            .unwrap();
+        registry
+            .register_tab(&session.id, "popup", Ownership::Borrowed)
+            .unwrap();
+        assert!(registry.unregister_tab(&session.id, "popup").unwrap());
+        assert!(!registry.unregister_tab(&session.id, "popup").unwrap());
+        assert!(!registry.unregister_tab(&session.id, "unknown").unwrap());
     }
 
     #[test]

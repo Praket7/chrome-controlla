@@ -200,10 +200,10 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     let schema_bytes = serde_json::to_vec(&tools.tools).unwrap().len();
     eprintln!(
         "default MCP tool schemas: {schema_bytes} bytes ({} KiB budget)",
-        (47 * 1024) / 1024
+        (60 * 1024) / 1024
     );
     assert!(
-        schema_bytes <= 47 * 1024,
+        schema_bytes <= 60 * 1024,
         "default tool schema budget is {schema_bytes} bytes"
     );
 
