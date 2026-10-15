@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { analyzePaired, evaluateClaimGate } from '../analysis/phase11-analysis.mjs';
 import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config, liveTaskUrl } from './phase11-runner.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -89,6 +90,25 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     assert.equal(row.candidate.authority_violations, 0);
     assert.equal(row.candidate.silent_stale_mutations, 0);
   }
+});
+
+test('adapter crashes retain elapsed wall time and leave unobserved counters unknown', async () => {
+  const report = await runBenchmark({
+    baselineId: 'playwright-mcp', fixtureBaseUrl: 'https://fixtures.example.test/',
+    commands: { controlla: [node, '-e', 'process.exit(1)'], 'playwright-mcp': adapter('playwright-mcp', 120, 3) },
+    resetCommand: reset, verifierCommand: verifier, environment,
+    modes: ['warm_skill'], concurrencyLevels: [1], repetitions: 1, deadlineMs: 1000
+  });
+  const failed = report.paired_rows[0].candidate;
+  assert.equal(failed.success, false);
+  assert.ok(failed.wall_ms >= 0 && failed.wall_ms <= 1000);
+  for (const field of ['model_round_trips', 'mcp_calls', 'browser_ops', 'retries', 'verification_ms', 'severe_wrong_target_events']) {
+    assert.equal(failed[field], null, `${field} must remain unknown after an adapter crash`);
+  }
+  const analysis = analyzePaired(report.paired_rows, { iterations: 100, seed: 8 });
+  assert.equal(analysis.model_round_trip_reduction, null);
+  assert.equal(analysis.severe_wrong_target_events, null);
+  assert.equal(evaluateClaimGate(analysis).checks.severe_wrong_target, false);
 });
 
 test('prompt-to-verified ends at the independent verifier, not an acting-client receipt', async () => {

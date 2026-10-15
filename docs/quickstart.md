@@ -36,8 +36,8 @@ Run these steps from the Controlla checkout you intend to use. Do not load a par
 
 Use the [browser-control skill](../packages/chrome-controlla/plugin/skills/browser-control/SKILL.md) as the full tool contract. If the client cannot load skills, follow these rules:
 
-1. Read the six live tool schemas once when a task starts, and again after an MCP reload. Call `browser` `describe` to learn the active interaction policy. Do not guess field names or reference formats. If the available tools are legacy names such as `session` or `observe`, stop and configure the V3 executable above.
-2. Use `browser` to discover and explicitly select existing tabs, or to open a new foreground tab. Follow `describe` for guarded versus local-unrestricted pairing. For a new logical open, supply a unique `idempotency_key`; reuse that same key only to recover that same open. Reuse the selected tab when the task asks to continue there.
+1. Use the six V3 schemas already supplied by the MCP. Do not call `describe`, list schemas, or perform discovery for an ordinary task. After a reload, use the newly supplied schema directly; diagnose only after an actual tool error. If the available tools are legacy names such as `session` or `observe`, configure the V3 executable above.
+2. For an exact existing tab, use its already-bound `session_id` and `chrome_tab_id`; do not call `open`. `browser action=open` always creates a new tab. Use `mode:"background"` with `target_policy:"create_background_window"` only when a separate unfocused automation window is explicitly requested. For each new target, supply a unique `idempotency_key` and reuse it only to recover that same open.
 3. Take one `snapshot` scoped to the decision. Use a single bounded `workflow` for known multi-step tasks instead of repeating snapshot/find/action calls. Choose a target from fresh evidence and keep its returned reference; do not infer a target from tab order or page position.
 4. Use `extract` for bounded structured page data and `verify` for an independent postcondition. Report success only when the returned evidence proves it. After an `unknown` or `dispatched` mutation, inspect or verify the result; never replay it blindly.
 5. For “newest” or “latest,” gather the complete relevant candidate set and rank by observed published time. If dates are missing or coverage is incomplete, report that uncertainty instead of guessing.
@@ -49,6 +49,8 @@ Use the [browser-control skill](../packages/chrome-controlla/plugin/skills/brows
 - **Existing page:** in guarded mode, discover tabs, select exact decimal tab IDs, pair once, accept once, then snapshot and run one workflow. In local-unrestricted mode, follow `describe`'s bootstrap route.
 - **Simple known change:** use one `act` with a fresh snapshot reference, then check its verified receipt. Do not take another full snapshot when the receipt already proves the requested result.
 - **Upload:** register only the requested file in the active session, use an observed file input/trigger and the required acceptance predicate, and continue only after `application_accepted:true`. That proves app acceptance, not persistence; verify persistence separately when the task requires it.
+
+`act` accepts `value` for `fill`, `secure_fill`, `type`, `select`, and `slider`; the last three require a value. `verify(text_present)` supports root text, a unique CSS selector, a fresh `@cN` reference, or a fresh loader-bound `@f:` frame reference. Omit `mode` when continuing or releasing a known browser session; Controlla uses the session's mode and rejects an explicit conflict. Background pointer actions on inactive user tabs are refused without activation.
 
 ## Troubleshooting
 

@@ -50,7 +50,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-peer WS handshake + hello bound: one silent local connection must not
 /// consume the whole pairing window and starve the legitimate extension.
 const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const SHARED_MESSAGE_LIMIT: usize = 1_048_576;
+const SHARED_COMMAND_LIMIT: usize = 1_048_576;
+const SHARED_RESULT_LIMIT: usize = 10 * 1024 * 1024;
 const SHARED_PROTOCOL_VERSION: u32 = 2;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -647,8 +648,8 @@ impl SharedExtensionProvider {
                 ));
             }
             let mut socket_config = WebSocketConfig::default();
-            socket_config.max_message_size = Some(SHARED_MESSAGE_LIMIT);
-            socket_config.max_frame_size = Some(SHARED_MESSAGE_LIMIT);
+            socket_config.max_message_size = Some(SHARED_RESULT_LIMIT);
+            socket_config.max_frame_size = Some(SHARED_RESULT_LIMIT);
             // Bound one peer's WS handshake + hello to a short slice of the
             // total pairing window so a single silent connection cannot consume
             // the entire pairing deadline and block the real extension. A timed
@@ -900,9 +901,13 @@ impl SharedExtensionSession {
         self.authorize_command(registry, session, target_id, method)?;
         let target_id = target_id.to_owned();
         let method = method.to_owned();
-        self.scheduler
-            .run_target(&target_id, self.command_wire(&target_id, &method, params))
-            .await
+        let gate_method = method.clone();
+        let dispatch = self.command_wire(&target_id, &method, params);
+        let gated = async move {
+            let _permit = crate::cancellation::admit_browser_command(&gate_method).await?;
+            dispatch.await
+        };
+        self.scheduler.run_target(&target_id, gated).await
     }
 
     pub async fn command_batch(
@@ -932,13 +937,21 @@ impl SharedExtensionSession {
         for action in &actions {
             self.authorize_command(registry, session, target_id, &action.method)?;
         }
+        let has_mutation = actions
+            .iter()
+            .any(|action| crate::cancellation::may_mutate(&action.method));
         let target_id = target_id.to_owned();
-        self.scheduler
-            .run_target(
-                &target_id,
-                self.batch_wire(&target_id, actions, deadline_ms),
-            )
-            .await
+        let method = if has_mutation {
+            "Runtime.callFunctionOn"
+        } else {
+            "Runtime.getProperties"
+        };
+        let dispatch = self.batch_wire(&target_id, actions, deadline_ms);
+        let gated = async move {
+            let _permit = crate::cancellation::admit_browser_command(method).await?;
+            dispatch.await
+        };
+        self.scheduler.run_target(&target_id, gated).await
     }
 
     /// Run a shared-document mutation under both the tab actor and document
@@ -956,12 +969,14 @@ impl SharedExtensionSession {
         let target_id = target_id.to_owned();
         let document_id = document_id.to_owned();
         let method = method.to_owned();
+        let gate_method = method.clone();
+        let dispatch = self.command_wire(&target_id, &method, params);
+        let gated = async move {
+            let _permit = crate::cancellation::admit_browser_command(&gate_method).await?;
+            dispatch.await
+        };
         self.scheduler
-            .run_document_mutation(
-                &target_id,
-                &document_id,
-                self.command_wire(&target_id, &method, params),
-            )
+            .run_document_mutation(&target_id, &document_id, gated)
             .await
     }
 
@@ -1137,7 +1152,7 @@ impl SharedExtensionSession {
             .collect::<Vec<_>>();
         let request = json!({"type":"batch","id":id,"target_id":target_id,"deadline_ms":deadline_ms,"actions":wire_actions});
         let serialized = request.to_string();
-        if serialized.len() > SHARED_MESSAGE_LIMIT {
+        if serialized.len() > SHARED_COMMAND_LIMIT {
             return Err(ProviderError::Extension(
                 "batch request exceeds the shared-message limit".into(),
             ));
@@ -3940,7 +3955,7 @@ list.addEventListener('scroll',render);render();
                     .unwrap();
                 assert!(matches!(rejected, Some(Ok(Message::Close(_))) | None));
                 let (mut bad, _) = connect_async(&endpoint).await.unwrap();
-                let oversized = "x".repeat(SHARED_MESSAGE_LIMIT + 1);
+                let oversized = "x".repeat(SHARED_COMMAND_LIMIT + 1);
                 let _ = bad.send(Message::Text(oversized.into())).await;
                 // The legitimate extension pairs right after the bad peer.
                 let (mut good, _) = connect_async(&endpoint).await.unwrap();

@@ -55,7 +55,13 @@ const packageArchive = (await readdir(out)).find((name) => name.endsWith('.tgz')
 if (!packageArchive) throw new Error('npm pack did not produce an archive');
 
 const extensionArchive = `chrome-controlla-extension-${packageJson.version}.tar.gz`;
-run('tar', ['-czf', path.join(out, extensionArchive), '-C', path.join(root, 'extensions/chrome-controlla'), 'manifest.json', 'background.js', 'popup.html', 'popup.js', 'README.md']);
+const extensionFiles = ['manifest.json', 'background.js', 'popup.html', 'popup.js', 'secure-input.html', 'secure-input.js', 'secure-input.css', 'open-recovery.html', 'README.md'];
+const extensionArchivePath = path.join(out, extensionArchive);
+run('tar', ['-czf', extensionArchivePath, '-C', path.join(root, 'extensions/chrome-controlla'), ...extensionFiles]);
+const archivedExtensionFiles = new Set(run('tar', ['-tzf', extensionArchivePath], { stdio: 'pipe' }).trim().split('\n'));
+for (const file of extensionFiles) {
+  if (!archivedExtensionFiles.has(file)) throw new Error(`Chrome extension archive is missing required runtime asset: ${file}`);
+}
 
 const metadata = JSON.parse(run('cargo', ['metadata', '--locked', '--format-version', '1', '--filter-platform', rustTarget], { stdio: 'pipe' }));
 if (!metadata.resolve) throw new Error('cargo metadata did not resolve the Controlla CLI dependency graph');

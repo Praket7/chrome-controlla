@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -55,16 +56,23 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
                 let mut socket = accept_async(stream).await.map_err(|e| e.to_string())?;
                 let hello = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "hello timed out".to_owned())?.ok_or("provider socket closed before hello")?.map_err(|e| e.to_string())?;
                 let hello: Value = serde_json::from_str(hello.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"protocol_version":1,"batch_execution":true,"batch_deadline":true}) {
+                if hello != json!({"type":"hello","token":"fixture-secret","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"extension_build_id":env!("CONTROLLA_EXTENSION_BUILD_ID"),"document_identity":true,"protocol_version":2,"batch_execution":true,"batch_deadline":true}) {
                     return Err(format!("unexpected provider hello: {hello}"));
                 }
-                socket.send(Message::Text(json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION")}).to_string().into())).await.map_err(|e| e.to_string())?;
+                socket.send(Message::Text(json!({"type":"ready","server_version":env!("CARGO_PKG_VERSION"),"protocol_version":2}).to_string().into())).await.map_err(|e| e.to_string())?;
                 ready_tx.send(()).map_err(|e| e.to_string())?;
                 socket.send(Message::Text(json!({"type":"command","id":7,"target_id":"42","method":"Runtime.evaluate","params":{"expression":"1+1"}}).to_string().into())).await.map_err(|e| e.to_string())?;
                 let result = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "command result timed out".to_owned())?.ok_or("provider socket closed before result")?.map_err(|e| e.to_string())?;
                 let result: Value = serde_json::from_str(result.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 if result != json!({"type":"result","id":7,"result":{"result":{"type":"number","value":2}}}) {
                     return Err(format!("unexpected command result: {result}"));
+                }
+                socket.send(Message::Text(json!({"type":"command","id":9,"target_id":"42","method":"Page.captureScreenshot","params":{"format":"png","fromSurface":true,"captureBeyondViewport":false,"clip":{"x":0,"y":0,"width":320,"height":180,"scale":1}}}).to_string().into())).await.map_err(|e| e.to_string())?;
+                let screenshot = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "screenshot result timed out".to_owned())?.ok_or("provider socket closed before screenshot result")?.map_err(|e| e.to_string())?;
+                let screenshot: Value = serde_json::from_str(screenshot.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                let expected_data = format!("{}{}", "A".repeat(512 * 1024), "BCDE");
+                if screenshot != json!({"type":"result","id":9,"lease_id":"roundtrip-1","result":{"data":expected_data}}) {
+                    return Err(format!("unexpected native-host screenshot assembly: id={}, data_len={}", screenshot["id"], screenshot["result"]["data"].as_str().map(str::len).unwrap_or(0)));
                 }
                 socket.send(Message::Text(json!({"type":"batch","id":8,"target_id":"42","actions":[{"method":"Input.dispatchKeyEvent","params":{"type":"keyDown","key":"x"}}],"deadline_ms":5000}).to_string().into())).await.map_err(|e| e.to_string())?;
                 let batch = tokio::time::timeout(TIMEOUT, socket.next()).await.map_err(|_| "batch result timed out".to_owned())?.ok_or("provider socket closed before batch result")?.map_err(|e| e.to_string())?;
@@ -158,7 +166,7 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         );
         write_native(
             &mut input,
-            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"document_identity":true,"batch_execution":true,"batch_deadline":true}),
+            json!({"type":"paired","request_id":"roundtrip-1","targets":["42"],"extension_version":env!("CARGO_PKG_VERSION"),"extension_build_id":env!("CONTROLLA_EXTENSION_BUILD_ID"),"protocol_version":2,"document_identity":true,"batch_execution":true,"batch_deadline":true}),
         );
         ready_rx.recv_timeout(TIMEOUT).unwrap_or_else(|e| {
             let _ = std::process::Command::new("kill")
@@ -182,6 +190,26 @@ fn native_host_roundtrips_authenticated_provider_command_and_releases() {
         write_native(
             &mut input,
             json!({"type":"result","id":7,"result":{"result":{"type":"number","value":2}}}),
+        );
+        let screenshot_command = loop {
+            let msg = next();
+            if msg["type"] == "command" && msg["id"] == 9 {
+                break msg;
+            }
+        };
+        assert_eq!(screenshot_command["method"], "Page.captureScreenshot");
+        let screenshot_data = format!("{}{}", "A".repeat(512 * 1024), "BCDE");
+        let digest = Sha256::digest(screenshot_data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        write_native(
+            &mut input,
+            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":1,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"chunk":"BCDE"}),
+        );
+        write_native(
+            &mut input,
+            json!({"type":"result_chunk","id":9,"lease_id":"roundtrip-1","transfer_id":"native-survival","index":0,"total_chunks":2,"total_chars":screenshot_data.len(),"base64_sha256":digest,"chunk":"A".repeat(512 * 1024)}),
         );
         let batch_deadline = Instant::now() + TIMEOUT;
         let batch = loop {

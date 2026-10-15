@@ -147,7 +147,7 @@ function compactTool(tool) {
       description: 'Optional high-level goal compiled into the shortest verified browser path. Prefer this for supported common tasks instead of manually orchestrating snapshots and actions.'
     };
     if (properties.action) {
-      properties.action.description = 'Browser operation. Use open for normal foreground navigation. When goal is present, use action=open.';
+      properties.action.description = 'Browser operation. action=open always creates a new target; use exact existing session_id and chrome_tab_id for an existing tab. For a separate unfocused automation window use mode=background and target_policy=create_background_window.';
     }
     if (properties.url) {
       properties.url.description = 'Direct HTTP(S) destination when known. Prefer the most specific known destination over a homepage.';

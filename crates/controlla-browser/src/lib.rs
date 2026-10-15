@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod blocking;
+pub mod cancellation;
 pub mod coordination;
 mod input;
 pub mod input_planner;
@@ -476,6 +477,7 @@ impl BrowserConnection {
         crate::scheduler::telemetry::admit_cdp_commands(1)
             .await
             .map_err(|reason| BrowserError::Connection(reason.into()))?;
+        let _dispatch_permit = cancellation::admit_browser_command(&method).await?;
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
         self.outgoing

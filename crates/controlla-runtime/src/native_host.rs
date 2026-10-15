@@ -3,6 +3,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(unix)]
@@ -19,6 +20,148 @@ use tokio_tungstenite::{
 };
 
 const MAX_MESSAGE: usize = 1_048_576;
+const MAX_SCREENSHOT_CHARS: usize = 8 * 1024 * 1024;
+const SCREENSHOT_CHUNK_CHARS: usize = 512 * 1024;
+const MAX_SCREENSHOT_CHUNKS: usize = 16;
+const MAX_SCREENSHOT_TRANSFERS: usize = 4;
+const SCREENSHOT_TRANSFER_TTL: Duration = Duration::from_secs(15);
+
+struct ScreenshotTransfer {
+    lease_id: String,
+    total_chunks: usize,
+    total_chars: usize,
+    base64_sha256: String,
+    chunks: Vec<Option<String>>,
+    started_at: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct ScreenshotAssembler {
+    transfers: HashMap<(String, u64, String), ScreenshotTransfer>,
+}
+
+impl ScreenshotAssembler {
+    fn expire(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.transfers
+            .retain(|_, transfer| transfer.started_at + SCREENSHOT_TRANSFER_TTL > now);
+    }
+
+    fn abort(&mut self, message: &Value) -> Result<(), &'static str> {
+        let id = message["id"]
+            .as_u64()
+            .ok_or("screenshot abort ID is invalid")?;
+        let lease = message["lease_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("screenshot abort lease is missing")?;
+        let transfer = message["transfer_id"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or("screenshot abort transfer ID is invalid")?;
+        self.transfers
+            .remove(&(lease.to_owned(), id, transfer.to_owned()));
+        Ok(())
+    }
+
+    fn push(&mut self, message: &Value) -> Result<Option<Value>, String> {
+        self.expire();
+        let now = tokio::time::Instant::now();
+        let id = message["id"]
+            .as_u64()
+            .ok_or("screenshot chunk id is invalid")?;
+        let lease_id = message["lease_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("screenshot chunk lease is missing")?
+            .to_owned();
+        let transfer_id = message["transfer_id"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or("screenshot transfer ID is invalid")?
+            .to_owned();
+        let index = message["index"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("screenshot chunk index is invalid")?;
+        let total_chunks = message["total_chunks"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (2..=MAX_SCREENSHOT_CHUNKS).contains(value))
+            .ok_or("screenshot chunk count is out of bounds")?;
+        let total_chars = message["total_chars"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (*value > SCREENSHOT_CHUNK_CHARS) && (*value <= MAX_SCREENSHOT_CHARS))
+            .ok_or("screenshot transfer length is out of bounds")?;
+        let base64_sha256 = message["base64_sha256"]
+            .as_str()
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or("screenshot transfer digest is invalid")?
+            .to_ascii_lowercase();
+        let chunk = message["chunk"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= SCREENSHOT_CHUNK_CHARS)
+            .ok_or("screenshot chunk is empty or oversized")?;
+        if index >= total_chunks {
+            return Err("screenshot chunk index exceeds chunk count".into());
+        }
+        let expected_chunks = total_chars.div_ceil(SCREENSHOT_CHUNK_CHARS);
+        let expected_len = if index + 1 == expected_chunks {
+            total_chars - index * SCREENSHOT_CHUNK_CHARS
+        } else {
+            SCREENSHOT_CHUNK_CHARS
+        };
+        if total_chunks != expected_chunks || chunk.len() != expected_len {
+            return Err("screenshot chunk geometry is inconsistent".into());
+        }
+        let key = (lease_id.clone(), id, transfer_id.clone());
+        if !self.transfers.contains_key(&key) && self.transfers.len() >= MAX_SCREENSHOT_TRANSFERS {
+            return Err("too many concurrent screenshot transfers".into());
+        }
+        let transfer = self
+            .transfers
+            .entry(key.clone())
+            .or_insert_with(|| ScreenshotTransfer {
+                lease_id,
+                total_chunks,
+                total_chars,
+                base64_sha256: base64_sha256.clone(),
+                chunks: vec![None; total_chunks],
+                started_at: now,
+            });
+        if transfer.total_chunks != total_chunks
+            || transfer.total_chars != total_chars
+            || transfer.base64_sha256 != base64_sha256
+            || transfer.chunks[index].is_some()
+        {
+            self.transfers.remove(&key);
+            return Err("screenshot chunk metadata changed or index was repeated".into());
+        }
+        transfer.chunks[index] = Some(chunk.to_owned());
+        if transfer.chunks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        let transfer = self
+            .transfers
+            .remove(&key)
+            .expect("completed transfer exists");
+        let data = transfer.chunks.into_iter().flatten().collect::<String>();
+        if data.len() != transfer.total_chars {
+            return Err("screenshot transfer length did not match its declaration".into());
+        }
+        let digest = Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if digest != transfer.base64_sha256 {
+            return Err("screenshot transfer digest mismatch".into());
+        }
+        Ok(Some(
+            json!({"type":"result","id":id,"lease_id":transfer.lease_id,"result":{"data":data}}),
+        ))
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct Pairing {
@@ -41,6 +184,7 @@ struct NativeReply {
     kind: String,
     targets: Option<Vec<String>>,
     extension_version: Option<String>,
+    extension_build_id: Option<String>,
     document_identity: Option<bool>,
     #[serde(default)]
     batch_execution: bool,
@@ -288,9 +432,11 @@ where
     } else {
         paired.protocol_version
     };
-    if protocol_version < 2 && extension_version != env!("CARGO_PKG_VERSION") {
-        return Err("extension/server version mismatch".into());
-    }
+    let expected_build_id = validate_extension_compatibility(
+        protocol_version,
+        &extension_version,
+        paired.extension_build_id.as_deref(),
+    )?;
     if paired.document_identity != Some(true) {
         return Err(
             "extension lacks durable document identity support; reload the updated extension"
@@ -316,7 +462,7 @@ where
         .send(Message::Text(
             json!({
                 "type":"hello", "token":pairing.token, "targets":targets,
-                "extension_version":extension_version, "document_identity":true,
+                "extension_version":extension_version, "extension_build_id":expected_build_id, "document_identity":true,
                 "protocol_version":protocol_version,
                 "batch_execution":paired.batch_execution, "batch_deadline":paired.batch_deadline
             })
@@ -350,6 +496,31 @@ where
     }
     *provider_ready = true;
     proxy(native_rx, output, &mut socket, &pairing.request_id).await
+}
+
+fn validate_extension_compatibility(
+    protocol_version: u32,
+    extension_version: &str,
+    extension_build_id: Option<&str>,
+) -> Result<String, String> {
+    if protocol_version < 2 {
+        return Err(format!(
+            "extension protocol {protocol_version} is unsupported; reload the matching Controlla extension"
+        ));
+    }
+    if extension_version != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "extension version mismatch: expected {}, received {extension_version}",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    let expected_build_id = env!("CONTROLLA_EXTENSION_BUILD_ID").to_owned();
+    if extension_build_id != Some(expected_build_id.as_str()) {
+        return Err(format!(
+            "extension build identity mismatch: expected {expected_build_id}; reload the matching Controlla extension"
+        ));
+    }
+    Ok(expected_build_id)
 }
 
 async fn notify_pair_error(pairing: &Pairing, error: &str) -> Result<(), String> {
@@ -470,11 +641,25 @@ where
         + Unpin,
     S::Error: std::fmt::Display,
 {
+    let mut screenshot_transfers = ScreenshotAssembler::default();
+    let mut cleanup_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            _ = cleanup_tick.tick() => screenshot_transfers.expire(),
             native = native_rx.recv() => {
                 let message = native.ok_or("native port closed")??;
                 match message["type"].as_str() {
+                    Some("result_chunk") => match screenshot_transfers.push(&message) {
+                        Ok(Some(assembled)) => socket.send(Message::Text(assembled.to_string().into())).await.map_err(|error| error.to_string())?,
+                        Ok(None) => {},
+                        Err(error) => socket.send(Message::Text(json!({"type":"result","id":message["id"],
+                            "lease_id":lease_id,"error":error}).to_string().into())).await.map_err(|send_error| send_error.to_string())?,
+                    },
+                    Some("result_chunk_abort") => {
+                        screenshot_transfers.abort(&message).map_err(str::to_owned)?;
+                        socket.send(Message::Text(json!({"type":"result","id":message["id"],
+                            "lease_id":lease_id,"error":"Screenshot transfer was explicitly aborted.","reason_code":"screenshot_transfer_aborted"}).to_string().into())).await.map_err(|error| error.to_string())?;
+                    }
                     Some("result" | "batch_result") if message["id"].is_u64() || message["id"].is_string() => {
                         socket.send(Message::Text(message.to_string().into())).await.map_err(|error| error.to_string())?;
                     }
@@ -485,6 +670,13 @@ where
                 Some(Ok(Message::Text(text))) => {
                     if text.len() > MAX_MESSAGE { return Err("provider message exceeds size limit".into()); }
                     let mut value: Value = serde_json::from_str(&text).map_err(|_| "provider sent invalid JSON".to_owned())?;
+                    if value["type"] == "cancel_screenshot" {
+                        let id = value["id"].as_u64().ok_or("screenshot cancellation ID is invalid")?;
+                        value["lease_id"] = json!(lease_id);
+                        value["id"] = json!(id);
+                        write_shared_message(&output, &value).await?;
+                        continue;
+                    }
                     if !matches!(value["type"].as_str(), Some("command" | "batch")) { return Err("provider sent an unsupported message".into()); }
                     value["lease_id"] = json!(lease_id);
                     write_shared_message(&output, &value).await?;
@@ -607,6 +799,116 @@ where
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[test]
+    fn extension_pairing_requires_matching_protocol_version_and_build_identity() {
+        let version = env!("CARGO_PKG_VERSION");
+        let build = env!("CONTROLLA_EXTENSION_BUILD_ID").to_owned();
+        assert_eq!(
+            validate_extension_compatibility(2, version, Some(&build)).unwrap(),
+            build
+        );
+        assert!(
+            validate_extension_compatibility(1, version, Some(&build))
+                .unwrap_err()
+                .contains("protocol 1")
+        );
+        assert!(
+            validate_extension_compatibility(2, "0.0.0", Some(&build))
+                .unwrap_err()
+                .contains("version mismatch")
+        );
+        assert!(
+            validate_extension_compatibility(2, version, None)
+                .unwrap_err()
+                .contains("build identity mismatch")
+        );
+        assert!(
+            validate_extension_compatibility(2, version, Some("stale-build"))
+                .unwrap_err()
+                .contains("build identity mismatch")
+        );
+        let stale_same_version = format!("controlla-chrome-extension:{version}:{}", "0".repeat(64));
+        assert_ne!(build, stale_same_version);
+        assert!(
+            validate_extension_compatibility(2, version, Some(&stale_same_version))
+                .unwrap_err()
+                .contains("build identity mismatch")
+        );
+    }
+
+    #[test]
+    fn extension_build_id_matches_every_shipped_runtime_asset() {
+        let assets: &[(&str, &[u8])] = &[
+            (
+                "background.js",
+                include_bytes!("../../../extensions/chrome-controlla/background.js"),
+            ),
+            (
+                "manifest.json",
+                include_bytes!("../../../extensions/chrome-controlla/manifest.json"),
+            ),
+            (
+                "open-recovery.html",
+                include_bytes!("../../../extensions/chrome-controlla/open-recovery.html"),
+            ),
+            (
+                "popup.html",
+                include_bytes!("../../../extensions/chrome-controlla/popup.html"),
+            ),
+            (
+                "popup.js",
+                include_bytes!("../../../extensions/chrome-controlla/popup.js"),
+            ),
+            (
+                "secure-input.css",
+                include_bytes!("../../../extensions/chrome-controlla/secure-input.css"),
+            ),
+            (
+                "secure-input.html",
+                include_bytes!("../../../extensions/chrome-controlla/secure-input.html"),
+            ),
+            (
+                "secure-input.js",
+                include_bytes!("../../../extensions/chrome-controlla/secure-input.js"),
+            ),
+        ];
+        let extension_source = include_str!("../../../extensions/chrome-controlla/background.js");
+        let asset_declaration = extension_source
+            .split_once("const CONTROLLA_EXTENSION_BUILD_ASSETS = [")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(assets, _)| assets)
+            .expect("extension declares its build asset set");
+        let extension_assets = asset_declaration
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extension_assets,
+            assets.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "native-host and extension build asset lists must be identical and ordered"
+        );
+        let mut digest = Sha256::new();
+        for (name, bytes) in assets {
+            digest.update(name.as_bytes());
+            digest.update([0]);
+            digest.update(bytes);
+            digest.update([0]);
+        }
+        let digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            env!("CONTROLLA_EXTENSION_BUILD_ID"),
+            format!(
+                "controlla-chrome-extension:{}:{digest}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
 
     #[tokio::test]
     async fn native_message_round_trips_and_rejects_oversize() {
@@ -785,5 +1087,125 @@ mod tests {
         assert!(read_pairing(&link).await.is_err());
         let _ = tokio::fs::remove_file(link).await;
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn screenshot_chunks_reassemble_out_of_order_and_verify_digest() {
+        let data = format!("{}{}", "A".repeat(SCREENSHOT_CHUNK_CHARS), "BCDEFG");
+        let digest = Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let chunk = |index: usize, value: &str, digest: &str| {
+            json!({
+                "type":"result_chunk","id":7,"lease_id":"lease-a","transfer_id":"transfer-a",
+                "index":index,"total_chunks":2,"total_chars":data.len(),"base64_sha256":digest,"chunk":value
+            })
+        };
+        let mut assembler = ScreenshotAssembler::default();
+        assert!(
+            assembler
+                .push(&chunk(1, "BCDEFG", &digest))
+                .unwrap()
+                .is_none()
+        );
+        let complete = assembler
+            .push(&chunk(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete["type"], "result");
+        assert_eq!(complete["id"], 7);
+        assert_eq!(complete["result"]["data"], data);
+    }
+
+    #[test]
+    fn screenshot_chunk_abort_releases_partial_payload_immediately() {
+        let data = format!("{}{}", "A".repeat(SCREENSHOT_CHUNK_CHARS), "BCDEFG");
+        let digest = Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let first = json!({"id":19,"lease_id":"lease-x","transfer_id":"transfer-x","index":0,
+            "total_chunks":2,"total_chars":data.len(),"base64_sha256":digest,"chunk":"A".repeat(SCREENSHOT_CHUNK_CHARS)});
+        let mut assembler = ScreenshotAssembler::default();
+        assert!(assembler.push(&first).unwrap().is_none());
+        assert_eq!(assembler.transfers.len(), 1);
+        assembler
+            .abort(&json!({"id":19,"lease_id":"lease-x","transfer_id":"transfer-x"}))
+            .unwrap();
+        assert!(
+            assembler.transfers.is_empty(),
+            "aborted screenshot bytes are discarded immediately"
+        );
+    }
+
+    #[test]
+    fn screenshot_chunk_transfer_expiry_releases_partial_payload() {
+        let key = (
+            "lease-expired".to_owned(),
+            27,
+            "transfer-expired".to_owned(),
+        );
+        let mut assembler = ScreenshotAssembler::default();
+        assembler.transfers.insert(
+            key.clone(),
+            ScreenshotTransfer {
+                lease_id: key.0.clone(),
+                total_chunks: 2,
+                total_chars: SCREENSHOT_CHUNK_CHARS + 1,
+                base64_sha256: "0".repeat(64),
+                chunks: vec![Some("A".repeat(SCREENSHOT_CHUNK_CHARS)), None],
+                started_at: tokio::time::Instant::now()
+                    - SCREENSHOT_TRANSFER_TTL
+                    - Duration::from_millis(1),
+            },
+        );
+        assembler.expire();
+        assert!(
+            assembler.transfers.is_empty(),
+            "expired partial screenshot bytes are dropped"
+        );
+    }
+
+    #[test]
+    fn screenshot_chunks_reject_replays_corruption_and_bad_geometry() {
+        let data = format!("{}{}", "A".repeat(SCREENSHOT_CHUNK_CHARS), "BCDEFG");
+        let digest = Sha256::digest(data.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let message = |index: usize, chunk: &str, hash: &str, total_chars: usize| {
+            json!({
+                "type":"result_chunk","id":8,"lease_id":"lease-a","transfer_id":"transfer-b",
+                "index":index,"total_chunks":2,"total_chars":total_chars,"base64_sha256":hash,"chunk":chunk
+            })
+        };
+        let mut assembler = ScreenshotAssembler::default();
+        let first = message(0, &data[..SCREENSHOT_CHUNK_CHARS], &digest, data.len());
+        assert!(assembler.push(&first).unwrap().is_none());
+        assert!(assembler.push(&first).is_err());
+        assert!(assembler.transfers.is_empty());
+        assert!(
+            assembler
+                .push(&message(1, "BCDEFG", &"0".repeat(64), data.len()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            assembler
+                .push(&message(
+                    0,
+                    &data[..SCREENSHOT_CHUNK_CHARS],
+                    &"0".repeat(64),
+                    data.len()
+                ))
+                .is_err()
+        );
+        assert!(assembler.transfers.is_empty());
+        assert!(
+            assembler
+                .push(&message(0, "short", &digest, data.len()))
+                .is_err()
+        );
     }
 }

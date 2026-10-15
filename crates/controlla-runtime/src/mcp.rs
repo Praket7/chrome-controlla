@@ -154,6 +154,8 @@ struct SharedTabArgs {
         description = "Optional readiness gate for action=open: document_committed attaches at the navigation commit; dom_content_loaded waits for the root document readiness event. Defaults to dom_content_loaded."
     )]
     wait_until: Option<String>,
+    create_background_window: Option<bool>,
+    target_window_id: Option<u64>,
 }
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ExtractArgs {
@@ -195,6 +197,8 @@ struct WorkflowArgs {
 struct WorkflowStatusArgs {
     session_id: String,
     operation_id: String,
+    #[serde(default)]
+    cancel: bool,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -2235,20 +2239,34 @@ impl App {
 
     #[tool(
         name = "workflow_status",
-        description = "Read the durable status and latest persisted checkpoint for a workflow operation."
+        description = "Read the durable status and latest checkpoint for a workflow operation. Set cancel=true to atomically stop an accepted or between-dispatch job; a possibly in-flight remote operation cannot be cancelled and must be reconciled."
     )]
     async fn workflow_status(
         &self,
         Parameters(args): Parameters<WorkflowStatusArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let cancellation_requested = if args.cancel {
+            self.jobs
+                .cancel(&self.principal, &args.session_id, &args.operation_id)
+                .map_err(|error| invalid(error.to_string()))?
+        } else {
+            false
+        };
         let operation = self
             .jobs
             .get(&self.principal, &args.session_id, &args.operation_id)
             .map_err(|error| invalid(error.to_string()))?
             .ok_or_else(|| invalid("unknown operation_id for this session"))?;
-        Ok(rmcp::handler::server::wrapper::Json(
-            operation_response(operation, true).map_err(invalid)?,
-        ))
+        let mut response = operation_response(operation, true).map_err(invalid)?;
+        if args.cancel {
+            response["cancellation_requested"] = json!(cancellation_requested);
+            response["cancellation_boundary"] = json!(if cancellation_requested {
+                "fenced_before_next_dispatch"
+            } else {
+                "operation_may_be_in_flight_or_already_terminal"
+            });
+        }
+        Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
     #[tool(
@@ -4425,9 +4443,196 @@ impl App {
         &self,
         Parameters(args): Parameters<SharedTabArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
-        validate_shared_url(&args.url)?;
+        if matches!(args.action.as_str(), "open" | "navigate") {
+            validate_shared_url(&args.url)?;
+        } else if !args.url.is_empty() {
+            return Err(invalid("lifecycle actions do not accept url"));
+        }
+        if args.action == "close_owned" {
+            let target = args
+                .chrome_tab_id
+                .as_deref()
+                .ok_or_else(|| invalid("chrome_tab_id is required to close an owned tab"))?;
+            if target.parse::<u32>().is_err() {
+                return Err(invalid("chrome_tab_id must be a decimal Chrome tab ID"));
+            }
+            let shared = self
+                .shared_sessions
+                .lock()
+                .await
+                .get(&args.session_id)
+                .cloned()
+                .ok_or_else(|| invalid("unknown shared session_id"))?;
+            let shared = shared.lock().await;
+            if shared.handle.principal != self.principal.as_ref() {
+                return Err(invalid("session is not owned by this server principal"));
+            }
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            let source = connection.selected_targets().iter().find(|candidate| candidate.as_str() != target)
+                .cloned()
+                .ok_or_else(|| invalid("close_owned needs another still-open tab in this session to verify the target lifecycle"))?;
+            let receipt = connection
+                .command(
+                    shared.registry()?,
+                    &shared.handle,
+                    &source,
+                    "Controlla.closeOwnedTab",
+                    json!({"owned_tab_id":target}),
+                )
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if receipt["status"] != "closed"
+                || receipt["topology_verified"] != true
+                || receipt["tab_id"] != target
+            {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"unknown","reason":"Chrome did not independently confirm closure of the exact Controlla-owned tab","receipt":receipt}),
+                ));
+            }
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"closed","verified":true,"receipt":receipt}),
+            ));
+        }
+        if args.action == "move_owned" {
+            if !args.url.is_empty()
+                || args.idempotency_key.is_some()
+                || args.active.is_some()
+                || args.wait_until.is_some()
+                || args.create_background_window == Some(true)
+            {
+                return Err(invalid(
+                    "move_owned accepts only session_id, chrome_tab_id, and target_window_id",
+                ));
+            }
+            let target = args
+                .chrome_tab_id
+                .as_deref()
+                .ok_or_else(|| invalid("chrome_tab_id is required"))?;
+            let window_id = args
+                .target_window_id
+                .ok_or_else(|| invalid("target_window_id is required"))?;
+            let shared = self
+                .shared_sessions
+                .lock()
+                .await
+                .get(&args.session_id)
+                .cloned()
+                .ok_or_else(|| invalid("unknown shared session_id"))?;
+            let shared = shared.lock().await;
+            if shared.handle.principal != self.principal.as_ref() {
+                return Err(invalid("session is not owned by this server principal"));
+            }
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            let source = connection
+                .selected_targets()
+                .iter()
+                .find(|candidate| candidate.as_str() != target)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid("move_owned needs another still-open source tab in this session")
+                })?;
+            let receipt = connection
+                .command(
+                    shared.registry()?,
+                    &shared.handle,
+                    &source,
+                    "Controlla.moveOwnedTab",
+                    json!({"owned_tab_id":target,"target_window_id":window_id}),
+                )
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if receipt["status"] != "moved"
+                || receipt["topology_verified"] != true
+                || receipt["tab_id"] != target
+                || receipt["window_id"].as_u64() != Some(window_id)
+            {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"unknown","reason":"Chrome did not independently confirm the exact moved tab and destination window","receipt":receipt}),
+                ));
+            }
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"moved","verified":true,"receipt":receipt}),
+            ));
+        }
+        if args.action == "activate_owned" {
+            if args.active.is_some()
+                || args.wait_until.is_some()
+                || args.create_background_window == Some(true)
+                || args.target_window_id.is_some()
+            {
+                return Err(invalid(
+                    "activate_owned accepts only session_id, chrome_tab_id, and idempotency_key",
+                ));
+            }
+            let target = args
+                .chrome_tab_id
+                .as_deref()
+                .ok_or_else(|| invalid("chrome_tab_id is required"))?;
+            if target.parse::<u32>().is_err() {
+                return Err(invalid("chrome_tab_id must be a decimal Chrome tab ID"));
+            }
+            let idempotency_key = args
+                .idempotency_key
+                .as_deref()
+                .filter(|key| {
+                    !key.is_empty() && key.len() <= 128 && key.chars().all(|c| c.is_ascii_graphic())
+                })
+                .ok_or_else(|| {
+                    invalid(
+                        "activate_owned requires a 1–128 character printable ASCII idempotency_key",
+                    )
+                })?;
+            let shared = self
+                .shared_sessions
+                .lock()
+                .await
+                .get(&args.session_id)
+                .cloned()
+                .ok_or_else(|| invalid("unknown shared session_id"))?;
+            let shared = shared.lock().await;
+            if shared.handle.principal != self.principal.as_ref() {
+                return Err(invalid("session is not owned by this server principal"));
+            }
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            let source = connection.selected_targets().iter().find(|candidate| candidate.as_str() != target).cloned()
+                .ok_or_else(|| invalid("activate_owned needs another still-open tab in this session to verify the target"))?;
+            let receipt = connection
+                .command(
+                    shared.registry()?,
+                    &shared.handle,
+                    &source,
+                    "Controlla.activateOwnedTab",
+                    json!({"owned_tab_id":target,"idempotency_key":idempotency_key}),
+                )
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if receipt["status"] != "activated"
+                || receipt["topology_verified"] != true
+                || receipt["tab_id"] != target
+                || receipt["tab_active"] != true
+                || receipt["window_focused"] != true
+            {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"unknown","reason":"Chrome did not verify activation and focus of the exact Controlla-owned tab","receipt":receipt}),
+                ));
+            }
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"activated","verified":true,"receipt":receipt}),
+            ));
+        }
         if args.action != "open" && args.action != "navigate" {
-            return Err(invalid("shared_tab action must be open or navigate"));
+            return Err(invalid(
+                "shared_tab action must be open, navigate, close_owned, move_owned, or activate_owned",
+            ));
         }
         if args
             .wait_until
@@ -4443,6 +4648,21 @@ impl App {
         }
         if args.action != "open" && args.active.is_some() {
             return Err(invalid("active is supported only for action=open"));
+        }
+        if args.action != "open" && args.create_background_window == Some(true) {
+            return Err(invalid(
+                "background window policy and placement are supported only for action=open",
+            ));
+        }
+        if args.action != "open" && args.action != "move_owned" && args.target_window_id.is_some() {
+            return Err(invalid(
+                "target_window_id is supported only for action=open or move_owned",
+            ));
+        }
+        if args.create_background_window == Some(true) && args.active.unwrap_or(true) {
+            return Err(invalid(
+                "create_background_window requires active=false so the created Chrome window remains unfocused",
+            ));
         }
         if args.action == "open" && args.idempotency_key.as_deref().is_none_or(str::is_empty) {
             return Err(invalid(
@@ -4508,7 +4728,7 @@ impl App {
                 &shared.handle,
                 &source,
                 method,
-                json!({"url":args.url,"idempotency_key":args.idempotency_key,"active":args.active.unwrap_or(true),"wait_until":args.wait_until.unwrap_or_else(|| "dom_content_loaded".into())}),
+                json!({"url":args.url,"idempotency_key":args.idempotency_key,"active":args.active.unwrap_or(true),"wait_until":args.wait_until.unwrap_or_else(|| "dom_content_loaded".into()),"create_background_window":args.create_background_window.unwrap_or(false),"target_window_id":args.target_window_id}),
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
@@ -5777,6 +5997,49 @@ mod tests {
         assert!(status.is_err());
         client.cancel().await.unwrap();
         server.waiting().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_status_cancel_fences_a_running_job_before_next_dispatch() {
+        let jobs = crate::jobs::Journal::open(":memory:").unwrap();
+        let operation = jobs
+            .admit(
+                "server-principal",
+                "session",
+                "cancel-key",
+                &json!({"op":"observe"}),
+            )
+            .unwrap()
+            .operation;
+        assert!(
+            jobs.start("server-principal", "session", &operation.id)
+                .unwrap()
+        );
+        let app = App::with_principal_and_journal("server-principal", jobs.clone());
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = serve_directly::<RoleServer, _, _, _, _>(app, server_io, None);
+        let client = ().serve(client_io).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("workflow_status").with_arguments(
+                    json!({"session_id":"session","operation_id":operation.id,"cancel":true})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(response["status"], "cancelled");
+        assert_eq!(response["cancellation_requested"], true);
+        assert!(matches!(
+            jobs.record_dispatch("server-principal", "session", &operation.id, "late"),
+            Err(crate::jobs::JournalError::InvalidTransition("dispatch"))
+        ));
+        drop(client);
+        server.cancel().await.unwrap();
     }
 
     #[test]

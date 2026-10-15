@@ -4,6 +4,8 @@ Guide version: `clients-2026-10-06-v1`. Server package: `controlla-runtime` `0.1
 
 The current agent interface is the V3 six-tool MCP: `browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`. For a source checkout, build both binaries with `cargo build --locked --release -p controlla-runtime --bins`: `target/release/controlla` registers the native host, and `target/release/controlla-v2 mcp` runs the V3 MCP. Do not configure the source `controlla mcp` command when you want the V3 tools; that executable serves the legacy tool contract. The packaged launcher `bin/controlla mcp` routes to V3. The optional HTTP server is authenticated and loopback-only. Each concurrently running MCP process needs a unique absolute `CONTROLLA_STATE_DIR`. Shared-tab control uses Chrome's native messaging bridge; it does not use a remote debugging port. See [`quickstart.md`](quickstart.md) for the shortest setup and agent workflow.
 
+Runtime contract notes: `act` accepts `value` for `fill`, `secure_fill`, `type`, `select`, and `slider`; `type`, `select`, and `slider` require it. `verify(text_present)` can read bounded root text, a unique CSS-selected region, a fresh `@cN` semantic reference, or a fresh loader-bound `@f:` frame. Incomplete or truncated evidence cannot prove absence. Existing-session operations infer their mode when omitted, and reject an explicit mode that contradicts the session. Background pointer input to an inactive user-owned tab returns `not_dispatched` without activating it.
+
 ## One-time Chrome bridge setup
 
 For a first install, follow [`quickstart.md`](quickstart.md). Install once per Chrome profile; all local MCP clients can use the same registered bridge. Give each concurrently running MCP process its own `CONTROLLA_STATE_DIR`. Each session owns its selected tabs independently: releasing one session leaves other sessions attached, while a tab already leased by another session is rejected with a clear error. Multiple simultaneous sessions require the current extension and native host protocol; an older extension continues to support one session and tells you to reload before enabling concurrency.
@@ -28,6 +30,10 @@ For a generic stdio client, the entry is:
 ```
 
 Use the client-specific format below when its config schema differs. Keep the state directory absolute and unique for each running process. A successful MCP tool listing proves only that the client started the server; it does not prove the Chrome extension/native host connection.
+
+### Legacy V2 `session` workflow
+
+The following `session` protocol is for legacy V2 clients only. The current V3 MCP exposes `browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`; do not use this section for V3 tasks.
 
 In MCP, call `session` with `action: "discover_shared_tabs"`. Select one or more IDs from `snapshot.tabs` and pass those `target_ids` plus `snapshot.host_id` to `session` with `action: "pair_shared"`; this creates **one session for all selected tabs** over the native bridge. Then call `session` with `action: "accept_shared"` and its returned `session_id`. If you omit `host_id`, pairing uses the manual popup fallback. Discovery includes at most 100 eligible tabs; when `snapshot.truncated` is `true`, later tabs are omitted. Listing does not attach to tabs.
 

@@ -1,5 +1,13 @@
 # Blockers and external dependencies
 
+## Stage 1 reliable-contracts remaining gates — 2026-10-14
+
+- The Stage 1 shared provider/mode/action/version contract, full packaged-extension build identity, bounded screenshot transport, independent upload acceptance fixture, event-based readiness, owned target lifecycle, and cancellation/interference recovery have passed local code and wiring review. Fresh Luna Medium and Luna High reviews concluded `ALL CODE/WIRING COMPLETE LOCALLY`. The first Luna High review identified screenshot acceptance coverage gaps; cross-layer request replay, max-crop/high-DPI, transfer-expiry, and native-host process tests closed those gaps and passed a new separate High re-review. Live exit evidence remains unqualified because live tests were explicitly deferred.
+- The localhost upload fixture ran in isolated headless Chrome: the server confirmed the exact registered bytes and SHA-256, and both ordinary output and React-style `role=status` acceptance evidence passed. The configured extension and any live application were not used, and no persistence is claimed.
+- Chunk-level and PNG fixtures cover the production runtime request through the extension validator, bounded delivery, maximum crop, scale-2 high-DPI capture, oversize/corrupt data, cancellation/abort, 15-second expiry, capture navigation invalidation, and chunk assembly through a running native-host roundtrip that continues to the next command. Screenshot delivery through the configured MCP remains unverified.
+- The extension fixture covers selected-window placement, owned move/activation, and cancellation during preflight; live user-interference, tab replacement/adoption, and concurrent MCP-process acceptance remain open. Protocol/build identity checks pass locally; installed extension/MCP reload qualification is deferred under the user's explicit no-live-test boundary.
+- User requested smoke tests only and no live tests. Reloading the exact extension and restarting the configured Codex MCP are therefore deferred; the current checkout/build is not evidence the loaded client uses these changes.
+
 ## Prompt-to-outcome implementation boundary — 2026-10-14
 
 - The new optional local download destination is Unix-only and intentionally refuses traversal/symlink paths and overwrite. Other platforms must use the opaque artifact handle; no Windows/macOS-vs-Linux matrix qualification is claimed.
@@ -185,3 +193,29 @@ Stage 2 source implementation and local fixtures are complete for S2-01 through 
 The isolated Chrome OOPIF fixture now passes end to end. It verified Chrome's attached iframe target, automatic flattened-session bootstrap, child frame/context registration, and a readback from the cross-origin child document through `frame_command`. The fix orders target/frame graph updates before event publication, seeds the target-local frame tree before enabling Runtime contexts, and retains the parent-frame relationship for OOPIF roots. This qualifies the isolated real-Chrome fixture on this Mac; it does not qualify all OOPIF sites, extension transport, or real applications.
 
 `npm run check:clients` passes 12 adapter/configuration and exact-schema contract tests, including enforcement that qualification requires real task-event evidence. No per-client prompt-to-outcome runs were performed: the real host task/evidence drivers are not configured for six clients, so client live qualification remains open.
+# 2026-10-14 — background-window/visual-control implementation
+
+- Historical status entry: the local implementation and fixture checks passed at that point; the live qualification and additional Stage 1 gaps recorded later remain open.
+- Local implementation and fixture checks passed at that time; no hosted CI run covered that diff.
+- Reloading the unpacked Chrome extension and restarting/reloading the Codex Controlla MCP is required before live verification of the background-owned window and bounded screenshot; this is one of several remaining qualification gates.
+- Controlla does not promise zero activation for an inactive existing user tab: such pointer requests now fail before dispatch. The supported no-Chrome-focus path is an explicitly requested, separate Controlla-owned background window. Chrome controls its placement; selecting a monitor or virtual desktop is not implemented.
+- Live Canva slide navigation/capture, real-site OOPIF input, hosted CI, client qualification, and comparative latency remain unverified. Do not describe the product as fastest or universally superior based on these local results.
+- A dedicated Canva slide-selector adapter is still absent. Current agent guidance requires observed slide identity, readback, and image evidence; the generic workflow must fail/report unreviewed slides when the app does not expose those signals.
+
+
+## 2026-10-14 — live results supersede reload-only blocker
+
+Historical audit snapshot: the specific screenshot-parameter, action-value, guarded file-selection, root-text, root-completeness, and URL-equivalence defects listed below were corrected locally in the Stage 1 corrective pass at the top of this file. The unresolved Stage 1 gates remain open; see that current ledger for exact boundaries.
+
+### Stage 1 continuation boundaries — 2026-10-15
+
+The Stage 1 local implementation and wiring are complete. The fresh whole-plan Luna Medium review concluded **ALL CODE/WIRING COMPLETE LOCALLY**, and the item-level plan now marks local work separately from live qualification. Do not treat the live gates below as missing local implementation or claim full Stage 1 exit before they pass.
+
+- Shared action validation now uses a provider/mode/action/version contract before target work. Local contract tests compare public V3 actions, runtime dispatch mappings, extension authorization lists, schema requirements, and tool guidance; the installed configured extension/MCP pair has not been reloaded to qualify its runtime identity.
+- Screenshot chunking, integrity checks, MCP image attachment, explicit transfer abort cleanup, and capture/navigation invalidation have local coverage. An installed shared-extension payload and cancellation of an already-dispatched browser mutation are still unverified.
+- The isolated upload acceptance fixture now passes in private headless Chrome against localhost: server bytes/hash match, and both ordinary output and role=status acceptance are observed. App persistence remains unproven.
+- Root navigation readiness now uses pre-subscribed document events and a bounded identity read. Redirect/account policy needs live qualification.
+- `close_owned`, caller-selected owned automation-window placement, `move_owned`, and foreground owned-tab `activate` verify receipt ownership and resulting topology locally. Live moved/replaced/adopted targets, cross-process isolation, and same-target human interference remain open acceptance cases.
+- User-requested boundary held: no live browser test, Chrome extension reload, or Codex MCP restart. After the user reloads the exact unpacked extension and restarts Codex MCP, run the live target/focus/screenshot/upload/navigation/interference cases. Local Rust/extension/client/doc checks do not qualify those behaviors or justify a fastest/best-in-world claim.
+
+At the time of that audit, reload was not the only blocker: shared visual capture had a parameter mismatch; act validation rejected type/select/slider values; guarded upload selection was rejected; text predicates missed ordinary output text; unrelated unread frames blocked root findings; and URL comparison rejected canonical root-slash equivalence. The Stage 1 corrective pass fixed those items locally, but shared download remains unsupported, inactive Canva pointer selection is refused, and no complete slide capture was performed. See the three staged plans for acceptance gates. Existing source/fixture passes do not close the remaining live gaps.

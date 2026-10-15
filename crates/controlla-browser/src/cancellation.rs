@@ -1,0 +1,181 @@
+use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+/// Workflow cancellation is checked at the browser-command boundary. A command
+/// that has reserved this gate may finish, but after cancel returns no later
+/// mutating command can be admitted.
+pub struct WorkflowCancellation {
+    cancelled: AtomicBool,
+    dispatched: AtomicUsize,
+    in_flight: AtomicUsize,
+    gate: Arc<Mutex<()>>,
+}
+
+impl Default for WorkflowCancellation {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            dispatched: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+impl WorkflowCancellation {
+    /// Request cancellation immediately, then wait out any command already
+    /// admitted so the caller's acknowledgement is a real dispatch fence.
+    pub async fn cancel(&self) -> bool {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let _gate = self.gate.clone().lock_owned().await;
+        self.dispatched.load(Ordering::SeqCst) > 0 || self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn has_dispatched(&self) -> bool {
+        self.dispatched.load(Ordering::SeqCst) > 0
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+tokio::task_local! {
+    static ACTIVE_WORKFLOW_CANCELLATION: Arc<WorkflowCancellation>;
+}
+
+pub async fn with_workflow_cancellation<T>(
+    cancellation: Arc<WorkflowCancellation>,
+    future: impl Future<Output = T>,
+) -> T {
+    ACTIVE_WORKFLOW_CANCELLATION
+        .scope(cancellation, future)
+        .await
+}
+
+pub struct BrowserCommandPermit {
+    cancellation: Option<Arc<WorkflowCancellation>>,
+    _gate: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for BrowserCommandPermit {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+pub async fn admit_browser_command(
+    method: &str,
+) -> Result<BrowserCommandPermit, crate::BrowserError> {
+    if !may_mutate(method) {
+        return Ok(BrowserCommandPermit {
+            cancellation: None,
+            _gate: None,
+        });
+    }
+    let Ok(cancellation) = ACTIVE_WORKFLOW_CANCELLATION.try_with(Arc::clone) else {
+        return Ok(BrowserCommandPermit {
+            cancellation: None,
+            _gate: None,
+        });
+    };
+    let gate = cancellation.gate.clone().lock_owned().await;
+    if cancellation.cancelled.load(Ordering::SeqCst) {
+        return Err(crate::BrowserError::Cancelled);
+    }
+    cancellation.dispatched.fetch_add(1, Ordering::SeqCst);
+    cancellation.in_flight.fetch_add(1, Ordering::SeqCst);
+    Ok(BrowserCommandPermit {
+        cancellation: Some(cancellation),
+        _gate: Some(gate),
+    })
+}
+
+pub fn may_mutate(method: &str) -> bool {
+    method.starts_with("Input.")
+        || matches!(
+            method,
+            "Page.navigate"
+                | "DOM.setFileInputFiles"
+                | "Runtime.callFunctionOn"
+                | "Runtime.evaluate"
+                | "Controlla.fastType"
+                | "Controlla.securePasswordFill"
+                | "Controlla.frameClick"
+                | "Controlla.frameFill"
+                | "Controlla.frameSelectFile"
+                | "Controlla.setFrameFileInputFiles"
+                | "Controlla.openTab"
+                | "Controlla.navigate"
+                | "Controlla.closeOwnedTab"
+                | "Controlla.moveOwnedTab"
+                | "Controlla.activateOwnedTab"
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkflowCancellation, admit_browser_command, with_workflow_cancellation};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancellation_during_preflight_fences_the_later_mutating_command() {
+        let cancellation = Arc::new(WorkflowCancellation::default());
+        let side_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let for_call = cancellation.clone();
+        let effects = side_effects.clone();
+        let operation = tokio::spawn(async move {
+            with_workflow_cancellation(for_call, async {
+                tokio::task::yield_now().await; // async preflight before the browser mutation
+                if let Ok(_permit) = admit_browser_command("Input.dispatchKeyEvent").await {
+                    effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+        cancellation.cancel().await;
+        operation.await.unwrap();
+        assert_eq!(
+            side_effects.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "cancellation during preflight prevents the side effect at the dispatch boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_an_admitted_command_before_acknowledging() {
+        let cancellation = Arc::new(WorkflowCancellation::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let for_call = cancellation.clone();
+        let command_entered = entered.clone();
+        let command_release = release.clone();
+        let operation = tokio::spawn(async move {
+            with_workflow_cancellation(for_call, async {
+                let _permit = admit_browser_command("Page.navigate").await.unwrap();
+                command_entered.notify_one();
+                command_release.notified().await;
+            })
+            .await;
+        });
+        entered.notified().await;
+        let for_cancel = cancellation.clone();
+        let cancel = tokio::spawn(async move { for_cancel.cancel().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_finished(),
+            "cancel waits until the admitted command leaves the gate"
+        );
+        release.notify_one();
+        assert!(
+            cancel.await.unwrap(),
+            "the caller is told that a command may have taken effect"
+        );
+        operation.await.unwrap();
+    }
+}

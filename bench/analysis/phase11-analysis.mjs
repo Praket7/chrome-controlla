@@ -17,7 +17,8 @@ function mulberry32(seed) {
 
 function quantile(values, probability) {
   const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(probability * sorted.length)))];
+  const rank = Math.ceil(probability * sorted.length);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, rank - 1))];
 }
 
 /**
@@ -37,15 +38,23 @@ export function effectiveSuccess(result) {
  * callers must never silently discard them. */
 export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
   if (!Array.isArray(rows) || rows.length < 2) throw new Error('at least two paired rows are required');
+  const clusters = new Map();
+  rows.forEach((row, index) => {
+    const key = row.task_id ?? row.taskId ?? `row-${index}`;
+    const group = clusters.get(key) ?? [];
+    group.push(Number(effectiveSuccess(row.candidate)) - Number(effectiveSuccess(row.baseline)));
+    clusters.set(key, group);
+  });
+  if (clusters.size < 2) throw new Error('at least two distinct paired task clusters are required');
+  const clusterDeltas = [...clusters.values()].map(values => values.reduce((sum, value) => sum + value, 0) / values.length);
   const random = mulberry32(seed);
   const successDeltas = [];
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     let delta = 0;
-    for (let draw = 0; draw < rows.length; draw += 1) {
-      const row = rows[Math.floor(random() * rows.length)];
-      delta += Number(effectiveSuccess(row.candidate)) - Number(effectiveSuccess(row.baseline));
+    for (let draw = 0; draw < clusterDeltas.length; draw += 1) {
+      delta += clusterDeltas[Math.floor(random() * clusterDeltas.length)];
     }
-    successDeltas.push(delta / rows.length);
+    successDeltas.push(delta / clusterDeltas.length);
   }
   const candidateWall = rows.map(row => row.candidate.wall_ms);
   const baselineWall = rows.map(row => row.baseline.wall_ms);
@@ -59,15 +68,20 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
     Number.isFinite(candidate) && candidate >= 0 && Number.isFinite(baseline) && baseline >= 0);
   const candidatePromptFinal = hasPromptToFinal ? promptToFinal.map(([candidate]) => candidate) : [];
   const baselinePromptFinal = hasPromptToFinal ? promptToFinal.map(([, baseline]) => baseline) : [];
-  const candidateRounds = rows.reduce((sum, row) => sum + row.candidate.model_round_trips, 0);
-  const baselineRounds = rows.reduce((sum, row) => sum + row.baseline.model_round_trips, 0);
-  const severe = rows.reduce((sum, row) => sum + row.candidate.severe_wrong_target_events, 0);
-  const authority = rows.reduce((sum, row) => sum + row.candidate.authority_violations, 0);
-  const stale = rows.reduce((sum, row) => sum + row.candidate.silent_stale_mutations, 0);
+  const sumMetric = select => {
+    const values = rows.map(select);
+    return values.every(Number.isFinite) ? values.reduce((sum, value) => sum + value, 0) : null;
+  };
+  const candidateRounds = sumMetric(row => row.candidate.model_round_trips);
+  const baselineRounds = sumMetric(row => row.baseline.model_round_trips);
+  const severe = sumMetric(row => row.candidate.severe_wrong_target_events);
+  const authority = sumMetric(row => row.candidate.authority_violations);
+  const stale = sumMetric(row => row.candidate.silent_stale_mutations);
   const candidateVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.candidate)), 0);
   const baselineVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.baseline)), 0);
   return {
     paired_rows: rows.length,
+    paired_task_clusters: clusters.size,
     candidate_verified_successes: candidateVerified,
     baseline_verified_successes: baselineVerified,
     success_delta: (candidateVerified - baselineVerified) / rows.length,
@@ -90,7 +104,7 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
     baseline_p95_prompt_to_final_ms: hasPromptToFinal ? quantile(baselinePromptFinal, 0.95) : null,
     prompt_to_final_median_reduction: hasPromptToFinal ? 1 - median(candidatePromptFinal) / median(baselinePromptFinal) : null,
     prompt_to_final_p95_reduction: hasPromptToFinal ? 1 - quantile(candidatePromptFinal, 0.95) / quantile(baselinePromptFinal, 0.95) : null,
-    model_round_trip_reduction: baselineRounds === 0 ? 0 : 1 - candidateRounds / baselineRounds,
+    model_round_trip_reduction: !Number.isFinite(candidateRounds) || !Number.isFinite(baselineRounds) ? null : baselineRounds === 0 ? 0 : 1 - candidateRounds / baselineRounds,
     severe_wrong_target_events: severe,
     authority_violations: authority,
     silent_stale_mutations: stale,
@@ -121,9 +135,9 @@ export function evaluateClaimGate(report, gates = {}) {
     prompt_to_final_evidence: report.prompt_to_final_evidence_complete === true,
     prompt_to_final_median: report.prompt_to_final_median_reduction >= required.minimum_median_prompt_to_final_reduction,
     prompt_to_final_p95: report.prompt_to_final_p95_reduction >= required.minimum_p95_prompt_to_final_reduction,
-    severe_wrong_target: report.severe_wrong_target_events <= required.maximum_severe_wrong_target_events,
-    authority: report.authority_violations <= required.maximum_authority_violations,
-    stale_mutation: report.silent_stale_mutations <= required.maximum_silent_stale_mutations,
+    severe_wrong_target: Number.isFinite(report.severe_wrong_target_events) && report.severe_wrong_target_events <= required.maximum_severe_wrong_target_events,
+    authority: Number.isFinite(report.authority_violations) && report.authority_violations <= required.maximum_authority_violations,
+    stale_mutation: Number.isFinite(report.silent_stale_mutations) && report.silent_stale_mutations <= required.maximum_silent_stale_mutations,
   };
   return { eligible: Object.values(checks).every(Boolean), checks };
 }

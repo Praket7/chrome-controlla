@@ -9,6 +9,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
+use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -851,12 +852,99 @@ pub(super) fn probe_region_valid(region: ProbeRegionArgs) -> bool {
         && region.width * region.height <= MAX_PROBE_AREA
 }
 
-fn base64_decoded_len(data: &str) -> Option<usize> {
-    if data.is_empty() || !data.len().is_multiple_of(4) {
-        return None;
+fn shared_screenshot_params(region: ProbeRegionArgs) -> Value {
+    json!({
+        "format":"png",
+        "fromSurface":true,
+        "captureBeyondViewport":false,
+        "clip":{"x":region.x,"y":region.y,"width":region.width,"height":region.height,"scale":1.0}
+    })
+}
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
     }
-    let padding = usize::from(data.ends_with('=')) + usize::from(data.ends_with("=="));
-    data.len().checked_div(4)?.checked_mul(3)?.checked_sub(padding)
+    !crc
+}
+
+fn decode_validate_png(data: &str, max_bytes: usize) -> Result<(Vec<u8>, u32, u32), &'static str> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "Chrome returned invalid base64 screenshot data")?;
+    if bytes.len() > max_bytes || bytes.len() < 57 || bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") {
+        return Err("Chrome returned an empty, oversized, or invalid PNG screenshot");
+    }
+    let mut cursor = 8usize;
+    let mut dimensions = None;
+    let mut seen_idat = false;
+    let mut idat_closed = false;
+    let mut image_bytes = 0usize;
+    let mut seen_iend = false;
+    while cursor < bytes.len() {
+        let length_bytes = bytes.get(cursor..cursor + 4).ok_or("PNG chunk length is truncated")?;
+        let length = u32::from_be_bytes(length_bytes.try_into().map_err(|_| "PNG chunk length is invalid")?) as usize;
+        let chunk_end = cursor.checked_add(12).and_then(|value| value.checked_add(length))
+            .filter(|end| *end <= bytes.len()).ok_or("PNG chunk is truncated")?;
+        let kind = &bytes[cursor + 4..cursor + 8];
+        let payload = &bytes[cursor + 8..cursor + 8 + length];
+        let expected_crc = u32::from_be_bytes(bytes[cursor + 8 + length..chunk_end].try_into().map_err(|_| "PNG chunk CRC is invalid")?);
+        if png_crc32(&bytes[cursor + 4..cursor + 8 + length]) != expected_crc {
+            return Err("PNG chunk checksum mismatch");
+        }
+        if dimensions.is_none() {
+            if kind != b"IHDR" || length != 13 {
+                return Err("PNG must begin with a valid IHDR chunk");
+            }
+            let width = u32::from_be_bytes(payload[..4].try_into().map_err(|_| "PNG width is invalid")?);
+            let height = u32::from_be_bytes(payload[4..8].try_into().map_err(|_| "PNG height is invalid")?);
+            let bit_depth = payload[8];
+            let color_type = payload[9];
+            let valid_bit_depth = match color_type {
+                0 => matches!(bit_depth, 1 | 2 | 4 | 8 | 16),
+                2 => matches!(bit_depth, 8 | 16),
+                3 => matches!(bit_depth, 1 | 2 | 4 | 8),
+                4 | 6 => matches!(bit_depth, 8 | 16),
+                _ => false,
+            };
+            if width == 0 || height == 0 || width > 1600 || height > 1200
+                || u64::from(width) * u64::from(height) > 1_920_000
+                || !valid_bit_depth || payload[10] != 0 || payload[11] != 0 || payload[12] > 1
+            {
+                return Err("PNG dimensions or IHDR method fields are out of bounds");
+            }
+            dimensions = Some((width, height));
+        } else if kind == b"IHDR" {
+            return Err("PNG contains more than one IHDR chunk");
+        }
+        if kind == b"IDAT" {
+            if idat_closed || length == 0 {
+                return Err("PNG IDAT chunks are empty or noncontiguous");
+            }
+            seen_idat = true;
+            image_bytes = image_bytes.checked_add(length).ok_or("PNG image data length overflow")?;
+        } else if seen_idat && kind != b"IEND" {
+            idat_closed = true;
+        }
+        if kind == b"IEND" {
+            if length != 0 || !seen_idat || chunk_end != bytes.len() {
+                return Err("PNG IEND is invalid or does not terminate the image");
+            }
+            seen_iend = true;
+            cursor = chunk_end;
+            break;
+        }
+        cursor = chunk_end;
+    }
+    if !seen_iend || image_bytes == 0 || cursor != bytes.len() {
+        return Err("PNG is missing image data or its terminal IEND chunk");
+    }
+    let (width, height) = dimensions.ok_or("PNG dimensions are missing")?;
+    Ok((bytes, width, height))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -885,7 +973,7 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
     if args.region.is_some_and(|region| !probe_region_valid(region)) {
         return Err(invalid("probe region is out of bounds"));
     }
-    let max_bytes = args.max_bytes.unwrap_or(262_144).clamp(4_096, 1_000_000);
+    let max_bytes = args.max_bytes.unwrap_or(262_144).clamp(4_096, 6 * 1024 * 1024);
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
     let shared = core
@@ -1003,12 +1091,7 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
             &shared.handle,
             &args.chrome_tab_id,
             "Page.captureScreenshot",
-            json!({
-                "format":"png",
-                "fromSurface":true,
-                "captureBeyondViewport":true,
-                "clip":{"x":region.x,"y":region.y,"width":region.width,"height":region.height,"scale":1.0}
-            }),
+            shared_screenshot_params(region),
         ),
     )
     .await
@@ -1018,13 +1101,8 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         .as_str()
         .filter(|data| !data.is_empty())
         .ok_or_else(|| invalid("Chrome omitted targeted screenshot data"))?;
-    let byte_length = base64_decoded_len(data)
-        .ok_or_else(|| invalid("Chrome returned invalid targeted screenshot encoding"))?;
-    if byte_length > max_bytes {
-        return Err(invalid(format!(
-            "targeted screenshot is {byte_length} bytes, exceeding max_bytes={max_bytes}"
-        )));
-    }
+    let (image_bytes, pixel_width, pixel_height) = decode_validate_png(data, max_bytes).map_err(invalid)?;
+    let byte_length = image_bytes.len();
     let after = tokio::time::timeout_at(
         deadline,
         super::super::shared_frame_identity(
@@ -1049,12 +1127,13 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         "data_base64":data,
         "byte_length":byte_length,
         "crop":{"x":region.x,"y":region.y,"width":region.width,"height":region.height},
+        "pixel_dimensions":{"width":pixel_width,"height":pixel_height},
         "visual_ref":{
             "chrome_tab_id":args.chrome_tab_id,
             "frame_id":before.0,
             "loader_id":before.1,
             "url":before.2,
-            "content_hash":sha256_hex(data.as_bytes()),
+            "content_hash":sha256_hex(&image_bytes),
             "observed_at_ms":observed_at_ms
         }
     }))
@@ -1193,6 +1272,8 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         idempotency_key: None,
                         active: None,
                         wait_until: None,
+                        create_background_window: None,
+                        target_window_id: None,
                     }))
                     .await?;
                 app.core
@@ -1843,4 +1924,52 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })
+}
+
+
+#[cfg(test)]
+mod screenshot_payload_tests {
+    use super::{ProbeRegionArgs, decode_validate_png, shared_screenshot_params};
+    use base64::Engine as _;
+    use std::process::Command;
+
+    const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=";
+
+    #[test]
+    fn screenshot_payload_checks_decoding_dimensions_and_chunk_checksums() {
+        let (bytes, width, height) = decode_validate_png(ONE_PIXEL_PNG, 1024).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(bytes.len(), 68);
+        assert!(decode_validate_png(ONE_PIXEL_PNG, 67).is_err(), "decoded byte cap applies to actual image bytes");
+
+        let mut corrupt = base64::engine::general_purpose::STANDARD.decode(ONE_PIXEL_PNG).unwrap();
+        corrupt[37] ^= 1;
+        let corrupt = base64::engine::general_purpose::STANDARD.encode(corrupt);
+        assert_eq!(decode_validate_png(&corrupt, 1024), Err("PNG chunk checksum mismatch"));
+        assert!(decode_validate_png(&ONE_PIXEL_PNG[..ONE_PIXEL_PNG.len() - 4], 1024).is_err());
+        assert!(decode_validate_png("iVBORw0KGgo", 1024).is_err());
+    }
+
+    #[test]
+    fn runtime_generated_screenshot_request_passes_extension_validator() {
+        let params = shared_screenshot_params(ProbeRegionArgs {
+            x: 12.0,
+            y: 24.0,
+            width: 320.0,
+            height: 180.0,
+        });
+        let extension_harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../extensions/chrome-controlla/test-background.cjs");
+        let output = Command::new("node")
+            .arg(extension_harness)
+            .env("CONTROLLA_SCREENSHOT_PARAMS_JSON", params.to_string())
+            .output()
+            .expect("node must be available for the extension contract harness");
+        assert!(
+            output.status.success(),
+            "runtime screenshot parameters failed the extension harness: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

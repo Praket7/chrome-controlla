@@ -1,6 +1,6 @@
 # Background window, visual control, and reliability design
 
-**Status:** Design approved by the user on 2026-10-14; awaiting written-spec review before implementation planning.
+**Status:** Approved and implemented at code/fixture level on 2026-10-14; live Chrome and Canva qualification pending reload.
 
 ## Goal
 
@@ -35,7 +35,7 @@ Every browser task resolves one explicit target policy before it can create, act
 
 1. **Existing tab:** Bind to the exact user-named or uniquely identified existing tab. Do not create, replace, duplicate, or navigate another tab as a fallback. If identity is ambiguous, stop with a compact ambiguity result.
 2. **Existing automation window:** Use an existing window that the user explicitly designated for Controlla. Controlla may activate tabs inside that designated window when required, but must not focus the Chrome window or change active tabs in other windows.
-3. **Create background automation window:** Create a separate window only when the user or task contract explicitly requests one. Use `chrome.windows.create({focused:false, ...})`, bind all task commands to the returned owned window, and report the actual window ID and placement. Do not focus it. The user may provide supported placement preferences such as left/top/width/height. Do not claim OS virtual-desktop or monitor selection when Chrome does not expose it.
+3. **Create background automation window:** Create a separate window only when the user or task contract explicitly requests one. Use `chrome.windows.create({focused:false, ...})`, bind all task commands to the returned owned window, and report the actual window ID and placement. Do not focus it. Chrome chooses placement using its normal window policy; Controlla does not claim monitor or virtual-desktop selection.
 4. **Headless:** Reuse the existing private headless path only for task kinds it already supports. It is a separate mode and must never be silently substituted for an authenticated or user-tab task.
 
 Requests such as “use the open Canva tab” select **Existing tab**. Requests such as “open a separate background window and work there” select **Create background automation window**. Missing or ambiguous target policy must not cause an implicit new-tab fallback.

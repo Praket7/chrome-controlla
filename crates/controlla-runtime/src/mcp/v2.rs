@@ -14,6 +14,7 @@ struct SemanticTabState {
     document_key: String,
     document: Option<crate::semantic_state::SemanticDocumentKey>,
     next_ref: u32,
+    root_scope_complete: bool,
     key_to_short: BTreeMap<String, String>,
     short_to_legacy: BTreeMap<String, String>,
     identities: BTreeMap<String, crate::reference_reacquire::SemanticIdentity>,
@@ -98,6 +99,7 @@ struct BrowserFindArgs {
     limit: Option<usize>,
     max_matches: Option<usize>,
     match_mode: Option<String>,
+    #[schemars(description = "Optional semantic ancestor that narrows candidate matching to its subtree. Root-document scoped queries can use root-local completeness when unrelated frames are unread; exhaustive cross-frame claims still require global completeness.")]
     within_reference: Option<String>,
     href_hint: Option<String>,
 }
@@ -163,7 +165,7 @@ struct BrowserProbeArgs {
 enum BrowserPredicate {
     Text { reference: String, equals: String },
     TextPresent {
-        #[schemars(description = "Optional exact fresh @cN semantic node or @f child-frame reference. A fresh @f reference scopes text verification to that frame and is loader-bound.")]
+        #[schemars(description = "Optional scope: omit for root-page text, use a unique CSS selector for direct DOM text, a fresh @cN semantic reference, or a fresh @f child-frame reference.")]
         scope: Option<String>,
         text: String,
     },
@@ -177,6 +179,44 @@ enum BrowserPredicate {
     DownloadArtifact { artifact_handle: String, sha256: String, min_bytes: u64 },
     VisualRegionChanged { evidence_before: String, evidence_after: String },
     AppSpecific { adapter: String, predicate: serde_json::Value },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TextPredicateScope {
+    Root,
+    Reference(String),
+    ScopedSelector(String),
+    FrameReference(String),
+}
+
+fn parse_text_predicate_scope(scope: Option<&str>) -> Result<TextPredicateScope, &'static str> {
+    let Some(scope) = scope else { return Ok(TextPredicateScope::Root) };
+    if scope.starts_with("@f:") {
+        frame_scope_parts(scope).ok_or("frame scope must be a fresh @f frame reference")?;
+        return Ok(TextPredicateScope::FrameReference(scope.to_owned()));
+    }
+    if let Some(reference_id) = scope.strip_prefix("@c") {
+        if reference_id.is_empty() || scope.len() > 64 || !reference_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("semantic reference scope is malformed");
+        }
+        return Ok(TextPredicateScope::Reference(scope.to_owned()));
+    }
+    if scope.trim().is_empty() || scope.len() > 2_048 || scope.contains('\0') {
+        return Err("scoped text selector is out of bounds");
+    }
+    Ok(TextPredicateScope::ScopedSelector(scope.to_owned()))
+}
+
+fn urls_identify_same_resource(expected: &str, actual: &str) -> bool {
+    match (url::Url::parse(expected), url::Url::parse(actual)) {
+        (Ok(expected), Ok(actual))
+            if matches!(expected.scheme(), "http" | "https") && expected.scheme() == actual.scheme() => expected == actual,
+        _ => expected == actual,
+    }
+}
+
+fn text_presence_status(found: bool, truncated: bool) -> &'static str {
+    if found { "passed" } else if truncated { "incomplete" } else { "failed" }
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -283,6 +323,55 @@ pub(super) fn update_observation_bytes(value: &mut Value) -> u64 {
 fn attach_observation_metadata(value: &mut Value, decision: crate::observation_router::ObservationDecision) -> u64 {
     value["observation"] = json!({"mode":decision.mode,"reason":decision.reason,"bytes":0});
     update_observation_bytes(value)
+}
+
+fn bound_snapshot_response(value: &mut Value, max_bytes: usize) -> u64 {
+    let max_bytes = max_bytes.max(1);
+    if value.pointer("/delta/full").and_then(Value::as_bool) == Some(true) {
+        value["delta"]["upsert"] = json!([]);
+    }
+    let original_count = value["count"].as_u64().unwrap_or_else(|| {
+        value["items"].as_array().map_or(0, |items| items.len() as u64)
+    });
+    let mut truncated = false;
+    loop {
+        if truncated {
+            value["truncated"] = json!(true);
+            value["truncation_reason"] = json!("response_byte_limit");
+            value["scope_complete"] = json!(false);
+            value["root_scope_complete"] = json!(false);
+            value["global_complete"] = json!(false);
+            value["count"] = json!(original_count);
+            value["items_returned"] = json!(value["items"].as_array().map_or(0, Vec::len));
+        }
+        let bytes = update_observation_bytes(value);
+        if bytes <= max_bytes as u64 {
+            return bytes;
+        }
+        truncated = true;
+        let Some(items) = value["items"].as_array_mut() else {
+            break;
+        };
+        if items.pop().is_none() {
+            break;
+        }
+        let visible_references = value["items"].as_array().into_iter().flatten()
+            .filter_map(|item| item["reference"].as_str().map(str::to_owned))
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(upserts) = value.pointer_mut("/delta/upsert").and_then(Value::as_array_mut) {
+            upserts.retain(|item| item["reference"].as_str().is_some_and(|reference| visible_references.contains(reference)));
+        }
+    }
+    *value = json!({
+        "status":"incomplete",
+        "reason_code":"response_byte_limit",
+        "max_bytes":max_bytes,
+        "truncated":true,
+        "scope_complete":false,
+        "observation":{"mode":"bounded","reason":"final snapshot exceeded its byte budget","bytes":0}
+    });
+    let bytes = update_observation_bytes(value);
+    if bytes <= max_bytes as u64 { bytes } else { 0 }
 }
 
 fn query_needs_layout(query: &str) -> bool {
@@ -395,7 +484,9 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000),
             timeout_ms: Some(10_000),
         })).await?;
-        let bytes = attach_observation_metadata(&mut value, decision);
+        let response_max_bytes = args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000);
+        attach_observation_metadata(&mut value, decision);
+        let bytes = bound_snapshot_response(&mut value, response_max_bytes);
         record_observation_feedback(app, request, decision, started, &value, bytes);
         controlla_browser::scheduler::telemetry::record_observation(0, bytes).await;
         controlla_browser::scheduler::telemetry::record_phase(
@@ -404,6 +495,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         ).await;
         return Ok(value);
     }
+    let response_max_bytes = args.max_bytes.unwrap_or_else(snapshot_bytes).clamp(4096, 1_000_000);
     let legacy = app
         .legacy
         .shared_snapshot(Parameters(SharedSnapshotArgs {
@@ -412,7 +504,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             selector: args.selector.clone().unwrap_or_else(snapshot_scope),
             max_items: args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200),
             max_text_chars: args.max_text_chars.unwrap_or_else(|| if decision.mode == crate::observation_router::ObservationMode::SemanticRich { 6_000 } else { snapshot_chars() }).min(6000),
-            max_bytes: args.max_bytes.unwrap_or_else(snapshot_bytes).clamp(4096, 100_000),
+            max_bytes: response_max_bytes.min(100_000),
             href_hint: args.href_hint.clone(),
             goal: args.goal.clone(),
             max_scan_nodes: args.max_scan_nodes,
@@ -435,14 +527,17 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .unwrap_or_default()
         .to_owned();
     let scope_complete = snapshot["scope_complete"] == true;
+    let root_scope_complete = snapshot_root_scope_complete(&snapshot);
+    snapshot["root_scope_complete"] = json!(root_scope_complete);
     let mut semantic = app.semantic.lock().await;
-    let state = semantic.entry(key).or_default();
+    let state = semantic.entry(key.clone()).or_default();
     let document_changed = !state.document_key.is_empty() && state.document_key != doc_key;
     if state.document_key != doc_key {
         reset_semantic_document(state, &doc_key, &snapshot);
     }
     state.document = Some(crate::semantic_state::SemanticDocumentKey::from_snapshot(&snapshot));
     state.scope_complete = scope_complete;
+    state.root_scope_complete = root_scope_complete;
     if state.next_ref == 0 {
         state.next_ref = 1;
     }
@@ -529,7 +624,14 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         }
         snapshot["page_content_is_untrusted"] = json!(true);
     }
-    let bytes = attach_observation_metadata(&mut snapshot, decision);
+    attach_observation_metadata(&mut snapshot, decision);
+    let bytes = bound_snapshot_response(&mut snapshot, response_max_bytes);
+    if snapshot["truncation_reason"] == "response_byte_limit"
+        && let Some(state) = app.semantic.lock().await.get_mut(&key)
+    {
+        state.scope_complete = false;
+        state.root_scope_complete = false;
+    }
     record_observation_feedback(app, request, decision, started, &snapshot, bytes);
     controlla_browser::scheduler::telemetry::record_observation(
         snapshot["scanned_nodes"].as_u64().unwrap_or(0),
@@ -1031,6 +1133,29 @@ async fn retained_mutation_once(
     Ok(result)
 }
 
+fn snapshot_root_scope_complete(snapshot: &Value) -> bool {
+    snapshot["scope_complete"] == true
+        || matches!(snapshot["truncation_reason"].as_str(), Some("cross_origin_frames_unread" | "same_origin_frames_pending"))
+}
+
+fn find_scope_is_complete(global_complete: bool, root_complete: bool, within_root: bool, exact_root_matches_only: bool) -> bool {
+    global_complete || root_complete && (within_root || exact_root_matches_only)
+}
+
+fn exact_root_scope_only(global_complete: bool, mode: &str, within_root: bool, ranked: &[Value]) -> bool {
+    !global_complete
+        && !within_root
+        && mode == "exact"
+        && ranked.iter().any(|item| item["source_frame"] == "main")
+        && ranked.iter().all(|item| item["source_frame"] == "main")
+}
+
+fn workflow_find_is_usable(found: &Value) -> bool {
+    found["scope_complete"] == true
+        && found["ambiguous"] != true
+        && found["matches"].as_array().is_some_and(|matches| matches.len() == 1)
+}
+
 async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::ErrorData> {
     if args.query.trim().is_empty() || args.query.len() > 512 {
         return Err(invalid("query must contain 1..512 characters"));
@@ -1056,15 +1181,23 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
     }
     let state = app.semantic.lock().await;
     let state = state.get(&key).ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
-    let ancestor_id = if let Some(reference) = args.within_reference.as_deref() {
-        Some(state.items.get(reference).and_then(|item| item.pointer("/semantic_ancestor/id")).and_then(Value::as_str).ok_or_else(|| invalid("within_reference must identify a stable semantic ancestor"))?)
-    } else { None };
-    let ranked = crate::semantic_state::rank_candidates(state.items.values().cloned(), &args.query, args.role.as_deref(), args.href_hint.as_deref(), ancestor_id, mode == "exact");
-    let ambiguous = find_is_ambiguous(mode, state.scope_complete, &ranked);
+    let (ancestor_id, within_root) = if let Some(reference) = args.within_reference.as_deref() {
+        let item = state.items.get(reference).ok_or_else(|| invalid("within_reference must identify a stable semantic ancestor"))?;
+        let ancestor = item.pointer("/semantic_ancestor/id").and_then(Value::as_str).ok_or_else(|| invalid("within_reference must identify a stable semantic ancestor"))?;
+        (Some(ancestor), item["source_frame"] == "main")
+    } else { (None, false) };
+    let mut ranked = crate::semantic_state::rank_candidates(state.items.values().cloned(), &args.query, args.role.as_deref(), args.href_hint.as_deref(), ancestor_id, mode == "exact");
+    let exact_root_matches_only = exact_root_scope_only(state.scope_complete, mode, within_root, &ranked);
+    if exact_root_matches_only {
+        ranked.retain(|item| item["source_frame"] == "main");
+    }
+    let root_scoped = within_root || exact_root_matches_only;
+    let scope_complete = find_scope_is_complete(state.scope_complete, state.root_scope_complete, within_root, exact_root_matches_only);
+    let ambiguous = find_is_ambiguous(mode, scope_complete, &ranked);
     let limit = args.max_matches.or(args.limit).unwrap_or(10).clamp(1, 50);
     let matches = ranked.into_iter().take(if mode == "best" && !ambiguous { 1 } else { limit }).collect::<Vec<_>>();
     let count = matches.len();
-    Ok(json!({"matches":matches,"count":count,"ambiguous":ambiguous,"scope_complete":state.scope_complete,"semantic_revision":state.snapshot_id}))
+    Ok(json!({"matches":matches,"count":count,"ambiguous":ambiguous,"scope_complete":scope_complete,"global_scope_complete":state.scope_complete,"scope":if root_scoped {"root_document_subtree"} else {"all_collected_frames"},"semantic_revision":state.snapshot_id}))
 }
 
 fn find_is_ambiguous(mode: &str, scope_complete: bool, ranked: &[Value]) -> bool {
@@ -1073,6 +1206,44 @@ fn find_is_ambiguous(mode: &str, scope_complete: bool, ranked: &[Value]) -> bool
         "exact" => !scope_complete || ranked.len() > 1,
         _ => false,
     }
+}
+
+async fn verify_shared_dom_text(
+    app: &AppV2,
+    session_id: &str,
+    tab_id: &str,
+    scope: Option<&str>,
+    expected: &str,
+) -> Result<Value, rmcp::ErrorData> {
+    let selector = match parse_text_predicate_scope(scope).map_err(invalid)? {
+        TextPredicateScope::Root => None,
+        TextPredicateScope::ScopedSelector(selector) => Some(selector),
+        _ => return Err(invalid("DOM text verification requires root or CSS-selector scope")),
+    };
+    let live = app.legacy.shared_sessions.lock().await.get(session_id).cloned()
+        .ok_or_else(|| invalid("unknown session for text verification"))?;
+    let live = live.lock().await;
+    if live.handle.principal != app.legacy.principal.as_ref() {
+        return Err(invalid("text verification session is not owned by this server principal"));
+    }
+    let connection = live.connection.as_ref().ok_or_else(|| invalid("shared browser connection is unavailable"))?;
+    let registry = live.registry()?;
+    let before = super::shared_frame_identity(connection, registry, &live.handle, tab_id).await.map_err(invalid)?;
+    let selector_json = serde_json::to_string(&selector).map_err(|error| invalid(error.to_string()))?;
+    let expected_json = serde_json::to_string(expected).map_err(|error| invalid(error.to_string()))?;
+    let expression = format!("(()=>{{let e=document.body||document.documentElement;if({selector_json}!==null){{let found;try{{found=[...document.querySelectorAll({selector_json})]}}catch(_){{return {{ok:false,reason:'invalid_selector'}}}};if(found.length!==1)return {{ok:false,reason:'selector_not_unique'}};e=found[0]}}if(!e)return {{ok:false,reason:'scope_missing'}};const s=String(e.innerText??e.textContent??'');return {{ok:true,text_present:s.slice(0,4097).includes({expected_json}),truncated:s.length>4096}}}})()", selector_json=selector_json, expected_json=expected_json);
+    let response = connection.command(registry, &live.handle, tab_id, "Runtime.evaluate", json!({"expression":expression,"returnByValue":true})).await.map_err(|error| invalid(error.to_string()))?;
+    let value = super::shared_value(&response).map_err(invalid)?;
+    if value["ok"] != true {
+        return Ok(json!({"status":"incomplete","observer":"shared_root_dom_text","expected":{"text_contains":expected},"observed":{"scope":if selector.is_some() {"selector"} else {"root"},"reason":value["reason"]},"evidence_complete":false,"dispatch_occurred":false}));
+    }
+    let after = super::shared_frame_identity(connection, registry, &live.handle, tab_id).await.map_err(invalid)?;
+    if before != after {
+        return Ok(json!({"status":"incomplete","observer":"shared_root_dom_text","expected":{"text_contains":expected},"observed":null,"evidence_complete":false,"reason":"document changed during text readback","dispatch_occurred":false}));
+    }
+    let found = value["text_present"] == true;
+    let complete = value["truncated"] != true;
+    Ok(json!({"status":text_presence_status(found,!complete),"observer":"shared_root_dom_text","expected":{"text_contains":expected},"observed":{"text_present":found,"scope":if selector.is_some() {"selector"} else {"root"}},"evidence_complete":complete,"document":{"frame_id":before.0,"loader_id":before.1,"url":before.2},"dispatch_occurred":false}))
 }
 
 async fn verify_impl(app: &AppV2, args: &BrowserVerifyArgs) -> Result<Value, rmcp::ErrorData> {
@@ -1100,7 +1271,7 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
             .await.map_err(invalid)?;
         let actual = identity.2;
         let passed = match &args.predicate {
-            BrowserPredicate::Url { equals } => actual == *equals,
+            BrowserPredicate::Url { equals } => urls_identify_same_resource(equals, &actual),
             BrowserPredicate::UrlStartsWith { prefix } => !prefix.is_empty() && actual.starts_with(prefix),
             _ => unreachable!(),
         };
@@ -1141,6 +1312,29 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
             "scope_complete":complete,
             "document":frame["shared_frame_identity"]
         }));
+    }
+    if let BrowserPredicate::TextPresent { scope, text } = &args.predicate {
+        if text.is_empty() || text.len() > 4096 {
+            return Err(invalid("verification text must contain 1..4096 bytes"));
+        }
+        match parse_text_predicate_scope(scope.as_deref()).map_err(invalid)? {
+            TextPredicateScope::Root | TextPredicateScope::ScopedSelector(_) => {
+                return verify_shared_dom_text(app, &args.session_id, &args.chrome_tab_id, scope.as_deref(), text).await;
+            }
+            TextPredicateScope::Reference(reference) => {
+                let state = app.semantic.lock().await;
+                let Some(state) = state.get(&tab_key(&args.session_id, &args.chrome_tab_id)) else {
+                    return Ok(json!({"status":"incomplete","observer":"semantic_reference","expected":{"text_contains":text},"observed":null,"evidence_complete":false,"reason":"semantic evidence is unavailable"}));
+                };
+                let Some(item) = state.items.get(&reference).filter(|item| semantic_text_is_authoritative(item)) else {
+                    return Ok(json!({"status":"incomplete","observer":"semantic_reference","expected":{"text_contains":text},"observed":null,"evidence_complete":false,"reason":"reference is missing or has no authoritative text"}));
+                };
+                let actual = item.get("text").or_else(|| item.get("name")).and_then(Value::as_str).unwrap_or_default();
+                let passed = actual.contains(text);
+                return Ok(json!({"status":if passed {"passed"} else {"failed"},"observer":"fresh_semantic_reference","expected":{"text_contains":text},"observed":{"text_present":passed,"reference":reference},"evidence_complete":true,"document":item.get("document")}));
+            }
+            TextPredicateScope::FrameReference(_) => unreachable!("frame references returned above"),
+        }
     }
     let snapshot = snapshot_impl(app, &BrowserSnapshotArgs {
         session_id: args.session_id.clone(),
@@ -1216,7 +1410,7 @@ async fn verify_impl_unmeasured(app: &AppV2, args: &BrowserVerifyArgs) -> Result
         }
         BrowserPredicate::Url { equals } => {
             let actual = snapshot.get("url").and_then(Value::as_str).unwrap_or_default();
-            (actual == equals, json!(actual), true)
+            (urls_identify_same_resource(equals, actual), json!(actual), true)
         }
         BrowserPredicate::UrlStartsWith { prefix } => {
             if prefix.is_empty() { return Err(invalid("URL prefix cannot be empty")); }
@@ -1500,7 +1694,7 @@ impl AppV2 {
         Ok(Json(verify_impl(self, &args).await?))
     }
 
-    #[tool(name = "browser_workflow", description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. After an unknown mutation, only one immediately following read-only verify step may reconcile its postcondition; no mutation is retried.")]
+    #[tool(name = "browser_workflow", description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. Find requires an exact control name, one matching reference, and complete scope evidence; unread unrelated frames are allowed only for a unique root-document exact match. After an unknown mutation, only one immediately following read-only verify step may reconcile its postcondition; no mutation is retried.")]
     async fn browser_workflow(&self, Parameters(args): Parameters<BrowserWorkflowArgs>) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.steps.is_empty() || args.steps.len() > MAX_WORKFLOW_STEPS {
             return Err(invalid("workflow must contain 1..20 steps"));
@@ -1526,10 +1720,10 @@ impl AppV2 {
                         return Err(invalid("workflow save_as must be 1..64 ASCII alphanumeric/underscore characters"));
                     }
                     let found = find_impl(self, &BrowserFindArgs {
-                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(2), max_matches: None, match_mode: None, within_reference: None, href_hint: None,
+                        session_id: args.session_id.clone(), chrome_tab_id: args.chrome_tab_id.clone(), query, role, limit: Some(2), max_matches: None, match_mode: Some("exact".into()), within_reference: None, href_hint: None,
                     }).await?;
                     let matches = found["matches"].as_array().cloned().unwrap_or_default();
-                    if matches.len() != 1 {
+                    if !workflow_find_is_usable(&found) {
                         return Err(invalid(format!("workflow find for {save_as} must resolve exactly one control")));
                     }
                     let reference = matches[0]["reference"].as_str().ok_or_else(|| invalid("workflow find omitted reference"))?.to_owned();
@@ -1668,6 +1862,72 @@ fn selector_error_receipt(message: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_verification_normalizes_only_equivalent_http_url_forms() {
+        assert!(urls_identify_same_resource("https://example.test", "https://example.test/"));
+        assert!(urls_identify_same_resource("https://example.test:443/a", "https://example.test/a"));
+        assert!(!urls_identify_same_resource("https://example.test/a", "https://example.test/b"));
+        assert!(!urls_identify_same_resource("https://example.test/a#one", "https://example.test/a#two"));
+        assert!(!urls_identify_same_resource("https://example.test/a", "https://other.test/a"));
+    }
+
+    #[test]
+    fn snapshot_response_respects_byte_budget_without_duplicate_full_upserts() {
+        let items = (0..16)
+            .map(|index| json!({"reference":format!("@c{index}"),"name":"x".repeat(512)}))
+            .collect::<Vec<_>>();
+        let mut snapshot = json!({
+            "count":items.len(), "scope_complete":true, "root_scope_complete":true,
+            "items":items, "delta":{"full":true,"upsert":items,"removed":[]},
+            "observation":{"mode":"semantic_compact","reason":"fixture","bytes":0}
+        });
+        let bytes = bound_snapshot_response(&mut snapshot, 4096);
+        assert!(bytes <= 4096, "serialized snapshot is {bytes} bytes");
+        assert_eq!(snapshot["delta"]["upsert"], json!([]), "full snapshots use `items` as their single item payload");
+        assert!(snapshot["truncated"] == true);
+        assert_eq!(snapshot["scope_complete"], false);
+        assert_eq!(snapshot["root_scope_complete"], false);
+        assert!(snapshot["items"].as_array().unwrap().len() < snapshot["count"].as_u64().unwrap() as usize);
+        assert_eq!(snapshot["observation"]["bytes"], json!(bytes));
+        assert_eq!(serde_json::to_vec(&snapshot).unwrap().len() as u64, bytes);
+    }
+
+    #[test]
+    fn unread_unrelated_frames_do_not_invalidate_a_complete_root_scope() {
+        assert!(snapshot_root_scope_complete(&json!({"scope_complete":false,"truncation_reason":"cross_origin_frames_unread"})));
+        assert!(snapshot_root_scope_complete(&json!({"scope_complete":false,"truncation_reason":"same_origin_frames_pending"})));
+        assert!(!snapshot_root_scope_complete(&json!({"scope_complete":false,"truncation_reason":"scanned_nodes_exceeded"})));
+        assert!(!find_scope_is_complete(false, true, false, false));
+        assert!(find_scope_is_complete(false, true, true, false));
+        assert!(find_scope_is_complete(false, true, false, true));
+        let root_match = json!({"source_frame":"main"});
+        let frame_match = json!({"source_frame":"frame:7"});
+        assert!(exact_root_scope_only(false, "exact", false, std::slice::from_ref(&root_match)));
+        assert!(!exact_root_scope_only(false, "exact", false, &[root_match.clone(), frame_match.clone()]));
+        assert!(!exact_root_scope_only(false, "all", false, std::slice::from_ref(&root_match)));
+        assert!(!exact_root_scope_only(false, "exact", false, std::slice::from_ref(&frame_match)));
+        assert!(!exact_root_scope_only(true, "exact", false, std::slice::from_ref(&root_match)));
+        assert!(workflow_find_is_usable(&json!({"matches":[root_match.clone()],"scope_complete":true,"ambiguous":false})));
+        assert!(!workflow_find_is_usable(&json!({"matches":[root_match],"scope_complete":false,"ambiguous":false})));
+    }
+
+    #[test]
+    fn text_verification_scope_is_explicit_and_selector_failures_are_not_references() {
+        assert_eq!(parse_text_predicate_scope(None), Ok(TextPredicateScope::Root));
+        assert_eq!(parse_text_predicate_scope(Some("@c12")), Ok(TextPredicateScope::Reference("@c12".into())));
+        assert_eq!(parse_text_predicate_scope(Some("#upload-status")), Ok(TextPredicateScope::ScopedSelector("#upload-status".into())));
+        assert_eq!(parse_text_predicate_scope(Some("@f:frame:loader:2")), Ok(TextPredicateScope::FrameReference("@f:frame:loader:2".into())));
+        assert!(parse_text_predicate_scope(Some("@f:bad")).is_err());
+        assert!(parse_text_predicate_scope(Some("@c")).is_err());
+    }
+
+    #[test]
+    fn text_absence_requires_complete_dom_evidence_but_presence_is_proven() {
+        assert_eq!(text_presence_status(true, true), "passed");
+        assert_eq!(text_presence_status(false, false), "failed");
+        assert_eq!(text_presence_status(false, true), "incomplete");
+    }
 
     #[test]
     fn observation_learning_requires_relevant_complete_scope_not_just_nonempty_items() {

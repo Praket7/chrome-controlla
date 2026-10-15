@@ -436,3 +436,66 @@ impl CommandBudget {
         }
     }
 }
+
+#[cfg(test)]
+mod lease_recovery_tests {
+    use super::{LeaseTable, TargetKey};
+
+    fn target(session: &str, tab: &str) -> TargetKey {
+        TargetKey {
+            browser_id: session.to_owned(),
+            tab_id: tab.to_owned(),
+        }
+    }
+
+    #[test]
+    fn same_target_is_exclusive_while_independent_targets_progress_and_stale_owner_cannot_release()
+    {
+        let mut leases = LeaseTable::default();
+        let target_a = target("session-a", "tab-a");
+        let target_b = target("session-a", "tab-b");
+        leases
+            .acquire(target_a.clone(), "owner-1", 1_000, 5_000)
+            .unwrap();
+        assert!(
+            leases
+                .acquire(target_a.clone(), "owner-2", 1_001, 5_000)
+                .is_err(),
+            "same-target mutations serialize"
+        );
+        assert!(
+            leases
+                .acquire(target_b.clone(), "owner-3", 1_001, 5_000)
+                .is_ok(),
+            "independent target can progress"
+        );
+        assert!(
+            !leases.release(&target_a, "owner-2"),
+            "interfering caller cannot release another owner's lease"
+        );
+        assert_eq!(leases.owner(&target_a, 1_002).as_deref(), Some("owner-1"));
+    }
+
+    #[test]
+    fn expired_mutation_lease_cannot_be_resurrected_or_release_a_replacement_owner() {
+        let mut leases = LeaseTable::default();
+        let target = target("session", "tab");
+        leases
+            .acquire(target.clone(), "cancelled-operation", 100, 250)
+            .unwrap();
+        assert!(
+            leases
+                .renew(&target, "cancelled-operation", 351, 500)
+                .is_none()
+        );
+        assert_eq!(
+            leases
+                .acquire(target.clone(), "new-operation", 352, 500)
+                .unwrap()
+                .owner,
+            "new-operation"
+        );
+        assert!(!leases.release(&target, "cancelled-operation"));
+        assert_eq!(leases.owner(&target, 353).as_deref(), Some("new-operation"));
+    }
+}

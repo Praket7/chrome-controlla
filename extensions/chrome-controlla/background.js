@@ -6,10 +6,30 @@ const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
 const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
 const OPEN_RECEIPTS_KEY = "openReceipts";
+const ACTIVATION_RECEIPTS_KEY = "activationReceipts";
 const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const OPEN_RECEIPT_MAX_COUNT = 256;
 const MAX_BATCH_ACTIONS = 64;
-const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+const MAX_NATIVE_MESSAGE_BYTES = 900 * 1024;
+const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
+const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
+  const assets = await Promise.all(CONTROLLA_EXTENSION_BUILD_ASSETS.map(async name => {
+    const response = await fetch(chrome.runtime.getURL(name));
+    if (!response.ok) throw new Error(`Cannot verify installed Controlla extension asset ${name}.`);
+    return { name, bytes: new Uint8Array(await response.arrayBuffer()) };
+  }));
+  const encoder = new TextEncoder();
+  const parts = assets.flatMap(({ name, bytes }) => [encoder.encode(name), new Uint8Array([0]), bytes, new Uint8Array([0])]);
+  const totalBytes = parts.reduce((sum, part) => sum + part.length, 0);
+  const input = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const part of parts) { input.set(part, offset); offset += part.length; }
+  const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", input))]
+    .map(byte => byte.toString(16).padStart(2, "0")).join("");
+  return `controlla-chrome-extension:${chrome.runtime.getManifest().version}:${digest}`;
+})();
+const SCREENSHOT_CHUNK_CHARS = 512 * 1024;
+const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Page.captureScreenshot", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
   "Input.dispatchMouseEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser"]);
 let nativePort;
 let nativeReady = false;
@@ -56,6 +76,7 @@ const frameSessions = new Map();
 const frameSessionWaiters = new Map();
 const pendingSecureInputs = new Map();
 const openTabInflight = new Map();
+const cancelledScreenshotRequests = new Set();
 let openTabQueue = Promise.resolve();
 let activationEpoch = 0;
 let focusEpoch = 0;
@@ -111,18 +132,21 @@ function waitForFileChooser(tabId, documentId, timeoutMs, afterSequence = 0) {
   });
 }
 async function frameActionablePoint(route, objectId) {
-  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function __controllaFrameActionable(){const e=this,r=e.getBoundingClientRect(),v=e.ownerDocument.defaultView;if(!e.isConnected||!r.width||!r.height||r.left<0||r.top<0||r.right>v.innerWidth||r.bottom>v.innerHeight)return false;for(let n=e;n;n=n.parentElement){const s=v.getComputedStyle(n);if(n.disabled||n.getAttribute('aria-disabled')==='true'||n.hasAttribute('inert')||n.hasAttribute('hidden')||s.display==='none'||s.visibility!=='visible'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0)return false}const x=r.left+r.width/2,y=r.top+r.height/2,root=e.getRootNode(),h=(root.elementFromPoint?.(x,y)||e.ownerDocument.elementFromPoint(x,y));return !!h&&(h===e||e.contains(h))?{x,y}:false}", returnByValue: true });
+  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function __controllaFrameActionable(){const e=this,r=e.getBoundingClientRect(),v=e.ownerDocument.defaultView;if(!e.isConnected||!r.width||!r.height||r.left<0||r.top<0||r.right>v.innerWidth||r.bottom>v.innerHeight)return false;for(let n=e;n;n=n.parentElement){const s=v.getComputedStyle(n);if(n.disabled||n.getAttribute('aria-disabled')==='true'||n.hasAttribute('inert')||n.hasAttribute('hidden')||s.display==='none'||s.visibility!=='visible'||s.pointerEvents==='none'||Number.parseFloat(s.opacity||'1')<=0)return false}const x=r.left+r.width/2,y=r.top+r.height/2,root=e.getRootNode(),h=(root.elementFromPoint?.(x,y)||e.ownerDocument.elementFromPoint(x,y));return !!h&&(h===e||e.contains(h))?{x,y,viewport:{width:v.innerWidth,height:v.innerHeight}}:false}", returnByValue: true });
   const point = result.result?.value;
   if (!(point?.x >= 0) || !(point?.y >= 0)) throw new Error("Frame control is disabled, outside the viewport, or obscured.");
   return point;
 }
-async function rootPointForFrame(tabId, frameId, objectId, x, y) {
+async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) {
   const root = { tabId }, tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
   const path = (node, ancestors = []) => node?.frame?.id === frameId ? ancestors : (node?.childFrames || []).map(child => path(child, [...ancestors, child.frame.id])).find(Boolean);
   const frames = path(tree.frameTree);
   if (!frames?.length || frames.length > 8) throw new Error("Same-process frame ancestry is unavailable or too deep.");
-  let viewport = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
-  viewport = viewport.result?.value;
+  let viewport = childViewport;
+  if (!(viewport?.width > 0) || !(viewport?.height > 0)) {
+    const measured = await chrome.debugger.sendCommand(root, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+    viewport = measured.result?.value;
+  }
   for (const childFrameId of frames.reverse()) {
     const owner = await chrome.debugger.sendCommand(root, "DOM.getFrameOwner", { frameId: childFrameId });
     const box = await chrome.debugger.sendCommand(root, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId });
@@ -229,7 +253,49 @@ function trackTabDetach(tabId, current) {
 async function performDebuggerDetach(tabId) { try { await chrome.debugger.detach({ tabId }); } catch {} }
 async function attachDebugger(tabId) { await (pendingTabDetaches.get(tabId) || Promise.resolve()).catch(() => {}); return chrome.debugger.attach({ tabId }, "1.3"); }
 function queueNativeMutation(operation) { const result = nativeMutation.then(operation, operation); nativeMutation = result.catch(() => {}); return result; }
-function sendNative(port, generation, message) { if (nativePort !== port || nativePortGeneration !== generation) return false; try { port.postMessage(message); return true; } catch { return false; } }
+function sendNative(port, generation, message) {
+  if (nativePort !== port || nativePortGeneration !== generation) return false;
+  try {
+    const encoded = JSON.stringify(message);
+    if (new TextEncoder().encode(encoded).byteLength > MAX_NATIVE_MESSAGE_BYTES) {
+      port.postMessage({ type: message?.type === "tabs" ? "tabs_error" : (message?.type || "result"), id: message?.id, request_id: message?.request_id, lease_id: message?.lease_id,
+        error: "AX or command response exceeded the safe native-message size; result was not forwarded.", reason_code: "native_message_too_large" });
+      return false;
+    }
+    port.postMessage(message); return true;
+  } catch { return false; }
+}
+async function sendScreenshotResponse(port, generation, response) {
+  const data = response?.result?.data;
+  if (typeof data !== "string" || data.length <= SCREENSHOT_CHUNK_CHARS) return sendNative(port, generation, response);
+  const chunks = Array.from({ length: Math.ceil(data.length / SCREENSHOT_CHUNK_CHARS) }, (_, index) =>
+    data.slice(index * SCREENSHOT_CHUNK_CHARS, (index + 1) * SCREENSHOT_CHUNK_CHARS));
+  if (chunks.length > 16 || data.length > 8 * 1024 * 1024) {
+    return sendNative(port, generation, { type: "result", id: response.id, lease_id: response.lease_id,
+      error: "Screenshot exceeded the bounded chunk-transfer limit.", reason_code: "screenshot_transfer_too_large" });
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data));
+  const base64_sha256 = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const transfer_id = crypto.randomUUID();
+  const requestKey = `${response.lease_id || ""}:${response.id}`;
+  if (cancelledScreenshotRequests.delete(requestKey)) {
+    sendNative(port, generation, { type: "result_chunk_abort", id: response.id, lease_id: response.lease_id, transfer_id });
+    return false;
+  }
+  for (let index = 0; index < chunks.length; index++) {
+    if (cancelledScreenshotRequests.delete(requestKey)) {
+      sendNative(port, generation, { type: "result_chunk_abort", id: response.id, lease_id: response.lease_id, transfer_id });
+      return false;
+    }
+    const chunk = { type: "result_chunk", id: response.id, lease_id: response.lease_id,
+      transfer_id, index, total_chunks: chunks.length, total_chars: data.length, base64_sha256, chunk: chunks[index] };
+    if (!sendNative(port, generation, chunk)) {
+      sendNative(port, generation, { type: "result_chunk_abort", id: response.id, lease_id: response.lease_id, transfer_id });
+      return false;
+    }
+  }
+  return true;
+}
 function resolveNativeLease(leaseId, tabId) { if (leaseId) return nativeLeases.get(leaseId); const owner = nativeTabLeases.get(tabId); if (owner) return nativeLeases.get(owner); return nativeLeases.size === 1 ? nativeLeases.values().next().value : undefined; }
 function safeNativeError(value) { if (typeof value !== "string" || !value) return undefined; return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 256); }
 function safeErrorClass(error) { try { const name = error?.name; return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : "Error"; } catch { return "Error"; } }
@@ -310,7 +376,19 @@ function connectNative() {
 }
 async function handleNativeMessage(port, portGeneration, message) {
   if (port !== nativePort || portGeneration !== nativePortGeneration || !message || typeof message.type !== "string") return;
-  if (message.type === "ready") { nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false; void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {}); sendNative(port, portGeneration, { type: "capabilities", protocol_version: 2, multi_session_leases: true }); return; }
+  if (message.type === "ready") {
+    try {
+      const extensionBuildId = await CONTROLLA_EXTENSION_BUILD_ID_PROMISE;
+      if (port !== nativePort || portGeneration !== nativePortGeneration) return;
+      nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false;
+      void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {});
+      sendNative(port, portGeneration, { type: "capabilities", protocol_version: 2, extension_build_id: extensionBuildId, multi_session_leases: true });
+    } catch {
+      nativeReady = false;
+      nativeError = "Cannot verify the installed Controlla extension build.";
+    }
+    return;
+  }
   if (message.type === "list_tabs") {
     try {
       const tabs = await chrome.tabs.query({});
@@ -345,12 +423,24 @@ async function handleNativeMessage(port, portGeneration, message) {
   }
   if (message.type === "pair") { await queueNativeMutation(() => pairNative(port, portGeneration, message)); return; }
   if (message.type === "release") { await queueNativeMutation(() => message.lease_id ? detachNativeLease(message.lease_id) : detachNative(++nativeGeneration)); return; }
+  if (message.type === "cancel_screenshot") {
+    if (Number.isSafeInteger(message.id) && typeof message.lease_id === "string" && message.lease_id) {
+      cancelledScreenshotRequests.add(`${message.lease_id}:${message.id}`);
+      while (cancelledScreenshotRequests.size > 128) cancelledScreenshotRequests.delete(cancelledScreenshotRequests.values().next().value);
+    }
+    return;
+  }
   if (message.type === "command" || message.type === "batch") {
     const commandGeneration = nativeGeneration; const leaseId = message.lease_id; const startedAt = Date.now();
     const lease = resolveNativeLease(leaseId, Number(message.target_id));
     const authorize = tabId => nativeGeneration === commandGeneration && (lease ? lease.tabs.has(tabId) || lease.unrestricted : nativeAttachedTabs.has(tabId));
     const reply = response => {
-      const sent = nativeGeneration === commandGeneration && sendNative(port, portGeneration, { ...response, ...(leaseId ? { lease_id: leaseId } : {}) });
+      const envelope = { ...response, ...(leaseId ? { lease_id: leaseId } : {}) };
+      const screenshot = message.method === "Page.captureScreenshot" && response.type === "result";
+      const sent = nativeGeneration === commandGeneration && (screenshot || sendNative(port, portGeneration, envelope));
+      if (sent && screenshot) void sendScreenshotResponse(port, portGeneration, envelope).then(ok => {
+        if (!ok) sendNative(port, portGeneration, { type: "result", id: response.id, lease_id: leaseId, error: "Screenshot chunk transfer was interrupted.", reason_code: "screenshot_transfer_interrupted" });
+      }).catch(() => sendNative(port, portGeneration, { type: "result", id: response.id, lease_id: leaseId, error: "Screenshot chunk transfer failed.", reason_code: "screenshot_transfer_failed" }));
       traceSharedCommand("reply", message, Number(message.target_id), startedAt, { outcome: nativeGeneration !== commandGeneration ? "suppressed" : sent ? "sent" : "failed", responseBytes: (() => { try { return JSON.stringify(response).length; } catch { return 0; } })() });
     };
     if (message.type === "batch") await dispatchBatch(message, authorize, reply, true); else await dispatchCommand(message, authorize, reply, true);
@@ -384,7 +474,8 @@ async function pairNative(port, portGeneration, message) {
       const attached = await chrome.tabs.get(tabId).catch(() => null); const attachedFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
       if (navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || !attached || attached.status !== "complete" || attached.url !== beforeAttach.url || attachedFrame?.documentId !== beforeFrame.documentId) throw new Error("Tab " + tabId + " navigated during pairing; rediscover tabs and pair again.");
     }
-    sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, lease_id: leaseId, targets: [...lease.tabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true });
+    const extensionBuildId = await CONTROLLA_EXTENSION_BUILD_ID_PROMISE;
+    sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, lease_id: leaseId, targets: [...lease.tabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, extension_build_id: extensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true });
   } catch (error) {
     if (attemptGeneration !== undefined) await detachNativeLease(typeof message.lease_id === "string" && message.lease_id ? message.lease_id : message.request_id);
     if (reservation) for (const tabId of requested || []) { if (manualAttachedTabs.has(tabId)) continue; pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); }
@@ -484,10 +575,99 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (request.method === "Controlla.openTab") {
       const url = validateNavigationUrl(request.params?.url); const native = nativeRoute; const waitUntil = request.params?.wait_until ?? "dom_content_loaded";
       const active = request.params?.active ?? true;
+      const createBackgroundWindow = request.params?.create_background_window === true;
+      const targetWindowId = request.params?.target_window_id;
+      const placement = Object.fromEntries(["left", "top", "width", "height"].filter(key => Number.isSafeInteger(request.params?.[`window_${key}`])).map(key => [key, request.params[`window_${key}`]]));
       if (waitUntil !== "document_committed" && waitUntil !== "dom_content_loaded") throw new Error("wait_until must be document_committed or dom_content_loaded.");
       if (typeof active !== "boolean") throw new Error("active must be a boolean.");
-      const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration, waitUntil, active);
+      if (createBackgroundWindow && active) throw new Error("A Controlla-owned automation window must be requested in background mode.");
+      if (targetWindowId !== undefined && (!Number.isSafeInteger(targetWindowId) || targetWindowId <= 0 || createBackgroundWindow)) throw new Error("target_window_id must identify an existing Controlla automation window and cannot be combined with create_background_window.");
+      if (Object.values(placement).some(value => Math.abs(value) > 32768) || [placement.width, placement.height].some(value => value !== undefined && (value < 200 || value > 8192))) throw new Error("Background window placement is outside the supported bounds.");
+      if (!createBackgroundWindow && Object.keys(placement).length) throw new Error("Window placement requires create_background_window.");
+      const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration, waitUntil, active, createBackgroundWindow, placement, targetWindowId);
       respond({ type: "result", id: request.id, result }); return;
+    }
+    if (request.method === "Controlla.closeOwnedTab") {
+      const ownedTabId = Number(request.params?.owned_tab_id);
+      if (!Number.isSafeInteger(ownedTabId) || ownedTabId <= 0 || String(ownedTabId) !== String(request.params?.owned_tab_id)) throw new Error("owned_tab_id must be a decimal Chrome tab ID.");
+      const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+      const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+      const receiptEntry = Object.entries(receipts).find(([, receipt]) => receipt?.tab_id === String(ownedTabId));
+      if (!receiptEntry) throw new Error("This tab has no Controlla-owned open receipt; user-owned tabs cannot be closed by this operation.");
+      const [operationKey, receipt] = receiptEntry;
+      if (receipt.status === "closed") {
+        const stillOpen = await chrome.tabs.get(ownedTabId).then(() => true).catch(() => false);
+        if (stillOpen) throw new Error("Close was previously recorded but Chrome still reports the tab; inspect its lifecycle before retrying.");
+        respond({ type: "result", id: request.id, result: { status: "closed", tab_id: String(ownedTabId), window_id: receipt.window_id, document_id: receipt.document_id, topology_verified: true, idempotent_reuse: true } }); return;
+      }
+      if (receipt.status !== "complete" || !receipt.document_id) throw new Error("The Controlla open receipt is incomplete; refusing to close an unverified target.");
+      const identity = await nativePageIdentity(ownedTabId).catch(() => undefined);
+      if (!identity || identity.document_id !== receipt.document_id || identity.url !== receipt.url) throw new Error("The created tab's document changed after open; refusing to close the changed target.");
+      const tab = await chrome.tabs.get(ownedTabId);
+      await chrome.tabs.remove(ownedTabId);
+      const remainsOpen = await chrome.tabs.get(ownedTabId).then(() => true).catch(() => false);
+      if (remainsOpen) throw new Error("Chrome did not confirm that the Controlla-owned tab was removed.");
+      receipts[operationKey] = { ...receipt, status: "closed", closed_ms: Date.now() };
+      await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+      respond({ type: "result", id: request.id, result: { status: "closed", tab_id: String(ownedTabId), window_id: tab.windowId, document_id: identity.document_id, topology_verified: true, idempotent_reuse: false } }); return;
+    }
+    if (request.method === "Controlla.activateOwnedTab") {
+      const ownedTabId = Number(request.params?.owned_tab_id);
+      const idempotencyKey = request.params?.idempotency_key;
+      if (!Number.isSafeInteger(ownedTabId) || ownedTabId <= 0 || String(ownedTabId) !== String(request.params?.owned_tab_id)) throw new Error("owned_tab_id must be a decimal Chrome tab ID.");
+      if (typeof idempotencyKey !== "string" || !/^[!-~]{1,128}$/.test(idempotencyKey)) throw new Error("idempotency_key must contain 1–128 printable ASCII characters.");
+      const saved = await chrome.storage.local.get([OPEN_RECEIPTS_KEY, ACTIVATION_RECEIPTS_KEY]);
+      const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+      const receiptEntry = Object.entries(receipts).find(([, receipt]) => receipt?.tab_id === String(ownedTabId) && receipt.status === "complete");
+      if (!receiptEntry?.[1]?.document_id) throw new Error("This tab has no completed Controlla-owned open receipt; user-owned tabs cannot be activated by this operation.");
+      const [openKey, receipt] = receiptEntry;
+      const identity = await nativePageIdentity(ownedTabId).catch(() => undefined);
+      if (!identity || identity.document_id !== receipt.document_id || identity.url !== receipt.url) throw new Error("The owned tab document changed; refusing to activate a stale target.");
+      const activationReceipts = saved[ACTIVATION_RECEIPTS_KEY] || {};
+      const prior = activationReceipts[idempotencyKey];
+      if (prior && (prior.tab_id !== String(ownedTabId) || prior.document_id !== identity.document_id || prior.open_key !== openKey)) throw new Error("idempotency_key is already bound to a different activation target.");
+      const before = await chrome.tabs.get(ownedTabId);
+      if (!before.active || !(await chrome.windows.get(before.windowId)).focused) {
+        await chrome.windows.update(before.windowId, { focused: true });
+        await chrome.tabs.update(ownedTabId, { active: true });
+      }
+      const [after, afterIdentity, window] = await Promise.all([
+        chrome.tabs.get(ownedTabId), nativePageIdentity(ownedTabId).catch(() => undefined), chrome.windows.get(before.windowId)
+      ]);
+      if (!after.active || !window.focused || after.windowId !== before.windowId || !afterIdentity || afterIdentity.document_id !== identity.document_id || afterIdentity.url !== identity.url) {
+        throw new Error("Chrome did not verify the exact owned tab, unchanged document, active tab, and focused window.");
+      }
+      activationReceipts[idempotencyKey] = { tab_id: String(ownedTabId), document_id: identity.document_id, open_key: openKey, activated_ms: Date.now() };
+      const bounded = Object.entries(activationReceipts).slice(-256);
+      await chrome.storage.local.set({ [ACTIVATION_RECEIPTS_KEY]: Object.fromEntries(bounded) });
+      respond({ type: "result", id: request.id, result: { status: "activated", tab_id: String(ownedTabId), window_id: after.windowId,
+        document_id: afterIdentity.document_id, url: afterIdentity.url, tab_active: true, window_focused: true,
+        topology_verified: true, idempotent_reuse: !!prior } }); return;
+    }
+    if (request.method === "Controlla.moveOwnedTab") {
+      const ownedTabId = Number(request.params?.owned_tab_id);
+      const targetWindowId = request.params?.target_window_id;
+      if (!Number.isSafeInteger(ownedTabId) || ownedTabId <= 0 || String(ownedTabId) !== String(request.params?.owned_tab_id)) throw new Error("owned_tab_id must be a decimal Chrome tab ID.");
+      if (!Number.isSafeInteger(targetWindowId) || targetWindowId <= 0) throw new Error("target_window_id must be a positive Chrome window ID.");
+      const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+      const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+      const receipt = Object.values(receipts).find(value => value?.tab_id === String(ownedTabId) && value.status === "complete");
+      if (!receipt?.document_id) throw new Error("This tab has no completed Controlla-owned open receipt; user-owned tabs cannot be moved by this operation.");
+      const targetWindow = await assertOwnedAutomationWindow(targetWindowId);
+      const before = await chrome.tabs.get(ownedTabId);
+      const identity = await nativePageIdentity(ownedTabId).catch(() => undefined);
+      if (!identity || identity.document_id !== receipt.document_id || identity.url !== receipt.url) throw new Error("The owned tab document changed; refusing to move a stale target.");
+      if (before.active || (await chrome.windows.get(before.windowId)).focused) throw new Error("Move requires an inactive owned tab in an unfocused source window.");
+      await chrome.tabs.move(ownedTabId, { windowId: targetWindowId, index: -1 });
+      const [after, afterIdentity, finalWindow] = await Promise.all([
+        chrome.tabs.get(ownedTabId), nativePageIdentity(ownedTabId).catch(() => undefined), chrome.windows.get(targetWindowId)
+      ]);
+      if (after.windowId !== targetWindowId || !afterIdentity || afterIdentity.document_id !== identity.document_id || afterIdentity.url !== identity.url || finalWindow.focused || targetWindow.focused) {
+        throw new Error("Chrome did not verify the exact moved tab, unchanged document, and unfocused destination window.");
+      }
+      respond({ type: "result", id: request.id, result: { status: "moved", tab_id: String(ownedTabId), source_window_id: before.windowId,
+        window_id: after.windowId, document_id: afterIdentity.document_id, url: afterIdentity.url, tab_active: !!after.active,
+        window_focused: !!finalWindow.focused, topology_verified: true } }); return;
     }
     if (request.method === "Controlla.newTabs") {
       const since = request.params?.since_ms;
@@ -521,6 +701,11 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           (expectedViewport != null && (typeof expectedViewport !== "string" || expectedViewport.length > 256))) throw new Error("pointer click requires a bounded guarded target.");
       const target = await chrome.tabs.get(tabId), window = await chrome.windows.get(target.windowId);
       const wasActive = !!target.active;
+      if (!wasActive) {
+        respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,dispatch_may_have_occurred:false,temporary_activation:false,
+          reason_code:"activation_forbidden",reason:"Pointer input on an inactive user-owned tab would activate it. Use an explicitly Controlla-owned automation window or select the tab in the foreground."} });
+        return;
+      }
       const previous = wasActive ? target : (await chrome.tabs.query({ active:true, windowId:target.windowId }))[0];
       if (!previous?.id) { respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"active_tab_unavailable",reason:"Could not identify the tab to restore after pointer input."} }); return; }
       const documentId = pairedTabDocumentIds.get(tabId), generation = routeGeneration, activationEpochBefore = activationEpoch;
@@ -693,7 +878,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       respond({ type: "result", id: request.id, result: { ...selected, document_id: expectedDocumentId } }); return;
     }
     if (request.method === "Controlla.setFrameFileInputFiles") {
-      if (!nativeRoute || !nativeLease?.unrestricted) throw new Error("File selection requires local unrestricted mode.");
+      if (!nativeRoute || !nativeLease?.tabs.has(tabId)) throw new Error("File selection requires an exact native lease for the target tab.");
       const { frame_id: frameId, frame_loader_id: loaderId, backend_node_id: backendNodeId, file_path: filePath } = request.params || {};
       if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload target or local path is invalid.");
       const readTree = () => chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
@@ -710,7 +895,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       respond({ type: "result", id: request.id, result: { frame_id: frameId, frame_loader_id: loaderId, files: readback.result?.value } }); return;
     }
     if (request.method === "Controlla.frameSelectFile") {
-      if (!nativeRoute || !nativeLease?.unrestricted) throw new Error("File selection requires local unrestricted mode.");
+      if (!nativeRoute || !nativeLease?.tabs.has(tabId)) throw new Error("File selection requires an exact native lease for the target tab.");
       const { frame_id: frameId, frame_loader_id: loaderId, trigger_backend_node_id: triggerId, file_path: filePath } = request.params || {};
       if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(triggerId) || triggerId <= 0 || typeof filePath !== "string" || !filePath || filePath.length > 4096) throw new Error("Frame upload trigger or local path is invalid.");
       const root = { tabId };
@@ -745,16 +930,16 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         await chrome.debugger.sendCommand(route, "Page.setInterceptFileChooserDialog", { enabled: true });
         interceptionEnabled = true;
         let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-        if (!sessionId) ({ x, y } = await rootPointForFrame(tabId, frameId, resolvedTrigger.object.objectId, localPoint.x, localPoint.y));
+        ({ x, y } = await rootPointForFrame(tabId, frameId, resolvedTrigger.object.objectId, localPoint.x, localPoint.y, localPoint.viewport));
         if ((await readFrame())?.loaderId !== loaderId) throw new Error("Upload frame changed before dispatch.");
         if (operation.conflicted) throw new Error("Another file chooser opened before the upload trigger was pressed.");
         // shortcut: CDP does not identify a chooser's initiating click; add causal page instrumentation if same-frame human interaction must be distinguished during dispatch.
         operation.eventCursor = fileChooserEventSequence;
         operation.pressing = true;
-        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
         pressAttempted = true;
-        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-        await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
         dispatched = true;
         const chooser = await waitForFileChooser(tabId, expectedDocumentId, 4000, operation.eventCursor);
         if (operation.conflicted || chooser.frame_id !== frameId || chooser.frame_loader_id !== loaderId || (await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("File chooser belongs to another frame, document, or overlapping operation.");
@@ -816,22 +1001,22 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (!objectId) throw new Error("Frame click target could not be resolved for outcome verification.");
         const localPoint = await frameActionablePoint(child, objectId);
         let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-        if (!sessionId) ({ x, y } = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y));
+        ({ x, y } = await rootPointForFrame(tabId, frameId, objectId, localPoint.x, localPoint.y, localPoint.viewport));
         if (await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
         let pressAttempted = false;
         try {
-          if (inputMode === "mouse") await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+          if (inputMode === "mouse") await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
           pressAttempted = true;
           if (inputMode === "touch") {
-            await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
-            await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+            await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
+            await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           } else {
-            await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-            await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+            await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+            await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
           }
         } catch (error) {
-          if (pressAttempted && inputMode === "touch") await chrome.debugger.sendCommand(child, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
-          if (pressAttempted && inputMode === "mouse") await chrome.debugger.sendCommand(child, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
+          if (pressAttempted && inputMode === "touch") await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
+          if (pressAttempted && inputMode === "mouse") await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
           respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: false, dispatch_may_have_occurred: pressAttempted, verified: false, reason: String(error) } });
           return;
         }
@@ -918,9 +1103,24 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       return;
     }
     if (!SHARED_COMMAND_METHODS.has(request.method)) throw new Error("Command is outside the shared observe/input allowlist.");
+    if (request.method === "Page.captureScreenshot") {
+      const p = request.params || {}, clip = p.clip;
+      if (p.format !== "png" || p.captureBeyondViewport !== false || p.fromSurface !== true ||
+          !clip || ![clip.x, clip.y, clip.width, clip.height, clip.scale].every(Number.isFinite) ||
+          clip.x < 0 || clip.y < 0 || clip.width <= 0 || clip.height <= 0 || clip.width > 1600 || clip.height > 1200 ||
+          clip.scale <= 0 || clip.scale > 2 || clip.width * clip.height > 1_920_000) {
+        throw new Error("Shared screenshot requires a bounded PNG viewport crop (maximum 1600x1200 pixels).");
+      }
+    }
+    const screenshotDocumentId = request.method === "Page.captureScreenshot" ? pairedTabDocumentIds.get(tabId) : undefined;
     const requestBytes = JSON.stringify({ method: request.method, params: request.params || {} }).length;
-    traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes }); const result = await chrome.debugger.sendCommand({ tabId }, request.method, request.params || {}); traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result", requestBytes, responseBytes: (() => { try { return JSON.stringify(result).length; } catch { return 0; } })() }); respond({ type: "result", id: request.id, result });
-  } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error) }); }
+    traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes }); const result = await chrome.debugger.sendCommand({ tabId }, request.method, request.params || {});
+    if (screenshotDocumentId && pairedTabDocumentIds.get(tabId) !== screenshotDocumentId) {
+      throw Object.assign(new Error("Target document changed during screenshot capture; image bytes were discarded."), { reason_code: "screenshot_document_changed" });
+    }
+    if (request.method === "Page.captureScreenshot" && (typeof result?.data !== "string" || result.data.length > 8 * 1024 * 1024 || !result.data.startsWith("iVBOR"))) throw new Error("Screenshot was empty or exceeded the 6 MiB decoded image limit.");
+    traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result", requestBytes, responseBytes: (() => { try { return JSON.stringify(result).length; } catch { return 0; } })() }); respond({ type: "result", id: request.id, result });
+  } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error), ...(error?.reason_code ? { reason_code: error.reason_code } : {}) }); }
 }
 function validateNavigationUrl(value) { if (typeof value !== "string" || value.length > 2048) throw new Error("URL must be a bounded HTTP(S) URL."); const url = new URL(value); if (!(url.protocol === "http:" || url.protocol === "https:") || !url.hostname || url.username || url.password) throw new Error("URL must be HTTP(S) and cannot contain credentials."); return url.href; }
 async function nativePageIdentity(tabId) {
@@ -1006,6 +1206,11 @@ async function attachNewTab(tabId, url, native, generation, navigate = true, wai
 async function returnExistingOpen(receipt, url, native, generation) {
   if ((receipt.requested_url || receipt.url) !== url) throw new Error("Idempotency key is already bound to a different URL.");
   const tabId = Number(receipt.tab_id);
+  if (Number.isSafeInteger(receipt.target_window_id)) {
+    const window = await assertOwnedAutomationWindow(receipt.target_window_id);
+    const existingTab = await chrome.tabs.get(tabId).catch(() => undefined);
+    if (!existingTab || existingTab.windowId !== receipt.target_window_id || window.focused) throw new Error("The selected automation window changed or is focused; no replacement tab was opened.");
+  }
   const identity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!identity || identity.url !== receipt.url || identity.document_id !== receipt.document_id) throw new Error(`Open receipt ${receipt.tab_id} is stale; its tab changed or closed, so no replacement tab was opened.`);
   const attached = native ? nativeAttachedTabs : manualAttachedTabs;
@@ -1015,9 +1220,20 @@ async function returnExistingOpen(receipt, url, native, generation) {
     if (!routeActive(native, generation) || after?.url !== receipt.url || after?.document_id !== receipt.document_id) { await detachDebugger(tabId); throw new Error(`Open receipt ${receipt.tab_id} changed while reconnecting; no replacement tab was opened.`); }
     pairedTabUrls.set(tabId, after.url); pairedTabDocumentIds.set(tabId, after.document_id); attached.add(tabId);
   }
-  return { tab_id: receipt.tab_id, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true };
+  const tab = await chrome.tabs.get(tabId), window = await chrome.windows.get(tab.windowId);
+  return { tab_id: receipt.tab_id, window_id: receipt.window_id ?? tab.windowId, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true, created_background_window: receipt.create_background_window === true, placement: receipt.placement || {}, tab_active: !!tab.active, window_focused: !!window.focused };
 }
-async function createControllaTab(url, native, generation, tab, markerUrl, reused = false, waitUntil = "dom_content_loaded", active = true) {
+async function assertOwnedAutomationWindow(windowId) {
+  const window = await chrome.windows.get(windowId, { populate: true }).catch(() => undefined);
+  if (!window || window.focused !== false) throw new Error("Selected automation window is unavailable or focused; refusing to change user presentation.");
+  const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+  const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+  const owned = Object.values(receipts).some(receipt => receipt?.status === "complete"
+    && receipt.create_background_window === true && receipt.window_id === windowId);
+  if (!owned) throw new Error("Selected window has no completed Controlla automation-window ownership receipt.");
+  return window;
+}
+async function createControllaTab(url, native, generation, tab, markerUrl, reused = false, waitUntil = "dom_content_loaded", active = true, createBackgroundWindow = false, placement = {}) {
   tab ||= await chrome.tabs.create({ url: markerUrl, active });
   let identity, attachedIdentity;
   try {
@@ -1031,15 +1247,19 @@ async function createControllaTab(url, native, generation, tab, markerUrl, reuse
     failure.controllaOrphanTabId = String(tab.id);
     throw failure;
   }
-  return { tab_id: String(tab.id), ...identity, idempotent_reuse: reused, created_by_controlla: true };
+  const [currentTab, currentWindow] = await Promise.all([chrome.tabs.get(tab.id), chrome.windows.get(tab.windowId)]);
+  return { tab_id: String(tab.id), window_id: tab.windowId, ...identity, idempotent_reuse: reused, created_by_controlla: true,
+    created_background_window: createBackgroundWindow, placement, tab_active: !!currentTab.active, window_focused: !!currentWindow.focused };
 }
-async function openControllaTab(url, clientKey, native, generation, waitUntil = "dom_content_loaded", active = true) {
+async function openControllaTab(url, clientKey, native, generation, waitUntil = "dom_content_loaded", active = true, createBackgroundWindow = false, placement = {}, targetWindowId) {
   if (clientKey === undefined) throw new Error("idempotency_key is required so an open retry cannot create another tab.");
   if (typeof clientKey !== "string" || clientKey.length < 8 || clientKey.length > 256 || /[\u0000-\u001f\u007f]/.test(clientKey)) throw new Error("idempotency_key must be 8..256 bounded printable characters.");
   const pending = openTabInflight.get(clientKey);
   if (pending) {
     if (pending.url !== url) throw new Error("Idempotency key is already bound to a different URL.");
     if (pending.active !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
+    if (pending.createBackgroundWindow !== createBackgroundWindow || JSON.stringify(pending.placement) !== JSON.stringify(placement)) throw new Error("Idempotency key is already bound to a different target/window policy.");
+    if (pending.targetWindowId !== targetWindowId) throw new Error("Idempotency key is already bound to a different automation window.");
     return pending.promise;
   }
   const withReceiptLock = async operation => {
@@ -1056,8 +1276,12 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     const markerUrl = `${chrome.runtime.getURL("open-recovery.html")}#${encodeURIComponent(clientKey)}`;
     let receipt = receipts[clientKey];
     if (receipt?.status === "failed") throw new Error(`Open attempt left Controlla-created tab ${receipt.tab_id} for recovery; rediscover and pair that tab before retrying.`);
+    if (receipt?.status === "closed") throw new Error("This idempotency key belongs to a tab Controlla already closed; use a new key to create another tab.");
     if (receipt?.status === "complete" || receipt?.document_id) {
       if ((receipt.active ?? true) !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
+      if ((receipt.create_background_window === true) !== createBackgroundWindow || JSON.stringify(receipt.placement || {}) !== JSON.stringify(placement)) throw new Error("Idempotency key is already bound to a different target/window policy.");
+      if (receipt.target_window_id !== targetWindowId) throw new Error("Idempotency key is already bound to a different automation window.");
+      if (Number.isSafeInteger(targetWindowId)) await assertOwnedAutomationWindow(targetWindowId);
       if ((receipt.requested_url || receipt.url) !== url) throw new Error("Idempotency key is already bound to a different URL.");
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
       return { existing: receipt };
@@ -1070,48 +1294,61 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     if (tab && ![markerUrl, url].includes(tab.url)) throw new Error("Open recovery tab changed before completion; no replacement tab was opened.");
     const reused = !!receipt || !!tab;
     if (receipt && (receipt.active ?? true) !== active) throw new Error("Idempotency key is already bound to a different activation mode.");
-    if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active });
-    receipt = { status: "creating", tab_id: String(tab.id), url, requested_url: url, marker_url: markerUrl, active, created_ms: receipt?.created_ms || Date.now() };
+    if (receipt && ((receipt.create_background_window === true) !== createBackgroundWindow || JSON.stringify(receipt.placement || {}) !== JSON.stringify(placement))) throw new Error("Idempotency key is already bound to a different target/window policy.");
+    if (receipt && receipt.target_window_id !== targetWindowId) throw new Error("Idempotency key is already bound to a different automation window.");
+    if (Number.isSafeInteger(targetWindowId)) await assertOwnedAutomationWindow(targetWindowId);
+    let createdWindow;
+    if (!tab && createBackgroundWindow) {
+      createdWindow = await chrome.windows.create({ url: markerUrl, focused: false, type: "normal", ...placement });
+      tab = createdWindow?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
+      if (!tab || !Number.isSafeInteger(createdWindow?.id)) throw new Error("Chrome did not return the new unfocused Controlla window and tab.");
+    } else if (!tab && Number.isSafeInteger(targetWindowId)) tab = await chrome.tabs.create({ windowId: targetWindowId, url: markerUrl, active });
+    else if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active });
+    receipt = { status: "creating", tab_id: String(tab.id), window_id: createdWindow?.id ?? tab.windowId, target_window_id: targetWindowId, url, requested_url: url, marker_url: markerUrl, active, create_background_window: createBackgroundWindow, placement, created_ms: receipt?.created_ms || Date.now() };
     receipts[clientKey] = receipt;
     pruneOpenReceipts(receipts);
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
-    return { tab, markerUrl, reused, created_ms: receipt.created_ms };
+    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, placement };
     });
     if (reservation.existing) return returnExistingOpen(reservation.existing, url, native, generation);
     let result;
-    try { result = await createControllaTab(url, native, generation, reservation.tab, reservation.markerUrl, reservation.reused, waitUntil, active); }
+    try { result = await createControllaTab(url, native, generation, reservation.tab, reservation.markerUrl, reservation.reused, waitUntil, active, createBackgroundWindow, placement); }
     catch (error) {
       if (error?.controllaOrphanTabId) {
         await withReceiptLock(async () => {
           const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
           const receipts = saved[OPEN_RECEIPTS_KEY] || {};
-          receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, url, requested_url: url, active, created_ms: reservation.created_ms };
+          receipts[clientKey] = { status: "failed", tab_id: error.controllaOrphanTabId, window_id: reservation.window_id, target_window_id: targetWindowId, url, requested_url: url, active, create_background_window: createBackgroundWindow, placement, created_ms: reservation.created_ms };
           pruneOpenReceipts(receipts);
           await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
         });
       }
       throw error;
     }
+    if (Number.isSafeInteger(targetWindowId)) {
+      const selectedWindow = await assertOwnedAutomationWindow(targetWindowId);
+      if (result.window_id !== targetWindowId || selectedWindow.focused) throw new Error("Created tab moved or the selected automation window was focused; inspect its topology before retrying.");
+    }
     await withReceiptLock(async () => {
       const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
       const receipts = saved[OPEN_RECEIPTS_KEY] || {};
       const current = receipts[clientKey];
       if (current?.tab_id !== result.tab_id) throw new Error("Open receipt changed before completion; no second tab was opened.");
-      receipts[clientKey] = { status: "complete", tab_id: result.tab_id, url: result.url, requested_url: url, document_id: result.document_id, active, created_ms: reservation.created_ms };
+      receipts[clientKey] = { status: "complete", tab_id: result.tab_id, window_id: result.window_id ?? reservation.window_id, target_window_id: targetWindowId, url: result.url, requested_url: url, document_id: result.document_id, active, create_background_window: createBackgroundWindow, placement, created_ms: reservation.created_ms };
       pruneOpenReceipts(receipts);
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
     });
     return result;
   })();
-  const inflight = { url, active, promise: operation };
+  const inflight = { url, active, createBackgroundWindow, placement, targetWindowId, promise: operation };
   openTabInflight.set(clientKey, inflight);
   try { return await operation; } finally { if (openTabInflight.get(clientKey) === inflight) openTabInflight.delete(clientKey); }
 }
 function pruneOpenReceipts(receipts, now = Date.now()) {
   for (const [key, receipt] of Object.entries(receipts)) {
-    if (receipt?.status === "complete" && Number.isSafeInteger(receipt.created_ms) && now - receipt.created_ms > OPEN_RECEIPT_MAX_AGE_MS) delete receipts[key];
+    if (["complete", "closed"].includes(receipt?.status) && Number.isSafeInteger(receipt.created_ms) && now - receipt.created_ms > OPEN_RECEIPT_MAX_AGE_MS) delete receipts[key];
   }
-  const completed = Object.entries(receipts).filter(([, receipt]) => receipt?.status === "complete")
+  const completed = Object.entries(receipts).filter(([, receipt]) => ["complete", "closed"].includes(receipt?.status))
     .sort((a, b) => (a[1].created_ms || 0) - (b[1].created_ms || 0));
   while (Object.keys(receipts).length > OPEN_RECEIPT_MAX_COUNT && completed.length) delete receipts[completed.shift()[0]];
 }
@@ -1184,7 +1421,9 @@ async function pairManual(endpointUrl, token, tabs) {
   const next = new WebSocket(endpointUrl.href); socket = next;
   try {
     await new Promise((resolve, reject) => { next.onopen = resolve; next.onerror = () => reject(new Error("Cannot connect to the loopback provider.")); next.onclose = () => reject(new Error("Loopback pairing was closed.")); }); if (generation !== manualGeneration) throw new Error("Pairing was replaced.");
-    const extensionVersion = chrome.runtime.getManifest().version; next.send(JSON.stringify({ type: "hello", token, extension_version: extensionVersion, document_identity: true, batch_execution: true, batch_deadline: true, targets: [...manualAttachedTabs].map(String).sort() }));
+    const extensionVersion = chrome.runtime.getManifest().version;
+    const extensionBuildId = await CONTROLLA_EXTENSION_BUILD_ID_PROMISE;
+    next.send(JSON.stringify({ type: "hello", token, extension_version: extensionVersion, extension_build_id: extensionBuildId, document_identity: true, batch_execution: true, batch_deadline: true, targets: [...manualAttachedTabs].map(String).sort() }));
     await new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Provider did not confirm pairing.")), 5000); next.onmessage = event => { const reply = JSON.parse(event.data); if (reply.type === "ready" && reply.server_version === extensionVersion) { clearTimeout(timer); resolve(); } else { clearTimeout(timer); reject(new Error(reply.error || "Pairing rejected.")); } }; });
   } catch (error) { next.close(); if (socket === next) socket = undefined; await detachManual(generation); throw error; }
   if (generation !== manualGeneration) { next.close(); return; }
@@ -1270,5 +1509,10 @@ chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
   pendingMainFrameNavigations.delete(removedTabId); tabNavigationGenerations.set(removedTabId, (tabNavigationGenerations.get(removedTabId) || 0) + 1); if (!pairedTabUrls.has(removedTabId)) return;
   navigatingTabs.delete(removedTabId); debuggerDetachedDuringNavigation.delete(removedTabId); pairedTabUrls.delete(removedTabId); pairedTabDocumentIds.delete(removedTabId); manualAttachedTabs.delete(removedTabId); nativeAttachedTabs.delete(removedTabId); void detachDebugger(removedTabId);
 });
-chrome.tabs.onRemoved.addListener(tabId => { pendingMainFrameNavigations.delete(tabId); tabNavigationGenerations.delete(tabId); domReadyDocuments.delete(tabId); });
+chrome.tabs.onRemoved.addListener(tabId => {
+  pendingMainFrameNavigations.delete(tabId); tabNavigationGenerations.delete(tabId); domReadyDocuments.delete(tabId);
+  clearFrameSessions(tabId); clearFileChooserState(tabId, "Target tab was closed before the file chooser opened.");
+  fileChooserEvents.delete(tabId); fileChooserOperations.delete(tabId); navigationDebuggerAttaches.delete(tabId);
+  pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
+});
 void reconnectStateReady.then(() => { if (!reconnectExhausted) connectNative(); });

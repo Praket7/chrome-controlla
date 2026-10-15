@@ -14,16 +14,16 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "ca3dcbb77ecb659df19bd2f7439a28882282d10068fa8f32f4f40ff471a33744",
-      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1–A8 follow-up updates guarded-input regression fixture with the required stable DOM node token; 2026-10-14: OOPIF attached sessions seed their frame tree before Runtime contexts; target/session lifecycle events publish after identity state updates and retain attach-before-create targets",
+      "destination_sha256": "cae10740205751454963367c6091251e63541fd8a13b451419a8c3fa5142741f",
+      "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1–A8 follow-up updates guarded-input regression fixture with the required stable DOM node token; 2026-10-14: OOPIF attached sessions seed their frame tree before Runtime contexts; target/session lifecycle events publish after identity state updates and retain attach-before-create targets; Stage 1: shared workflow cancellation export and fenced command admission",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {
       "source_path": "../Comptrol/crates/comptrol-browser/src/manager.rs",
       "destination_path": "crates/controlla-browser/src/manager.rs",
       "source_sha256": "378c3593b7b63cfd4938917545671d8c9d826a4f561ef33fd24c1a1214355b5c",
-      "destination_sha256": "262c56a5b23e2a9a444592fc16acc1222b550405459a3aa106f5556eb9b61828",
-      "edits": "none; byte-for-byte copy before Phase 5; Phase 5 seeds the target graph from getTargets snapshots before immediate flattened attachment",
+      "destination_sha256": "56e1df7f4cf342e8783ab98a1cf33d585e85686f4f696a1c5538c27fd8c3bdaa",
+      "edits": "none; byte-for-byte copy before Phase 5; Phase 5 seeds the target graph from getTargets snapshots before immediate flattened attachment; Stage 1: shared workflow cancellation export and fenced command admission",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
     {

@@ -38,6 +38,20 @@ test('phase11 gates allow only a paired safety-clean measured win', () => {
   assert.ok(report.prompt_to_final_p95_reduction >= 0.25);
 });
 
+test('p95 uses nearest-rank exact percentile and bootstrap resamples task clusters', () => {
+  const rows = Array.from({ length: 20 }, (_, index) => ({
+    task_id: `task-${Math.floor(index / 2)}`,
+    candidate: { success: true, wall_ms: index + 1, prompt_to_verified_ms: index + 1, prompt_to_final_ms: index + 1,
+      model_round_trips: 1, severe_wrong_target_events: 0, authority_violations: 0, silent_stale_mutations: 0 },
+    baseline: { success: true, wall_ms: index + 1, prompt_to_verified_ms: index + 1, prompt_to_final_ms: index + 1,
+      model_round_trips: 1, severe_wrong_target_events: 0, authority_violations: 0, silent_stale_mutations: 0 },
+  }));
+  const report = analyzePaired(rows, { iterations: 100, seed: 31 });
+  assert.equal(report.candidate_p95_prompt_to_verified_ms, 19);
+  assert.equal(report.paired_rows, 20);
+  assert.equal(report.paired_task_clusters, 10);
+});
+
 test('prompt-to-final p95 regression blocks the claim gate', () => {
   const rows = structuredClone(winningRows);
   rows.forEach((row, index) => {

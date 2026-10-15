@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod artifacts;
+pub mod browser_contract;
 pub mod browser_workflow;
 pub mod cache;
 pub mod canva;

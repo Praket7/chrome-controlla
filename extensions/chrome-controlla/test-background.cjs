@@ -1,12 +1,17 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
-const { webcrypto } = require("node:crypto");
+const { webcrypto, createHash } = require("node:crypto");
+
+const runtimeScreenshotParams = process.env.CONTROLLA_SCREENSHOT_PARAMS_JSON
+  ? JSON.parse(process.env.CONTROLLA_SCREENSHOT_PARAMS_JSON)
+  : { format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 } };
 
 const sockets = [];
 const detached = [];
 const attached = [];
 const debuggerCalls = [];
+const createdWindows = [];
 const pendingCommands = [];
 const commandDiagnostics = [];
 let rejectNextCommand;
@@ -57,6 +62,8 @@ let overlapSameUrlNextNavigation = false;
 let replacePendingOnFrameRead;
 let nextWebNavigationTimeStamp = 10_000;
 let navigationError;
+let screenshotDataOverride;
+let navigateDuringScreenshot;
 let debuggerDetached;
 let debuggerEvent;
 let nextCreatedTab = 500;
@@ -118,11 +125,11 @@ class FakeNativePort {
 const chrome = {
   runtime: { getURL(path) { return `chrome-extension://fixture/${path}`; } },
   storage: { local: {
-    async get(key) { return { [key]: localStorage[key] }; },
+    async get(key) { return Object.fromEntries((Array.isArray(key) ? key : [key]).map(name => [name, localStorage[name]])); },
     async set(values) { Object.assign(localStorage, values); },
     async remove(key) { delete localStorage[key]; },
   }, session: {
-    async get(key) { return { [key]: sessionStorage[key] }; },
+    async get(key) { return Object.fromEntries((Array.isArray(key) ? key : [key]).map(name => [name, sessionStorage[name]])); },
     async set(values) { Object.assign(sessionStorage, values); },
     async remove(key) { delete sessionStorage[key]; },
   } },
@@ -138,6 +145,12 @@ const chrome = {
     },
     async create({ url, active = true, windowId }) { const tab = { id: nextCreatedTab++, windowId: windowId ?? 1, title: "New tab", url, status: "complete", active }; tabList.push(tab); if (active) focusedWindowActiveTabId = tab.id; if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
     async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) tabList.splice(index, 1); },
+    async move(tabId, { windowId }) {
+      const tab = tabList.find(item => item.id === tabId);
+      if (!tab) throw new Error("missing tab");
+      tab.windowId = windowId;
+      return { ...tab };
+    },
     async update(tabId, { url, active }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
@@ -196,7 +209,17 @@ const chrome = {
     onActivated: { addListener(callback) { tabsActivated = callback; } },
     onCreated: { addListener(callback) { tabsCreated = callback; } },
   },
-  windows: { async get(windowId) { return { id:windowId??1, focused:focusedWindowFocused }; }, onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } } },
+  windows: {
+    async get(windowId) { return { id:windowId??1, focused:focusedWindowFocused }; },
+    async update(windowId, { focused }) { if (focused !== undefined) focusedWindowFocused = focused; return { id: windowId, focused: !!focused }; },
+    async create(options) {
+      createdWindows.push(options);
+      const windowId = 900 + createdWindows.length;
+      const tab = await chrome.tabs.create({ url: options.url, active: true, windowId });
+      return { id: windowId, focused: options.focused, tabs: [tab] };
+    },
+    onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } }
+  },
   webNavigation: {
     async getFrame({ tabId, frameId }) {
       frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
@@ -259,6 +282,16 @@ const chrome = {
     async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
+      if (method === "Page.captureScreenshot") {
+        if (navigateDuringScreenshot) {
+          const { tabId, documentId, url } = navigateDuringScreenshot;
+          navigateDuringScreenshot = undefined;
+          tabDocumentOverrides.set(tabId, documentId);
+          tabUrlOverrides.set(tabId, url);
+          navigationCommitted?.({ tabId, frameId: 0, documentId, url, timeStamp: nextWebNavigationTimeStamp++ });
+        }
+        return { data: screenshotDataOverride || "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" };
+      }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,expected,prepare,normalize,requireFocus)")) {
         const [index, expected, prepare] = params.arguments.map(argument => argument.value);
         if (prepare) fastTypeFocused = true;
@@ -301,7 +334,7 @@ const chrome = {
         return { result: { value: frameOutcomeVerified } };
       }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("__controllaFrameActionable")) {
-        return { result: { value: frameActionable ? { x: 20, y: 30 } : false } };
+        return { result: { value: frameActionable ? { x: 20, y: 30, viewport: { width: 100, height: 100 } } : false } };
       }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("ownerDocument.defaultView.innerWidth")) {
         return { result: { value: params.objectId === "fixture-frame-owner" ? { width: 800, height: 600 } : { width: 100, height: 100 } } };
@@ -314,8 +347,9 @@ const chrome = {
         emitFileChooserOnFrameRelease = false;
         queueMicrotask(() => debuggerEvent?.({ tabId: target.tabId, sessionId: target.sessionId }, "Page.fileChooserOpened", { backendNodeId: 908, frameId: "frame-oopif", mode: "selectSingle" }));
       }
-      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && !target.sessionId && emitFileChooserOnRootRelease) {
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && !target.sessionId && (emitFileChooserOnRootRelease || emitFileChooserOnFrameRelease)) {
         emitFileChooserOnRootRelease = false;
+        emitFileChooserOnFrameRelease = false;
         queueMicrotask(() => debuggerEvent?.({ tabId: target.tabId }, "Page.fileChooserOpened", { backendNodeId: 908, frameId: "frame-oopif", mode: "selectSingle" }));
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && navigateFrameOnClick) { navigateFrameOnClick = false; childFrameUrl = "https://picker.example.test/next"; }
@@ -356,11 +390,21 @@ const chrome = {
   },
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
+const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
+const extensionAssetBytes = new Map(extensionBuildAssets.map(name => [name, fs.readFileSync(new URL(`./${name}`, `file://${__filename}`))]));
+const expectedExtensionDigest = createHash("sha256");
+for (const name of extensionBuildAssets) expectedExtensionDigest.update(name).update(Buffer.from([0])).update(extensionAssetBytes.get(name)).update(Buffer.from([0]));
+const expectedExtensionBuildId = `controlla-chrome-extension:0.1.0:${expectedExtensionDigest.digest("hex")}`;
 let backgroundContext;
 function runBackground() {
   backgroundContext = {
-    chrome, WebSocket: FakeWebSocket, URL, Set, Number, Array, String, Error, Promise, JSON,
+    chrome, WebSocket: FakeWebSocket, URL, TextEncoder, Set, Number, Array, String, Error, Promise, JSON,
     Date: { now() { return mockNow; } }, crypto: webcrypto,
+    fetch: async url => {
+      const assetName = extensionBuildAssets.find(name => String(url).endsWith(`/${name}`));
+      const bytes = assetName ? extensionAssetBytes.get(assetName) : undefined;
+      return { ok: !!bytes, async arrayBuffer() { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); } };
+    },
     performance: { now() { return mockNow; } },
     console: { debug(...args) { commandDiagnostics.push(args); } },
     setTimeout(callback, delay) {
@@ -370,7 +414,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
 
@@ -378,8 +422,17 @@ function message(payload) {
   return new Promise(resolve => listener(payload, {}, resolve));
 }
 function messageFrom(payload, sender) { return new Promise(resolve => listener(payload, sender, resolve)); }
+async function waitFor(predicate, description) {
+  const deadline = Date.now() + 1000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+}
 
 (async () => {
+  assert.equal(await backgroundContext.__testHooks.extensionBuildId, expectedExtensionBuildId,
+    "extension computes the same deterministic digest over every packaged runtime asset");
   await new Promise(resolve => setTimeout(resolve, 0));
   const nativeStatus = await message({ type: "native-status" });
   assert.equal(nativeStatus.transport, "native", "the background worker registers its message handler using supported Chrome events");
@@ -465,7 +518,42 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
-  assert.equal(JSON.stringify(native.sent.find(message => message.request_id === "pair-1")), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
+  assert.equal(JSON.stringify(native.sent.find(message => message.request_id === "pair-1")), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", extension_build_id: expectedExtensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
+  screenshotDataOverride = "iVBORw0KGgo" + "A".repeat(1_100_000);
+  native.hostMessage({ type: "command", id: 97001, target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const screenshotChunks = native.sent.filter(reply => reply.type === "result_chunk" && reply.id === 97001);
+  assert.equal(screenshotChunks.length, 3, "large screenshot responses are split into bounded native-message chunks");
+  assert.deepEqual(screenshotChunks.map(reply => reply.index), [0, 1, 2]);
+  assert.ok(screenshotChunks.every(reply => new TextEncoder().encode(JSON.stringify(reply)).byteLength < 900 * 1024));
+  assert.equal(new Set(screenshotChunks.map(reply => reply.transfer_id)).size, 1);
+  assert.ok(screenshotChunks.every(reply => reply.base64_sha256 === screenshotChunks[0].base64_sha256));
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params, runtimeScreenshotParams,
+    "the exact runtime-generated screenshot parameters reach the extension's bounded validator and Chrome dispatch");
+  screenshotDataOverride = undefined;
+  for (const [id, clip, description] of [
+    [97003, { x: 0, y: 0, width: 1600, height: 1200, scale: 1 }, "maximum crop"],
+    [97004, { x: 0, y: 0, width: 800, height: 600, scale: 2 }, "high-DPI crop"],
+  ]) {
+    native.hostMessage({ type: "command", id, target_id: "41", method: "Page.captureScreenshot", params: {
+      format: "png", fromSurface: true, captureBeyondViewport: false, clip
+    } });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params.clip.scale, clip.scale,
+      `${description} remains inside the shared screenshot contract`);
+    assert.ok(native.sent.some(reply => reply.type === "result" && reply.id === id), `${description} returns a result`);
+  }
+  screenshotDataOverride = "iVBORw0KGgo" + "A".repeat(1_100_000);
+  native.hostMessage({ type: "command", id: 97002, target_id: "41", lease_id: "pair-1", method: "Page.captureScreenshot", params: {
+    format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 }
+  } });
+  native.hostMessage({ type: "cancel_screenshot", id: 97002, lease_id: "pair-1" });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok(native.sent.some(reply => reply.type === "result_chunk_abort" && reply.id === 97002),
+    "canceled screenshot chunk delivery emits an explicit transfer abort for immediate native cleanup");
+  assert.equal(native.sent.some(reply => reply.type === "result_chunk" && reply.id === 97002), false,
+    "a canceled screenshot transfer emits no image chunks");
+  screenshotDataOverride = undefined;
   fastTypeValue = ""; fastTypeFocused = true;
   native.hostMessage({ type: "command", id: "fast-type-program", target_id: "41", method: "Controlla.fastType", params: { object_id: "fixture-editor", index: 0, expected: "", text: "Fast\nKeys", normalize_paragraphs: false } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -574,20 +662,22 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   frameOutcomeVerified = true;
   native.hostMessage({ type: "command", id: "oopif-click", target_id: "41", method: "Controlla.frameClick", params: { frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 91, outcome: { kind: "focused" }, timeout_ms: 250 } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(native.sent.at(-1).result.dispatch_acknowledged, true, "frame control click is dispatched only after child-tree identity validation");
+  assert.equal(native.sent.at(-1).result.dispatch_acknowledged, true, `frame control click is dispatched only after child-tree identity validation: ${JSON.stringify(native.sent.at(-1).result)}`);
   assert.equal(native.sent.at(-1).result.verified, true, "frame click evaluates the requested postcondition before acknowledging success");
-  assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent"), "frame click input is routed through the child target");
-  const frameMouseCallsBeforeTouch = debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent").length;
-  const frameTouchCallsBeforeTouch = debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchTouchEvent").length;
+  const rootFrameInput = debuggerCalls.find(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed");
+  assert.ok(rootFrameInput, "frame click input is routed through the root viewport coordinate space");
+  assert.deepEqual([rootFrameInput.params.x, rootFrameInput.params.y], [140, 260], "OOPIF-local coordinates are translated through the frame owner into root viewport coordinates");
+  const frameMouseCallsBeforeTouch = debuggerCalls.filter(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchMouseEvent").length;
+  const frameTouchCallsBeforeTouch = debuggerCalls.filter(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchTouchEvent").length;
   native.hostMessage({ type: "command", id: "oopif-touch", target_id: "41", method: "Controlla.frameClick", params: {
     frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 91, outcome: { kind: "focused" }, input_mode: "touch", timeout_ms: 250,
   } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.at(-1).result.input_mode, "touch");
   assert.equal(native.sent.at(-1).result.verified, true);
-  assert.equal(debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchTouchEvent").length - frameTouchCallsBeforeTouch, 2,
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchTouchEvent").length - frameTouchCallsBeforeTouch, 2,
     "frame touch tap dispatches one touchStart and one touchEnd");
-  assert.equal(debuggerCalls.filter(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.dispatchMouseEvent").length, frameMouseCallsBeforeTouch,
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchMouseEvent").length, frameMouseCallsBeforeTouch,
     "frame touch never falls back to mouse input");
   focusedWindowActiveTabId = 41;
   focusedWindowFocused = true;
@@ -716,6 +806,41 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   assert.equal(retryOpen.idempotent_reuse, true);
   assert.equal(tabList.filter(tab => tab.url === "https://example.test/idempotent").length, countAfterFirstOpen,
     "repeating one idempotency key does not create another tab");
+  tabList.find(tab => tab.id === Number(firstOpen.tab_id)).active = false;
+  focusedWindowFocused = false;
+  const activateRequest = { type: "command", target_id: "41", method: "Controlla.activateOwnedTab", params: { owned_tab_id: firstOpen.tab_id, idempotency_key: "activate-fixture-01" } };
+  native.hostMessage({ ...activateRequest, id: "activate-created-tab" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const activated = native.sent.find(message => message.id === "activate-created-tab")?.result;
+  assert.equal(activated?.status, "activated", JSON.stringify(native.sent.find(message => message.id === "activate-created-tab")));
+  assert.equal(activated?.topology_verified, true);
+  assert.equal(activated?.tab_active, true);
+  assert.equal(activated?.window_focused, true);
+  native.hostMessage({ ...activateRequest, id: "activate-created-tab-retry" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.find(message => message.id === "activate-created-tab-retry")?.result?.idempotent_reuse, true,
+    "repeated owned activation returns verified idempotent evidence");
+  native.hostMessage({ type: "command", id: "activate-user-tab", target_id: "41", method: "Controlla.activateOwnedTab", params: { owned_tab_id: "41", idempotency_key: "activate-user-01" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.find(message => message.id === "activate-user-tab")?.error || "", /no completed Controlla-owned open receipt/,
+    "activate refuses a user-owned tab without a persisted Controlla receipt");
+  focusedWindowFocused = false;
+  native.hostMessage({ type: "command", id: "close-user-tab", target_id: "41", method: "Controlla.closeOwnedTab", params: { owned_tab_id: "41" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(native.sent.find(message => message.id === "close-user-tab")?.error || "", /no Controlla-owned open receipt/,
+    "close_owned refuses any tab without a persisted Controlla open receipt");
+  native.hostMessage({ type: "command", id: "close-created-tab", target_id: "41", method: "Controlla.closeOwnedTab", params: { owned_tab_id: firstOpen.tab_id } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const closedCreatedTab = native.sent.find(message => message.id === "close-created-tab")?.result;
+  assert.equal(closedCreatedTab?.status, "closed");
+  assert.equal(closedCreatedTab?.topology_verified, true);
+  assert.equal(tabList.some(tab => String(tab.id) === firstOpen.tab_id), false,
+    "close_owned verifies that Chrome no longer lists the created tab");
+  native.hostMessage({ type: "command", id: "close-created-tab-retry", target_id: "41", method: "Controlla.closeOwnedTab", params: { owned_tab_id: firstOpen.tab_id } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const repeatedClose = native.sent.find(message => message.id === "close-created-tab-retry");
+  assert.equal(repeatedClose?.result?.idempotent_reuse, true,
+    `repeating close_owned verifies the already-closed lifecycle without affecting another tab: ${JSON.stringify(repeatedClose)}`);
   const concurrentKey = "client-fixture:concurrent-1234";
   native.hostMessage({ ...openRequest, id: "open-concurrent-a", params: { ...openRequest.params, idempotency_key: concurrentKey, url: "https://example.test/concurrent" } });
   native.hostMessage({ ...openRequest, id: "open-concurrent-b", params: { ...openRequest.params, idempotency_key: concurrentKey, url: "https://example.test/concurrent" } });
@@ -737,16 +862,18 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   tabList.find(tab => tab.id === 42).active = true;
   tabList.find(tab => tab.id === 41).active = false;
   emitActivationEvents = true;
+  const pointerCommandsBeforeInactiveAttempt = debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").length;
   native.hostMessage({ type: "command", id: "inactive-pointer-click", target_id: "41", method: "Controlla.pointerClick", params: {
     object_id: "fixture-target", function_declaration: "function(index,expected){return __fixturePointerGuard}",
     index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport"
   } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(native.sent.at(-1).result.status, "dispatched", "inactive-tab pointer click dispatches after temporary activation in the focused Chrome window");
-  assert.equal(native.sent.at(-1).result.restored_previous_tab, true, "receipt confirms restoration of the prior active tab");
+  assert.equal(native.sent.at(-1).result.status, "not_dispatched", "inactive user-owned tabs are never activated to synthesize background pointer input");
+  assert.equal(native.sent.at(-1).result.reason_code, "activation_forbidden");
+  assert.equal(native.sent.at(-1).result.temporary_activation, false);
   assert.equal(tabList.find(tab => tab.id === 41).active, false, "temporary activation restores the previously active tab");
-  assert.deepEqual(debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").slice(-3).map(call => call.params.type),
-    ["mouseMoved", "mousePressed", "mouseReleased"], "inactive pointer click sends an actual mouse sequence");
+  assert.equal(debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").length, pointerCommandsBeforeInactiveAttempt,
+    "activation-forbidden pointer click dispatches no trusted input");
   focusedWindowFocused = false;
   emitActivationEvents = true;
   afterNextTabActivation = () => { pointerGuardValue = { ...pointerGuardValue, viewport: "fixture-viewport-after-activation" }; };
@@ -756,12 +883,13 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
     index: 0, outcome: { kind: "focused" }, viewport: "fixture-viewport"
   } });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(native.sent.at(-1).result.status, "dispatched", "inactive tab receives pointer input while its Chrome window remains behind another app");
-  assert.equal(native.sent.at(-1).result.restored_previous_tab, true, "unfocused-window click restores the prior tab");
+  assert.equal(native.sent.at(-1).result.status, "not_dispatched", "an unfocused Chrome window does not make activation of its inactive user tab safe");
+  assert.equal(native.sent.at(-1).result.reason_code, "activation_forbidden");
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length, pointerCallsBeforeUnfocused,
+    "background refusal dispatches no pointer input");
+  afterNextTabActivation = undefined;
   assert.equal(focusedWindowFocused, false, "background pointer click does not focus the Chrome window");
   assert.equal(tabList.find(tab => tab.id === 41).active, false, "background pointer click restores the prior active tab");
-  assert.deepEqual(debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").slice(-3).map(call => call.params.type),
-    ["mouseMoved", "mousePressed", "mouseReleased"], "unfocused Chrome window still receives the guarded mouse sequence");
   afterNextDebuggerCall = () => {
     tabsActivated({ tabId: 42 }); tabsActivated({ tabId: 41 });
     windowFocusChanged(9); windowFocusChanged(-1);
@@ -1041,6 +1169,7 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   reconnectTimers.at(-1).callback();
   assert.equal(nativePorts.length, 3);
   nativePorts[2].hostMessage({ type: "ready" });
+  await waitFor(() => nativePorts[2].sent.some(message => message.type === "capabilities"), "verified extension build capabilities");
   assert.equal((await message({ type: "native-status" })).error, undefined, "ready clears stale native error");
   nativePorts[2].disconnect();
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -1075,6 +1204,7 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
 
   assert.equal((await message({ type: "pair", endpoint: "ws://127.0.0.1:1234/", token: "one", tabIds: [17] })).ok, true);
   assert.equal(sockets[0].sent[0].extension_version, "0.1.0", "extension handshake must identify the loaded version");
+  assert.equal(sockets[0].sent[0].extension_build_id, expectedExtensionBuildId, "extension handshake must identify the exact build");
   assert.equal(sockets[0].sent[0].document_identity, true, "manual handshake declares durable document identity support");
   const oldSocket = sockets.at(-1);
   assert.equal((await message({ type: "pair", endpoint: "ws://127.0.0.1:1234/", token: "two", tabIds: [18] })).ok, true);
@@ -1091,10 +1221,18 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   assert.equal(debuggerCalls.length, callsBeforeBlocked, "unlisted CDP methods must not reach chrome.debugger");
   assert.match(activeSocket.sent.at(-1).error, /outside the shared observe\/input allowlist/);
 
+  const screenshotCallsBefore = debuggerCalls.length;
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "bounded-screenshot", target_id: "18", method: "Page.captureScreenshot",
+    params: { format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 } }
+  }) });
+  assert.equal(debuggerCalls.length, screenshotCallsBefore + 1, "bounded screenshot capture is explicitly allowed for shared visual probes");
+  assert.equal(activeSocket.sent.at(-1).result.data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB");
+
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed", target_id: "18", method: "Input.dispatchMouseEvent", params: { type: "mousePressed" }
   }) });
-  assert.equal(debuggerCalls.length, callsBeforeBlocked + 1);
+  assert.equal(debuggerCalls.length, callsBeforeBlocked + 2);
   assert.equal(debuggerCalls.at(-1).method, "Input.dispatchMouseEvent");
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed-touch", target_id: "18", method: "Input.dispatchTouchEvent", params: { type: "touchStart", touchPoints: [{ id: 1, x: 1, y: 1 }] }
@@ -1150,6 +1288,24 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(liveNative.sent.at(-1).id, "unrestricted-file");
   assert.equal(debuggerCalls.length, fileCallsBefore + 1, "unrestricted shared file selection reaches Chrome");
+  liveNative.hostMessage({ type: "release" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  liveNative.hostMessage({ type: "pair", request_id: "pair-guarded-upload", tab_ids: [66], expected_urls: expectedUrls([66]), expected_document_ids: expectedDocuments([66]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(liveNative.sent.at(-1).type, "paired", "guarded shared target is bound to the observed tab and document");
+  attachOopifOnNextAutoAttach = true;
+  liveNative.hostMessage({ type: "command", id: "guarded-file-frame-ax", target_id: "66", method: "Controlla.frameAccessibility", params: { frame_id: "frame-oopif" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  liveNative.hostMessage({ type: "command", id: "guarded-file-frame-set", target_id: "66", method: "Controlla.setFrameFileInputFiles", params: { frame_id: "frame-oopif", frame_loader_id: "fixture-loader", backend_node_id: 91, file_path: "/tmp/staged-artifact" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(liveNative.sent.at(-1).result.files)), [{ name: "example", size: 12 }], "guarded sessions may select only through the validated staged-artifact upload route");
+  liveNative.hostMessage({ type: "command", id: "guarded-raw-file-refused", target_id: "66", method: "DOM.setFileInputFiles", params: { files: ["/tmp/arbitrary"] } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(liveNative.sent.at(-1).error, /local unrestricted mode/, "guarded sessions cannot use the unrestricted raw file-selection command");
+  liveNative.hostMessage({ type: "release" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  liveNative.hostMessage({ type: "pair", request_id: "pair-resume-unrestricted", tab_ids: [66], unrestricted: true });
+  await new Promise(resolve => setTimeout(resolve, 0));
   attachOopifOnNextAutoAttach = true;
   liveNative.hostMessage({ type: "command", id: "file-frame-ax", target_id: "66", method: "Controlla.frameAccessibility", params: { frame_id: "frame-oopif" } });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -1769,6 +1925,65 @@ function messageFrom(payload, sender) { return new Promise(resolve => listener(p
   restartPort.hostMessage({ ...openRequest, id: "open-prunes-expired-receipts", params: { url: "https://example.test/pruned", idempotency_key: "client-fixture:prune-expired-1", active: false } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(localStorage.openReceipts["expired:receipt"], undefined, "expired completed open receipts are pruned before new work");
+
+  restartPort.hostMessage({ ...openRequest, id: "open-owned-background-window", params: {
+    url: "https://example.test/owned-window", idempotency_key: "client-fixture:owned-window-123",
+    active: false, create_background_window: true, window_left: 80, window_top: 60, window_width: 1000, window_height: 720
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const ownedWindowResult = restartPort.sent.at(-1).result;
+  assert.equal(createdWindows.at(-1).focused, false, "owned automation window is created unfocused");
+  assert.deepEqual([createdWindows.at(-1).left, createdWindows.at(-1).top, createdWindows.at(-1).width, createdWindows.at(-1).height], [80, 60, 1000, 720]);
+  assert.equal(ownedWindowResult.created_by_controlla, true);
+  assert.equal(ownedWindowResult.window_id, 901);
+  assert.equal(tabList.find(tab => tab.id === Number(ownedWindowResult.tab_id)).windowId, ownedWindowResult.window_id);
+  assert.equal(focusedWindowFocused, false, "creating the owned window does not focus Chrome");
+
+  restartPort.hostMessage({ ...openRequest, id: "open-tab-before-move", params: {
+    url: "https://example.test/move-owned", idempotency_key: "client-fixture:move-owned-1234", active: false
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const moveSourceTabId = Number(restartPort.sent.at(-1).result.tab_id);
+  restartPort.hostMessage({ type: "command", id: "move-owned-tab", target_id: "41", method: "Controlla.moveOwnedTab", params: {
+    owned_tab_id: String(moveSourceTabId), target_window_id: ownedWindowResult.window_id
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const movedReceipt = restartPort.sent.at(-1).result;
+  assert.equal(movedReceipt.status, "moved");
+  assert.equal(movedReceipt.topology_verified, true);
+  assert.equal(movedReceipt.window_id, ownedWindowResult.window_id);
+  assert.equal(tabList.find(tab => tab.id === moveSourceTabId).windowId, ownedWindowResult.window_id,
+    "owned tab moves into the selected automation window with its document identity intact");
+
+  restartPort.hostMessage({ type: "command", id: "open-in-existing-owned-window", target_id: "41", method: "Controlla.openTab", params: {
+    url: "https://example.test/reuse-owned-window", idempotency_key: "client-fixture:reuse-owned-window-123",
+    active: true, target_window_id: ownedWindowResult.window_id
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const selectedWindowResult = restartPort.sent.at(-1).result;
+  assert.equal(selectedWindowResult.window_id, ownedWindowResult.window_id, "caller-selected automation window receives the new tab");
+  assert.equal(selectedWindowResult.window_focused, false, "selected background automation window stays unfocused");
+  assert.equal(tabList.find(tab => tab.id === Number(selectedWindowResult.tab_id)).active, true, "new tab is active inside the selected automation window");
+  assert.equal(focusedWindowFocused, false, "activating a tab inside the automation window does not focus Chrome");
+  restartPort.hostMessage({ type: "command", id: "open-in-unowned-window", target_id: "41", method: "Controlla.openTab", params: {
+    url: "https://example.test/unowned-window", idempotency_key: "client-fixture:unowned-window-123",
+    active: true, target_window_id: 2
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(restartPort.sent.at(-1).error, /no completed Controlla automation-window ownership receipt/,
+    "user-owned windows cannot be selected as automation windows");
+
+  restartPort.hostMessage({ ...openRequest, id: "open-for-screenshot-navigation", params: {
+    url: "https://example.test/screenshot-capture", idempotency_key: "client-fixture:screenshot-navigation-123"
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const screenshotNavigationTabId = Number(restartPort.sent.at(-1).result.tab_id);
+  navigateDuringScreenshot = { tabId: screenshotNavigationTabId, documentId: "screenshot-navigation-interloper", url: "https://example.test/after-capture" };
+  restartPort.hostMessage({ type: "command", id: "screenshot-navigated-during-capture", target_id: String(screenshotNavigationTabId), method: "Page.captureScreenshot", params: {
+    format: "png", captureBeyondViewport: false, fromSurface: true, clip: { x: 0, y: 0, width: 100, height: 100, scale: 1 }
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(restartPort.sent.at(-1).reason_code, "screenshot_document_changed", "capture bytes from a replaced document are discarded");
 
   console.log("Extension version handshake, pairing cleanup, chooser event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

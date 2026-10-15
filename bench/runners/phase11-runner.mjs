@@ -94,7 +94,8 @@ export async function invokeJsonCommand(argv, payload, timeoutMs, env = process.
   });
 }
 
-function numericMetric(result, name) {
+function numericMetric(result, name, { unknownAllowed = false } = {}) {
+  if (unknownAllowed && result[name] === null) return;
   if (typeof result[name] !== 'number' || !Number.isFinite(result[name]) || result[name] < 0) {
     throw new Error(`adapter result missing non-negative numeric ${name}`);
   }
@@ -116,7 +117,7 @@ export function validateAdapterResult(result, contract, expected) {
     'wall_ms','model_round_trips','model_tokens','mcp_calls','browser_ops','observation_bytes','screenshot_bytes',
     'retries','recovery_events','verification_ms','cpu_ms','peak_rss_bytes','focus_disruptions','clipboard_disruptions',
     'human_interventions','severe_wrong_target_events','authority_violations','silent_stale_mutations'
-  ]) numericMetric(result, field);
+  ]) numericMetric(result, field, { unknownAllowed: field !== 'wall_ms' });
   if (typeof result.cache_status !== 'string') throw new Error('cache_status must be a string');
   return result;
 }
@@ -144,13 +145,14 @@ async function runOne({ adapter, command, task, mode, concurrency, fixtureBaseUr
   try {
     raw = await invokeJsonCommand(command, { kind: 'run', ...input, environment }, deadlineMs, env, invocationMetrics);
   } catch (error) {
+    const elapsedMs = Number(process.hrtime.bigint() - adapterRequestStartedNs) / 1e6;
     raw = {
       adapter: adapter.id, task_id: task.id, mode, concurrency, success: false, independently_verified_success: false,
       ...(adapter.source_ref ? { source_ref: adapter.source_ref } : {}),
-      wall_ms: deadlineMs, model_round_trips: 0, model_tokens: 0, mcp_calls: 0, browser_ops: 0,
-      observation_bytes: 0, screenshot_bytes: 0, retries: 0, recovery_events: 0, cache_status: 'error',
-      verification_ms: 0, cpu_ms: 0, peak_rss_bytes: 0, focus_disruptions: 0, clipboard_disruptions: 0,
-      human_interventions: 0, severe_wrong_target_events: 0, authority_violations: 0, silent_stale_mutations: 0,
+      wall_ms: Math.min(deadlineMs, Math.max(0, elapsedMs)), model_round_trips: null, model_tokens: null, mcp_calls: null, browser_ops: null,
+      observation_bytes: null, screenshot_bytes: null, retries: null, recovery_events: null, cache_status: 'error',
+      verification_ms: null, cpu_ms: null, peak_rss_bytes: null, focus_disruptions: null, clipboard_disruptions: null,
+      human_interventions: null, severe_wrong_target_events: null, authority_violations: null, silent_stale_mutations: null,
       runner_error: error.message,
     };
   }

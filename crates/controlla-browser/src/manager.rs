@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
 const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,6 +17,7 @@ const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Default)]
 pub struct BrowserManager {
     connections: Arc<RwLock<HashMap<String, Arc<BrowserConnection>>>>,
+    connect_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl BrowserManager {
@@ -30,6 +31,20 @@ impl BrowserManager {
                 "empty debugger endpoint".to_owned(),
             ));
         }
+        if let Some(connection) = self.connections.read().await.get(endpoint).cloned()
+            && !connection.is_closed()
+        {
+            return Ok(connection);
+        }
+        let endpoint_lock = {
+            let mut locks = self.connect_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(endpoint.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _singleflight = endpoint_lock.lock().await;
         if let Some(connection) = self.connections.read().await.get(endpoint).cloned()
             && !connection.is_closed()
         {

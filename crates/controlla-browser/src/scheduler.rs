@@ -247,10 +247,10 @@ impl TargetScheduler {
 
     /// Run one operation while holding only the selected target's actor gate.
     pub async fn run_target<F: Future>(&self, target_id: &str, operation: F) -> F::Output {
-        let queued_at = Instant::now();
         let _guard = Self::gate(&self.targets, target_id).await;
+        let queued_for_global_gate = Instant::now();
         let _permit = self.adaptive.acquire().await;
-        let queue_wait = queued_at.elapsed();
+        let queue_wait = queued_for_global_gate.elapsed();
         let started_at = Instant::now();
         let output = operation.await;
         self.adaptive
@@ -266,11 +266,11 @@ impl TargetScheduler {
         document_id: &str,
         operation: F,
     ) -> F::Output {
-        let queued_at = Instant::now();
         let _target_guard = Self::gate(&self.targets, target_id).await;
         let _document_guard = Self::gate(&self.documents, document_id).await;
+        let queued_for_global_gate = Instant::now();
         let _permit = self.adaptive.acquire().await;
-        let queue_wait = queued_at.elapsed();
+        let queue_wait = queued_for_global_gate.elapsed();
         let started_at = Instant::now();
         let output = operation.await;
         self.adaptive

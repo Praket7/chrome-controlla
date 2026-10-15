@@ -1,0 +1,75 @@
+[
+  {
+    "time_ns": 1712040262008416,
+    "path": "/event",
+    "value": {
+      "kind": "click",
+      "value": 1,
+      "trusted": true,
+      "visible": "visible",
+      "focused": true
+    }
+  },
+  {
+    "time_ns": 1712072007148125,
+    "path": "/event",
+    "value": {
+      "kind": "plain",
+      "value": "Block audit",
+      "trusted": false,
+      "visible": "visible",
+      "focused": true
+    }
+  },
+  {
+    "time_ns": 1712115703636000,
+    "path": "/event",
+    "value": {
+      "kind": "touch",
+      "value": 1,
+      "trusted": true,
+      "visible": "visible",
+      "focused": true
+    }
+  },
+  {
+    "time_ns": 1712344975350166,
+    "path": "/event",
+    "value": {
+      "kind": "bottom",
+      "value": true,
+      "trusted": true,
+      "visible": "visible",
+      "focused": true
+    }
+  },
+  {
+    "time_ns": 1712383743761875,
+    "path": "/upload",
+    "value": {
+      "bytes": 11
+    }
+  },
+  {
+    "time_ns": 1712383745253083,
+    "path": "/event",
+    "value": {
+      "kind": "upload",
+      "value": "controlla-audit.txt",
+      "trusted": true,
+      "visible": "visible",
+      "focused": true
+    }
+  },
+  {
+    "time_ns": 1712414675570000,
+    "path": "/event",
+    "value": {
+      "kind": "click",
+      "value": 1,
+      "trusted": true,
+      "visible": "visible",
+      "focused": true
+    }
+  }
+]

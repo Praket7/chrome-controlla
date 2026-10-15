@@ -399,7 +399,10 @@ impl Journal {
     pub fn cancel(&self, principal: &str, session: &str, id: &str) -> Result<bool, JournalError> {
         let connection = self.0.lock().expect("journal mutex poisoned");
         expire_one(&connection, principal, session, id)?;
-        let changed = connection.execute("UPDATE operations SET status='cancelled', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status='accepted' AND deadline_at_ms>?4", params![id, principal, session, now_ms() as i64])?;
+        // `unknown` means a remote send may still be executing and cannot be
+        // safely cancelled. `not_sent` and `sent` are safe boundaries: either
+        // nothing was sent or the prior correlated operation was acknowledged.
+        let changed = connection.execute("UPDATE operations SET status='cancelled', revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND (status='accepted' OR (status='running' AND delivery IN ('not_sent','sent'))) AND deadline_at_ms>?4", params![id, principal, session, now_ms() as i64])?;
         if changed == 0 {
             expire_one(&connection, principal, session, id)?;
         }
@@ -547,4 +550,68 @@ fn expire_one(
 ) -> Result<(), JournalError> {
     connection.execute("UPDATE operations SET status=CASE WHEN status='accepted' OR delivery='not_sent' THEN 'failed' ELSE 'unknown' END, deadline_error='deadline_exceeded', delivery=CASE WHEN status='accepted' THEN 'not_sent' ELSE delivery END, revision=revision+1 WHERE id=?1 AND principal=?2 AND session=?3 AND status IN ('accepted','running') AND deadline_at_ms<=?4", params![id, principal, session, now_ms() as i64])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cancel_running_pre_dispatch_job_fences_late_dispatch() {
+        let journal = Journal::open(":memory:").unwrap();
+        let operation = journal
+            .admit("p", "s", "k", &json!({"op":"observe"}))
+            .unwrap()
+            .operation;
+        assert!(journal.start("p", "s", &operation.id).unwrap());
+        assert!(journal.cancel("p", "s", &operation.id).unwrap());
+        assert_eq!(
+            journal
+                .get("p", "s", &operation.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Cancelled
+        );
+        assert!(matches!(
+            journal.record_dispatch("p", "s", &operation.id, "late"),
+            Err(JournalError::InvalidTransition("dispatch"))
+        ));
+    }
+
+    #[test]
+    fn cancellation_refuses_ambiguous_in_flight_dispatch_then_allows_safe_boundary_cancel() {
+        let journal = Journal::open(":memory:").unwrap();
+        let operation = journal
+            .admit("p", "s", "k", &json!({"op":"observe"}))
+            .unwrap()
+            .operation;
+        assert!(journal.start("p", "s", &operation.id).unwrap());
+        assert!(
+            journal
+                .record_dispatch("p", "s", &operation.id, "first")
+                .unwrap()
+                .acquired
+        );
+        assert!(!journal.cancel("p", "s", &operation.id).unwrap());
+        assert_eq!(
+            journal
+                .get("p", "s", &operation.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Running
+        );
+        assert!(
+            journal
+                .acknowledge_dispatch("p", "s", &operation.id, "first")
+                .unwrap()
+        );
+        assert!(journal.cancel("p", "s", &operation.id).unwrap());
+        assert!(matches!(
+            journal.record_dispatch("p", "s", &operation.id, "second"),
+            Err(JournalError::InvalidTransition("dispatch"))
+        ));
+    }
 }
