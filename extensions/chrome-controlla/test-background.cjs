@@ -2768,10 +2768,11 @@ async function waitFor(predicate, description) {
     expected_urls: expectedUrls([41]), expected_document_ids: expectedDocuments([41]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   restartPort.hostMessage({ ...lostCreateRequest, id: "open-recover-lost-create-ack" });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await waitFor(() => restartPort.sent.some(message => message.id === "open-recover-lost-create-ack"), "recovered open result");
   assert.equal(tabList.length, lostCreateBaseline + 1, "a fresh service worker recovers the tab Chrome created before its reply was lost");
-  assert.ok(restartPort.sent.at(-1).result, JSON.stringify(restartPort.sent.at(-1)));
-  assert.equal(restartPort.sent.at(-1).result.idempotent_reuse, true);
+  const recoveredOpen = restartPort.sent.findLast(message => message.id === "open-recover-lost-create-ack");
+  assert.ok(recoveredOpen?.result, JSON.stringify(recoveredOpen));
+  assert.equal(recoveredOpen.result.idempotent_reuse, true);
   const conflictingKey = "client-fixture:conflict-1234";
   restartPort.hostMessage({ ...lostCreateRequest, id: "open-conflict-a", params: { ...lostCreateRequest.params, idempotency_key: conflictingKey, url: "https://example.test/conflict-a" } });
   restartPort.hostMessage({ ...lostCreateRequest, id: "open-conflict-b", params: { ...lostCreateRequest.params, idempotency_key: conflictingKey, url: "https://example.test/conflict-b" } });
