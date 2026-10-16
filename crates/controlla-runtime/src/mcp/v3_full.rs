@@ -21778,11 +21778,13 @@ mod v3_batch_delivery_tests {
 
     #[test]
     fn native_download_bytes_require_a_completed_identity_bound_bounded_file() {
-        let completed = json!({"status":"completed","download_id":19,"file_path":"/tmp/report.csv",
+        let report_path = std::env::temp_dir().join("report.csv");
+        let report_path = report_path.to_string_lossy().into_owned();
+        let completed = json!({"status":"completed","download_id":19,"file_path":report_path,
             "bytes_received":42,"total_bytes":42,"url_identity":{"matches_expected":true,"url_sha256":"abc"}});
         assert_eq!(
             validate_native_download_completion(&completed).unwrap(),
-            ("/tmp/report.csv", 19)
+            (report_path.as_str(), 19)
         );
         assert!(validate_native_download_completion(&json!({"status":"started"})).is_err());
         let mut mismatched_url = completed.clone();
