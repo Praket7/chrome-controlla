@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.84",
+    "model": "gpt-6-luna",
+    "selected_adapters": [
+      "controlla"
+    ],
+    "adapter_versions": {
+      "playwright_mcp": "0.0.83",
+      "chrome_devtools_mcp": "1.10.1",
+      "agent_browser": "0.39.1"
+    },
+    "controlla_binary_sha256": "beb588d4c15ce8d35f7d33ac84eb3c5d9e0b1d758dae7ef47419034df68a4cbe",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64",
+    "timing_origin": "immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "d6f88d5ce7c5ade865c2fe676d3ee277870dd30c0d29c4d4006121da0860bba7",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": 10117.376875,
+        "process_spawn_to_independent_verification_ms": 12270.169875,
+        "process_spawn_to_final_ms": 11471.0585,
+        "first_browser_tool_started_ms": 7929.552541,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 71872,
+        "output_tokens": 349,
+        "external_tool_calls": 1,
+        "successful_browser_tool_calls": 1,
+        "tool_names": [
+          "chrome-controlla.browser:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 10117.376875,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "task",
+              "mode": "headless",
+              "release_after_task": true,
+              "task": {
+                "kind": "research",
+                "urls": [
+                  "https://example.com/"
+                ],
+                "selector": "p:first-of-type",
+                "goal": "Read the document title and the first paragraph exactly as shown."
+              }
+            },
+            "result_summary": {
+              "status": "completed",
+              "private_session_released": true,
+              "route": "semantic_program",
+              "verification": "passed",
+              "metrics": {
+                "host_round_trips": 31
+              },
+              "receipts": [
+                {
+                  "kind": "navigate",
+                  "status": "verified",
+                  "verified": true,
+                  "snippet": ""
+                },
+                {
+                  "kind": "extract",
+                  "verified": true,
+                  "title": "Example Domain",
+                  "snippet": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+                }
+              ]
+            },
+            "result_preview": "{\"diagnostics_omitted\":true,\"elapsed_ms\":129,\"execution_route\":{\"actual_cost\":{\"browser_command_budget_used\":31,\"cdp_commands\":31,\"elapsed_ms\":129,\"host_round_trips\":31,\"logical_task_step_receipts\":2,\"observation_bytes\":0,\"reported_internal_model_calls\":0,\"returned_observation_count_source\":\"structured_mcp_response_at_return_boundary\",\"returned_observation_packets\":0},\"model_budget\":{\"internal_calls_allowed\":0,\"internal_calls_observed\":0,\"passed\":true,\"status\":\"passed\"},\"reason\":\"a deterministic semantic program is available\",\"tier\":\"semantic_program\",\"verification\":\"passed\"},\"metrics\":{\"cdp_commands\":31,\"host_round_trips\":31,\"observation_bytes\":0,\"phases\":{\"artifact_transfer_us\":0,\"discovery_us\":0,\"dispatch_us\":0,\"enrichment_us\":0,\"grounding_us\":0,\"pair_us\":0,\"readiness_us\":0,\"serialization_us\":8,\"snapshot_us\":0,\"verification_us\":0},\"returned_observation_packets\":0},\"nodes\":null,\"observation_boundary\":{\"count_complete\":true,\"count_source\":\"structured_mcp_response_at_return_boundary\",\"external_model_inspection\":null,\"external_model_telemetry\":\"outside_mcp_process\",\"returned_observation_packets\":0},\"page_content_is_untrusted\":true,\"private_session_released\":true,\"receipts\":[{\"dispatch_acknowledged\":true,\"evidence_hash\":\"10d8ca20d232b1d921476483ddf64caaae0d205956fa9b864165ee6df025608d\",\"kind\":\"navigate\",\"response_compacted\":true,\"resumed_from_checkpoint\":false,\"snippet\":\"\",\"status\":\"verified\",\"verified\":true},{\"evidence_hash\":\"b8492ce2d8a9060d7ca34e077dfd313d49e44c3b887419010b0f1f6ad7905b39\",\"kind\":\"extract\",\"response_compacted\":true,\"resumed_from_checkpoint\":false,\"snippet\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\",\"title\":\"Example Domain\",\"verified\":true}],\"receipts_omitted\":0,\"receipts_returned\":2,\"response_budget\":{\"max_bytes\":2048,\"reason\":\"compact receipt default\",\"source\":\"default\"},\"status\":\"completed\",\"steps\":2,\"truncated\":true}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 5731,
+        "output_sha256": "6c1f2b9447f3f9c418843a5e469d40f0871fb8c6187da7a8b50cd38a14f8dd0c",
+        "final_answer_excerpt": "{\"title\":\"Example Domain\",\"paragraph\":\"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": {
+          "title": "Example Domain",
+          "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+        },
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "browser_outcome_matches_reference": true,
+        "final_answer_matches_reference": true,
+        "independently_verified_success": true,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "browser_outcome_matches_reference": true,
+          "final_answer_matches_reference": true,
+          "cleanup_verification_method": "adapter_specific_close_result",
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

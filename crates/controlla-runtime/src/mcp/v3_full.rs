@@ -4746,7 +4746,11 @@ async fn workflow_fill_form(
             Err(error) => json!({"ok":false,"reason":error.to_string()}),
         }
     } else {
-        json!({"ok":false,"reason":"batch did not complete every field"})
+        json!({
+            "ok":false,
+            "checks":vec![false; references.len()],
+            "reason":"batch did not complete every field"
+        })
     };
     let after = {
         let connection = live
@@ -4798,6 +4802,7 @@ async fn workflow_fill_form(
             json!({"status":"verified","action":"fill_form","dispatch_acknowledged":true,"completed_fields":completed,"deltas":deltas,"final_readback":{"ok":true,"checks":final_checks},"document_changed":false}),
         )
     } else if completed == 1
+        && references.len() == 1
         && receipts
             .first()
             .is_some_and(fill_form_known_pre_dispatch_failure)
@@ -5057,6 +5062,15 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "count",
         "coverage_complete",
         "end_of_list",
+        "goal_satisfied",
+        "scope_complete",
+        "scanned_nodes",
+        "text_requested",
+        "slice_incomplete",
+        "identity_incomplete",
+        "deduplicated",
+        "scrolls",
+        "matches",
         "application_accepted",
         "persisted",
         "account_marker_matches",
@@ -5067,6 +5081,7 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "dispatch_acknowledged",
         "dispatch_may_have_occurred",
         "retry_safe",
+        "resumed_from_checkpoint",
         "outcome",
         "filename",
         "mime",
@@ -5095,6 +5110,7 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "snippet",
         "text",
         "value",
+        "resumed_from_checkpoint",
     ];
     let encoded = serde_json::to_vec(&compacted).unwrap_or_default();
     use sha2::Digest;
@@ -5142,6 +5158,14 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "count",
         "coverage_complete",
         "end_of_list",
+        "goal_satisfied",
+        "scope_complete",
+        "scanned_nodes",
+        "text_requested",
+        "slice_incomplete",
+        "identity_incomplete",
+        "deduplicated",
+        "scrolls",
         "application_accepted",
         "persisted",
         "artifact_handle",
@@ -5159,10 +5183,12 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "source_identity",
         "evidence_hash",
         "mime",
+        "matches",
         "title",
         "snippet",
         "text",
         "value",
+        "resumed_from_checkpoint",
     ];
     while v3_workflow_response_size(&result) > 640 {
         let removable = result
@@ -5204,10 +5230,20 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "count",
             "coverage_complete",
             "end_of_list",
+            "goal_satisfied",
+            "scope_complete",
+            "scanned_nodes",
+            "text_requested",
+            "slice_incomplete",
+            "identity_incomplete",
+            "deduplicated",
+            "scrolls",
+            "matches",
             "title",
             "snippet",
             "text",
             "value",
+            "resumed_from_checkpoint",
         ];
         let mut fallback_retain = vec![
             "status",
@@ -5228,11 +5264,21 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "count",
             "coverage_complete",
             "end_of_list",
+            "goal_satisfied",
+            "scope_complete",
+            "scanned_nodes",
+            "text_requested",
+            "slice_incomplete",
+            "identity_incomplete",
+            "deduplicated",
+            "scrolls",
             "evidence_hash",
+            "matches",
             "title",
             "snippet",
             "text",
             "value",
+            "resumed_from_checkpoint",
         ];
         if kind == "upload" {
             fallback_keys.extend([
@@ -5376,6 +5422,7 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "selection_readback_verified",
             "file_input_consumed_by_page",
             "downloaded_artifact_available",
+            "resumed_from_checkpoint",
         ] {
             if let Some(value) = result.get(key).filter(|value| value.is_boolean()) {
                 bounded.insert(key.to_owned(), value.clone());
@@ -5482,6 +5529,7 @@ fn compact_v3_step_for_response_budget(value: Value) -> Value {
             "evidence_payload_dropped",
             "reason_code",
             "retry_safe",
+            "resumed_from_checkpoint",
             "next_action",
         ],
         "verify" => &[
@@ -5521,9 +5569,14 @@ fn compact_v3_step_for_response_budget(value: Value) -> Value {
             "downloaded_artifact_available",
             "download_lifecycle",
             "source_identity",
+            "title",
+            "snippet",
+            "text",
+            "value",
             "evidence_handle",
             "evidence_hash",
             "retry_safe",
+            "resumed_from_checkpoint",
             "next_action",
         ],
     };
@@ -5726,6 +5779,23 @@ fn compact_v3_evidence_field(key: &str, value: &Value) -> Value {
             64
         };
         return json!(text.chars().take(limit).collect::<String>());
+    }
+    if key == "matches" {
+        let matches = value.as_array().cloned().unwrap_or_default();
+        let compact_matches = matches
+            .iter()
+            .take(3)
+            .map(|item| {
+                let mut bounded = serde_json::Map::new();
+                for field in ["reference", "role", "name", "text", "href"] {
+                    if let Some(value) = item.get(field).filter(|value| !value.is_null()) {
+                        bounded.insert(field.to_owned(), compact_v3_bounded_string(value, 160));
+                    }
+                }
+                Value::Object(bounded)
+            })
+            .collect::<Vec<_>>();
+        return Value::Array(compact_matches);
     }
     if v3_workflow_response_size(value) <= 384 {
         return value.clone();
@@ -5951,12 +6021,31 @@ fn bound_v3_workflow_response(
         let removable_diagnostics = ["metrics", "expected_cost", "operation_ms", "route_budget"];
         if let Some(key) = removable_diagnostics
             .iter()
-            .find(|key| value.get(**key).is_some())
+            .find(|key| {
+                value.get(**key).is_some()
+                    && (**key != "metrics"
+                        || value["metrics"]
+                            .as_object()
+                            .is_some_and(|metrics| metrics.len() > 4))
+            })
         {
-            value
-                .as_object_mut()
-                .expect("workflow response object")
-                .remove(*key);
+            if *key == "metrics" {
+                // Preserve the phase timings that let callers understand where
+                // the operation spent time, while dropping verbose command
+                // attribution from the default wire budget.
+                let metrics = value.get("metrics").cloned().unwrap_or(Value::Null);
+                value["metrics"] = json!({
+                    "phases": metrics.get("phases").cloned().unwrap_or_else(|| json!({})),
+                    "cdp_commands": metrics["cdp_commands"],
+                    "host_round_trips": metrics["host_round_trips"],
+                    "observation_bytes": metrics["observation_bytes"]
+                });
+            } else {
+                value
+                    .as_object_mut()
+                    .expect("workflow response object")
+                    .remove(*key);
+            }
             value["diagnostics_omitted"] = json!(true);
             value["truncated"] = json!(true);
             continue;
@@ -6456,6 +6545,12 @@ fn reject_research_extract(
 }
 
 fn task_receipt(kind: &str, url: &str, reference: Option<&str>, value: &Value) -> Value {
+    let resumed_from_checkpoint = value["resumed_from_checkpoint"] == true
+        // Save/click adapters use this fixed internal reason when returning a
+        // checkpoint reconciliation result. Keep the marker even if an adapter
+        // omitted the parallel boolean while projecting its result.
+        || value["reason"].as_str()
+            == Some("fresh task-bound postcondition passed; mutation was not replayed");
     let snippet = if kind == "extract" {
         value["items"]
             .as_array()
@@ -6485,6 +6580,7 @@ fn task_receipt(kind: &str, url: &str, reference: Option<&str>, value: &Value) -
         "affected_controls":bounded.affected_controls,"verified":bounded.verified,
         "reason_code":value["reason_code"],"dispatch_acknowledged":value["dispatch_acknowledged"],
         "dispatch_may_have_occurred":value["dispatch_may_have_occurred"],
+        "resumed_from_checkpoint":resumed_from_checkpoint,
         "route":value["route"],"skill_id":value["skill_id"],"skill_version":value["skill_version"],
         "internal_model_calls":value["internal_model_calls"],
         "root_document_matches":value["root_document_matches"],"account_marker_matches":value["account_marker_matches"],
@@ -16309,6 +16405,18 @@ impl AppV3 {
             crate::v3::BrowserMode::Background => "background",
             crate::v3::BrowserMode::Headless => "headless",
         };
+        // Preserve the typed security contract before generic capability
+        // resolution can turn secure_fill into an ambiguous provider error.
+        if args.action == "secure_fill" && mode != crate::v3::BrowserMode::Foreground {
+            return Ok(Json(json!({
+                "status":"not_dispatched",
+                "action":"secure_fill",
+                "reason_code":"foreground_session_required",
+                "dispatch_may_have_occurred":false,
+                "verified":false,
+                "reason":"Secure password entry requires an interactive foreground browser session."
+            })));
+        }
         let provider = mode.default_provider();
         let capability = match controlla_runtime::browser_contract::resolve_action_capability(
             provider,
@@ -20220,7 +20328,10 @@ impl AppV3 {
             replayed["execution_route"] = route_receipt;
             return Ok(Json(replayed));
         }
-        let mut url = String::new();
+        // Existing-tab mutation tasks begin on an already observed document.
+        // Seed the per-step identity from that observation so resumable fills
+        // and saves do not compare the live URL against an empty placeholder.
+        let mut url = current_page_url.clone().unwrap_or_default();
         let mut active_tab_id = args.chrome_tab_id.clone();
         let mut speculative_profile: Option<crate::site_profiles::SiteProfile> = None;
         let mut speculative_fallback: Option<String> = None;
@@ -21015,6 +21126,13 @@ impl AppV3 {
                 result["focus_changed_during_operation"] = changed;
             }
             let mut receipt = task_receipt(kind, &url, reference.as_deref(), &result);
+            // The resumed mutation result is deliberately kept separate from the
+            // ordinary action payload. Preserve the checkpoint marker at the task
+            // receipt boundary even if an adapter omits it while projecting its
+            // own result shape.
+            if resumed_click_result.is_some() {
+                receipt["resumed_from_checkpoint"] = json!(true);
+            }
             receipt["elapsed_ms"] = json!(step_started.elapsed().as_millis() as u64);
             let verified = receipt["verified"] == true;
             if verified
@@ -24508,6 +24626,19 @@ mod v3_batch_delivery_tests {
         assert!(compacted["snippet"]
             .as_str()
             .is_some_and(|text| text.contains("documentation examples")));
+    }
+
+    #[test]
+    fn compact_task_receipt_keeps_resume_marker() {
+        let receipt = task_receipt(
+            "save_draft",
+            "https://example.test/",
+            Some("@c1"),
+            &json!({"status":"verified","verified":true,"resumed_from_checkpoint":true}),
+        );
+        assert_eq!(receipt["resumed_from_checkpoint"], true);
+        let compacted = super::compact_v3_step_for_response_budget(receipt);
+        assert_eq!(compacted["resumed_from_checkpoint"], true, "{compacted}");
     }
 
     #[test]
