@@ -6,9 +6,10 @@
 
 use crate::{FrameRecord, TargetRecord};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_REGISTRY_NAMESPACE: AtomicU64 = AtomicU64::new(1);
@@ -197,7 +198,6 @@ pub struct ArtifactMetadata {
     pub scope: ArtifactScope,
 }
 
-#[cfg(unix)]
 const ARTIFACT_TTL_MS: u64 = 60 * 60 * 1000;
 
 fn unix_epoch_ms() -> u64 {
@@ -207,7 +207,6 @@ fn unix_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(unix)]
 fn artifact_mime(filename: &str) -> &'static str {
     match filename
         .rsplit_once('.')
@@ -539,68 +538,71 @@ impl SessionRegistry {
         }) {
             return Err(SessionError::ArtifactStoreFull);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (filename, bytes);
-            Err(SessionError::ArtifactUnsupported)
-        }
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| SessionError::ArtifactIo)?;
+        let id = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let directory = std::env::temp_dir().join(format!("controlla-artifact-{id}"));
         #[cfg(unix)]
-        {
-            let mut nonce = [0u8; 16];
-            getrandom::fill(&mut nonce).map_err(|_| SessionError::ArtifactIo)?;
-            let id = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-            let directory = std::env::temp_dir().join(format!("controlla-artifact-{id}"));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&directory)
-                .map_err(|_| SessionError::ArtifactIo)?;
-            let path = directory.join(filename);
-            use std::io::Write;
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            let mut file = std::fs::OpenOptions::new()
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|_| SessionError::ArtifactIo)?;
+        #[cfg(not(unix))]
+        std::fs::create_dir(&directory).map_err(|_| SessionError::ArtifactIo)?;
+        let path = directory.join(filename);
+        use std::io::Write;
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&path)
-                .map_err(|_| {
-                    let _ = std::fs::remove_dir(&directory);
-                    SessionError::ArtifactIo
-                })?;
-            if file.write_all(bytes).is_err() {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_dir(&directory);
-                return Err(SessionError::ArtifactIo);
-            }
-            let handle = ArtifactHandle {
-                opaque: format!("artifact_{id}"),
-                scope,
-            };
-            let metadata = ArtifactMetadata {
-                handle: handle.clone(),
-                filename: filename.to_owned(),
-                mime: artifact_mime(filename).to_owned(),
-                size: bytes.len(),
-                sha256: sha2::Sha256::digest(bytes)
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-                source_identity,
-                expires_at_ms: unix_epoch_ms().saturating_add(ARTIFACT_TTL_MS),
-                scope,
-            };
-            self.artifacts
-                .entry(session.id.clone())
-                .or_default()
-                .insert(
-                    id,
-                    StoredArtifact {
-                        metadata: metadata.clone(),
-                        path,
-                        directory,
-                    },
-                );
-            Ok(metadata)
+        };
+        #[cfg(not(unix))]
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut file = file.map_err(|_| {
+            let _ = std::fs::remove_dir(&directory);
+            SessionError::ArtifactIo
+        })?;
+        if file.write_all(bytes).is_err() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(&directory);
+            return Err(SessionError::ArtifactIo);
         }
+        let handle = ArtifactHandle {
+            opaque: format!("artifact_{id}"),
+            scope,
+        };
+        let metadata = ArtifactMetadata {
+            handle: handle.clone(),
+            filename: filename.to_owned(),
+            mime: artifact_mime(filename).to_owned(),
+            size: bytes.len(),
+            sha256: sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            source_identity,
+            expires_at_ms: unix_epoch_ms().saturating_add(ARTIFACT_TTL_MS),
+            scope,
+        };
+        self.artifacts
+            .entry(session.id.clone())
+            .or_default()
+            .insert(
+                id,
+                StoredArtifact {
+                    metadata: metadata.clone(),
+                    path,
+                    directory,
+                },
+            );
+        Ok(metadata)
     }
 
     pub fn artifact_metadata(
