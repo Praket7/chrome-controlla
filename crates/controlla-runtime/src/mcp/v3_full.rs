@@ -13968,7 +13968,7 @@ async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::Er
 #[tool_router]
 impl AppV3 {
     #[tool(
-        description = "Open or reuse tabs and navigate; act changes existing tabs. Use action=task for one-call private headless mode with a read-only Research task without tab_ids. open.steps batches bounded reads, actions, and verification. Upload needs a scoped artifact, trigger, account marker, and acceptance predicate; file_path is local_unrestricted only.",
+        description = "Use open for new tabs/URLs, act for existing tabs; close_owned and activate (explicit request, Controlla-owned) are guarded. multi_touch is supported. action=task is one-call private headless mode for a read-only Research task without tab_ids; open.steps batches reads, actions, verification.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn browser(
@@ -16533,7 +16533,7 @@ impl AppV3 {
     }
 
     #[tool(
-        description = "Guarded actions on an existing tab. DOM click/fill/select/type/press/scroll work in hidden tabs with readback; hover/swipe/pinch/IME/secure_fill/native dialogs need foreground. secure_fill requires allow_password=true. Never retry an unknown mutation.",
+        description = "Guarded actions on an existing tab. DOM click/fill/select/type/press/scroll work hidden with readback; swipe, two-finger multi_touch, pinch, IME, and secure_fill/native dialogs need foreground; swipe uses child-frame viewport CSS pixels. secure_fill requires allow_password=true; never retry a mutation.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<std::collections::BTreeMap<String, Value>>()
     )]
     async fn act(
