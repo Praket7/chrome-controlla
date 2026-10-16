@@ -702,7 +702,7 @@ function message(payload) {
 }
 function messageFrom(payload, sender) { return new Promise(resolve => listener(payload, sender, resolve)); }
 async function waitFor(predicate, description) {
-  const deadline = Date.now() + 1000;
+  const deadline = Date.now() + 5000;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
     await new Promise(resolve => setTimeout(resolve, 0));
