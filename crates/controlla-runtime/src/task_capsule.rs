@@ -160,12 +160,12 @@ impl TaskCapsule {
                         ));
                     }
                 }
-                CapsuleStep::Extract { output, .. } | CapsuleStep::Download { output, .. } => {
-                    if output.trim().is_empty() || output.len() > MAX_OUTPUT_NAME {
-                        return Err(CapsuleValidationError(
-                            "artifact outputs must be named and bounded".into(),
-                        ));
-                    }
+                CapsuleStep::Extract { output, .. } | CapsuleStep::Download { output, .. }
+                    if output.trim().is_empty() || output.len() > MAX_OUTPUT_NAME =>
+                {
+                    return Err(CapsuleValidationError(
+                        "artifact outputs must be named and bounded".into(),
+                    ));
                 }
                 _ => {}
             }

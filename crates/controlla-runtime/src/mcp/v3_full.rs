@@ -16098,16 +16098,14 @@ impl AppV3 {
             };
             let opened = if let Some((_, reused_tab, source_tab)) = reused_target.as_ref() {
                 let mut activation_verified = mode == crate::v3::BrowserMode::Background;
-                if mode == crate::v3::BrowserMode::Foreground {
-                    if source_tab.is_some() {
+                if mode == crate::v3::BrowserMode::Foreground && source_tab.is_some() {
                         let Json(activation) = self.core.legacy.shared_tab(Parameters(super::SharedTabArgs {
                             session_id: session_id.clone(), action: "activate_owned".into(),
                             chrome_tab_id: Some(reused_tab.clone()), url: String::new(), idempotency_key: args.idempotency_key.clone(),
                             active: None, wait_until: None, create_background_window: None, target_window_id: None,
                             candidate_tab_id: None, created_at_ms: None, since_ms: None, account_marker_selector: None, account_marker_text: None,
                         })).await?;
-                        activation_verified = activation["status"] == "activated" && activation["verified"] == true;
-                    }
+                    activation_verified = activation["status"] == "activated" && activation["verified"] == true;
                 }
                 let inventory = crate::native_setup::read_tabs().map_err(invalid)?;
                 let tab = inventory["tabs"].as_array().and_then(|tabs| tabs.iter().find(|tab| tab["id"].as_u64().map(|id| id.to_string()).as_deref() == Some(reused_tab.as_str()))).cloned().unwrap_or(Value::Null);
@@ -27174,10 +27172,26 @@ mod v3_batch_delivery_tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    #[test]
     // A private Chrome process talks only to a localhost receipt fixture. This
     // covers the public headless route, not the installed extension or a vendor.
-    async fn v3_hidden_file_upload_waits_for_delayed_application_acceptance() {
+    fn v3_hidden_file_upload_waits_for_delayed_application_acceptance() {
+        std::thread::Builder::new()
+            .name("controlla-v3-hidden-upload-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(v3_hidden_file_upload_waits_for_delayed_application_acceptance_inner());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn v3_hidden_file_upload_waits_for_delayed_application_acceptance_inner() {
         use rmcp::{ServiceExt, model::CallToolRequestParams};
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

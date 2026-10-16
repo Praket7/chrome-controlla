@@ -746,7 +746,7 @@ async function waitFor(predicate, description) {
     candidate.hostMessage({ type: "recovery_ack", sequence: 6 });
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal((await message({ type: "native-status" })).recovery_journal.status, "recovery_required", "stale acknowledgements cannot clear recovery state");
-    candidate.hostMessage({ type: "recovery_ack", sequence: 7 });
+    candidate.hostMessage({ type: "recovery_ack", sequence: 7, recovery_complete: true });
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal((await message({ type: "native-status" })).recovery_journal.status, "clear", "matching acknowledgement clears the durable checkpoint");
     candidate.disconnect("native host unavailable");
@@ -2757,8 +2757,8 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   loseNextCreatedTabReply = true;
   restartPort.hostMessage({ ...lostCreateRequest, id: "open-lost-create-ack" });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.match(restartPort.sent.at(-1).error, /simulated lost tabs.create reply/);
+  await waitFor(() => restartPort.sent.some(message => message.id === "open-lost-create-ack" && /simulated lost tabs.create reply/.test(message.error || "")), "lost tabs.create reply error");
+  assert.match(restartPort.sent.find(message => message.id === "open-lost-create-ack")?.error || "", /simulated lost tabs.create reply/);
   restartPort.disconnect("simulate worker restart after tab creation");
   runBackground();
   await new Promise(resolve => setTimeout(resolve, 0));
