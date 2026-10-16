@@ -966,11 +966,16 @@ async fn work_can_finish_after_the_response_wait_budget() {
             .status,
         JobStatus::Running
     );
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert_eq!(
-        journal.get("p", "s", &id).unwrap().unwrap().status,
-        JobStatus::Completed
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if journal.get("p", "s", &id).unwrap().unwrap().status == JobStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background work should finish after the response wait budget");
     cleanup(&path);
 }
 
