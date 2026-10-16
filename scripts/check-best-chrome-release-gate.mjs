@@ -6,6 +6,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
+const rootPath = fileURLToPath(root);
 const requiredFiles = [
   'bench/phase10-pilot.test.mjs',
   'scripts/check-phase10-heldout.mjs',
@@ -19,7 +20,8 @@ const requiredFiles = [
 for (const path of requiredFiles) await access(new URL(path, root));
 
 const phase11Path = process.env.PHASE11_TASK_SET ?? 'bench/tasks/phase11-realistic.json';
-const phase11 = JSON.parse(await readFile(new URL(phase11Path, root), 'utf8'));
+const phase11File = resolve(rootPath, phase11Path);
+const phase11 = JSON.parse(await readFile(phase11File, 'utf8'));
 assert.equal(phase11.frozen_phase10_unchanged, true);
 assert.equal(phase11.claim_gates.maximum_severe_wrong_target_events, 0);
 assert.equal(phase11.claim_gates.maximum_authority_violations, 0);
