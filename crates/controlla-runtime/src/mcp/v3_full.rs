@@ -5088,6 +5088,13 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "browser_guid",
         "trigger_status",
         "targeted_visual_evidence",
+        // Read receipts carry the bounded facts the caller asked for. Keep these
+        // through every response-budget fallback so compaction cannot turn a
+        // successful extract into an unverifiable acknowledgement.
+        "title",
+        "snippet",
+        "text",
+        "value",
     ];
     let encoded = serde_json::to_vec(&compacted).unwrap_or_default();
     use sha2::Digest;
@@ -5151,6 +5158,11 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "download_lifecycle",
         "source_identity",
         "evidence_hash",
+        "mime",
+        "title",
+        "snippet",
+        "text",
+        "value",
     ];
     while v3_workflow_response_size(&result) > 640 {
         let removable = result
@@ -5192,6 +5204,10 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "count",
             "coverage_complete",
             "end_of_list",
+            "title",
+            "snippet",
+            "text",
+            "value",
         ];
         let mut fallback_retain = vec![
             "status",
@@ -5213,6 +5229,10 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "coverage_complete",
             "end_of_list",
             "evidence_hash",
+            "title",
+            "snippet",
+            "text",
+            "value",
         ];
         if kind == "upload" {
             fallback_keys.extend([
@@ -5326,6 +5346,19 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
                 );
             }
         }
+        // Preserve a small, untrusted text proof for read/extract receipts even
+        // when the fixed fallback is reached. This is the independent verifier's
+        // postcondition, not page trust or executable instruction content.
+        if matches!(kind, "extract" | "snapshot" | "find_all" | "collect_virtual") {
+            for key in ["title", "snippet", "text", "value"] {
+                if let Some(field) = result.get(key).filter(|field| !field.is_null()) {
+                    let bounded_value = compact_v3_bounded_string(field, 256);
+                    if !bounded_value.is_null() {
+                        bounded.insert(key.to_owned(), bounded_value);
+                    }
+                }
+            }
+        }
         if let Some(handle) = result
             .get("artifact_handle")
             .filter(|value| !value.is_null())
@@ -5364,11 +5397,19 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             if let Some(handle) = result.get("artifact_handle") {
                 bounded.insert(
                     "artifact_handle".into(),
-                    compact_v3_bounded_string(handle, 32),
+                    // `artifact_<32 hex>` is already opaque; keep the full
+                    // handle so a later upload/drop can deserialize it.
+                    compact_v3_artifact_handle(handle),
                 );
             }
             if let Some(digest) = result.get("sha256") {
                 bounded.insert("sha256".into(), compact_v3_bounded_string(digest, 64));
+            }
+            if let Some(mime) = result.get("mime") {
+                bounded.insert("mime".into(), compact_v3_bounded_string(mime, 64));
+            }
+            if let Some(expires_at_ms) = result.get("expires_at_ms") {
+                bounded.insert("expires_at_ms".into(), expires_at_ms.clone());
             }
             if let Some(lifecycle) = result.get("download_lifecycle") {
                 bounded.insert(
@@ -5408,6 +5449,11 @@ fn compact_v3_step_for_response_budget(value: Value) -> Value {
             "complete",
             "limited",
             "truncated",
+            "snippet",
+            "title",
+            "text",
+            "value",
+            "items",
             "next_action",
         ],
         "choose" => &[
@@ -5529,6 +5575,33 @@ fn compact_v3_bounded_string(value: &Value, max_chars: usize) -> Value {
     }
 }
 
+fn compact_v3_artifact_handle(value: &Value) -> Value {
+    let Some(text) = value.as_str() else {
+        return Value::Null;
+    };
+    // Scoped handles carry an opaque id plus `@<scope>`. Preserve the complete
+    // typed handle so it remains usable by a subsequent upload/drop call; cap
+    // malformed untrusted strings more aggressively for the 640-byte receipt.
+    let valid_opaque = text
+        .split_once('@')
+        .map(|(opaque, scope)| {
+            opaque.strip_prefix("artifact_").is_some_and(|id| {
+                id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) && matches!(
+                scope,
+                "private_headless_session"
+                    | "local_unrestricted_shared_session"
+                    | "guarded_shared_session"
+            )
+        })
+        .unwrap_or_else(|| {
+            text.strip_prefix("artifact_").is_some_and(|id| {
+                id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        });
+    json!(text.chars().take(if valid_opaque { 96 } else { 48 }).collect::<String>())
+}
+
 fn compact_v3_sha256(value: &Value) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
@@ -5645,7 +5718,14 @@ fn compact_v3_evidence_field(key: &str, value: &Value) -> Value {
         return Value::Object(evidence);
     }
     if let Some(text) = value.as_str() {
-        return json!(text.chars().take(64).collect::<String>());
+        // Read receipts need enough bounded text to prove the requested fact;
+        // mutation/debug strings remain on the smaller default budget.
+        let limit = if matches!(key, "title" | "snippet" | "text" | "value") {
+            256
+        } else {
+            64
+        };
+        return json!(text.chars().take(limit).collect::<String>());
     }
     if v3_workflow_response_size(value) <= 384 {
         return value.clone();
@@ -22402,6 +22482,8 @@ mod v3_batch_delivery_tests {
         );
         assert_eq!(receipt["application_accepted"], false);
         assert_eq!(receipt["persisted"], false);
+        let compacted = compact_v3_workflow_step(receipt, false, false);
+        assert_eq!(compacted["mime"], "text/csv");
     }
 
     #[test]
@@ -24402,6 +24484,30 @@ mod v3_batch_delivery_tests {
             "s1"
         );
         assert!(compacted["evidence_hash"].as_str().is_some());
+    }
+
+    #[test]
+    fn compact_extract_keeps_bounded_read_fact_when_receipt_overflows() {
+        let receipt = json!({
+            "kind":"extract",
+            "status":"verified",
+            "verified":true,
+            "title":"Example Domain",
+            "snippet":"This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
+            "url":"https://example.com/",
+            "debug":"x".repeat(12_000),
+            "extra":"y".repeat(12_000)
+        });
+        let compacted = compact_v3_workflow_step(receipt, false, false);
+        assert!(
+            v3_workflow_response_size(&compacted) <= 640,
+            "{}: {compacted}",
+            v3_workflow_response_size(&compacted)
+        );
+        assert_eq!(compacted["title"], "Example Domain");
+        assert!(compacted["snippet"]
+            .as_str()
+            .is_some_and(|text| text.contains("documentation examples")));
     }
 
     #[test]

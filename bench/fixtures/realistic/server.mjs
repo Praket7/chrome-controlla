@@ -71,7 +71,7 @@ const server = createServer(async (req,res) => {
   }
   if (req.method === 'GET' && url.pathname === '/__state') return json(res,200,taskState(url.searchParams.get('task_id') ?? ''));
   if (req.method === 'GET' && url.pathname === '/frame') return res.end(`<html><body><p>Independent child frame for ${url.searchParams.get('task') ?? ''}</p></body></html>`);
-  if (req.method === 'GET' && url.pathname.startsWith('/fixture/')) return res.end(page(url.searchParams.get('task') ?? url.pathname.split('/').pop(), url.pathname.split('/').pop(), url.searchParams.get('scenario') ?? ''));
+  if (req.method === 'GET' && (url.pathname.startsWith('/fixture/') || ['registration-form','records-table','paired-tabs','spa-router','canvas-widget','virtual-list','file-input','workflow-suite','slide-deck'].includes(url.pathname.replace(/^\//,'')))) { const fixture=url.pathname.replace(/^\/|\/\$/g,'').replace(/^fixture\//,''); const taskId=url.searchParams.get('task') ?? fixture; const current=taskState(taskId); current.events.push({at:Date.now(),kind:'visited',fixture,url:url.toString()}); tasks.set(taskId,current); await persist(); return res.end(page(taskId, fixture, url.searchParams.get('scenario') ?? '')); }
   res.writeHead(404); res.end('not found');
 });
 server.listen(port,'127.0.0.1',()=>{const address=server.address(); console.log(JSON.stringify({ok:true,base_url:`http://127.0.0.1:${address.port}`}));});
