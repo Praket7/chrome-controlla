@@ -17084,6 +17084,7 @@ impl AppV3 {
                 action: args.action.clone(),
                 expected_postcondition: json!({"kind":"fresh_live_postcondition","action":args.action,
                     "verification":"passed","outcome_kind":result.as_ref().ok().and_then(|receipt| receipt["outcome"]["kind"].as_str())}),
+                replay: None,
                 last_verified_ms: now_ms(),
             };
             let recorded = memory.lock().await.record(key, entry, verification);
@@ -20572,6 +20573,7 @@ impl AppV3 {
                     {
                         memory.lock().await.has_fresh_origin_intent(&origin, &memory_intent, now_ms())
                     } else { false };
+                    let mut action_memory_status = if action_memory_candidate { "candidate" } else { "miss" };
                     let action_memory_key = if action_memory_candidate {
                         match super::full::current_skill_context_core(&self.core, &args.session_id, &active_tab_id).await {
                             Ok((origin, structural_signature)) => Some(crate::page_action_memory::ActionMemoryKey {
@@ -20580,13 +20582,25 @@ impl AppV3 {
                             Err(_) => None,
                         }
                     } else { None };
+                    if matches!(&args.task, crate::v3_tasks::TaskPrimitive::Research { .. })
+                        && self.action_memory.is_some()
+                    {
+                        route_receipt["page_action_memory"] = json!({
+                            "cache_status": action_memory_status,
+                            "replay_requires_fresh_identity": true,
+                            "secrets_persisted": false,
+                        });
+                    }
                     if let Some(key) = action_memory_key.as_ref()
                         && let Some(memory) = self.action_memory.as_ref()
                         && let Some(entry) = memory.lock().await.lookup(key, now_ms()).cloned()
                         && entry.action == "extract"
-                        && let Some(remembered_selector) = entry.semantic_target.get("selector").and_then(Value::as_str)
+                        && let Some(crate::page_action_memory::ReplayPlan::Extract { selector: remembered_selector }) = entry.replay
                     {
-                        memory_selector = Some(remembered_selector.to_owned());
+                        memory_selector = Some(remembered_selector);
+                        action_memory_status = "hit";
+                    } else if action_memory_candidate {
+                        action_memory_status = "stale";
                     }
                     let visual_route_selected = execution_route.selected == crate::capability_router::ExecutionTier::TargetedVisual
                         && targeted_visual_evidence.is_some();
@@ -20652,7 +20666,7 @@ impl AppV3 {
                     let memory_used = webmcp_result.is_none() && skill_result.is_none() && memory_selector.is_some();
                     if memory_used {
                         selector = memory_selector.clone().unwrap_or_else(|| ordinary_selector.clone());
-                        route_receipt["page_action_memory"] = json!({"used_as_hint":true,"action":"extract","selector":selector,"structure_matched":true});
+                        route_receipt["page_action_memory"] = json!({"cache_status":action_memory_status,"used_as_hint":true,"action":"extract","selector":selector,"structure_matched":true,"replay_requires_fresh_identity":true});
                     }
                     let mut value = if let Some(value) = webmcp_result {
                         if value["status"] == "unknown" {
@@ -20737,13 +20751,16 @@ impl AppV3 {
                         && matches!(value["status"].as_str(), Some("not_dispatched" | "unsupported" | "incomplete"))
                     {
                         let reason = value["reason"].as_str().unwrap_or("remembered affordance was not usable").to_owned();
+                        if let (Some(key), Some(memory)) = (action_memory_key.as_ref(), self.action_memory.as_ref()) {
+                            memory.lock().await.invalidate(key);
+                        }
                         value = self.core.browser_extract(Parameters(BrowserExtractArgs {
                             session_id: args.session_id.clone(), chrome_tab_id: active_tab_id.clone(), selector: ordinary_selector.clone(),
                             fields: std::collections::BTreeMap::from([("text".into(), ":scope".into())]),
                             max_items: Some(100), max_text_chars: Some(2_000), max_bytes: Some(20_000),
                             goal: research_goal(&args.task, &url),
                         })).await.map(|Json(value)| value).unwrap_or_else(|error| json!({"status":"unknown","reason":format!("safe semantic fallback failed: {error}")}));
-                        route_receipt["page_action_memory"] = json!({"used_as_hint":true,"fell_back":true,"reason":reason});
+                        route_receipt["page_action_memory"] = json!({"cache_status":"healed","used_as_hint":true,"fell_back":true,"reason":reason,"invalidated":true});
                         selector = ordinary_selector;
                     }
                     let action_memory_key_present = action_memory_key.is_some();
@@ -20753,7 +20770,9 @@ impl AppV3 {
                     {
                         let entry = crate::page_action_memory::ActionMemoryEntry {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
-                            expected_postcondition: json!({"kind":"nonempty_complete_extraction"}), last_verified_ms: now_ms(),
+                            expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
+                            replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            last_verified_ms: now_ms(),
                         };
                         if let Some(memory) = self.action_memory.as_ref()
                             && memory.lock().await.record(key, entry, crate::verifier::Verification::Passed)
@@ -20773,7 +20792,9 @@ impl AppV3 {
                         let intent = memory_intent.clone();
                         let entry = crate::page_action_memory::ActionMemoryEntry {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
-                            expected_postcondition: json!({"kind":"nonempty_complete_extraction"}), last_verified_ms:now_ms(),
+                            expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
+                            replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            last_verified_ms:now_ms(),
                         };
                         tokio::spawn(async move {
                             if let Ok((origin, structural_signature)) = super::full::current_skill_context_core(&app.core, &session, &tab).await
