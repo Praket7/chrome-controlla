@@ -274,3 +274,7 @@ The local persistence gap is closed for saved PNGs within the 270,000-byte limit
 ### Stage 3 final local review corrections — 2026-10-15
 
 The latest independent-review findings are closed locally: checkpoint disk refresh/update/persist is protected by an OS lock and an eight-process merge regression; workflow text evidence is caller opt-in, bounded to 2.5 KiB, labeled untrusted, omits URLs/form values/attributes/scripts, and has default-exclusion and payload-limit regressions. The plan's measurable/external gates remain open: actual prompt-submit and result-delivery hooks, six real-client qualification, configured extension/MCP reload, app/render freshness and server persistence, matched 30-trial competitor runs, hosted CI for this dirty source, and measured 6/12/20 transport targets. These are not proven by local smoke tests or simulated adapters. No universal performance or superiority claim is qualified.
+# Architectural completion pass — 2026-10-16
+
+- The new capsule, target graph, network-candidate, compact-catalog, and protocol-contract modules are implemented and locally tested. They do not by themselves prove installed-Chrome behavior, compositor correctness, or competitor superiority.
+- The extension and native runtime still retain the six-tool compatibility surface for existing clients; the three-concept catalog is an explicit mapping layer and is not yet a breaking public API migration.

@@ -849,6 +849,9 @@ struct SharedClickArgs {
     input_mode: Option<String>,
     #[serde(default)]
     click_kind: Option<String>,
+    /// Revision returned by the watcher-backed tab inventory. When supplied,
+    /// the extension refuses dispatch if topology changed after discovery.
+    expected_target_revision: Option<u64>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -864,6 +867,7 @@ struct SharedScrollArgs {
     expected_focus_epoch: Option<u64>,
     #[serde(default)]
     scroll_to_target: Option<bool>,
+    expected_target_revision: Option<u64>,
 }
 
 #[allow(dead_code)] // Used by the V3 CLI binary.
@@ -878,6 +882,7 @@ struct SharedSwipeArgs {
     timeout_ms: Option<u64>,
     expected_activation_epoch: Option<u64>,
     expected_focus_epoch: Option<u64>,
+    expected_target_revision: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -893,6 +898,7 @@ struct SharedPinchArgs {
     timeout_ms: Option<u64>,
     expected_activation_epoch: Option<u64>,
     expected_focus_epoch: Option<u64>,
+    expected_target_revision: Option<u64>,
 }
 
 fn validate_wheel_delta(delta_x: i32, delta_y: i32) -> Result<(), &'static str> {
@@ -3820,7 +3826,8 @@ impl App {
                         "object_id": snapshot.object_id, "index": index, "guard_function": guard,
                         "scroll_request": "scroll-to-target-v1", "timeout_ms": timeout,
                         "expected_activation_epoch": args.expected_activation_epoch,
-                        "expected_focus_epoch": args.expected_focus_epoch
+                        "expected_focus_epoch": args.expected_focus_epoch,
+                        "expected_target_revision": args.expected_target_revision
                     }),
                 ),
             )
@@ -3866,7 +3873,8 @@ impl App {
             let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.frameScroll",json!({
                 "frame_id":frame_id,"loader_id":frame_loader_id,"backend_node_id":backend_node_id,
                 "delta_x":args.delta_x,"delta_y":args.delta_y,"timeout_ms":timeout,
-                "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+                "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch,
+                "expected_target_revision":args.expected_target_revision
             })).await;
             let mut receipt = match response {
                 Ok(response) => shared_command_value(&response),
@@ -3946,7 +3954,8 @@ impl App {
         let dispatch=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerScroll",json!({
             "object_id":snapshot.object_id,"index":index,"delta_x":args.delta_x,"delta_y":args.delta_y,
             "guard_function":guard,"viewport":viewport,"timeout_ms":timeout
-            ,"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+            ,"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch,
+            "expected_target_revision":args.expected_target_revision
         }))).await;
         let receipt = match dispatch {
             Ok(Ok(value)) => shared_command_value(&value),
@@ -4117,7 +4126,8 @@ impl App {
         let dispatch=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerSwipe",json!({
             "object_id":snapshot.object_id,"index":index,"guard_function":guard,"viewport":viewport,
             "start_x":args.start_x,"start_y":args.start_y,"end_x":args.end_x,"end_y":args.end_y,"timeout_ms":timeout.as_millis(),
-            "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch
+            "expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch,
+            "expected_target_revision":args.expected_target_revision
         }))).await;
         let mut receipt = match dispatch {
             Ok(Ok(value)) => shared_command_value(&value),
@@ -4274,7 +4284,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default();
-        let mut receipt=match tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerMultiTouch",json!({"object_id":snapshot.object_id,"index":index,"guard_function":guard,"viewport":viewport,"center_x":args.center_x,"center_y":args.center_y,"start_distance":args.start_distance,"end_distance":args.end_distance,"timeout_ms":timeout.as_millis(),"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch}))).await {Ok(Ok(value))=>shared_command_value(&value),_=>json!({"status":"unknown","reason_code":"touch_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})};
+        let mut receipt=match tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerMultiTouch",json!({"object_id":snapshot.object_id,"index":index,"guard_function":guard,"viewport":viewport,"center_x":args.center_x,"center_y":args.center_y,"start_distance":args.start_distance,"end_distance":args.end_distance,"timeout_ms":timeout.as_millis(),"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch,"expected_target_revision":args.expected_target_revision}))).await {Ok(Ok(value))=>shared_command_value(&value),_=>json!({"status":"unknown","reason_code":"touch_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})};
         let acknowledged = matches!(receipt["status"].as_str(), Some("dispatched" | "verified"));
         if acknowledged {
             let mut poll = Duration::from_millis(20);
@@ -4598,7 +4608,8 @@ impl App {
                     &args.chrome_tab_id,
                     "Controlla.pointerClick",
                     json!({"object_id":snapshot.object_id,"index":index,"outcome":outcome,
-                    "function_declaration":guard,"viewport":prepared_viewport,"click_kind":click_kind}),
+                    "function_declaration":guard,"viewport":prepared_viewport,"click_kind":click_kind,
+                    "expected_target_revision":args.expected_target_revision}),
                 ),
             )
             .await;

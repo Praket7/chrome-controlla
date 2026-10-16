@@ -258,3 +258,76 @@ test('follow-up tools can use only the opaque context handle', async () => {
   assert.equal(calls[1].args.chrome_tab_id, '8');
   assert.equal(calls[1].args.context, undefined);
 });
+
+test('structured failed snapshots trigger context recovery instead of false success', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    if (name === 'browser' && args.action === 'open') return { structuredContent: { status: 'verified', session_id: 's1', tab_id: '8', url: 'https://example.test/' } };
+    if (name === 'snapshot') return { structuredContent: { status: 'failed', reason_code: 'target_lifecycle_changed' } };
+    if (name === 'browser' && args.action === 'discover_shared_tabs') return { structuredContent: { snapshot: { host_id: 'h1', tabs: [{ id: 8, url: 'https://example.test/' }] } } };
+    if (name === 'browser' && args.action === 'pair_shared') return { structuredContent: { session_id: 's2' } };
+    if (name === 'browser' && args.action === 'accept_shared') return { structuredContent: { accepted: true } };
+    throw new Error(`unexpected tool ${name}`);
+  }});
+  runtime.setServerTools(fakeTools());
+  const opened = await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/' });
+  const recovered = await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/', context: opened.structuredContent.context });
+  assert.equal(recovered.structuredContent.status, 'reused');
+  assert.ok(calls.some(call => call.name === 'browser' && call.args.action === 'discover_shared_tabs'));
+});
+
+test('open reuses the bound ESPN tab after a focus or session transition', async () => {
+  const calls = [];
+  let stale = false;
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    if (name === 'browser' && args.action === 'open') {
+      return { structuredContent: { status: 'verified', session_id: 's1', tab_id: '77', url: args.url, mode: args.mode ?? 'foreground' } };
+    }
+    if (name === 'snapshot') {
+      if (stale) throw new Error('session was not created through the V3 browser route');
+      return { structuredContent: { status: 'observed', url: 'https://www.espn.com/' } };
+    }
+    if (name === 'browser' && args.action === 'discover_shared_tabs') {
+      return { structuredContent: { snapshot: { host_id: 'h1', tabs: [{ id: 88, url: 'https://www.espn.com/', window_id: 4 }] } } };
+    }
+    if (name === 'browser' && args.action === 'pair_shared') {
+      return { structuredContent: { session_id: 's2' } };
+    }
+    if (name === 'browser' && args.action === 'accept_shared') {
+      return { structuredContent: { accepted: true } };
+    }
+    throw new Error(`unexpected tool ${name}`);
+  }});
+  runtime.setServerTools(fakeTools());
+  const opened = await runtime.handleToolCall('browser', { action: 'open', url: 'https://www.espn.com/' });
+  const context = opened.structuredContent.context;
+  stale = true;
+  const reused = await runtime.handleToolCall('browser', { action: 'open', url: 'https://www.espn.com/', context });
+  assert.equal(reused.structuredContent.status, 'reused');
+  assert.equal(reused.structuredContent.same_target, true);
+  assert.equal(reused.structuredContent.tab_id, '88');
+  assert.deepEqual(calls.map(call => `${call.name}:${call.args.action ?? ''}`), [
+    'browser:open',
+    'snapshot:',
+    'browser:discover_shared_tabs',
+    'browser:pair_shared',
+    'browser:accept_shared'
+  ]);
+});
+
+test('reuse_existing false preserves explicit new-tab behavior', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    if (name === 'browser') return { structuredContent: { status: 'verified', session_id: `s${calls.length}`, tab_id: String(70 + calls.length), url: args.url, mode: args.mode ?? 'foreground' } };
+    if (name === 'snapshot') return { structuredContent: { status: 'observed', url: 'https://www.espn.com/' } };
+    throw new Error(`unexpected tool ${name}`);
+  }});
+  runtime.setServerTools(fakeTools());
+  await runtime.handleToolCall('browser', { action: 'open', url: 'https://www.espn.com/' });
+  await runtime.handleToolCall('browser', { action: 'open', url: 'https://www.espn.com/', reuse_existing: false });
+  assert.equal(calls.filter(call => call.name === 'browser').length, 2);
+  assert.equal(calls[1].args.action, 'open');
+});

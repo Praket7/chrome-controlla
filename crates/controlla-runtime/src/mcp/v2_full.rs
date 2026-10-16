@@ -1108,8 +1108,11 @@ fn validate_screenshot_evidence(
         || evidence["image_sha256"].as_str() != Some(expected.image_sha256)
         || evidence["visual_revision"].as_str() != Some(expected.image_sha256)
         || evidence["target_lifecycle"].as_str() != Some("active")
-        || evidence["render_frame_provenance"].as_str()
-            != Some("two_animation_frames_before_compositor_capture")
+        || !matches!(
+            evidence["render_frame_provenance"].as_str(),
+            Some("two_animation_frames_before_compositor_capture")
+                | Some("hidden_tab_renderer_clock_fallback")
+        )
         || evidence["dimensions"]["width"].as_u64() != Some(u64::from(expected.width))
         || evidence["dimensions"]["height"].as_u64() != Some(u64::from(expected.height))
     {
@@ -2372,6 +2375,19 @@ mod screenshot_payload_tests {
         assert_eq!(
             public["viewport_transform"]["capture_beyond_viewport"],
             false
+        );
+
+        let mut hidden = evidence.clone();
+        hidden["render_frame_provenance"] =
+            serde_json::json!("hidden_tab_renderer_clock_fallback");
+        let hidden_public = validate_screenshot_evidence(
+            &hidden,
+            expectation("123", "image-hash", 1, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            hidden_public["render_frame_provenance"],
+            "hidden_tab_renderer_clock_fallback"
         );
 
         let mut stale = evidence.clone();

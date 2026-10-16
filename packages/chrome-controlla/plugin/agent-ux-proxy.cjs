@@ -19,7 +19,7 @@ const TOOL_DESCRIPTIONS = {
 };
 
 const COMPACT_FIELDS = {
-  browser: ['action', 'url', 'mode', 'ready_when', 'task', 'filename', 'bytes_base64', 'file_path', 'artifact_handle', 'encoding', 'steps'],
+  browser: ['action', 'url', 'mode', 'ready_when', 'task', 'filename', 'bytes_base64', 'file_path', 'artifact_handle', 'encoding', 'steps', 'reuse_existing'],
   snapshot: ['goal', 'href_hint', 'frame_id', 'max_items', 'max_text_chars', 'max_bytes', 'max_scan_nodes', 'selector'],
   act: ['action', 'reference', 'expected_value', 'value', 'allow_password', 'key', 'outcome', 'timeout_ms', 'typing_mode', 'delay_ms', 'page_tool_name', 'page_tool_input'],
   workflow: ['steps', 'program'],
@@ -147,7 +147,7 @@ function compactTool(tool) {
       description: 'Optional high-level goal compiled into the shortest verified browser path. Prefer this for supported common tasks instead of manually orchestrating snapshots and actions.'
     };
     if (properties.action) {
-      properties.action.description = 'Browser operation. action=open always creates a new target; use exact existing session_id and chrome_tab_id for an existing tab. For a separate unfocused automation window use mode=background and target_policy=create_background_window.';
+      properties.action.description = 'Browser operation. action=open reuses the current Controlla context when the requested URL is already bound (set reuse_existing=false to force a new tab); otherwise it creates a new target. Context transitions survive window switches and extension focus changes.';
     }
     if (properties.url) {
       properties.url.description = 'Direct HTTP(S) destination when known. Prefer the most specific known destination over a homepage.';
@@ -190,10 +190,12 @@ class ContextRegistry {
     this.contexts = new Map();
   }
 
-  create(sessionId, tabId) {
+  create(sessionId, tabId, metadata = {}) {
     if (!sessionId || !tabId) return null;
     const id = `ctx_${crypto.randomUUID().replaceAll('-', '').slice(0, 20)}`;
-    this.contexts.set(id, { session_id: String(sessionId), chrome_tab_id: String(tabId) });
+    const record = { session_id: String(sessionId), chrome_tab_id: String(tabId), ...clone(metadata) };
+    if (Object.keys(metadata).length) record.last_seen_ms = Date.now();
+    this.contexts.set(id, record);
     return id;
   }
 
@@ -212,6 +214,25 @@ class ContextRegistry {
   size() {
     return this.contexts.size;
   }
+}
+
+function normalizedTargetUrl(value) {
+  try {
+    const url = new URL(String(value));
+    url.hash = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return String(value ?? '').trim().replace(/#.*$/, '').replace(/\/$/, '');
+  }
+}
+
+function sameTargetUrl(left, right) {
+  return Boolean(left && right) && normalizedTargetUrl(left) === normalizedTargetUrl(right);
+}
+
+function recoverableContextError(error) {
+  const text = String(error?.message ?? error ?? '').toLowerCase();
+  return /session (?:is )?not (?:registered|created)|unknown shared session|unknown v3|unknown target|pairing ended|session .* route|tab .* (?:missing|closed|not found)|context probe did not produce a healthy snapshot/.test(text);
 }
 
 class OpenKeyCache {
@@ -458,7 +479,12 @@ class AgentUxRuntime {
     const sessionId = value?.session_id;
     const tabId = value?.tab_id ?? value?.chrome_tab_id;
     if (!sessionId || !tabId) return { result, context: null };
-    const context = this.contexts.create(sessionId, tabId);
+    const context = this.contexts.create(sessionId, tabId, {
+      url: value.url ?? value.document?.url ?? null,
+      mode: value.mode ?? null,
+      window_id: value.window_id ?? null,
+      document_id: value.document_id ?? value.document?.document_id ?? null
+    });
     return {
       result: withStructuredPatch(result, {
         context,
@@ -470,6 +496,98 @@ class AgentUxRuntime {
         }
       }),
       context
+    };
+  }
+
+  async rebindContext(contextId) {
+    const current = this.contexts.resolve(contextId);
+    if (!current) return null;
+    try {
+      const probe = await this.callTool('snapshot', {
+        session_id: current.session_id,
+        chrome_tab_id: current.chrome_tab_id,
+        max_items: 1,
+        max_text_chars: 0
+      });
+      const observed = getStructured(probe);
+      const failedStatus = ['unknown', 'failed', 'error', 'not_dispatched', 'incomplete'].includes(String(observed?.status || '').toLowerCase());
+      if (!observed || failedStatus || (observed.verified === false && !observed.url)) {
+        throw new Error(`Controlla context probe did not produce a healthy snapshot (status=${observed?.status ?? 'missing'})`);
+      }
+      if (observed?.url) current.url = observed.url;
+      current.last_seen_ms = Date.now();
+      return current;
+    } catch (error) {
+      if (!recoverableContextError(error)) throw error;
+    }
+
+    // A server/extension restart invalidates the old V3 session, but the
+    // Chrome tab can remain alive. Rediscover and pair the exact tab first;
+    // only fall back to a unique URL match when Chrome assigned a new tab ID.
+    const discovered = getStructured(await this.callTool('browser', {
+      action: 'discover_shared_tabs',
+      mode: current.mode ?? 'foreground'
+    }));
+    const snapshot = discovered?.snapshot ?? discovered;
+    const tabs = Array.isArray(snapshot?.tabs) ? snapshot.tabs : [];
+    let candidate = tabs.find(tab => String(tab.id) === String(current.chrome_tab_id));
+    if (!candidate && current.url) {
+      const matches = tabs.filter(tab => sameTargetUrl(tab.url, current.url));
+      if (matches.length === 1) candidate = matches[0];
+      else if (matches.length > 1) throw new Error('Controlla context recovery is ambiguous: multiple tabs still match the bound URL');
+    }
+    if (!candidate) throw new Error('Controlla context recovery could not find the previously bound tab');
+    const paired = getStructured(await this.callTool('browser', {
+      action: 'pair_shared',
+      mode: current.mode ?? 'foreground',
+      host_id: snapshot.host_id,
+      target_ids: [String(candidate.id)]
+    }));
+    const sessionId = paired?.session_id;
+    if (!sessionId) throw new Error('Controlla context recovery pairing omitted session_id');
+    const accepted = getStructured(await this.callTool('browser', {
+      action: 'accept_shared',
+      mode: current.mode ?? 'foreground',
+      session_id: sessionId
+    }));
+    if (accepted?.accepted !== true) throw new Error('Controlla context recovery pairing was not accepted');
+    current.session_id = String(sessionId);
+    current.chrome_tab_id = String(candidate.id);
+    current.url = candidate.url ?? current.url;
+    current.window_id = candidate.window_id ?? current.window_id;
+    current.document_id = candidate.document_id ?? current.document_id;
+    current.last_seen_ms = Date.now();
+    return current;
+  }
+
+  async reuseExistingOpen(args) {
+    if (args?.reuse_existing === false || args?.url == null) return null;
+    const contextId = args.context ?? (this.contexts.size() === 1 ? [...this.contexts.contexts.keys()][0] : null);
+    if (!contextId) return null;
+    const current = this.contexts.resolve(contextId);
+    if (!current || !sameTargetUrl(current.url, args.url)) return null;
+    const rebound = await this.rebindContext(contextId);
+    const context = contextId;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        status: 'reused',
+        verified: true,
+        same_target: true,
+        session_id: rebound.session_id,
+        tab_id: rebound.chrome_tab_id,
+        url: rebound.url,
+        mode: rebound.mode,
+        context,
+        target_reused_after_focus_or_session_change: true,
+        orchestration: { external_tool_calls: 1, internal_tool_calls: 0, schema_discovery_calls: 0, repo_reads_required: 0 }
+      }) }],
+      structuredContent: {
+        status: 'reused', verified: true, same_target: true,
+        session_id: rebound.session_id, tab_id: rebound.chrome_tab_id,
+        url: rebound.url, mode: rebound.mode, context,
+        target_reused_after_focus_or_session_change: true,
+        orchestration: { external_tool_calls: 1, internal_tool_calls: 0, schema_discovery_calls: 0, repo_reads_required: 0 }
+      }
     };
   }
 
@@ -552,8 +670,23 @@ class AgentUxRuntime {
   async handleToolCall(name, args) {
     if (!SIX_TOOLS.includes(name)) throw new Error(`unknown Controlla tool: ${name}`);
     if (name === 'browser' && args?.goal) return this.runGoal(args);
+    if (name === 'browser' && args?.action === 'open') {
+      const reused = await this.reuseExistingOpen(args);
+      if (reused) return reused;
+    }
     const prepared = this.prepareArgs(name, args);
-    const result = await this.callTool(name, prepared);
+    let result;
+    try {
+      result = await this.callTool(name, prepared);
+    } catch (error) {
+      if (name !== 'browser' && args?.context && recoverableContextError(error)) {
+        await this.rebindContext(args.context);
+        const rebound = this.prepareArgs(name, args);
+        result = await this.callTool(name, rebound);
+      } else {
+        throw error;
+      }
+    }
     if (name === 'browser' && prepared.action === 'open') return this.rememberContext(result).result;
     if (name === 'browser' && ['release', 'release_shared'].includes(prepared.action)) {
       const sessionId = prepared.session_id;

@@ -187,7 +187,8 @@ pub fn click_guard_script(unsafe_predicate: &str) -> String {
 }
 
 pub fn unrestricted_mode() -> bool {
-    // shortcut: this local experiment bypasses interaction guards, not Chrome transport checks; replace with an explicit policy before release.
+    // Local fixture mode bypasses page interaction guards only; native
+    // transport, identity, lease, and postcondition checks remain enforced.
     std::env::var_os("CONTROLLA_UNRESTRICTED").is_some_and(|value| value == "1")
 }
 

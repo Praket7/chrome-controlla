@@ -1022,3 +1022,11 @@ and the native host aggregates them up to 5,000 tabs with an explicit
 truncation signal. Parallel frame inventory fences topology changes before and
 after reads and has a deterministic detach race fixture. Live worker restart
 and installed-Chrome qualification remain open.
+# Architectural completion pass — 2026-10-16
+
+| Area | Local evidence | Live/host evidence |
+|---|---|---|
+| TaskCapsule validation | Unit tests reject unbounded capsules and mutations without verification predicates | Live execution qualification pending |
+| Revisioned target graph | Unit tests reject stale graph revisions and bump changed target revisions | Chrome restart and multi-window qualification pending |
+| Network read acceleration | Unit tests allow only same-origin successful JSON GET candidates with opaque handles | First-party app response qualification pending |
+| Compact catalog and protocol contract | Rust unit tests plus MV3 capability handshake assertions | Client discovery migration pending |

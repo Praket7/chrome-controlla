@@ -317,7 +317,10 @@ pub async fn run() -> Result<(), String> {
     let mut inventory_tabs = Vec::<Value>::new();
     let mut inventory_in_progress = false;
     let mut inventory_started_at = None::<tokio::time::Instant>;
-    let mut inventory_poll = tokio::time::interval(Duration::from_secs(5));
+    // Chrome events mark the inventory dirty immediately; retain a slow
+    // safety poll for missed MV3 wakeups instead of rebuilding every five
+    // seconds while dozens or hundreds of tabs are unchanged.
+    let mut inventory_poll = tokio::time::interval(Duration::from_secs(30));
     // Pairing requests are tiny local files. Check often enough to keep cold
     // pairing responsive without adding a filesystem watcher dependency.
     let mut pairing_poll = tokio::time::interval(Duration::from_millis(75));
@@ -372,6 +375,18 @@ pub async fn run() -> Result<(), String> {
                 let message = native.ok_or("native port closed")??;
                 match message["type"].as_str() {
                     Some("capabilities") => extension_protocol_version = message["protocol_version"].as_u64().and_then(|version| u32::try_from(version).ok()).unwrap_or(0),
+                    Some("inventory_dirty") => {
+                        if !inventory_in_progress {
+                            inventory_tabs.clear();
+                            inventory_in_progress = true;
+                            inventory_started_at = Some(tokio::time::Instant::now());
+                            if let Err(error) = request_inventory_shared(&output).await {
+                                eprintln!("Native inventory refresh request failed: {error}");
+                                inventory_in_progress = false;
+                                inventory_started_at = None;
+                            }
+                        }
+                    },
                     Some("tabs") if message["request_id"] == "inventory" => {
                         let Some(page) = message["tabs"].as_array() else { inventory_in_progress = false; inventory_started_at = None; continue; };
                         if inventory_tabs.len().saturating_add(page.len()) > 5000 {

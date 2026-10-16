@@ -96,6 +96,7 @@ let replacePendingOnFrameRead;
 let nextWebNavigationTimeStamp = 10_000;
 let navigationError;
 let screenshotDataOverride;
+let screenshotDataSequence;
 let rendererFrameUnavailable = false;
 let navigateDuringScreenshot;
 let freezeDuringScreenshot;
@@ -258,14 +259,14 @@ const chrome = {
       if (!tab) throw new Error("No tab with id: " + tabId);
       return { ...tab, url: tabUrlOverrides.has(tabId) ? tabUrlOverrides.get(tabId) : tab.url };
     },
-    onUpdated: { addListener(callback) { tabsUpdated = callback; }, removeListener() {} },
-    onMoved: { addListener(callback) { tabsMoved = callback; } },
-    onAttached: { addListener(callback) { tabsAttached = callback; } },
-    onDetached: { addListener(callback) { tabsDetached = callback; } },
-    onReplaced: { addListener(callback) { tabsReplaced = callback; } },
-    onRemoved: { addListener(callback) { tabsRemoved = callback; } },
+    onUpdated: { addListener(callback) { const prior = tabsUpdated; tabsUpdated = (...args) => { prior?.(...args); callback(...args); }; }, removeListener() {} },
+    onMoved: { addListener(callback) { const prior = tabsMoved; tabsMoved = (...args) => { prior?.(...args); callback(...args); }; } },
+    onAttached: { addListener(callback) { const prior = tabsAttached; tabsAttached = (...args) => { prior?.(...args); callback(...args); }; } },
+    onDetached: { addListener(callback) { const prior = tabsDetached; tabsDetached = (...args) => { prior?.(...args); callback(...args); }; } },
+    onReplaced: { addListener(callback) { const prior = tabsReplaced; tabsReplaced = (...args) => { prior?.(...args); callback(...args); }; } },
+    onRemoved: { addListener(callback) { const prior = tabsRemoved; tabsRemoved = (...args) => { prior?.(...args); callback(...args); }; } },
     onActivated: { addListener(callback) { tabsActivatedListeners.add(callback); }, removeListener(callback) { tabsActivatedListeners.delete(callback); } },
-    onCreated: { addListener(callback) { tabsCreated = callback; } },
+    onCreated: { addListener(callback) { const prior = tabsCreated; tabsCreated = (...args) => { prior?.(...args); callback(...args); }; } },
   },
   windows: {
     async get(windowId) { return { id:windowId??1, focused:focusedWindowFocused }; },
@@ -277,9 +278,11 @@ const chrome = {
       const tab = await chrome.tabs.create({ url: options.url, active: true, windowId });
       return { id: windowId, focused: options.focused, tabs: [tab] };
     },
-    onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } }
+    onFocusChanged: { addListener(callback) { const prior = windowFocusChanged; windowFocusChanged = (...args) => { prior?.(...args); callback(...args); }; } },
+    onRemoved: { addListener() {} },
   },
-  tabGroups: { async query() { return [{ id:7, windowId:1, title:"Research", color:"blue", collapsed:true }]; } },
+  tabGroups: { async query() { return [{ id:7, windowId:1, title:"Research", color:"blue", collapsed:true }]; },
+    onCreated: { addListener() {} }, onUpdated: { addListener() {} }, onRemoved: { addListener() {} } },
   webNavigation: {
     async getFrame({ tabId, frameId }) {
       frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
@@ -370,7 +373,8 @@ const chrome = {
           tabUrlOverrides.set(tabId, url);
           navigationCommitted?.({ tabId, frameId: 0, documentId, url, timeStamp: nextWebNavigationTimeStamp++ });
         }
-        return { data: screenshotDataOverride || "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" };
+        const nextScreenshot = screenshotDataSequence?.length ? screenshotDataSequence.shift() : screenshotDataOverride;
+        return { data: nextScreenshot || "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" };
       }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,expected,prepare,normalize,requireFocus)")) {
         const [index, expected, prepare] = params.arguments.map(argument => argument.value);
@@ -611,7 +615,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
 
@@ -640,6 +644,58 @@ function testOpenShadowFrameActionGuard() {
   assert.equal(guard.call(target), false, "shadow ancestry beyond the bounded root chain fails closed");
 }
 testOpenShadowFrameActionGuard();
+
+function testWatcherStateMirrorContracts() {
+  const { createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt } = backgroundContext.__testHooks;
+  let state = createWatcherStateMirror();
+  state = applyWatcherStateEvent(state, { kind: "snapshot", tabs: [
+    { id: 4, windowId: 2, groupId: 8, document_id: "doc-1", status: "complete", active: true },
+    { id: 5, windowId: 2, groupId: 8, document_id: "doc-5", status: "complete", active: false,
+      url: "https://private.example.test/path?access_token=do-not-store", title: "secret title" },
+  ], windows: [{ id: 2, focused: false, state: "normal" }], groups: [{ id: 8, windowId: 2, title: "Work" }] });
+  assert.equal(state.revision, 1);
+  assert.equal(watcherStateMatches(state, 4, 1, "doc-1"), true,
+    "an action may consume the exact observed tab and topology revision");
+  assert.equal(state.tabs.find(tab => tab.id === 4).target_revision, 1);
+  assert.equal(JSON.stringify(state).includes("access_token"), false,
+    "URLs, titles, and credential-like query values never enter the persisted watcher mirror");
+  assert.equal(JSON.stringify(state).includes("private.example.test"), false);
+  assert.equal(watcherStateMatches(state, 4, 0, "doc-1"), false,
+    "a stale topology revision must be rejected");
+  const beforeMove = state.revision;
+  state = applyWatcherStateEvent(state, { kind: "tab_updated", tab_id: 4, change_info: { url: "https://example.test/next" } });
+  assert.equal(state.revision, beforeMove + 1);
+  assert.equal(watcherStateMatches(state, 4, state.revision, "doc-1"), false,
+    "navigation invalidates an old target binding");
+  assert.equal(watcherStateMatches(state, 5, 1, "doc-5"), true,
+    "a change in one tab does not invalidate unrelated tab targets");
+  const beforeFocusRevision = state.tabs.find(tab => tab.id === 4).target_revision;
+  assert.equal(watcherStateMatches(state, 4, beforeFocusRevision), true);
+  state = applyWatcherStateEvent(state, { kind: "window_focus", window_id: 2 });
+  assert.equal(watcherStateMatches(state, 4, beforeFocusRevision), true,
+    "window focus changes preserve a target binding; execution checks revalidate focus at dispatch");
+  state = applyWatcherStateEvent(state, { kind: "tab_activated", tab_id: 4, window_id: 2 });
+  assert.equal(watcherStateMatches(state, 4, beforeFocusRevision), true,
+    "tab activation changes preserve a target binding; the target identity is unchanged");
+  state = applyWatcherStateEvent(state, { kind: "tab_updated", tab_id: 4, change_info: { status: "complete" } });
+  assert.equal(watcherStateMatches(state, 4, beforeFocusRevision), true,
+    "completion settling does not invalidate a stable document binding");
+  state = applyWatcherStateEvent(state, { kind: "tab_removed", tab_id: 4 });
+  assert.equal(watcherStateMatches(state, 4, state.revision, "doc-1"), false,
+    "tab removal evicts the target binding");
+  assert.equal(watcherRevisionReceipt(5, 1)?.reason_code,
+    "stale_watcher_revision", "removed or invalidated mirror state refuses an old mutation revision");
+  const oversizedSnapshot = applyWatcherStateEvent(createWatcherStateMirror(), {
+    kind: "snapshot",
+    tabs: Array.from({ length: 2049 }, (_, id) => ({ id, windowId: 1, status: "complete" })),
+    windows: [{ id: 1 }], groups: []
+  });
+  assert.equal(oversizedSnapshot.complete, false,
+    "a capped inventory must not claim the watcher has a complete browser graph");
+  assert.equal(watcherStateMatches(oversizedSnapshot, 0, oversizedSnapshot.tabs[0].target_revision), false,
+    "actions fail closed when the mirror had to truncate the browser inventory");
+}
+testWatcherStateMirrorContracts();
 
 function message(payload) {
   return new Promise(resolve => listener(payload, {}, resolve));
@@ -734,6 +790,13 @@ async function waitFor(predicate, description) {
   assert.equal(listed.last_focused_window_id, 1, "tab inventory identifies the last-focused Chrome window");
   assert.ok(listed.tabs.every(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//.test(tab.url)));
   assert.ok(listed.tabs.every(tab => typeof tab.document_id === "string"));
+  assert.equal(listed.watcher_state?.complete, true,
+    "tab inventory returns only after the watcher mirror has been rehydrated from the same browser snapshot");
+  assert.ok(listed.tabs.every(tab => Number.isSafeInteger(tab.watcher_target_revision)),
+    "each listed stable target carries the revision from the completed watcher snapshot");
+  assert.equal(listed.tabs.find(tab => tab.id === 41).watcher_target_revision,
+    listed.watcher_state.revision,
+    "the listed target revision is bound to the mirror snapshot returned in the same inventory response");
   assert.ok(listed.tabs.every(tab => tab.title.length <= 256 && tab.url.length <= 2048));
   assert.equal(listed.tabs.find(tab => tab.id === 42).active_for_open, true,
     "the active tab in Chrome's last-focused window is marked as the open anchor");
@@ -814,6 +877,13 @@ async function waitFor(predicate, description) {
     }
     throw new Error(`Timed out waiting for command result ${id}`);
   };
+  // Keep this regression on an explicitly foreground target so the strict
+  // two-animation-frame refusal remains covered independently of the hidden
+  // tab fallback below.
+  const priorScreenshotTabActive = discardedTab.active;
+  const priorScreenshotWindowFocused = focusedWindowFocused;
+  discardedTab.active = true;
+  focusedWindowFocused = true;
   rendererFrameUnavailable = true;
   native.hostMessage({ type: "command", id: "screenshot-without-renderer-frame", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
   const missingRendererFrame = await waitForCommandResult("screenshot-without-renderer-frame");
@@ -821,6 +891,8 @@ async function waitFor(predicate, description) {
   assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, captureCountBeforeDiscarded,
     "renderer-frame uncertainty refuses before compositor capture");
   rendererFrameUnavailable = false;
+  discardedTab.active = priorScreenshotTabActive;
+  focusedWindowFocused = priorScreenshotWindowFocused;
   let topologyCommandEntered, releaseTopologyCommand;
   const topologyCommandBlocked = new Promise(resolve => { topologyCommandEntered = resolve; });
   const topologyCommandRelease = new Promise(resolve => { releaseTopologyCommand = resolve; });
@@ -863,6 +935,9 @@ async function waitFor(predicate, description) {
   assert.notEqual(screenshotChunks[0].visual_evidence.image_sha256, createHash("sha256").update(screenshotDataOverride).digest("hex"), "image hash is distinct from the base64 transfer hash");
   assert.equal(screenshotChunks[0].base64_sha256, createHash("sha256").update(screenshotDataOverride).digest("hex"), "chunk hash covers the exact base64 transfer payload");
   assert.ok(Number.isSafeInteger(screenshotChunks[0].visual_evidence?.captured_at_ms), "screenshot evidence carries a capture timestamp");
+  assert.ok(screenshotChunks[0].visual_evidence?.watcher_target_revision === null
+    || Number.isSafeInteger(screenshotChunks[0].visual_evidence?.watcher_target_revision),
+  "screenshot evidence carries a watcher revision when topology is known");
   assert.deepEqual(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params, runtimeScreenshotParams,
     "the exact runtime-generated screenshot parameters reach the extension's bounded validator and Chrome dispatch");
   assert.equal(screenshotChunks[0].visual_evidence.target_lifecycle, "active");
@@ -872,6 +947,14 @@ async function waitFor(predicate, description) {
   assert.ok(debuggerCalls.some(call => call.method === "Runtime.evaluate" && call.params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")),
     "extension waits for a new renderer animation frame before screenshot dispatch");
   screenshotDataOverride = undefined;
+  screenshotDataSequence = ["not-a-png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"];
+  const malformedCaptureBefore = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
+  native.hostMessage({ type: "command", id: "hidden-malformed-fallback", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  const malformedFallback = await waitForCommandResult("hidden-malformed-fallback");
+  assert.equal(malformedFallback.type, "result", "hidden screenshot retries after a malformed compositor payload");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, malformedCaptureBefore + 2,
+    "malformed hidden compositor data falls back once to the view surface");
+  screenshotDataSequence = undefined;
   const capturesBeforeTransition = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
   freezeDuringScreenshot = true;
   native.hostMessage({ type: "command", id: "freeze-during-screenshot", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
@@ -1896,6 +1979,9 @@ async function waitFor(predicate, description) {
   assert.equal(nativePorts.length, 3);
   nativePorts[2].hostMessage({ type: "ready" });
   await waitFor(() => nativePorts[2].sent.some(message => message.type === "capabilities"), "verified extension build capabilities");
+  const capabilities = nativePorts[2].sent.find(message => message.type === "capabilities");
+  assert.equal(capabilities.contract_version, 3, "extension advertises the shared protocol contract version");
+  assert.equal(capabilities.authorized_method_count, 25, "extension advertises the bounded shared method inventory");
   assert.equal((await message({ type: "native-status" })).error, undefined, "ready clears stale native error");
   nativePorts[2].disconnect();
   await new Promise(resolve => setTimeout(resolve, 0));

@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "track": "phase11-public-readonly-pilot",
+  "release_claim_eligible": false,
+  "scope": "one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix",
+  "task": {
+    "id": "example-domain-title-paragraph",
+    "url": "https://example.com/",
+    "verifier": "independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls"
+  },
+  "environment": {
+    "chrome_version": "Google Chrome 155.0.8059.84",
+    "model": "gpt-6-luna",
+    "selected_adapters": [
+      "controlla"
+    ],
+    "adapter_versions": {
+      "playwright_mcp": "0.0.83",
+      "chrome_devtools_mcp": "1.10.1",
+      "agent_browser": "0.39.1"
+    },
+    "controlla_binary_sha256": "44f23439b587b887a9c58997a9dd154e6c925a875ef188966f0f98b4fe26682d",
+    "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "run_mode": "cold_unknown",
+    "machine": "darwin-arm64",
+    "timing_origin": "immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch"
+  },
+  "pairs": [
+    {
+      "replicate": 1,
+      "execution_order": [
+        "controlla"
+      ],
+      "controlla": {
+        "adapter": "controlla",
+        "prompt_hash": "d6f88d5ce7c5ade865c2fe676d3ee277870dd30c0d29c4d4006121da0860bba7",
+        "timing_origin": "immediately_before_codex_cli_spawn",
+        "process_spawn_to_browser_outcome_ms": null,
+        "process_spawn_to_independent_verification_ms": 16837.992125,
+        "process_spawn_to_final_ms": 15896.166,
+        "first_browser_tool_started_ms": 11703.465209,
+        "host_turns_completed": 1,
+        "model_round_trips": null,
+        "input_tokens": 126612,
+        "output_tokens": 396,
+        "external_tool_calls": 1,
+        "successful_browser_tool_calls": 1,
+        "tool_names": [
+          "chrome-controlla.browser:completed"
+        ],
+        "tool_diagnostics": [
+          {
+            "elapsed_ms": 14324.913875,
+            "server": "chrome-controlla",
+            "tool": "browser",
+            "status": "completed",
+            "arguments": {
+              "action": "task",
+              "mode": "headless",
+              "release_after_task": true,
+              "task": {
+                "kind": "research",
+                "urls": [
+                  "https://example.com/"
+                ],
+                "selector": "p:first-of-type",
+                "goal": "Read the document title and the first paragraph exactly as shown."
+              }
+            },
+            "result_summary": {
+              "status": "completed",
+              "private_session_released": true,
+              "route": "semantic_program",
+              "verification": "passed",
+              "receipts": [
+                {
+                  "kind": "navigate",
+                  "status": "verified",
+                  "verified": true
+                },
+                {
+                  "kind": "extract",
+                  "verified": true
+                }
+              ]
+            },
+            "result_preview": "{\"diagnostics_omitted\":true,\"elapsed_ms\":149,\"execution_route\":{\"actual_cost\":{\"browser_command_budget_used\":32,\"cdp_commands\":32,\"elapsed_ms\":149,\"host_round_trips\":32,\"logical_task_step_receipts\":2,\"observation_bytes\":0,\"reported_internal_model_calls\":0,\"returned_observation_count_source\":\"structured_mcp_response_at_return_boundary\",\"returned_observation_packets\":0},\"model_budget\":{\"internal_calls_allowed\":0,\"internal_calls_observed\":0,\"passed\":true,\"status\":\"passed\"},\"reason\":\"a deterministic semantic program is available\",\"tier\":\"semantic_program\",\"verification\":\"passed\"},\"nodes\":null,\"observation_boundary\":{\"count_complete\":true,\"count_source\":\"structured_mcp_response_at_return_boundary\",\"external_model_inspection\":null,\"external_model_telemetry\":\"outside_mcp_process\",\"returned_observation_packets\":0},\"page_content_is_untrusted\":true,\"private_session_released\":true,\"receipts\":[{\"dispatch_acknowledged\":true,\"evidence_hash\":\"62ab14aa1a76862a3e6aa64fa4ca53c9015f5a084a4b0c460c8820d5d85fc320\",\"kind\":\"navigate\",\"response_compacted\":true,\"status\":\"verified\",\"verified\":true},{\"evidence_hash\":\"20ef5e3b111ebcb0db10d789412cf3a3c6b42eee91d1f0da918bc36f633a84e3\",\"kind\":\"extract\",\"response_compacted\":true,\"verified\":true}],\"receipts_omitted\":0,\"receipts_returned\":2,\"response_budget\":{\"max_bytes\":2048,\"reason\":\"compact receipt default\",\"source\":\"default\"},\"status\":\"completed\",\"steps\":2,\"truncated\":true}"
+          }
+        ],
+        "failed_tool_errors": [],
+        "output_bytes": 4201,
+        "output_sha256": "40fa86a1800bbce21e7e3fc579f71ee36d9735461fbb4affcd70d803e3918cb9",
+        "final_answer_excerpt": "{\"error\":\"browser failed\"}",
+        "exit_code": 0,
+        "error": null,
+        "answer": null,
+        "reference_sha256": "25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484",
+        "verifier_error": null,
+        "browser_outcome_matches_reference": false,
+        "final_answer_matches_reference": false,
+        "independently_verified_success": false,
+        "evidence": {
+          "expected_server": "chrome-controlla",
+          "expected_navigation_observed": true,
+          "read_tool_observed": true,
+          "cleanup_verified": true,
+          "browser_outcome_matches_reference": false,
+          "final_answer_matches_reference": false,
+          "cleanup_verification_method": "adapter_specific_close_result",
+          "unrelated_actions": [],
+          "reference": {
+            "title": "Example Domain",
+            "paragraph": "This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes."
+          }
+        }
+      }
+    }
+  ]
+}

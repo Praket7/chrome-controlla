@@ -1856,6 +1856,7 @@ async fn retained_click_once(
             timeout_ms: args.timeout_ms,
             input_mode: (args.action == "touch").then(|| "touch".to_owned()),
             click_kind: Some(args.action.as_str().to_owned()).filter(|kind| kind != "touch"),
+            expected_target_revision: None,
         }))
         .await?;
     Ok(value)
@@ -3339,6 +3340,7 @@ impl AppV2 {
                             timeout_ms: None,
                             input_mode: None,
                             click_kind: None,
+                            expected_target_revision: None,
                         }))
                         .await?;
                     value

@@ -1,0 +1,50 @@
+{
+  "schema_version": 3,
+  "track": "phase11-realistic",
+  "candidate_adapter": "controlla",
+  "randomization": {
+    "method": "seeded_paired_order",
+    "seed": 20261015
+  },
+  "results_storage": "comparison_files",
+  "environment": {
+    "candidate_source_sha": "c0d1dab61f481fd0b42c1cf5e090884383c7c148",
+    "dirty_tree_patch_sha256": "60c88231082aa6185589535865c763746fc4869e34047714cfcbd59535ecc30c",
+    "runtime_binary_sha256": "b3cbf945f9f05637afbdbe1a7086b96f1633ff1082eda5001d7134e35b1bc8cc",
+    "extension_build_sha256": "1ae72ca32871da03115cd4004b4eab11f4bcae84c21c84cde4b8e1ad9015d1f7",
+    "chrome_version": "local",
+    "os_build": "darwin",
+    "machine_profile": "darwin-arm64",
+    "model": "gpt-6-luna",
+    "model_settings": "default",
+    "prompt_hash": "adapter-generated",
+    "token_budget": 32000,
+    "fixture_revision": "local-realistic-v1",
+    "network_profile": "loopback-only",
+    "account_fixture_id": "phase11-local-disposable",
+    "browser_version": "local",
+    "machine": "darwin-arm64",
+    "run_mode": "headless",
+    "verifier_version": "local-independent-state-v1",
+    "client_adapter_versions": {
+      "controlla": "local-command-adapter-v1",
+      "controlla-1": "local-command-adapter-v1",
+      "controlla-2-pre-stage2": "local-command-adapter-v1",
+      "playwright-mcp": "local-command-adapter-v1",
+      "chrome-devtools-mcp": "local-command-adapter-v1",
+      "agent-browser": "local-command-adapter-v1",
+      "stagehand": "local-command-adapter-v1",
+      "browser-use": "local-command-adapter-v1"
+    }
+  },
+  "comparisons": [
+    {
+      "baseline_adapter": "playwright-mcp",
+      "evidence_file": "bench/reports/phase11-suite-local-smoke-3.json.comparisons/playwright-mcp.json",
+      "randomization": {
+        "method": "seeded_paired_order",
+        "seed": 20261015
+      }
+    }
+  ]
+}
