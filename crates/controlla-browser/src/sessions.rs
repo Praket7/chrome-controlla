@@ -6,6 +6,7 @@
 
 use crate::{FrameRecord, TargetRecord};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -196,6 +197,7 @@ pub struct ArtifactMetadata {
     pub scope: ArtifactScope,
 }
 
+#[cfg(unix)]
 const ARTIFACT_TTL_MS: u64 = 60 * 60 * 1000;
 
 fn unix_epoch_ms() -> u64 {
@@ -205,6 +207,7 @@ fn unix_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn artifact_mime(filename: &str) -> &'static str {
     match filename
         .rsplit_once('.')

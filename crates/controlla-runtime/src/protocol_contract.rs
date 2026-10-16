@@ -42,6 +42,6 @@ mod tests {
         assert_eq!(CONTRACT_VERSION, 3);
         assert!(AUTHORIZED_METHODS.len() > 10);
         assert!(!method_is_authorized("Network.getAllCookies"));
-        assert!(MAX_NATIVE_MESSAGE_BYTES < 1024 * 1024);
+        const { assert!(MAX_NATIVE_MESSAGE_BYTES < 1024 * 1024) };
     }
 }
