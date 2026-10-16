@@ -107,9 +107,10 @@ async function main() {
   const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
   const output = resolve(root, argValue('output') ?? `bench/reports/phase11-suite-${config.track}-${stamp}.json`);
   const candidateId = process.env.PHASE11_CANDIDATE_ID ?? 'controlla';
-  const baselines = process.env.PHASE11_BASELINE_IDS
-    ? process.env.PHASE11_BASELINE_IDS.split(',').map(value => value.trim()).filter(Boolean)
-    : await structuredBaselineIds(candidateId, configPath);
+  const baselines = argValue('baseline-ids')?.split(',').map(value => value.trim()).filter(Boolean)
+    ?? (process.env.PHASE11_BASELINE_IDS
+      ? process.env.PHASE11_BASELINE_IDS.split(',').map(value => value.trim()).filter(Boolean)
+      : await structuredBaselineIds(candidateId, configPath));
   const commands = {
     [candidateId]: parseCommand(process.env[commandEnvName(candidateId)], commandEnvName(candidateId)),
   };
@@ -119,7 +120,7 @@ async function main() {
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
   const comparisonDir = `${output}.comparisons`;
-  const report = await runFullSuite({ candidateId, fixtureBaseUrl, commands, resetCommand, verifierCommand,
+  const report = await runFullSuite({ candidateId, baselineIds: baselines, fixtureBaseUrl, commands, resetCommand, verifierCommand,
     environment, modes, executionModes, concurrencyLevels, repetitions, deadlineMs, configPath, retainRows: false,
     onComparison: async evidence => {
       await mkdir(comparisonDir, { recursive: true });

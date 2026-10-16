@@ -46,3 +46,9 @@ Provide real command bindings and a fixture/verifier environment, then run `benc
 - `PHASE11_ENVIRONMENT_JSON`
 
 The suite should be run with a fixed checkout, pinned adapter identities, a dedicated fixture base URL, and the repository’s default 30 repetitions after two warmups. No synthetic/mock rows should be merged into release evidence.
+
+## Harness repair
+
+The configured runner now lives at `scripts/run-phase11-suite.mjs`. It starts `bench/fixtures/realistic/server.mjs`, binds `bench/adapters/phase11-command.mjs` for every structured adapter, and uses `phase11-reset.mjs` plus `phase11-verifier.mjs` for independent state reset/readback. It records all required environment identity fields and writes comparison shards through the existing suite runner.
+
+The adapter smoke path is real Codex MCP execution. Unsupported foreground/background requests return explicit unsupported rows; they are never relabeled as headless measurements. The full release matrix still requires a headed/background display harness before those cohorts can qualify.
