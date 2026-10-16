@@ -1,6 +1,7 @@
 //! Low-level browser execution telemetry used by higher-level benchmark and routing receipts.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,8 +9,14 @@ use tokio::sync::Mutex;
 
 tokio::task_local! {
     static CURRENT_OPERATION_METRICS: Arc<Mutex<OperationMetrics>>;
+    static CURRENT_OPERATION_STARTED: Instant;
+    static CURRENT_OPERATION_ID: String;
     static CURRENT_COMMAND_BUDGET: Arc<Mutex<CommandBudgetUsage>>;
 }
+
+static NEXT_OPERATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const MAX_CDP_METHODS: usize = 64;
+const CDP_METHOD_OVERFLOW: &str = "__method_cardinality_overflow__";
 
 #[derive(Default)]
 struct CommandBudgetUsage {
@@ -25,8 +32,32 @@ struct CommandBudgetUsage {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct OperationMetrics {
+    /// Process-local correlation key for the MCP operation receipt. It is not
+    /// a cross-process trace ID or evidence of client prompt submission.
+    pub operation_id: Option<String>,
+    /// Legacy count of top-level telemetry scopes; this does not assert that a
+    /// caller model inspected the result.
     pub model_visible_calls: u64,
+    /// Page-evidence response envelopes emitted at an MCP return boundary.
+    pub returned_observation_packets: u64,
     pub host_round_trips: u64,
+    /// Native-host wire messages observed by the provider.
+    pub native_host_messages: u64,
+    pub native_host_messages_sent: u64,
+    pub native_host_messages_received: u64,
+    /// Dedicated Chrome launch-to-DevTools endpoint time when measured.
+    pub startup_us: Option<u64>,
+    /// V3 shared-session attachment time when measured.
+    pub attach_us: Option<u64>,
+    /// Elapsed time from operation-scope entry to first/last provider dispatch.
+    /// None means no browser operation was observed in this scope.
+    pub first_browser_op_us: Option<u64>,
+    pub last_browser_op_us: Option<u64>,
+    /// Dispatched CDP commands grouped into a bounded purpose taxonomy.
+    pub command_purposes: BTreeMap<String, u64>,
+    /// Method-level counts for command attribution. Cardinality is bounded;
+    /// additional distinct methods are retained in the overflow bucket.
+    pub cdp_methods: BTreeMap<String, u64>,
     pub cdp_commands: u64,
     pub cdp_commands_partial: bool,
     pub cdp_bytes: u64,
@@ -60,6 +91,8 @@ pub struct OperationPhaseMetrics {
     pub verification_us: u64,
     pub enrichment_us: u64,
     pub artifact_transfer_us: u64,
+    /// Time spent assembling/serializing the structured MCP receipt locally.
+    pub serialization_us: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +106,7 @@ pub enum OperationPhase {
     Verification,
     Enrichment,
     ArtifactTransfer,
+    Serialization,
 }
 
 impl OperationMetrics {
@@ -80,7 +114,47 @@ impl OperationMetrics {
         self.model_visible_calls = self
             .model_visible_calls
             .saturating_add(other.model_visible_calls);
+        self.returned_observation_packets = self
+            .returned_observation_packets
+            .saturating_add(other.returned_observation_packets);
         self.host_round_trips = self.host_round_trips.saturating_add(other.host_round_trips);
+        self.native_host_messages = self
+            .native_host_messages
+            .saturating_add(other.native_host_messages);
+        self.native_host_messages_sent = self
+            .native_host_messages_sent
+            .saturating_add(other.native_host_messages_sent);
+        self.native_host_messages_received = self
+            .native_host_messages_received
+            .saturating_add(other.native_host_messages_received);
+        if let Some(value) = other.first_browser_op_us {
+            self.first_browser_op_us = Some(
+                self.first_browser_op_us
+                    .map_or(value, |current| current.min(value)),
+            );
+        }
+        if let Some(value) = other.last_browser_op_us {
+            self.last_browser_op_us = Some(
+                self.last_browser_op_us
+                    .map_or(value, |current| current.max(value)),
+            );
+        }
+        for (purpose, count) in &other.command_purposes {
+            let current = self.command_purposes.entry(purpose.clone()).or_default();
+            *current = current.saturating_add(*count);
+        }
+        for (method, count) in &other.cdp_methods {
+            let key = if self.cdp_methods.contains_key(method)
+                || (method != CDP_METHOD_OVERFLOW && self.cdp_methods.len() < MAX_CDP_METHODS - 1)
+                || method == CDP_METHOD_OVERFLOW
+            {
+                method.as_str()
+            } else {
+                CDP_METHOD_OVERFLOW
+            };
+            let current = self.cdp_methods.entry(key.to_owned()).or_default();
+            *current = current.saturating_add(*count);
+        }
         self.cdp_commands = self.cdp_commands.saturating_add(other.cdp_commands);
         self.cdp_commands_partial |= other.cdp_commands_partial;
         self.cdp_bytes = self.cdp_bytes.saturating_add(other.cdp_bytes);
@@ -130,6 +204,7 @@ impl OperationPhaseMetrics {
         self.artifact_transfer_us = self
             .artifact_transfer_us
             .saturating_add(other.artifact_transfer_us);
+        self.serialization_us = self.serialization_us.saturating_add(other.serialization_us);
     }
 }
 
@@ -142,13 +217,22 @@ pub async fn collect_operation_metrics<T>(
         return (result, metrics.lock().await.clone());
     }
 
+    let sequence = NEXT_OPERATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let operation_id = format!("mcp:{}:{sequence}", std::process::id());
     let metrics = Arc::new(Mutex::new(OperationMetrics {
         model_visible_calls: 1,
+        operation_id: Some(operation_id.clone()),
         ..OperationMetrics::default()
     }));
     let started = Instant::now();
-    let result = CURRENT_OPERATION_METRICS
-        .scope(Arc::clone(&metrics), future)
+    let result = CURRENT_OPERATION_ID
+        .scope(
+            operation_id,
+            CURRENT_OPERATION_STARTED.scope(
+                started,
+                CURRENT_OPERATION_METRICS.scope(Arc::clone(&metrics), future),
+            ),
+        )
         .await;
     metrics.lock().await.elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
     let collected = metrics.lock().await.clone();
@@ -270,6 +354,159 @@ pub async fn record_browser_command(
     .await;
 }
 
+/// Record a native-host wire message at the send or response boundary.
+pub async fn record_native_host_message(received: bool) {
+    update_current_metrics(|metrics| {
+        metrics.native_host_messages = metrics.native_host_messages.saturating_add(1);
+        if received {
+            metrics.native_host_messages_received =
+                metrics.native_host_messages_received.saturating_add(1);
+        } else {
+            metrics.native_host_messages_sent = metrics.native_host_messages_sent.saturating_add(1);
+        }
+    })
+    .await;
+}
+
+/// Record elapsed dedicated-browser startup through DevTools endpoint readiness.
+pub async fn record_startup_duration_us(elapsed_us: u64) {
+    update_current_metrics(|metrics| {
+        metrics.startup_us = Some(
+            metrics
+                .startup_us
+                .unwrap_or_default()
+                .saturating_add(elapsed_us),
+        );
+    })
+    .await;
+}
+
+/// Record elapsed provider/session attachment for the current MCP operation.
+pub async fn record_attach_duration_us(elapsed_us: u64) {
+    update_current_metrics(|metrics| {
+        metrics.attach_us = Some(
+            metrics
+                .attach_us
+                .unwrap_or_default()
+                .saturating_add(elapsed_us),
+        );
+    })
+    .await;
+}
+
+/// Measure dedicated-browser startup and record duration on both success and failure.
+pub async fn measure_startup<T>(operation: impl Future<Output = T>) -> (T, u64) {
+    let started = Instant::now();
+    let result = operation.await;
+    let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    record_startup_duration_us(elapsed_us).await;
+    (result, elapsed_us)
+}
+
+/// Measure provider/session attachment and record duration on both success and failure.
+pub async fn measure_attach<T>(operation: impl Future<Output = T>) -> (T, u64) {
+    let started = Instant::now();
+    let result = operation.await;
+    let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    record_attach_duration_us(elapsed_us).await;
+    (result, elapsed_us)
+}
+
+/// Record the provider send boundary, before waiting for the extension reply.
+pub async fn record_browser_operation_dispatch() {
+    let Some(offset_us) = CURRENT_OPERATION_STARTED
+        .try_with(|started| started.elapsed().as_micros().min(u64::MAX as u128) as u64)
+        .ok()
+    else {
+        return;
+    };
+    update_current_metrics(|metrics| {
+        metrics.first_browser_op_us = Some(
+            metrics
+                .first_browser_op_us
+                .map_or(offset_us, |value| value.min(offset_us)),
+        );
+        metrics.last_browser_op_us = Some(
+            metrics
+                .last_browser_op_us
+                .map_or(offset_us, |value| value.max(offset_us)),
+        );
+    })
+    .await;
+}
+
+/// Record dispatched CDP work by a fixed, low-cardinality purpose category.
+pub async fn record_command_purpose(method: &str, count: u64) {
+    let purpose = match method {
+        "Page.navigate" | "Page.reload" | "Page.stopLoading" => "navigation",
+        "Page.getFrameTree"
+        | "Page.getNavigationHistory"
+        | "Controlla.checkIdentityMarker"
+        | "Controlla.presentationState" => "document_identity",
+        "Page.captureScreenshot" | "Controlla.captureScreenshot" => "visual_capture",
+        "DOMSnapshot.captureSnapshot"
+        | "Accessibility.getPartialAXTree"
+        | "Controlla.frameAccessibility"
+        | "Controlla.snapshot"
+        | "Controlla.find"
+        | "Controlla.fileInputSnapshot"
+        | "Controlla.findFileInput" => "observation",
+        "Runtime.evaluate" => "page_script_evaluation",
+        "Input.dispatchMouseEvent"
+        | "Input.dispatchKeyEvent"
+        | "Input.insertText"
+        | "Controlla.click"
+        | "Controlla.fill"
+        | "Controlla.drag"
+        | "Controlla.frameClick"
+        | "Controlla.pointerClick"
+        | "Controlla.pointerScroll"
+        | "Controlla.pointerSwipe"
+        | "Controlla.frameScroll"
+        | "Controlla.scrollToTarget"
+        | "Controlla.fastType"
+        | "Controlla.frameFill"
+        | "Controlla.humanTypeCharacter"
+        | "Controlla.securePasswordFill" => "mutation",
+        "Page.setFileInputFiles"
+        | "Controlla.upload"
+        | "Controlla.waitForFileChooser"
+        | "Controlla.frameSelectFile"
+        | "Controlla.setFrameFileInputFiles"
+        | "Controlla.downloadLifecycle"
+        | "IO.read"
+        | "IO.close" => "file_transfer",
+        "Controlla.activateOwnedTab"
+        | "Controlla.closeOwnedTab"
+        | "Controlla.moveOwnedTab"
+        | "Controlla.openTab"
+        | "Controlla.navigate"
+        | "Controlla.newTabs" => "target_lifecycle",
+        _ => "other",
+    };
+    update_current_metrics(|metrics| {
+        let current = metrics
+            .command_purposes
+            .entry(purpose.to_owned())
+            .or_default();
+        *current = current.saturating_add(count);
+        let method_key = if metrics.cdp_methods.contains_key(method)
+            || (method != CDP_METHOD_OVERFLOW && metrics.cdp_methods.len() < MAX_CDP_METHODS - 1)
+            || method == CDP_METHOD_OVERFLOW
+        {
+            method
+        } else {
+            CDP_METHOD_OVERFLOW
+        };
+        let method_count = metrics
+            .cdp_methods
+            .entry(method_key.to_owned())
+            .or_default();
+        *method_count = method_count.saturating_add(count);
+    })
+    .await;
+}
+
 pub async fn mark_cdp_commands_partial() {
     update_current_metrics(|metrics| metrics.cdp_commands_partial = true).await;
 }
@@ -301,6 +538,7 @@ pub async fn record_phase(phase: OperationPhase, elapsed_us: u64) {
             OperationPhase::Verification => &mut metrics.phases.verification_us,
             OperationPhase::Enrichment => &mut metrics.phases.enrichment_us,
             OperationPhase::ArtifactTransfer => &mut metrics.phases.artifact_transfer_us,
+            OperationPhase::Serialization => &mut metrics.phases.serialization_us,
         };
         *value = value.saturating_add(elapsed_us);
     })
@@ -321,20 +559,78 @@ mod tests {
     #[tokio::test]
     async fn operation_scope_collects_command_and_phase_metrics() {
         let (value, metrics) = collect_operation_metrics(async {
+            record_browser_operation_dispatch().await;
             record_browser_command(1, 3, 120, 40, 7).await;
+            record_native_host_message(false).await;
+            record_native_host_message(true).await;
+            record_command_purpose("Page.getFrameTree", 1).await;
+            record_command_purpose("DOMSnapshot.captureSnapshot", 2).await;
             record_phase(OperationPhase::Snapshot, 9).await;
+            record_browser_operation_dispatch().await;
             "observed"
         })
         .await;
 
         assert_eq!(value, "observed");
         assert_eq!(metrics.model_visible_calls, 1);
+        assert!(
+            metrics
+                .operation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mcp:"))
+        );
+        assert_eq!(
+            metrics.startup_us, None,
+            "startup is unavailable in this process scope"
+        );
+        assert_eq!(
+            metrics.attach_us, None,
+            "attach is unavailable in this process scope"
+        );
         assert_eq!(metrics.host_round_trips, 1);
+        assert_eq!(metrics.native_host_messages, 2);
+        assert_eq!(metrics.native_host_messages_sent, 1);
+        assert_eq!(metrics.native_host_messages_received, 1);
+        assert!(metrics.first_browser_op_us.is_some());
+        assert!(metrics.last_browser_op_us >= metrics.first_browser_op_us);
         assert_eq!(metrics.cdp_commands, 3);
         assert_eq!(metrics.cdp_bytes, 120);
         assert_eq!(metrics.queue_us, 40);
         assert_eq!(metrics.execution_us, 7);
+        assert_eq!(metrics.command_purposes["document_identity"], 1);
+        assert_eq!(metrics.command_purposes["observation"], 2);
+        assert_eq!(metrics.cdp_methods["Page.getFrameTree"], 1);
+        assert_eq!(metrics.cdp_methods["DOMSnapshot.captureSnapshot"], 2);
+        assert_eq!(metrics.cdp_methods.values().sum::<u64>(), 3);
         assert_eq!(metrics.phases.snapshot_us, 9);
+    }
+
+    #[tokio::test]
+    async fn method_attribution_bounds_cardinality_and_preserves_total() {
+        let (_, metrics) = collect_operation_metrics(async {
+            for index in 0..80 {
+                record_command_purpose(&format!("Test.method{index}"), 1).await;
+            }
+        })
+        .await;
+
+        assert_eq!(metrics.cdp_methods.len(), MAX_CDP_METHODS);
+        assert_eq!(metrics.cdp_methods[CDP_METHOD_OVERFLOW], 17);
+        assert_eq!(metrics.cdp_methods.values().sum::<u64>(), 80);
+    }
+
+    #[tokio::test]
+    async fn startup_and_attach_lifecycle_spans_are_observed_when_measured() {
+        let (_, metrics) = collect_operation_metrics(async {
+            let (startup, _) = measure_startup(async { Err::<(), _>("startup failed") }).await;
+            assert!(startup.is_err());
+            let (attach, _) = measure_attach(async { Err::<(), _>("attach failed") }).await;
+            assert!(attach.is_err());
+        })
+        .await;
+
+        assert!(metrics.startup_us.is_some());
+        assert!(metrics.attach_us.is_some());
     }
 
     #[tokio::test]

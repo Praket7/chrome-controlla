@@ -76,6 +76,8 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         let c=connection.clone(); let t=target.clone();
         let host_round_trips=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let trips=host_round_trips.clone();
+        let command_trace=std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let trace=command_trace.clone();
         let lost_release_ack=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let lose_ack=lost_release_ack.clone();
         let proxy=tokio::spawn(async move {
@@ -83,6 +85,10 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
                 let request:Value=serde_json::from_str(message.to_text().unwrap()).unwrap();
                 trips.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                 let actions=if request["type"]=="batch" {request["actions"].as_array().unwrap().clone()} else {vec![request.clone()]};
+                trace.lock().unwrap().push(json!({
+                    "request_type":request["type"],
+                    "methods":actions.iter().map(|action|action["method"].clone()).collect::<Vec<_>>()
+                }));
                 let mut receipts=Vec::new();
                 for (index,action) in actions.iter().enumerate() {
                     let (_,targets)=c.target_snapshot().await;
@@ -162,8 +168,14 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(eval("document.activeElement.id".into()).await["result"]["value"],"trusted");
         snapshot=trusted["snapshot"].clone();
         let first_ref=item(&snapshot,"Accounts")["reference"].clone();
+        let click_start=host_round_trips.load(std::sync::atomic::Ordering::Relaxed);
+        let click_trace_start=command_trace.lock().unwrap().len();
         let clicked=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":first_ref,"outcome":{"kind":"expanded"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(clicked["status"],"verified","{clicked}");
+        let click_round_trips=host_round_trips.load(std::sync::atomic::Ordering::Relaxed)-click_start;
+        let click_commands=command_trace.lock().unwrap()[click_trace_start..].to_vec();
+        eprintln!("S3-04 warm click/readback fixture: {click_round_trips} native bridge round trips; command groups {click_commands:?}");
+        assert!(click_round_trips<=6,"warm click/readback exceeded the proposed six native bridge round trips: {click_commands:?}");
         snapshot=clicked["snapshot"].clone();
         aria_upload=item(&snapshot,"ARIA Upload");
         let aria_upload_click=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":aria_upload["reference"],"outcome":{"kind":"visible","selector":"#upload-opened"}}))).await.unwrap().structured_content.unwrap();
@@ -181,11 +193,19 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(stale["status"], "unknown", "the unique same-document replacement should be reacquired and clicked: {stale}");
         assert_eq!(eval("window.clicks".into()).await["result"]["value"], 2);
         lost_release_ack.store(true,std::sync::atomic::Ordering::Relaxed);
+        let navigation_start=host_round_trips.load(std::sync::atomic::Ordering::Relaxed);
+        let navigation_trace_start=command_trace.lock().unwrap().len();
         let nav=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&stale["snapshot"],"Story")["reference"],"outcome":{"kind":"navigation"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(nav["status"],"verified","{nav}");
         assert_eq!(nav["dispatch_acknowledged"],false,"lost release acknowledgement must remain visible");
         assert_eq!(nav["navigation_observed"],true);
         assert!(nav["url"].as_str().unwrap().ends_with("#done"));
+        let extracted=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Story","roles":["link"]},"max_items":3,"max_text_chars":0,"max_bytes":8192}))).await.unwrap().structured_content.unwrap();
+        assert_eq!(extracted["goal_satisfied"],true,"navigation follow-up evidence must be extracted from the expected story control: {extracted}");
+        let navigation_round_trips=host_round_trips.load(std::sync::atomic::Ordering::Relaxed)-navigation_start;
+        let navigation_commands=command_trace.lock().unwrap()[navigation_trace_start..].to_vec();
+        eprintln!("S3-04 navigation plus extraction fixture: {navigation_round_trips} native bridge round trips; command groups {navigation_commands:?}");
+        assert!(navigation_round_trips<=12,"navigation plus extraction exceeded the proposed twelve native bridge round trips: {navigation_commands:?}");
         eval("document.body.replaceChildren(Object.assign(document.createElement('button'),{textContent:'Open requested panel'}),...Array.from({length:50000},(_,i)=>Object.assign(document.createElement('div'),{textContent:'dashboard cell '+i})))".into()).await;
         let targeted=client.call_tool(call("shared_snapshot",json!({"session_id":session,"chrome_tab_id":"123","goal":{"query":"Open requested panel","roles":["button"]},"max_scan_nodes":50000,"max_items":1,"max_text_chars":100,"max_bytes":8192}))).await.unwrap().structured_content.unwrap();
         assert_eq!(targeted["goal_satisfied"],true,"{targeted}");

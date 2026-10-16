@@ -4,8 +4,8 @@ pub use controlla_runtime::{
     execution_cost_router, guard_reason, http_auth, http_server, jobs, metrics, native_host,
     native_setup, observation_router, page_action_memory, process_lease, reference_reacquire,
     relevance, runtime_observer, semantic_state, site_profiles, skill_induction, skill_runtime,
-    skill_store, skills, slides_deck, v3, v3_runtime, v3_tasks, verifier, visual_probe,
-    widget_adapters, workflow, workflow_dag, workflow_vm,
+    skill_store, skills, slides_deck, task_checkpoints, v3, v3_runtime, v3_tasks, verifier,
+    visual_probe, widget_adapters, workflow, workflow_dag, workflow_vm,
 };
 
 #[allow(dead_code, clippy::unnecessary_sort_by)]

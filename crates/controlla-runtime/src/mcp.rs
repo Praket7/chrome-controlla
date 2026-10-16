@@ -880,6 +880,21 @@ struct SharedSwipeArgs {
     expected_focus_epoch: Option<u64>,
 }
 
+#[allow(dead_code)]
+struct SharedPinchArgs {
+    session_id: String,
+    chrome_tab_id: String,
+    reference: String,
+    center_x: f64,
+    center_y: f64,
+    start_distance: f64,
+    end_distance: f64,
+    outcome: SharedClickOutcome,
+    timeout_ms: Option<u64>,
+    expected_activation_epoch: Option<u64>,
+    expected_focus_epoch: Option<u64>,
+}
+
 fn validate_wheel_delta(delta_x: i32, delta_y: i32) -> Result<(), &'static str> {
     const MAX_DELTA: i32 = 1200;
     if (delta_x == 0) == (delta_y == 0) {
@@ -912,6 +927,42 @@ fn validate_swipe_endpoints(
         return Err("swipe path length must be within 20..=1200 CSS pixels");
     }
     Ok(())
+}
+
+fn validate_pinch(
+    center_x: f64,
+    center_y: f64,
+    start_distance: f64,
+    end_distance: f64,
+) -> Result<(), &'static str> {
+    if [center_x, center_y, start_distance, end_distance]
+        .iter()
+        .any(|v| !v.is_finite() || !(0.0..=10_000.0).contains(v))
+    {
+        return Err("pinch values must be finite and within 0..=10000");
+    }
+    if !(40.0..=600.0).contains(&start_distance)
+        || !(20.0..=800.0).contains(&end_distance)
+        || !(0.5..=2.0).contains(&(end_distance / start_distance))
+    {
+        return Err("pinch distances must be bounded and scale ratio must be 0.5..=2.0");
+    }
+    Ok(())
+}
+
+fn shared_pinch_guard_script() -> &'static str {
+    r#"function(index,cx,cy,startDistance,endDistance,expectedViewport){
+      const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,reason:'stale_reference'};
+      const b=e.getBoundingClientRect(),vw=innerWidth,vh=innerHeight;
+      const viewport=JSON.stringify([vw,vh,devicePixelRatio||1]);
+      const points=d=>[{x:cx-d/2,y:cy},{x:cx+d/2,y:cy}];
+      const start=points(startDistance),end=points(endDistance),inside=p=>p.x>=b.left&&p.x<=b.right&&p.y>=b.top&&p.y<=b.bottom;
+      const valid=p=>p.x>=0&&p.y>=0&&p.x<vw&&p.y<vh;
+      const style=getComputedStyle(e);
+      if(expectedViewport&&viewport!==expectedViewport)return {ok:false,reason:'viewport_changed'};
+      if(!start.every(p=>valid(p)&&inside(p)&&(document.elementFromPoint(p.x,p.y)===e||e.contains(document.elementFromPoint(p.x,p.y))))||!end.every(valid)||b.width<=0||b.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return {ok:false,reason:'pinch_target_or_endpoint_not_interactable'};
+      return {ok:true,viewport,rect:{left:b.left,top:b.top,width:b.width,height:b.height}};
+    }"#
 }
 
 fn shared_scroll_guard_script() -> &'static str {
@@ -1322,6 +1373,14 @@ async fn evaluate_shared_outcome(
         connection.command(registry,&shared.handle,tab,"Runtime.evaluate",json!({"expression":expression,"returnByValue":true})).await
     }.map_err(|e|e.to_string())?;
     Ok(shared_value(&response)? == true)
+}
+
+fn shared_outcome_identity_allows_verification(
+    outcome: &SharedClickOutcome,
+    snapshot: &(String, String, String),
+    current: &(String, String, String),
+) -> bool {
+    matches!(outcome, SharedClickOutcome::Navigation { .. }) || snapshot == current
 }
 
 fn shared_new_tab_matches(response: &Value, expected_url: Option<&str>) -> bool {
@@ -2350,6 +2409,67 @@ async fn shared_interaction_epoch(
     shared_value(&response)
 }
 
+async fn shared_identity_and_epoch(
+    connection: &PageSessionTransport,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    object_id: &str,
+    deadline: Duration,
+) -> Result<((String, String, String), Value), String> {
+    if matches!(connection, PageSessionTransport::Shared(shared) if shared.supports_batch_execution())
+    {
+        let batch = connection
+            .command_batch(
+                registry,
+                handle,
+                tab_id,
+                vec![
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Runtime.callFunctionOn".into(),
+                        params: json!({
+                            "objectId": object_id,
+                            "functionDeclaration": r#"function(){const s=window[Symbol.for('controlla.interactionEpoch.v1')];if(!s)return null;const a=document.activeElement;const focus=a?JSON.stringify([a.tagName,a.id||'',a.getAttribute('name')||'',a.getAttribute('role')||'',a.getAttribute('aria-label')||'']):'';let selection='';if(a&&typeof a.selectionStart==='number')selection=JSON.stringify([a.selectionStart,a.selectionEnd,a.selectionDirection||'none']);else{const x=window.getSelection?.();if(x)selection=JSON.stringify([x.anchorNode?.nodeType,x.anchorOffset,x.focusNode?.nodeType,x.focusOffset,x.isCollapsed])}const viewport=JSON.stringify([innerWidth,innerHeight,scrollX,scrollY,visualViewport?.width,visualViewport?.height,visualViewport?.offsetLeft,visualViewport?.offsetTop,visualViewport?.scale]);return {semantic_revision:s.semantic,focus,selection,viewport}}"#,
+                            "returnByValue": true
+                        }),
+                        stop_on_not_ok: false,
+                    },
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Page.getFrameTree".into(),
+                        params: Value::Null,
+                        stop_on_not_ok: false,
+                    },
+                ],
+                deadline,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        return shared_identity_epoch_batch(&batch);
+    }
+    let identity = shared_frame_identity(connection, registry, handle, tab_id).await?;
+    let epoch = shared_interaction_epoch(connection, registry, handle, tab_id, object_id).await?;
+    Ok((identity, epoch))
+}
+
+#[derive(Debug, Clone)]
+struct SharedOperationRead {
+    identity: (String, String, String),
+    interaction_epoch: Value,
+}
+
+impl SharedOperationRead {
+    fn new(identity: (String, String, String), interaction_epoch: Value) -> Self {
+        Self {
+            identity,
+            interaction_epoch,
+        }
+    }
+
+    fn remains_fresh(&self, identity: &(String, String, String), epoch: &Value) -> bool {
+        &self.identity == identity && self.interaction_epoch == *epoch
+    }
+}
+
 fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String), String> {
     let frame = response
         .get("frameTree")
@@ -2368,6 +2488,27 @@ fn frame_identity_from_tree(response: &Value) -> Result<(String, String, String)
         .ok_or_else(|| "Page.getFrameTree omitted root frame URL".to_owned())?;
     let fragment = frame["urlFragment"].as_str().unwrap_or("");
     Ok((id.to_owned(), loader.to_owned(), format!("{url}{fragment}")))
+}
+
+fn shared_identity_epoch_batch(batch: &Value) -> Result<((String, String, String), Value), String> {
+    if batch["completed"] != 2 || batch.get("batch_error").is_some() {
+        return Err("identity/epoch batch did not complete".into());
+    }
+    let receipts = batch["receipts"]
+        .as_array()
+        .filter(|items| items.len() == 2)
+        .ok_or("identity/epoch batch omitted receipts")?;
+    if receipts[0]["method"] != "Runtime.callFunctionOn"
+        || receipts[1]["method"] != "Page.getFrameTree"
+        || receipts.iter().any(|item| item.get("error").is_some())
+    {
+        return Err("identity/epoch batch returned unexpected receipts".into());
+    }
+    Ok((
+        frame_identity_from_tree(&receipts[1]["result"])?,
+        shared_value(&receipts[0]["result"])
+            .map_err(|error| format!("interaction epoch read failed: {error}"))?,
+    ))
 }
 
 fn frame_handles_from_tree(
@@ -3148,12 +3289,24 @@ impl App {
                         Ok(Err(error)) => {
                             drop(shared);
                             self.shared_sessions.lock().await.remove(id);
-                            return Err(invalid(error.to_string()));
+                            let message = error.to_string();
+                            let next = if message.contains("already leased")
+                                || message.contains("already paired")
+                                || message.contains("occupied")
+                            {
+                                "Release the session that owns the tab, then rediscover and pair its current document identity. Do not retry this lease blindly."
+                            } else {
+                                "Follow the pairing error, then rediscover the tab before creating a new pair."
+                            };
+                            return Err(invalid(format!("{message} Next action: {next}")));
                         }
                         Err(error) => {
                             drop(shared);
                             self.shared_sessions.lock().await.remove(id);
-                            return Err(invalid(error.to_string()));
+                            let message = error.to_string();
+                            return Err(invalid(format!(
+                                "{message} Next action: rediscover the tab and create a fresh pair_shared request."
+                            )));
                         }
                     };
                     shared.registry = Some(registry);
@@ -3622,27 +3775,32 @@ impl App {
             .as_ref()
             .ok_or_else(|| invalid("session not accepted"))?;
         let registry = shared.registry()?;
-        let identity =
-            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
-                .await
-                .map_err(invalid)?;
-        let interaction = shared_interaction_epoch(
-            connection,
-            registry,
-            &shared.handle,
-            &args.chrome_tab_id,
-            &snapshot.object_id,
+        let fresh = tokio::time::timeout_at(
+            deadline,
+            shared_identity_and_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
         )
         .await
+        .map_err(|_| invalid("scroll deadline exceeded before dispatch"))?
         .map_err(invalid)?;
-        if !unrestricted
-            && !shared_epoch_matches(
-                &snapshot,
-                &args.chrome_tab_id,
-                &identity,
-                &interaction,
-                crate::v3::EpochUse::GuardedClick,
-            )
+        let read = SharedOperationRead::new(fresh.0, fresh.1);
+        let identity = &read.identity;
+        let interaction = &read.interaction_epoch;
+        if !read.remains_fresh(&snapshot.identity, &snapshot.interaction_epoch)
+            || (!unrestricted
+                && !shared_epoch_matches(
+                    &snapshot,
+                    &args.chrome_tab_id,
+                    identity,
+                    interaction,
+                    crate::v3::EpochUse::GuardedClick,
+                ))
         {
             return Ok(rmcp::handler::server::wrapper::Json(
                 json!({"status":"not_dispatched","action":if scroll_to_target{"scroll_to"}else{"scroll"},"reason_code":"stale_document","dispatch_may_have_occurred":false,"reason":"The target document or viewport changed; take a fresh snapshot."}),
@@ -3767,20 +3925,17 @@ impl App {
                 json!({"status":"not_dispatched","action":"scroll","reason_code":"invalid_scroll_guard","dispatch_may_have_occurred":false}),
             ));
         };
-        let fresh = tokio::time::timeout_at(deadline, async {
-            let identity =
-                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
-                    .await?;
-            let interaction = shared_interaction_epoch(
+        let fresh = tokio::time::timeout_at(
+            deadline,
+            shared_identity_and_epoch(
                 connection,
                 registry,
                 &shared.handle,
                 &args.chrome_tab_id,
                 &snapshot.object_id,
-            )
-            .await?;
-            Ok::<_, String>((identity, interaction))
-        })
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
+        )
         .await;
         if !matches!(fresh,Ok(Ok((ref id,ref epoch))) if shared_epoch_matches(&snapshot,&args.chrome_tab_id,id,epoch,crate::v3::EpochUse::GuardedClick))
         {
@@ -3887,27 +4042,32 @@ impl App {
             .as_ref()
             .ok_or_else(|| invalid("session not accepted"))?;
         let registry = shared.registry()?;
-        let identity =
-            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
-                .await
-                .map_err(invalid)?;
-        let interaction = shared_interaction_epoch(
-            connection,
-            registry,
-            &shared.handle,
-            &args.chrome_tab_id,
-            &snapshot.object_id,
+        let fresh = tokio::time::timeout_at(
+            deadline,
+            shared_identity_and_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
         )
         .await
+        .map_err(|_| invalid("swipe deadline exceeded before dispatch"))?
         .map_err(invalid)?;
-        if !unrestricted
-            && !shared_epoch_matches(
-                &snapshot,
-                &args.chrome_tab_id,
-                &identity,
-                &interaction,
-                crate::v3::EpochUse::GuardedClick,
-            )
+        let read = SharedOperationRead::new(fresh.0, fresh.1);
+        let identity = &read.identity;
+        let interaction = &read.interaction_epoch;
+        if !read.remains_fresh(&snapshot.identity, &snapshot.interaction_epoch)
+            || (!unrestricted
+                && !shared_epoch_matches(
+                    &snapshot,
+                    &args.chrome_tab_id,
+                    identity,
+                    interaction,
+                    crate::v3::EpochUse::GuardedClick,
+                ))
         {
             return Ok(rmcp::handler::server::wrapper::Json(
                 json!({"status":"not_dispatched","action":"swipe","reason_code":"stale_document","dispatch_may_have_occurred":false}),
@@ -3981,9 +4141,221 @@ impl App {
         Ok(rmcp::handler::server::wrapper::Json(receipt))
     }
 
+    #[allow(dead_code)]
+    async fn shared_multi_touch(
+        &self,
+        args: SharedPinchArgs,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        validate_pinch(
+            args.center_x,
+            args.center_y,
+            args.start_distance,
+            args.end_distance,
+        )
+        .map_err(invalid)?;
+        let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(3000).clamp(1000, 10000));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let shared = self
+            .shared_sessions
+            .lock()
+            .await
+            .get(&args.session_id)
+            .cloned()
+            .ok_or_else(|| invalid("unknown shared session_id"))?;
+        let mut shared = shared.lock().await;
+        if shared.handle.principal != self.principal.as_ref() {
+            return Err(invalid("session is not owned by this server principal"));
+        }
+        let snapshot = shared
+            .snapshots
+            .get(&args.chrome_tab_id)
+            .cloned()
+            .ok_or_else(|| invalid("take shared_snapshot first"))?;
+        let (token, index) = args
+            .reference
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("invalid reference; use the returned reference unchanged"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid reference index"))?;
+        let unrestricted = crate::guard_reason::unrestricted_mode();
+        if index >= snapshot.count
+            || (!unrestricted && (token != snapshot.token || snapshot.consumed))
+        {
+            return Err(invalid(
+                "stale or consumed reference; take one fresh snapshot before acting",
+            ));
+        }
+        if !unrestricted {
+            shared
+                .snapshots
+                .get_mut(&args.chrome_tab_id)
+                .unwrap()
+                .consumed = true;
+        }
+        let connection = shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("session not accepted"))?;
+        let registry = shared.registry()?;
+        let fresh = tokio::time::timeout_at(
+            deadline,
+            shared_identity_and_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
+        )
+        .await
+        .map_err(|_| invalid("multi_touch deadline exceeded before dispatch"))?
+        .map_err(invalid)?;
+        let read = SharedOperationRead::new(fresh.0, fresh.1);
+        let identity = &read.identity;
+        let interaction = &read.interaction_epoch;
+        if !read.remains_fresh(&snapshot.identity, &snapshot.interaction_epoch)
+            || (!unrestricted
+                && !shared_epoch_matches(
+                    &snapshot,
+                    &args.chrome_tab_id,
+                    identity,
+                    interaction,
+                    crate::v3::EpochUse::GuardedClick,
+                ))
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"multi_touch","reason_code":"stale_document","dispatch_may_have_occurred":false}),
+            ));
+        }
+        let guard = shared_pinch_guard_script();
+        let preflight=tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":args.center_x},{"value":args.center_y},{"value":args.start_distance},{"value":args.end_distance},{"value":Value::Null}],"returnByValue":true}))).await;
+        let checked = match preflight {
+            Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
+            _ => {
+                return Ok(rmcp::handler::server::wrapper::Json(
+                    json!({"status":"not_dispatched","action":"multi_touch","reason_code":"pinch_preflight_failed","dispatch_may_have_occurred":false}),
+                ));
+            }
+        };
+        if checked["ok"] != true {
+            let mut refusal = crate::guard_reason::refusal(&checked);
+            refusal["action"] = json!("multi_touch");
+            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+        }
+        let Some(viewport) = checked["viewport"].as_str() else {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"multi_touch","reason_code":"invalid_pinch_guard","dispatch_may_have_occurred":false}),
+            ));
+        };
+        let fresh = tokio::time::timeout_at(deadline, async {
+            let id =
+                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                    .await?;
+            let epoch = shared_interaction_epoch(
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+            )
+            .await?;
+            Ok::<_, String>((id, epoch))
+        })
+        .await;
+        if !matches!(fresh,Ok(Ok((ref id,ref epoch))) if shared_epoch_matches(&snapshot,&args.chrome_tab_id,id,epoch,crate::v3::EpochUse::GuardedClick))
+        {
+            return Ok(rmcp::handler::server::wrapper::Json(
+                json!({"status":"not_dispatched","action":"multi_touch","reason_code":"changed_target","dispatch_may_have_occurred":false}),
+            ));
+        }
+        let dispatch_started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default();
+        let mut receipt=match tokio::time::timeout_at(deadline,connection.command(registry,&shared.handle,&args.chrome_tab_id,"Controlla.pointerMultiTouch",json!({"object_id":snapshot.object_id,"index":index,"guard_function":guard,"viewport":viewport,"center_x":args.center_x,"center_y":args.center_y,"start_distance":args.start_distance,"end_distance":args.end_distance,"timeout_ms":timeout.as_millis(),"expected_activation_epoch":args.expected_activation_epoch,"expected_focus_epoch":args.expected_focus_epoch}))).await {Ok(Ok(value))=>shared_command_value(&value),_=>json!({"status":"unknown","reason_code":"touch_delivery_unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true,"next_action":"inspect_current_state_once_before_retrying"})};
+        let acknowledged = matches!(receipt["status"].as_str(), Some("dispatched" | "verified"));
+        if acknowledged {
+            let mut poll = Duration::from_millis(20);
+            while tokio::time::Instant::now() < deadline {
+                let identity = match tokio::time::timeout_at(
+                    deadline,
+                    shared_frame_identity(
+                        connection,
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                {
+                    Some(value) => value,
+                    None => break,
+                };
+                if !shared_outcome_identity_allows_verification(
+                    &args.outcome,
+                    &snapshot.identity,
+                    &identity,
+                ) {
+                    receipt["status"] = json!("unknown");
+                    receipt["reason_code"] = json!("document_replaced_during_outcome");
+                    receipt["dispatch_may_have_occurred"] = json!(true);
+                    break;
+                }
+                let observed = tokio::time::timeout_at(
+                    deadline,
+                    evaluate_shared_outcome(
+                        &shared,
+                        &args.chrome_tab_id,
+                        &snapshot,
+                        index,
+                        &args.outcome,
+                        &identity,
+                        dispatch_started_ms,
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+                let after = tokio::time::timeout_at(
+                    deadline,
+                    shared_frame_identity(
+                        connection,
+                        registry,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
+                if observed && matches!(after, Some(ref value) if *value == identity) {
+                    receipt["status"] = json!("verified");
+                    receipt["verified"] = json!(true);
+                    receipt["outcome"] = serde_json::to_value(&args.outcome).unwrap_or(Value::Null);
+                    break;
+                }
+                tokio::time::sleep(poll).await;
+                poll = (poll * 2).min(Duration::from_millis(200));
+            }
+            if receipt["status"] != "verified" {
+                receipt["status"] = json!("unknown");
+                receipt["reason_code"] = json!("outcome_verification_timeout");
+                receipt["dispatch_may_have_occurred"] = json!(true);
+            }
+        }
+        receipt["action"] = json!("multi_touch");
+        receipt["reference"] = json!(args.reference);
+        Ok(rmcp::handler::server::wrapper::Json(receipt))
+    }
+
     #[tool(
         name = "shared_click",
-        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse clicks on inactive tabs briefly activate the tab inside its Chrome window, dispatch guarded CDP input, then restore the prior tab when safe; this does not focus a Chrome window behind another app. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
+        description = "Apply one guarded pointer tap to exactly one shared_snapshot reference. input_mode defaults to mouse; touch uses CDP touchStart/touchEnd and never falls back to mouse. Mouse input requires the target tab to already be active; inactive user-owned tabs return not_dispatched and are never activated. Trusted background input is supported only for an active tab inside an explicitly Controlla-owned unfocused automation window. Declare a bounded outcome: navigation, visible/text selector, expanded/selected, or focused. Returns verified, not_dispatched, or unknown plus a fresh snapshot where available. Unknown is never automatically retried; inspect the returned state before deciding. A successful UI outcome does not prove save/persistence."
     )]
     async fn shared_click(
         &self,
@@ -4148,24 +4520,17 @@ impl App {
                 })));
             };
             dispatch_snapshot.interaction_epoch["viewport"] = json!(prepared_viewport);
-            let fresh = tokio::time::timeout_at(deadline, async {
-                let identity = shared_frame_identity(
-                    connection,
-                    registry,
-                    &shared.handle,
-                    &args.chrome_tab_id,
-                )
-                .await?;
-                let interaction = shared_interaction_epoch(
+            let fresh = tokio::time::timeout_at(
+                deadline,
+                shared_identity_and_epoch(
                     connection,
                     registry,
                     &shared.handle,
                     &args.chrome_tab_id,
                     &snapshot.object_id,
-                )
-                .await?;
-                Ok::<_, String>((identity, interaction))
-            })
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ),
+            )
             .await;
             if !matches!(fresh, Ok(Ok((ref identity, ref interaction))) if shared_epoch_matches(&dispatch_snapshot, &args.chrome_tab_id, identity, interaction, crate::v3::EpochUse::GuardedClick))
             {
@@ -4241,6 +4606,22 @@ impl App {
                 Ok(Ok(response)) => {
                     let value = shared_command_value(&response);
                     if value["status"] == "not_dispatched" {
+                        let mut value = value;
+                        let next_action = match value["reason_code"].as_str() {
+                            Some("activation_forbidden") => {
+                                "use an active tab in a Controlla-owned unfocused automation window, or use an observed href navigation"
+                            }
+                            Some("final_target_revalidation_failed")
+                            | Some("activation_revalidation_failed") => {
+                                "take one fresh snapshot and reacquire the target reference"
+                            }
+                            Some("tab_topology_unstable") | Some("tab_topology_changed") => {
+                                "wait for the tab move to settle, then rediscover and pair the tab"
+                            }
+                            _ => "take one fresh snapshot and follow the returned reason",
+                        };
+                        value["next_action"] = json!(next_action);
+                        value["mutation_retry_policy"] = json!("correct_reason_then_reobserve");
                         return Ok(rmcp::handler::server::wrapper::Json(value));
                     }
                     pointer_activation = json!({
@@ -6634,10 +7015,11 @@ pub(crate) fn state_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         App, LOCAL_STDIO_PRINCIPAL, SHARED_CLICK_UNSAFE_PREDICATE, SHARED_TYPE_GUARD_FUNCTION,
-        SharedPageSnapshot, click_mouse_events, final_click_guard_matches_viewport,
-        pointer_click_events, pointer_events, shared_command_value, shared_epoch_matches,
-        shared_typing_minimum_duration, validate_loopback_ws, validate_swipe_endpoints,
-        validate_wheel_delta,
+        SharedOperationRead, SharedPageSnapshot, click_mouse_events,
+        final_click_guard_matches_viewport, pointer_click_events, pointer_events,
+        shared_command_value, shared_epoch_matches, shared_identity_epoch_batch,
+        shared_outcome_identity_allows_verification, shared_typing_minimum_duration,
+        validate_loopback_ws, validate_pinch, validate_swipe_endpoints, validate_wheel_delta,
     };
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt, model::CallToolRequestParams,
@@ -6663,6 +7045,75 @@ mod tests {
         assert!(validate_swipe_endpoints(0.0, 0.0, 1201.0, 0.0).is_err());
         assert!(validate_swipe_endpoints(f64::NAN, 0.0, 100.0, 0.0).is_err());
         assert!(validate_swipe_endpoints(10_001.0, 1.0, 100.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn multi_touch_pinch_requires_bounded_geometry_and_scale_ratio() {
+        assert!(validate_pinch(200.0, 300.0, 80.0, 120.0).is_ok());
+        assert!(validate_pinch(f64::NAN, 300.0, 80.0, 120.0).is_err());
+        assert!(validate_pinch(200.0, 300.0, 30.0, 60.0).is_err());
+        assert!(validate_pinch(200.0, 300.0, 80.0, 170.0).is_err());
+        assert!(validate_pinch(10_001.0, 300.0, 80.0, 120.0).is_err());
+    }
+
+    #[test]
+    fn multi_touch_outcome_verification_rejects_replacement_documents() {
+        let original = ("https://app.test".into(), "frame-a".into(), "doc-1".into());
+        let same = original.clone();
+        let replacement = ("https://app.test".into(), "frame-a".into(), "doc-2".into());
+        let visible = super::SharedClickOutcome::Visible {
+            selector: "#ready".into(),
+        };
+        let navigation = super::SharedClickOutcome::Navigation { url: None };
+        assert!(shared_outcome_identity_allows_verification(
+            &visible, &original, &same
+        ));
+        assert!(!shared_outcome_identity_allows_verification(
+            &visible,
+            &original,
+            &replacement
+        ));
+        assert!(shared_outcome_identity_allows_verification(
+            &navigation,
+            &original,
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn coalesced_identity_epoch_batch_requires_ordered_complete_receipts() {
+        let valid = json!({
+            "completed": 2,
+            "receipts": [
+                {"method":"Runtime.callFunctionOn","result":{"result":{"value":{"semantic_revision":7}}}},
+                {"method":"Page.getFrameTree","result":{"frameTree":{"frame":{"id":"frame-1","loaderId":"loader-1","url":"https://app.test"}}}}
+            ]
+        });
+        let (identity, epoch) = shared_identity_epoch_batch(&valid).unwrap();
+        assert_eq!(identity.1, "loader-1");
+        assert_eq!(epoch["semantic_revision"], 7);
+        let wrong_order = json!({"completed":2,"receipts":[valid["receipts"][1].clone(),valid["receipts"][0].clone()]});
+        assert!(shared_identity_epoch_batch(&wrong_order).is_err());
+    }
+
+    #[test]
+    fn operation_read_record_reuses_only_matching_identity_and_epoch() {
+        let identity = (
+            "frame-1".into(),
+            "loader-1".into(),
+            "https://app.test".into(),
+        );
+        let epoch = json!({"semantic_revision":7,"viewport":"800x600"});
+        let read = SharedOperationRead::new(identity.clone(), epoch.clone());
+        assert!(read.remains_fresh(&identity, &epoch));
+        assert!(!read.remains_fresh(
+            &(identity.0.clone(), "loader-2".into(), identity.2.clone()),
+            &epoch
+        ));
+        assert!(!read.remains_fresh(
+            &identity,
+            &json!({"semantic_revision":8,"viewport":"800x600"})
+        ));
     }
 
     #[test]

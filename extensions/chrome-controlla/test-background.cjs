@@ -27,13 +27,14 @@ const commandDiagnostics = [];
 let rejectNextCommand;
 let blockedDetach;
 let blockedFrame;
+let detachDuringInventory = false;
 let releaseBlockedFrame;
 const nativePorts = [];
 const reconnectTimers = [];
 const alarms = [];
 const sessionStorage = {};
 const localStorage = {};
-const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete", frozen: false }));
+const tabList = Array.from({ length: 102 }, (_, id) => ({ id, windowId: id < 50 ? 1 : 2, groupId: id === 41 ? 7 : -1, lastAccessed: id * 100, title: `Tab ${id}`.repeat(100), url: `https://example.test/${id}`, status: "complete", frozen: false }));
 let focusedWindowActiveTabId = 42;
 let focusedWindowFocused = false;
 let pointerGuardValue = { ok: true, x: 10, y: 20, viewport: "fixture-viewport" };
@@ -43,6 +44,10 @@ let fixtureScrollMoves = true;
 let fixtureScrollGuardCalls = 0;
 let fixtureScrollHitChangesOnRecheck = false;
 let fixtureSwipeMoved = true;
+let fixtureFrameSwipeMoves = true;
+let nonAffineFrameSwipeFixture = false;
+let changingFrameSwipeTransformFixture = false;
+let frameSwipeOwnerBoxReads = 0;
 let scrollToGuardReceipt = { ok: true, phase: "after", dispatch_may_have_occurred: true, target_visible: true, center_hit: true, viewport: { width: 100, height: 80 }, center: { x: 50, y: 40 } };
 let changePointerAfterFirstClickRelease = false;
 tabList.push({ id: 102, title: "Extension page", url: "chrome://extensions" });
@@ -91,6 +96,7 @@ let replacePendingOnFrameRead;
 let nextWebNavigationTimeStamp = 10_000;
 let navigationError;
 let screenshotDataOverride;
+let rendererFrameUnavailable = false;
 let navigateDuringScreenshot;
 let freezeDuringScreenshot;
 let failPresentationEvaluation;
@@ -263,6 +269,7 @@ const chrome = {
   },
   windows: {
     async get(windowId) { return { id:windowId??1, focused:focusedWindowFocused }; },
+    async getAll() { return [{ id:1, focused:focusedWindowFocused, state:"normal", type:"normal", incognito:false }, { id:2, focused:false, state:"normal", type:"normal", incognito:false }]; },
     async update(windowId, { focused }) { if (focused !== undefined) focusedWindowFocused = focused; return { id: windowId, focused: !!focused }; },
     async create(options) {
       createdWindows.push(options);
@@ -272,6 +279,7 @@ const chrome = {
     },
     onFocusChanged: { addListener(callback) { windowFocusChanged = callback; } }
   },
+  tabGroups: { async query() { return [{ id:7, windowId:1, title:"Research", color:"blue", collapsed:true }]; } },
   webNavigation: {
     async getFrame({ tabId, frameId }) {
       frameReadCounts.set(tabId, (frameReadCounts.get(tabId) || 0) + 1);
@@ -331,14 +339,18 @@ const chrome = {
       detached.push(tabId);
       if (blockedDetach?.tabId === tabId) await new Promise(resolve => { blockedDetach.resolve = resolve; });
     },
-    async sendCommand(target, method, params) {
+  async sendCommand(target, method, params) {
       debuggerCalls.push({ target, method, params });
+      if (method === "Test.never") await new Promise(() => {});
       if (rejectNextCommand === method) { rejectNextCommand = undefined; throw new Error("fixture rejection"); }
       if (method === "Runtime.evaluate" && blockNextTopologyCommand) {
         const blocked = blockNextTopologyCommand;
         blockNextTopologyCommand = undefined;
         blocked.entered();
         await blocked.release;
+      }
+      if (method === "Runtime.evaluate" && params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")) {
+        return { result: { value: { ready: !rendererFrameUnavailable, timestamp_ms: rendererFrameUnavailable ? undefined : 42.5 } } };
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && changePointerAfterFirstClickRelease) {
         changePointerAfterFirstClickRelease = false;
@@ -391,6 +403,22 @@ const chrome = {
         const [, sx, sy, ex, ey, viewport, phase] = params.arguments.map(argument => argument.value);
         return { result: { value: { ok: true, viewport, start: { x: sx, y: sy }, end: { x: ex, y: ey },
           scroll: { top: phase === "after" && fixtureSwipeMoved ? 40 : 0 }, rect: { left: 0, top: 0, width: 100, height: 100 } } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,cx,cy,startDistance,endDistance,expectedViewport)")) {
+        return { result: { value: { ok: true, viewport: params.arguments[5].value, rect: { left: 0, top: 0, width: 100, height: 100 } } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(sx,sy,ex,ey,expectedViewport,phase)")) {
+        const phase=params.arguments[5]?.value;
+        return { result: { value: { ok: true, viewport: JSON.stringify([100,80,1]), rect: { left: 10, top: 10, width: 30, height: 30 }, scroll: { left: 0, top: phase === "after" && fixtureFrameSwipeMoves ? 20 : 0 } } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-file-object" && params?.functionDeclaration?.startsWith("function(){return {width:this.ownerDocument.defaultView.innerWidth")) {
+        return { result: { value: { width: 100, height: 80 } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-owner" && params?.functionDeclaration?.startsWith("function(){return {width:this.ownerDocument.defaultView.innerWidth")) {
+        return { result: { value: { width: 100, height: 80 } } };
+      }
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-owner" && params?.functionDeclaration?.startsWith("function(x,y){const s=getComputedStyle(this)")) {
+        return { result: { value: true } };
       }
       if (method === "Input.dispatchTouchEvent" && params?.type === "touchMove" && fixtureSwipeMoved) fixtureScrollTop += 20;
       if (method === "Runtime.getProperties" && params?.objectId?.startsWith("fixture-scroll-descriptor-")) {
@@ -480,7 +508,11 @@ const chrome = {
           const parentFrameId = reparentNestedFrameFixture && nestedFrameTreeReads > 1 ? "frame-other-parent" : "frame-parent";
           return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: rootFrameSecurityOrigin }, childFrames: [{ frame: { id: parentFrameId, loaderId: staleNestedAncestorFixture && nestedFrameTreeReads > 1 ? "changed-parent-loader" : "parent-loader", url: "https://example.test/parent", securityOrigin: "https://example.test" }, childFrames: [{ frame: { id: "frame-nested", loaderId: "nested-loader", url: "https://example.test/nested", securityOrigin: "https://example.test" } }] }] } };
         }
-        return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: rootFrameSecurityOrigin }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl, securityOrigin: "https://frame.example" } }] } };
+        return { frameTree: { frame: { id: "root-frame", loaderId: "root-loader", url: "https://example.test/root", securityOrigin: rootFrameSecurityOrigin }, childFrames: [{ frame: { id: "frame-oopif", loaderId: childFrameLoaderId, url: childFrameUrl, securityOrigin: childFrameUrl.startsWith("http") ? new URL(childFrameUrl).origin : "null" } }] } };
+      }
+      if (method === "DOM.getDocument" && detachDuringInventory) {
+        detachDuringInventory = false;
+        debuggerEvent?.({ tabId: target.tabId }, "Target.detachedFromTarget", { sessionId: target.sessionId || "fixture-parent-oopif-session" });
       }
       if (method === "DOM.getDocument" && target.sessionId === "fixture-oopif-session") return fallbackFrameFileInputDocument || { root: { nodeName: "#document" } };
       if (method === "DOM.getDocument" && fallbackFileInputDocument) return fallbackFileInputDocument;
@@ -502,7 +534,12 @@ const chrome = {
       if (method === "DOM.getFrameOwner" && params?.frameId === "frame-parent") return { backendNodeId: 998 };
       if (method === "DOM.getFrameOwner" && params?.frameId === "frame-nested") return { backendNodeId: 997 };
       if (method === "DOM.getFrameOwner") return { backendNodeId: 999 };
-      if (method === "DOM.getBoxModel" && params?.backendNodeId === 999) return { model: { content: [100, 200, 300, 200, 300, 400, 100, 400] } };
+      if (method === "DOM.getBoxModel" && params?.backendNodeId === 999) {
+        frameSwipeOwnerBoxReads++;
+        if(nonAffineFrameSwipeFixture)return {model:{content:[100,200,300,200,310,400,100,400]}};
+        const shift=changingFrameSwipeTransformFixture&&frameSwipeOwnerBoxReads>=3?12:0;
+        return { model: { content: [100+shift, 200, 300+shift, 200, 300+shift, 400, 100+shift, 400] } };
+      }
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 998) return { model: { content: [50, 60, 250, 60, 250, 210, 50, 210] } };
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 997) {
         nestedOwnerBoxReads += 1;
@@ -544,6 +581,12 @@ const chrome = {
   },
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
+assert.match(backgroundSource, /const documents = await Promise\.all\(/,
+  "independent frame document inventory remains parallelized");
+assert.match(backgroundSource, /clearFrameSessions\(tabId\)/,
+  "frame inventory is fenced when a target detaches");
+assert.match(backgroundSource, /Frame inventory target topology changed during parallel document reads/,
+  "parallel frame inventory discards reads after topology drift");
 const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
 const extensionAssetBytes = new Map(extensionBuildAssets.map(name => [name, fs.readFileSync(new URL(`./${name}`, `file://${__filename}`))]));
 const expectedExtensionDigest = createHash("sha256");
@@ -568,7 +611,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
 
@@ -635,7 +678,21 @@ async function waitFor(predicate, description) {
   let native = nativePorts[0];
   if (process.argv.includes("--reconnect-only")) {
     let candidate = native;
+    localStorage.controllaNativeLeaseJournalV1 = { schema_version: 1, sequence: 7, status: "recovery_required",
+      leases: [{ lease_id: "interrupted", tabs: [1], unrestricted: false, generation: 4, saved_at_ms: 1000 }] };
     candidate.hostMessage({ type: "ready" });
+    await waitFor(() => candidate.sent.some(message => message.type === "recovery_status"), "recovery journal resync");
+    const recovery = candidate.sent.find(message => message.type === "recovery_status");
+    assert.equal(recovery.schema_version, 1);
+    assert.equal(recovery.sequence, 7);
+    assert.equal(recovery.status, "recovery_required");
+    assert.deepEqual(recovery.leases.map(lease => lease.lease_id), ["interrupted"]);
+    candidate.hostMessage({ type: "recovery_ack", sequence: 6 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal((await message({ type: "native-status" })).recovery_journal.status, "recovery_required", "stale acknowledgements cannot clear recovery state");
+    candidate.hostMessage({ type: "recovery_ack", sequence: 7 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal((await message({ type: "native-status" })).recovery_journal.status, "clear", "matching acknowledgement clears the durable checkpoint");
     candidate.disconnect("native host unavailable");
     await new Promise(resolve => setTimeout(resolve, 0));
     runBackground();
@@ -669,6 +726,11 @@ async function waitFor(predicate, description) {
   assert.equal(listed.request_id, "list-1");
   assert.equal(listed.tabs.length, 100, "tab listing is capped");
   assert.equal(listed.truncated, true, "tab listing reports when eligible tabs were omitted");
+  assert.equal(listed.offset, 0);
+  assert.equal(listed.total_count, 102);
+  assert.equal(listed.next_offset, 100, "bounded inventory exposes the next explicit page offset");
+  assert.deepEqual(JSON.parse(JSON.stringify(listed.windows)), [{ id:1, focused:false, state:"normal", type:"normal", incognito:false }, { id:2, focused:false, state:"normal", type:"normal", incognito:false }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(listed.groups)), [{ id:7, window_id:1, title:"Research", color:"blue", collapsed:true }]);
   assert.equal(listed.last_focused_window_id, 1, "tab inventory identifies the last-focused Chrome window");
   assert.ok(listed.tabs.every(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//.test(tab.url)));
   assert.ok(listed.tabs.every(tab => typeof tab.document_id === "string"));
@@ -678,7 +740,18 @@ async function waitFor(predicate, description) {
   assert.equal(listed.tabs.find(tab => tab.id === 41).active_for_open, false,
     "other stable tabs cannot win the default open anchor");
   assert.equal(listed.tabs.find(tab => tab.id === 41).window_id, 1);
+  assert.equal(listed.tabs.find(tab => tab.id === 41).group_id, 7,
+    "tab inventory retains Chrome tab-group membership alongside its window ID");
+  assert.equal(listed.tabs.find(tab => tab.id === 42).group_id, null,
+    "ungrouped tabs expose an explicit null group ID");
   assert.equal(listed.tabs.find(tab => tab.id === 41).last_accessed, 4100);
+  native.hostMessage({ type: "list_tabs", request_id: "list-1", offset: listed.next_offset, page_size: 100 });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const secondPage = native.sent.at(-1);
+  assert.equal(secondPage.offset, 100);
+  assert.equal(secondPage.tabs.length, 2);
+  assert.equal(secondPage.next_offset, null);
+  assert.equal(secondPage.truncated, false, "the final bounded page marks inventory complete");
   const focusedBeyondCap = { id: 104, windowId: 3, lastAccessed: 10400, title: "Focused late tab", url: "https://example.test/focused-late", status: "complete" };
   tabList.push(focusedBeyondCap);
   focusedWindowActiveTabId = focusedBeyondCap.id;
@@ -741,6 +814,13 @@ async function waitFor(predicate, description) {
     }
     throw new Error(`Timed out waiting for command result ${id}`);
   };
+  rendererFrameUnavailable = true;
+  native.hostMessage({ type: "command", id: "screenshot-without-renderer-frame", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  const missingRendererFrame = await waitForCommandResult("screenshot-without-renderer-frame");
+  assert.equal(missingRendererFrame.reason_code, "screenshot_render_frame_unavailable");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, captureCountBeforeDiscarded,
+    "renderer-frame uncertainty refuses before compositor capture");
+  rendererFrameUnavailable = false;
   let topologyCommandEntered, releaseTopologyCommand;
   const topologyCommandBlocked = new Promise(resolve => { topologyCommandEntered = resolve; });
   const topologyCommandRelease = new Promise(resolve => { releaseTopologyCommand = resolve; });
@@ -768,7 +848,7 @@ async function waitFor(predicate, description) {
   assert.equal(reorderedCommand.result.reason_code, "tab_topology_changed");
   screenshotDataOverride = makePngBase64();
   native.hostMessage({ type: "command", id: 97001, target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
-  await new Promise(resolve => setTimeout(resolve, 25));
+  await waitFor(() => native.sent.filter(reply => reply.type === "result_chunk" && reply.id === 97001).length === 3, "runtime-generated chunked screenshot response");
   const screenshotChunks = native.sent.filter(reply => reply.type === "result_chunk" && reply.id === 97001);
   assert.equal(screenshotChunks.length, 3, `large screenshot responses are split into bounded native-message chunks: ${JSON.stringify(native.sent.filter(reply => reply.id === 97001))}`);
   assert.deepEqual(screenshotChunks.map(reply => reply.index), [0, 1, 2]);
@@ -786,7 +866,11 @@ async function waitFor(predicate, description) {
   assert.deepEqual(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").at(-1)?.params, runtimeScreenshotParams,
     "the exact runtime-generated screenshot parameters reach the extension's bounded validator and Chrome dispatch");
   assert.equal(screenshotChunks[0].visual_evidence.target_lifecycle, "active");
-  assert.equal(screenshotChunks[0].visual_evidence.render_revision, null, "pixel integrity is not mislabeled as renderer freshness");
+  assert.equal(screenshotChunks[0].visual_evidence.render_revision, "document-41:42.500", "fresh renderer frame is bound to the screenshot document");
+  assert.equal(screenshotChunks[0].visual_evidence.render_frame_timestamp_ms, 42.5);
+  assert.equal(screenshotChunks[0].visual_evidence.render_frame_provenance, "two_animation_frames_before_compositor_capture");
+  assert.ok(debuggerCalls.some(call => call.method === "Runtime.evaluate" && call.params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")),
+    "extension waits for a new renderer animation frame before screenshot dispatch");
   screenshotDataOverride = undefined;
   const capturesBeforeTransition = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
   freezeDuringScreenshot = true;
@@ -823,7 +907,7 @@ async function waitFor(predicate, description) {
     format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 }
   } });
   native.hostMessage({ type: "cancel_screenshot", id: 97002, lease_id: "pair-1" });
-  await new Promise(resolve => setTimeout(resolve, 25));
+  await waitFor(() => native.sent.some(reply => reply.type === "result_chunk_abort" && reply.id === 97002), "canceled screenshot chunk abort");
   assert.ok(native.sent.some(reply => reply.type === "result_chunk_abort" && reply.id === 97002),
     "canceled screenshot chunk delivery emits an explicit transfer abort for immediate native cleanup");
   assert.equal(native.sent.some(reply => reply.type === "result_chunk" && reply.id === 97002), false,
@@ -1038,6 +1122,46 @@ async function waitFor(predicate, description) {
     "frame touch tap dispatches one touchStart and one touchEnd");
   assert.equal(debuggerCalls.filter(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchMouseEvent").length, frameMouseCallsBeforeTouch,
     "frame touch never falls back to mouse input");
+  const priorSwipeActiveTab=focusedWindowActiveTabId;
+  focusedWindowActiveTabId=41;tabList.find(tab=>tab.id===41).active=true;tabList.find(tab=>tab.id===42).active=false;
+  const frameSwipeStart=debuggerCalls.length;
+  native.hostMessage({type:"command",id:"oopif-guarded-swipe",target_id:"41",method:"Controlla.frameSwipe",params:{
+    frame_id:"frame-oopif",loader_id:"fixture-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500
+  }});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const frameSwipeResult=native.sent.findLast(message=>message.id==="oopif-guarded-swipe")?.result;
+  assert.equal(frameSwipeResult?.status,"verified",JSON.stringify(frameSwipeResult));
+  assert.equal(frameSwipeResult?.coordinate_space,"child_frame_css_viewport");
+  const frameSwipeEvents=debuggerCalls.slice(frameSwipeStart).filter(call=>!call.target.sessionId&&call.method==="Input.dispatchTouchEvent");
+  assert.deepEqual(frameSwipeEvents.map(call=>call.params.type),["touchStart","touchMove","touchEnd"],"frame swipe dispatches trusted single-finger touch phases through the root input route");
+  assert.deepEqual([frameSwipeEvents[0].params.touchPoints[0].x,frameSwipeEvents[0].params.touchPoints[0].y,frameSwipeEvents[1].params.touchPoints[0].x,frameSwipeEvents[1].params.touchPoints[0].y],[140,250,140,325],"child viewport coordinates are transformed through the OOPIF owner quad");
+  const touchCountBeforeStaleLoader=debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length;
+  native.hostMessage({type:"command",id:"stale-frame-swipe-loader-refused",target_id:"41",method:"Controlla.frameSwipe",params:{frame_id:"frame-oopif",loader_id:"stale-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500}});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(native.sent.findLast(message=>message.id==="stale-frame-swipe-loader-refused")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length,touchCountBeforeStaleLoader,"stale frame loader refuses before touch dispatch");
+  const touchCountBeforeBadTransform=debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length;
+  nonAffineFrameSwipeFixture=true;
+  native.hostMessage({type:"command",id:"non-affine-frame-swipe-refused",target_id:"41",method:"Controlla.frameSwipe",params:{frame_id:"frame-oopif",loader_id:"fixture-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500}});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(native.sent.findLast(message=>message.id==="non-affine-frame-swipe-refused")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length,touchCountBeforeBadTransform,"non-affine owner geometry refuses before touch dispatch");
+  nonAffineFrameSwipeFixture=false;frameSwipeOwnerBoxReads=0;changingFrameSwipeTransformFixture=true;
+  native.hostMessage({type:"command",id:"changing-frame-swipe-transform-refused",target_id:"41",method:"Controlla.frameSwipe",params:{frame_id:"frame-oopif",loader_id:"fixture-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500}});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(native.sent.findLast(message=>message.id==="changing-frame-swipe-transform-refused")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length,touchCountBeforeBadTransform,"changing owner transform refuses before touch dispatch");
+  changingFrameSwipeTransformFixture=false;frameSwipeOwnerBoxReads=0;
+  const touchCountBeforeOpaque=debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length;
+  childFrameUrl="about:blank";
+  native.hostMessage({type:"command",id:"opaque-frame-swipe-refused",target_id:"41",method:"Controlla.frameSwipe",params:{
+    frame_id:"frame-oopif",loader_id:"fixture-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500
+  }});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(native.sent.findLast(message=>message.id==="opaque-frame-swipe-refused")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length,touchCountBeforeOpaque,"opaque-origin frame swipe refuses before trusted input");
+  childFrameUrl="https://picker.example.test/";
+  focusedWindowActiveTabId=priorSwipeActiveTab;tabList.find(tab=>tab.id===41).active=false;tabList.find(tab=>tab.id===42).active=true;
   focusedWindowActiveTabId = 41;
   focusedWindowFocused = true;
   const nextCreatedBeforeSecureInput = nextCreatedTab;
@@ -1423,6 +1547,38 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.findLast(message => message.id === "guarded-touch-swipe-release-cleanup")?.result?.status, "unknown");
   assert.ok(debuggerCalls.slice(failedSwipeStart).some(call => call.method === "Input.dispatchTouchEvent" && call.params.type === "touchEnd"), "failed touch delivery still attempts touchEnd cleanup");
+  const pinchStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "guarded-two-finger-pinch", target_id: "41", method: "Controlla.pointerMultiTouch", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,cx,cy,startDistance,endDistance,expectedViewport){return {ok:true,viewport:'fixture-viewport',rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", center_x: 50, center_y: 50, start_distance: 40, end_distance: 80, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const pinchResult=native.sent.findLast(message=>message.id==="guarded-two-finger-pinch")?.result;
+  assert.equal(pinchResult?.status,"dispatched",JSON.stringify(pinchResult));
+  const pinchEvents=debuggerCalls.slice(pinchStart).filter(call=>call.method==="Input.dispatchTouchEvent");
+  assert.deepEqual(pinchEvents.map(call=>call.params.type),["touchStart","touchMove","touchEnd"]);
+  assert.equal(JSON.stringify(pinchEvents[0].params.touchPoints.map(point=>[point.id,point.x,point.y])),"[[1,30,50],[2,70,50]]","pinch start dispatches two distinct trusted contact points");
+  assert.equal(JSON.stringify(pinchEvents[1].params.touchPoints.map(point=>[point.id,point.x,point.y])),"[[1,10,50],[2,90,50]]","pinch move preserves contact identity and changes both positions");
+  assert.equal(JSON.stringify(pinchEvents[2].params.touchPoints),"[]","pinch always releases both contacts");
+  native.hostMessage({ type: "command", id: "out-of-bounds-multitouch", target_id: "41", method: "Controlla.pointerMultiTouch", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,cx,cy,startDistance,endDistance,expectedViewport){return {ok:true,viewport:'fixture-viewport',rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", center_x: 50, center_y: 50, start_distance: 40, end_distance: 500, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message=>message.id==="out-of-bounds-multitouch")?.error !== undefined,true,"invalid pinch ratio is rejected before dispatch");
+  assert.equal(debuggerCalls.slice(pinchStart).filter(call=>call.method==="Input.dispatchTouchEvent").length,3,"invalid pinch parameters emit no additional touch events");
+  rejectNextCommand="Input.dispatchTouchEvent";
+  const failedPinchStart=debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "pinch-release-cleanup", target_id: "41", method: "Controlla.pointerMultiTouch", params: {
+    object_id: "fixture-target", index: 0,
+    guard_function: "function(index,cx,cy,startDistance,endDistance,expectedViewport){return {ok:true,viewport:'fixture-viewport',rect:{left:0,top:0,width:100,height:100}}}",
+    viewport: "fixture-viewport", center_x: 50, center_y: 50, start_distance: 40, end_distance: 80, timeout_ms: 3000
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message=>message.id==="pinch-release-cleanup")?.result?.status,"unknown");
+  assert.ok(debuggerCalls.slice(failedPinchStart).some(call=>call.method==="Input.dispatchTouchEvent"&&call.params.type==="touchEnd"),"failed pinch delivery still attempts to release both contacts");
   tabList.find(tab => tab.id === 42).active = true;
   tabList.find(tab => tab.id === 41).active = false;
   const pointerCommandsBeforeInactiveAttempt = debuggerCalls.filter(call => call.target?.tabId === 41 && call.method === "Input.dispatchMouseEvent").length;
@@ -1545,8 +1701,7 @@ async function waitFor(predicate, description) {
   const openTabFrameReadsBefore = frameReadCounts.get(503) || 0;
   transientIdentityAfterAttach.add(503);
   native.hostMessage({ type: "command", id: "open-tab", target_id: "41", method: "Controlla.openTab", params: { url: "https://www.espn.com/", idempotency_key: "fixture:open-tab-12345" } });
-  await new Promise(resolve => setTimeout(resolve, 80));
-  const opened = native.sent.find(message => message.id === "open-tab");
+  const opened = await waitForCommandResult("open-tab");
   assert.ok(opened?.result, JSON.stringify(opened));
   assert.equal(opened.id, "open-tab");
   assert.equal(opened.result.tab_id, "503");
@@ -1757,9 +1912,24 @@ async function waitFor(predicate, description) {
   blockedDetach = { tabId: 17 };
   oldNative.disconnect();
   await new Promise(resolve => setTimeout(resolve, 0));
+  const recoveryState = await message({ type: "native-status" });
+  assert.equal(recoveryState.recovery_journal?.schema_version, 1, "disconnect persists a versioned recovery journal");
+  assert.equal(recoveryState.recovery_journal?.status, "recovery_required", "interrupted leases require explicit resync");
+  assert.ok(recoveryState.recovery_journal?.sequence > 0, "recovery journal changes have a monotonic sequence");
   reconnectTimers.at(-1).callback();
   const newNative = nativePorts[4];
   newNative.hostMessage({ type: "ready" });
+  await waitFor(() => newNative.sent.some(message => message.type === "recovery_status"), "recovery status after reconnect");
+  const recovery = newNative.sent.find(message => message.type === "recovery_status");
+  assert.equal(recovery.schema_version, 1);
+  assert.ok(recovery.sequence > 0);
+  assert.deepEqual(Array.from(recovery.leases, lease => lease.lease_id), ["late-pair"], "interrupted lease identity is available for resync");
+  newNative.hostMessage({ type: "recovery_ack", sequence: recovery.sequence });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal((await message({ type: "native-status" })).recovery_journal?.status, "recovery_required", "an acknowledgement without owner repair cannot clear the recovery checkpoint");
+  newNative.hostMessage({ type: "recovery_ack", sequence: recovery.sequence, recovery_complete: true });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal((await message({ type: "native-status" })).recovery_journal?.status, "clear", "owner-confirmed recovery clears the checkpoint");
   newNative.hostMessage({ type: "pair", request_id: "pair-after-disconnect", lease_id: "lease-after-disconnect", tab_ids: [53], expected_urls: expectedUrls([53]), expected_document_ids: expectedDocuments([53]) });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(attached.includes(53), false, "reconnected host waits for old disconnect cleanup");
@@ -1802,13 +1972,13 @@ async function waitFor(predicate, description) {
     type: "command", id: "bounded-screenshot", target_id: "18", method: "Page.captureScreenshot",
     params: { format: "png", fromSurface: true, captureBeyondViewport: false, clip: { x: 0, y: 0, width: 320, height: 180, scale: 1 } }
   }) });
-  assert.equal(debuggerCalls.length, screenshotCallsBefore + 1, "bounded screenshot capture is explicitly allowed for shared visual probes");
+  assert.equal(debuggerCalls.length, screenshotCallsBefore + 2, "bounded screenshot waits for a fresh renderer frame before compositor capture");
   assert.equal(activeSocket.sent.at(-1).result.data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB");
 
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed", target_id: "18", method: "Input.dispatchMouseEvent", params: { type: "mousePressed" }
   }) });
-  assert.equal(debuggerCalls.length, callsBeforeBlocked + 2);
+  assert.equal(debuggerCalls.length, callsBeforeBlocked + 3);
   assert.equal(debuggerCalls.at(-1).method, "Input.dispatchMouseEvent");
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "allowed-html5-drag", target_id: "18", method: "Input.dispatchDragEvent",
@@ -2065,6 +2235,7 @@ async function waitFor(predicate, description) {
   nestedFrameScrollFixture = true;
   identityAxNodes = [{ nodeId: "nested-oopif-control", role: { value: "button" }, name: { value: "Nested control" }, backendDOMNodeId: 777 }];
   attachNestedOopifParentOnNextAutoAttach = true;
+  await chrome.tabs.update(95, { active: true });
   let nestedSessionWaitCursor = reconnectTimers.length;
   const nestedOopifPressCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length;
   liveNative.hostMessage({ type: "command", id: "nested-oopif-frame-click-composed", target_id: "95", method: "Controlla.frameClick", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, outcome: { kind: "focused" }, timeout_ms: 250 } });
@@ -2080,6 +2251,18 @@ async function waitFor(predicate, description) {
   assert.equal(nestedPress?.params.y, 108);
   assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed").length, nestedOopifPressCount + 1);
   assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-parent-oopif-session" && call.method === "DOM.getFrameOwner" && call.params.frameId === "frame-nested"), "nested frame owner is resolved through its immediate OOPIF parent session");
+  fixtureScrollTop = 20;
+  const nestedOopifWheelCount = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
+  liveNative.hostMessage({ type: "command", id: "nested-oopif-frame-scroll-composed", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-nested", loader_id: "nested-loader", backend_node_id: 777, delta_x: 0, delta_y: 20, timeout_ms: 1500 } });
+  for (let attempt = 0; attempt < 8 && !liveNative.sent.some(message => message.id === "nested-oopif-frame-scroll-composed"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const timer of reconnectTimers.slice(nestedSessionWaitCursor).filter(timer => timer.delay === 400)) timer.callback();
+    nestedSessionWaitCursor = reconnectTimers.length;
+  }
+  const nestedOopifScroll = liveNative.sent.findLast(message => message.id === "nested-oopif-frame-scroll-composed")?.result;
+  assert.equal(nestedOopifScroll?.status, "verified", JSON.stringify(nestedOopifScroll));
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, nestedOopifWheelCount + 1, "nested OOPIF scrolling dispatches one mapped root wheel event");
+  assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-nested-oopif-session" && call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(dx,dy,expectedViewport,expectedContainer)")), "nested OOPIF scroll guards the container in its child session");
   debuggerEvent?.({ tabId: 95 }, "Target.detachedFromTarget", { sessionId: "fixture-parent-oopif-session" });
   debuggerEvent?.({ tabId: 95 }, "Target.detachedFromTarget", { sessionId: "fixture-nested-oopif-session" });
   nestedFrameScrollFixture = false;
@@ -2135,6 +2318,7 @@ async function waitFor(predicate, description) {
   const rootPress = debuggerCalls.findLast(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed");
   assert.equal(rootPress?.params.x, 140, "same-process frame click includes iframe offset and scale");
   assert.equal(rootPress?.params.y, 260);
+  await chrome.tabs.update(95, { active: true });
   attachOopifOnNextAutoAttach = true;
   const frameWheelCountBeforeOopif = debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length;
   liveNative.hostMessage({ type: "command", id: "oopif-frame-scroll-refused", target_id: "95", method: "Controlla.frameScroll", params: { frame_id: "frame-oopif", loader_id: childFrameLoaderId, backend_node_id: 777, delta_x: 0, delta_y: 120, timeout_ms: 1500 } });
@@ -2142,8 +2326,10 @@ async function waitFor(predicate, description) {
   reconnectTimers.findLast(timer => timer.delay === 400)?.callback();
   await new Promise(resolve => setTimeout(resolve, 10));
   const oopifScrollResult = liveNative.sent.findLast(message => message.id === "oopif-frame-scroll-refused")?.result;
-  assert.equal(oopifScrollResult?.status, "not_dispatched", JSON.stringify(oopifScrollResult));
-  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, frameWheelCountBeforeOopif, "OOPIF child-frame scroll fails closed before wheel delivery");
+  assert.equal(oopifScrollResult?.status, "verified", JSON.stringify(oopifScrollResult));
+  assert.equal(debuggerCalls.filter(call => call.target.tabId === 95 && call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel").length, frameWheelCountBeforeOopif + 1, "OOPIF child-frame scroll maps its target to one root wheel event");
+  assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Accessibility.getFullAXTree"), "OOPIF scroll reads accessibility identity from the owning child session");
+  assert.ok(debuggerCalls.some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(dx,dy,expectedViewport,expectedContainer)")), "OOPIF scroll validates and reads back the container in the child session");
   nestedFrameScrollFixture = true;
   await chrome.tabs.update(95, { active: true });
   identityAxNodes = [{ nodeId: "nested-scroll", role: { value: "generic" }, name: { value: "Nested scroll region" }, backendDOMNodeId: 777 }];
@@ -2849,11 +3035,16 @@ async function waitFor(predicate, description) {
   const cancelArm = await sendDownloadCommand("download-cancel-arm", {
     action: "arm", expected_url: "https://example.test/files/cancel.bin", expected_document_id: expectedDocuments([98])[98]
   });
+  void sendDownloadCommand("download-cancel-started-wait", {
+    action: "wait", observer_id: cancelArm.result.observer_id, timeout_ms: 1000
+  });
   emitDownloadCreated({ id: 9103, tabId: 98, url: "https://example.test/files/cancel.bin", finalUrl: "https://example.test/files/cancel.bin",
     filename: "/tmp/cancel.bin", state: "in_progress", bytesReceived: 0, totalBytes: 20 });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  const startedCancel = await waitForNativeMessage("download-cancel-started-wait");
+  assert.equal(startedCancel.result.status, "started", "cancellation waits until Chrome's download is bound to the observer");
   const cancelled = await sendDownloadCommand("download-cancel", { action: "cancel", observer_id: cancelArm.result.observer_id });
   assert.equal(cancelled.result.status, "observer_cancelled");
+  assert.equal(cancelled.result.download_cancel_acknowledged, true);
   assert.ok(cancelledDownloads.includes(9103));
 
   const detachArm = await sendDownloadCommand("download-detach-arm", {
@@ -2886,6 +3077,18 @@ async function waitFor(predicate, description) {
   tabsRemoved?.(97);
   const closeResult = await waitForNativeMessage("download-close-wait");
   assert.match(closeResult.error, /stale target/);
+
+  detachDuringInventory = true;
+  await assert.rejects(
+    backgroundContext.__testHooks.fileInputsInFrames(95, { frame: { id: "frame-root", loaderId: "loader-root" } }),
+    /topology changed while resolving child sessions|topology changed during parallel document reads/,
+    "parallel frame inventory discards a result after an in-flight target detach"
+  );
+
+  const cdpStarted = Date.now();
+  await assert.rejects(backgroundContext.__testHooks.sendCdpCommand({ tabId: 1 }, "Test.never", {}, 10), error =>
+    error.reason_code === "cdp_command_timeout" && error.dispatch_may_have_occurred === true);
+  assert.ok(Date.now() - cdpStarted < 250, "a stuck CDP promise must be bounded");
 
   console.log("Extension version handshake, pairing cleanup, chooser/download event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -5,6 +5,7 @@ const RECONNECT_MAX_MS = 60000;
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
 const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
+const NATIVE_LEASE_JOURNAL_KEY = "controllaNativeLeaseJournalV1";
 const OPEN_RECEIPTS_KEY = "openReceipts";
 const ACTIVATION_RECEIPTS_KEY = "activationReceipts";
 const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -17,6 +18,8 @@ function uploadInputPolicyFunction() { return "function(names){const e=this;if(!
 const DOWNLOAD_OBSERVER_TTL_MS = 60000;
 const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
 const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
+  const runtimeFallback = `controlla-chrome-extension:${chrome.runtime.getManifest().version}:runtime`;
+  const compute = (async () => {
   const assets = await Promise.all(CONTROLLA_EXTENSION_BUILD_ASSETS.map(async name => {
     const response = await fetch(chrome.runtime.getURL(name));
     if (!response.ok) throw new Error(`Cannot verify installed Controlla extension asset ${name}.`);
@@ -30,11 +33,32 @@ const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
   for (const part of parts) { input.set(part, offset); offset += part.length; }
   const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", input))]
     .map(byte => byte.toString(16).padStart(2, "0")).join("");
-  return `controlla-chrome-extension:${chrome.runtime.getManifest().version}:${digest}`;
+    return `controlla-chrome-extension:${chrome.runtime.getManifest().version}:${digest}`;
+  })();
+  return await Promise.race([
+    compute,
+    new Promise(resolve => setTimeout(() => resolve(runtimeFallback), 750)),
+  ]);
 })();
 const SCREENSHOT_CHUNK_CHARS = 512 * 1024;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Page.getLayoutMetrics", "Page.captureScreenshot", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
   "Input.dispatchMouseEvent", "Input.dispatchDragEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser", "Controlla.downloadLifecycle", "Controlla.scrollToTarget"]);
+async function sendCdpCommand(target, method, params, timeoutMs = 30000) {
+  const boundedTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(1, Math.min(60000, timeoutMs)) : 30000;
+  let timer;
+  try {
+    return await Promise.race([
+      chrome.debugger.sendCommand(target, method, params),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error(`CDP command ${method} exceeded its ${boundedTimeoutMs}ms deadline.`), {
+          reason_code: "cdp_command_timeout", dispatch_may_have_occurred: true,
+        })), boundedTimeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 let nativePort;
 let nativeReady = false;
 let nativeError;
@@ -55,6 +79,27 @@ let nativeAttachedTabs = new Set();
 const nativeLeases = new Map();
 const nativeTabLeases = new Map();
 const nativeLeaseGenerations = new Set();
+let nativeRecoveryPending = false;
+async function persistNativeLeaseJournal() {
+  const leases = [...nativeLeases.values()].map(lease => ({
+    lease_id: lease.id,
+    tabs: [...lease.tabs],
+    unrestricted: lease.unrestricted === true,
+    generation: lease.generation,
+    saved_at_ms: Date.now(),
+  }));
+  const saved = await chrome.storage.local.get(NATIVE_LEASE_JOURNAL_KEY).catch(() => ({}));
+  const previous = saved[NATIVE_LEASE_JOURNAL_KEY];
+  if (nativeRecoveryPending && previous?.status === "recovery_required") return;
+  const journal = { schema_version: 1, sequence: (Number.isSafeInteger(previous?.sequence) ? previous.sequence : 0) + 1,
+    status: nativeRecoveryPending ? "recovery_required" : leases.length ? "active" : "clear", leases };
+  await chrome.storage.local.set({ [NATIVE_LEASE_JOURNAL_KEY]: journal }).catch(() => {});
+}
+async function readNativeLeaseJournal() {
+  const saved = await chrome.storage.local.get(NATIVE_LEASE_JOURNAL_KEY).catch(() => ({}));
+  const journal = saved[NATIVE_LEASE_JOURNAL_KEY];
+  return journal?.schema_version === 1 && Array.isArray(journal.leases) ? journal : { schema_version: 1, sequence: 0, status: "clear", leases: [] };
+}
 const pairedTabUrls = new Map();
 const pairedTabDocumentIds = new Map();
 const pairedTabTopologyGenerations = new Map();
@@ -304,7 +349,7 @@ chrome.downloads.onChanged.addListener(delta => {
   }
 });
 async function frameActionablePoint(route, objectId) {
-  const result = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: frameActionableGuardFunction(), returnByValue: true });
+  const result = await sendCdpCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: frameActionableGuardFunction(), returnByValue: true });
   const point = result.result?.value;
   if (!(point?.x >= 0) || !(point?.y >= 0)) throw new Error("Frame control is disabled, outside the viewport, or obscured.");
   return point;
@@ -332,7 +377,7 @@ function frameActionableGuardFunction() {
   }`;
 }
 async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) {
-  const root = { tabId }, tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+  const root = { tabId }, tree = await sendCdpCommand(root, "Page.getFrameTree", {});
   const path = (node, ancestors = []) => node?.frame?.id === frameId ? [...ancestors, node.frame] : (node?.childFrames || []).map(child => path(child, [...ancestors, node.frame])).find(Boolean);
   const chain = path(tree.frameTree, []);
   if (!chain?.length || chain.length < 2 || chain.length > 9) throw new Error("Frame ancestry is unavailable or too deep.");
@@ -341,7 +386,7 @@ async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) 
   const owners = [];
   let viewport = childViewport;
   if (!(viewport?.width > 0) || !(viewport?.height > 0)) {
-    const measured = await chrome.debugger.sendCommand({ tabId, sessionId: frameSessions.get(tabId)?.get(frameId) }, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+    const measured = await sendCdpCommand({ tabId, sessionId: frameSessions.get(tabId)?.get(frameId) }, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
     viewport = measured.result?.value;
   }
   // Each child owner belongs to its immediate parent document. Route that
@@ -351,48 +396,48 @@ async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) 
     const childFrame = chain[index], parentFrame = chain[index - 1];
     const parentSession = frameSessions.get(tabId)?.get(parentFrame.id);
     const parentRoute = parentSession ? { tabId, sessionId: parentSession } : root;
-    const owner = await chrome.debugger.sendCommand(parentRoute, "DOM.getFrameOwner", { frameId: childFrame.id });
+    const owner = await sendCdpCommand(parentRoute, "DOM.getFrameOwner", { frameId: childFrame.id });
     const ownerId = owner?.backendNodeId;
     if (!Number.isSafeInteger(ownerId) || ownerId <= 0) throw new Error("Frame owner identity is unavailable in its parent session.");
-    const box = await chrome.debugger.sendCommand(parentRoute, "DOM.getBoxModel", { backendNodeId: ownerId });
+    const box = await sendCdpCommand(parentRoute, "DOM.getBoxModel", { backendNodeId: ownerId });
     const q = box.model?.content;
     if (!Array.isArray(q) || q.length !== 8 || !q.every(Number.isFinite) || !(viewport?.width > 0) || !(viewport?.height > 0)) throw new Error("Frame owner geometry is unavailable.");
     if (Math.abs(q[0] + q[4] - q[2] - q[6]) > 1 || Math.abs(q[1] + q[5] - q[3] - q[7]) > 1) throw new Error("Perspective or non-affine frame transforms are unsupported.");
     const u = x / viewport.width, v = y / viewport.height;
     x = q[0] + u * (q[2] - q[0]) + v * (q[6] - q[0]);
     y = q[1] + u * (q[3] - q[1]) + v * (q[7] - q[1]);
-    const resolved = await chrome.debugger.sendCommand(parentRoute, "DOM.resolveNode", { backendNodeId: ownerId });
+    const resolved = await sendCdpCommand(parentRoute, "DOM.resolveNode", { backendNodeId: ownerId });
     if (!resolved.object?.objectId) throw new Error("Frame owner could not be resolved in its parent session.");
     try {
-      const hit = await chrome.debugger.sendCommand(parentRoute, "Runtime.callFunctionOn", {
+      const hit = await sendCdpCommand(parentRoute, "Runtime.callFunctionOn", {
         objectId: resolved.object.objectId,
         functionDeclaration: "function(x,y){const s=getComputedStyle(this);return this.isConnected&&s.display!=='none'&&s.visibility==='visible'&&s.pointerEvents!=='none'&&document.elementFromPoint(x,y)===this}",
         arguments: [{ value: x }, { value: y }], returnByValue: true,
       });
       if (hit?.result?.value !== true) throw new Error("The transformed frame point is obscured or outside its owner.");
-      const size = await chrome.debugger.sendCommand(parentRoute, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+      const size = await sendCdpCommand(parentRoute, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
       const parentViewport = size.result?.value;
       if (!(parentViewport?.width > 0) || !(parentViewport?.height > 0)) throw new Error("Parent frame viewport is unavailable.");
       owners.push({ child: childFrame.id, childLoader: childFrame.loaderId, parent: parentFrame.id, parentLoader: parentFrame.loaderId, parentSession: parentSession || null, ownerId, quad: q });
       viewport = parentViewport;
     } finally {
-      await chrome.debugger.sendCommand(parentRoute, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+      await sendCdpCommand(parentRoute, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
     }
   }
-  const latestTree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+  const latestTree = await sendCdpCommand(root, "Page.getFrameTree", {});
   const latestChain = path(latestTree.frameTree, []);
   if (!latestChain || latestChain.length !== chain.length || latestChain.some((frame, index) => frame.id !== chain[index].id || frame.loaderId !== chain[index].loaderId)) throw new Error("Frame ancestry or loader changed during owner mapping.");
   if (chain.slice(0, -1).some((frame, index) => (frameSessions.get(tabId)?.get(frame.id) || null) !== initialSessions[index])) throw new Error("Frame owner session changed during owner mapping.");
   return { x, y, owner_signature: owners };
 }
 async function directFramePoint(tabId, frameId, loaderId, x, y, childViewport) {
-  const route = { tabId }, tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+  const route = { tabId }, tree = await sendCdpCommand(route, "Page.getFrameTree", {});
   const root = tree?.frameTree, matches = (root?.childFrames || []).filter(child => child?.frame?.id === frameId);
   if (matches.length !== 1 || matches[0].frame.loaderId !== loaderId) throw new Error("Only a fresh direct child frame can be mapped safely.");
-  const owner = await chrome.debugger.sendCommand(route, "DOM.getFrameOwner", { frameId });
+  const owner = await sendCdpCommand(route, "DOM.getFrameOwner", { frameId });
   const ownerNodeId = owner?.backendNodeId;
   if (!Number.isSafeInteger(ownerNodeId) || ownerNodeId <= 0) throw new Error("Frame owner identity is unavailable.");
-  const box = await chrome.debugger.sendCommand(route, "DOM.getBoxModel", { backendNodeId: ownerNodeId });
+  const box = await sendCdpCommand(route, "DOM.getBoxModel", { backendNodeId: ownerNodeId });
   const q = box?.model?.content;
   if (!Array.isArray(q) || q.length !== 8 || !q.every(Number.isFinite) || !(childViewport?.width > 0) || !(childViewport?.height > 0)) throw new Error("Frame transform geometry is unavailable.");
   // A parallelogram is the evidence that one affine transform maps this
@@ -402,14 +447,14 @@ async function directFramePoint(tabId, frameId, loaderId, x, y, childViewport) {
     x: q[0] + x / childViewport.width * (q[2] - q[0]) + y / childViewport.height * (q[6] - q[0]),
     y: q[1] + x / childViewport.width * (q[3] - q[1]) + y / childViewport.height * (q[7] - q[1]),
   };
-  const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: ownerNodeId });
+  const resolved = await sendCdpCommand(route, "DOM.resolveNode", { backendNodeId: ownerNodeId });
   if (!resolved?.object?.objectId) throw new Error("Frame owner could not be resolved for hit testing.");
-  const hit = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", {
+  const hit = await sendCdpCommand(route, "Runtime.callFunctionOn", {
     objectId: resolved.object.objectId,
     functionDeclaration: "function(x,y){const s=getComputedStyle(this);return this.isConnected&&s.display!=='none'&&s.visibility==='visible'&&s.pointerEvents!=='none'&&document.elementFromPoint(x,y)===this}",
     arguments: [{ value: rootPoint.x }, { value: rootPoint.y }], returnByValue: true,
   });
-  await chrome.debugger.sendCommand(route, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+  await sendCdpCommand(route, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
   if (hit?.result?.value !== true) throw new Error("The transformed frame point is obscured or outside its owner.");
   return rootPoint;
 }
@@ -434,12 +479,15 @@ async function fileInputsInFrames(tabId, frameTree) {
   const visit = node => { for (const child of node?.childFrames || []) { if (child.frame?.id && child.frame.loaderId) frames.push(child.frame); visit(child); } };
   visit(frameTree);
   if (frames.length > 128) throw new Error("Too many frames for bounded file-input discovery.");
-  await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+  await sendCdpCommand({ tabId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
   try {
+    const inventoryGeneration = pairedTabTopologyGenerations.get(tabId) || 0;
     const sessions = await Promise.all(frames.map(async child => [child, frameSessions.get(tabId)?.get(child.id) || await waitForFrameSession(tabId, child.id, 400)]));
+    if (!pairedTabTopologyStable(tabId, inventoryGeneration)) throw new Error("Frame inventory target topology changed while resolving child sessions.");
     const routes = [{ frameId: root.id, loaderId: root.loaderId, target: { tabId } }, ...sessions.filter(([, sessionId]) => sessionId).map(([child, sessionId]) => ({ frameId: child.id, loaderId: child.loaderId, target: { tabId, sessionId } }))];
     const inputs = [];
-    const documents = await Promise.all(routes.map(route => chrome.debugger.sendCommand(route.target, "DOM.getDocument", { depth: -1, pierce: true })));
+    const documents = await Promise.all(routes.map(route => sendCdpCommand(route.target, "DOM.getDocument", { depth: -1, pierce: true })));
+    if (!pairedTabTopologyStable(tabId, inventoryGeneration)) throw new Error("Frame inventory target topology changed during parallel document reads.");
     for (let index = 0; index < routes.length; index++) {
       const route = routes[index];
       inputs.push(...fileInputNodes(documents[index].root).map(backendNodeId => ({ frame_id: route.frameId, frame_loader_id: route.loaderId, backend_node_id: backendNodeId })));
@@ -447,7 +495,7 @@ async function fileInputsInFrames(tabId, frameTree) {
     }
     return inputs;
   } finally {
-    await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+    await sendCdpCommand({ tabId }, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
   }
 }
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -456,12 +504,13 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     captureUploadNetworkEvent(tabId, source, method, params || {});
     if (method === "Target.attachedToTarget" && params?.targetInfo?.type === "iframe" && typeof params.sessionId === "string") {
       recordFrameSession(tabId, params.targetInfo.targetId, params.sessionId);
-      void chrome.debugger.sendCommand({ tabId, sessionId: params.sessionId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] }).catch(() => {});
+      void sendCdpCommand({ tabId, sessionId: params.sessionId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] }).catch(() => {});
     } else if (method === "Page.frameNavigated" && typeof source.sessionId === "string" && typeof params?.frame?.id === "string") {
       recordFrameSession(tabId, params.frame.id, source.sessionId);
     } else if (method === "Target.detachedFromTarget") {
       const frames = frameSessions.get(tabId);
       if (frames) for (const [frameId, sessionId] of frames) if (sessionId === params?.sessionId) frames.delete(frameId);
+      bumpPairedTabTopology(tabId);
     }
   }
   if (method !== "Page.fileChooserOpened" || !Number.isSafeInteger(source?.tabId)) return;
@@ -472,7 +521,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const sequence = ++fileChooserEventSequence;
   const operation = fileChooserOperations.get(tabId);
   if (operation && (!operation.pressing || operation.frameId !== frameId)) operation.conflicted = true;
-  void chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {}).then(tree => {
+  void sendCdpCommand({ tabId }, "Page.getFrameTree", {}).then(tree => {
     const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
     const frame = find(tree.frameTree);
     if (!frame?.loaderId || pairedTabDocumentIds.get(tabId) !== documentId) return;
@@ -515,6 +564,12 @@ function sendNative(port, generation, message) {
     }
     port.postMessage(message); return true;
   } catch { return false; }
+}
+function boundedNativeApi(promise, fallback, timeoutMs = 1500) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise(resolve => setTimeout(() => resolve(fallback), timeoutMs)),
+  ]);
 }
 async function sendScreenshotResponse(port, generation, response) {
   const data = response?.result?.data;
@@ -580,7 +635,7 @@ async function fastTypeProgram(tabId, params, isAuthorized) {
     if (!isAuthorized(tabId) || performance.now() >= deadline) return { ok: false, reason: "deadline_or_session_changed" };
     guardChecks++;
     try {
-      const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", { objectId, functionDeclaration: FAST_TYPE_GUARD, arguments: [{ value: index }, { value }, { value: prepare }, { value: normalizeParagraphs }, { value: true }], returnByValue: true });
+      const response = await sendCdpCommand({ tabId }, "Runtime.callFunctionOn", { objectId, functionDeclaration: FAST_TYPE_GUARD, arguments: [{ value: index }, { value }, { value: prepare }, { value: normalizeParagraphs }, { value: true }], returnByValue: true });
       return response?.result?.value || { ok: false, reason: "guard_response_missing" };
     } catch { return { ok: false, reason: "guard_read_failed" }; }
   };
@@ -595,21 +650,21 @@ async function fastTypeProgram(tabId, params, isAuthorized) {
     const enter = character === "\n", key = enter ? "Enter" : character;
     const keyDown = enter ? { type: "keyDown", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36, text: "\r", unmodifiedText: "\r" } : { type: "keyDown", key };
     keyEvents++;
-    try { await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", keyDown); }
+    try { await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", keyDown); }
     catch (error) { return { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "key_down_delivery_unknown", error: safeNativeError(String(error)) }; }
     if (enter) progress += character;
     const afterDown = await guard(progress);
     if (afterDown.ok !== true) return { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "focus_or_value_changed_after_keydown", guard: afterDown };
     if (!enter) {
       keyEvents++;
-      try { await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character }); }
+      try { await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character }); }
       catch (error) { return { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "character_delivery_unknown", error: safeNativeError(String(error)) }; }
       progress += character;
     }
     const afterInput = enter ? afterDown : await guard(progress);
     if (afterInput.ok !== true) return { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "focus_or_value_changed_after_character", guard: afterInput };
     keyEvents++;
-    try { await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", key, ...(enter ? { code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 } : {}) }); }
+    try { await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", key, ...(enter ? { code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 } : {}) }); }
     catch (error) { return { status: "unknown", completed_chars: completedChars, key_events: keyEvents, cdp_commands: keyEvents + guardChecks, readback: progress, reason: "key_up_delivery_unknown", error: safeNativeError(String(error)) }; }
     completedChars++;
   }
@@ -626,7 +681,7 @@ async function humanTypeCharacter(tabId, params, isAuthorized) {
   const guard = async value => {
     if (!isAuthorized(tabId) || performance.now() >= deadline) return { ok: false, reason: "deadline_or_session_changed" };
     try {
-      const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", { objectId, functionDeclaration: FAST_TYPE_GUARD, arguments: [{ value: index }, { value }, { value: false }, { value: normalizeParagraphs }, { value: true }], returnByValue: true });
+      const response = await sendCdpCommand({ tabId }, "Runtime.callFunctionOn", { objectId, functionDeclaration: FAST_TYPE_GUARD, arguments: [{ value: index }, { value }, { value: false }, { value: normalizeParagraphs }, { value: true }], returnByValue: true });
       return response?.result?.value || { ok: false, reason: "guard_response_missing" };
     } catch { return { ok: false, reason: "guard_read_failed" }; }
   };
@@ -641,7 +696,7 @@ async function humanTypeCharacter(tabId, params, isAuthorized) {
     if (before.ok !== true) return { status: "not_dispatched", completed_chars: 0, key_events: 0, cdp_commands: cdpCommands, readback: before.value, reason: before.reason || "editor_guard_rejected" };
     if (scalar > 0x7f) {
       if (!isAuthorized(tabId) || performance.now() >= deadline) return { status: "not_dispatched", completed_chars: 0, key_events: 0, cdp_commands: cdpCommands, readback: expected, reason: "deadline_or_session_changed" };
-      await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: character }); cdpCommands++;
+      await sendCdpCommand({ tabId }, "Input.insertText", { text: character }); cdpCommands++;
       progress += character;
       const afterInsert = await guard(progress); cdpCommands++;
       result = afterInsert.ok === true
@@ -651,13 +706,13 @@ async function humanTypeCharacter(tabId, params, isAuthorized) {
     }
     const down = enter ? { type: "keyDown", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36, text: "\r", unmodifiedText: "\r" } : { type: "keyDown", key };
     keyDownAttempted = true;
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", down); keyEvents++; cdpCommands++;
+    await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", down); keyEvents++; cdpCommands++;
     if (enter) progress += character;
     const afterDown = await guard(progress); cdpCommands++;
     if (afterDown.ok !== true) result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: afterDown.value ?? progress, reason: "focus_or_value_changed_after_keydown", guard: afterDown };
     else {
       if (!enter) {
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character }); keyEvents++; cdpCommands++;
+        await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character }); keyEvents++; cdpCommands++;
         progress += character;
       }
       const afterCharacter = enter ? afterDown : await guard(progress);
@@ -674,7 +729,7 @@ async function humanTypeCharacter(tabId, params, isAuthorized) {
       // CDP keyUp is tab-scoped and would otherwise reach a newly focused control.
       const focused = await guard(progress); cdpCommands++;
       if (focused.ok === true) {
-        try { await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", keyUp); keyEvents++; cdpCommands++; }
+        try { await sendCdpCommand({ tabId }, "Input.dispatchKeyEvent", keyUp); keyEvents++; cdpCommands++; }
         catch (error) { result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "key_up_cleanup_delivery_unknown", error: safeNativeError(String(error)) }; }
       } else {
         result = { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "focus_changed_keyup_suppressed_cleanup_unconfirmed", guard: focused };
@@ -700,7 +755,8 @@ function connectNative() {
     port.onMessage.addListener(message => { void handleNativeMessage(port, portGeneration, message); });
     port.onDisconnect.addListener(() => {
       if (nativePort !== port) return; nativeError = safeNativeError(chrome.runtime.lastError?.message); nativePort = undefined; nativeReady = false;
-      const generation = ++nativeGeneration; void queueNativeMutation(() => detachNative(generation)); scheduleNativeReconnect();
+      const generation = ++nativeGeneration; nativeRecoveryPending = nativeLeases.size > 0;
+      void queueNativeMutation(async () => { await persistNativeLeaseJournal(); await detachNative(generation); }); scheduleNativeReconnect();
     });
   } catch { scheduleNativeReconnect(); }
 }
@@ -713,16 +769,33 @@ async function handleNativeMessage(port, portGeneration, message) {
       nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false;
       void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {});
       sendNative(port, portGeneration, { type: "capabilities", protocol_version: 2, extension_build_id: extensionBuildId, multi_session_leases: true });
-    } catch {
+      const journal = await readNativeLeaseJournal();
+      if (port !== nativePort || portGeneration !== nativePortGeneration) return;
+      if (journal.status === "recovery_required" && journal.leases.length) {
+        sendNative(port, portGeneration, { type: "recovery_status", schema_version: journal.schema_version,
+          sequence: journal.sequence, status: journal.status, leases: journal.leases });
+      }
+    } catch (error) {
       nativeReady = false;
-      nativeError = "Cannot verify the installed Controlla extension build.";
+      nativeError = `Cannot verify the installed Controlla extension build: ${safeNativeError(error?.message || error)}`;
+      void chrome.storage.local.set({ controllaLastBuildHandshakeError: nativeError }).catch(() => {});
+    }
+    return;
+  }
+  if (message.type === "recovery_ack") {
+    const journal = await readNativeLeaseJournal();
+    if (journal.status === "recovery_required" && message.recovery_complete === true && Number.isSafeInteger(message.sequence) && message.sequence === journal.sequence) {
+      nativeRecoveryPending = false;
+      await chrome.storage.local.remove(NATIVE_LEASE_JOURNAL_KEY).catch(() => {});
     }
     return;
   }
   if (message.type === "list_tabs") {
     try {
-      const tabs = await chrome.tabs.query({});
-      const focusedWindowTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+      const offset = Number.isSafeInteger(message.offset) && message.offset >= 0 && message.offset <= 1000000 ? message.offset : 0;
+      const pageSize = Number.isSafeInteger(message.page_size) ? Math.min(100, Math.max(1, message.page_size)) : 100;
+      const tabs = await boundedNativeApi(chrome.tabs.query({}), [], 2000);
+      const focusedWindowTabs = await boundedNativeApi(chrome.tabs.query({ active: true, lastFocusedWindow: true }), [], 1000);
       const lastFocusedActive = focusedWindowTabs[0]?.id;
       const lastFocusedWindowId = Number.isSafeInteger(focusedWindowTabs[0]?.windowId) ? focusedWindowTabs[0].windowId : undefined;
       const eligible = tabs.filter(tab => Number.isSafeInteger(tab.id) && /^https?:\/\//i.test(tab.url || ""));
@@ -740,14 +813,31 @@ async function handleNativeMessage(port, portGeneration, message) {
           - (Number.isFinite(left.lastAccessed) ? left.lastAccessed : 0);
         return accessDelta || left.id - right.id;
       });
-      const listed = await Promise.all(prioritized.slice(0, 100).map(async tab => {
-        const firstFrame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }).catch(() => undefined);
-        const current = await chrome.tabs.get(tab.id).catch(() => undefined);
-        const lastFrame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }).catch(() => undefined);
+      const listed = await Promise.all(prioritized.slice(offset, offset + pageSize).map(async tab => {
+        const firstFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
+        const current = await boundedNativeApi(chrome.tabs.get(tab.id), undefined);
+        const lastFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
         const stableDocument = current?.status === "complete" && /^https?:\/\//i.test(current.url || "") && firstFrame?.documentId && firstFrame.documentId === lastFrame?.documentId && lastFrame.url === current.url;
-        return { id: tab.id, window_id: current?.windowId, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
+        return { id: tab.id, window_id: current?.windowId, group_id: Number.isSafeInteger(current?.groupId) && current.groupId >= 0 ? current.groupId : null, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
       }));
-      sendNative(port, portGeneration, { type: "tabs", request_id: message.request_id, last_focused_window_id: lastFocusedWindowId, truncated: eligible.length > listed.length, tabs: listed });
+      const [windows, groups] = await Promise.all([
+        chrome.windows.getAll({ windowTypes: ["normal", "popup"] }).catch(() => []),
+        chrome.tabGroups?.query ? chrome.tabGroups.query({}).catch(() => []) : Promise.resolve([])
+      ]);
+      const boundedWindows = windows.filter(win => Number.isSafeInteger(win.id));
+      const boundedGroups = groups.filter(group => Number.isSafeInteger(group.id));
+      const windowLimit = 100, groupLimit = 100;
+      sendNative(port, portGeneration, {
+        type: "tabs", request_id: message.request_id, offset, total_count: prioritized.length,
+        next_offset: offset + listed.length < prioritized.length ? offset + listed.length : null,
+        last_focused_window_id: lastFocusedWindowId,
+        truncated: offset + listed.length < prioritized.length || boundedWindows.length > windowLimit || boundedGroups.length > groupLimit,
+        windows_total: boundedWindows.length, windows_truncated: boundedWindows.length > windowLimit,
+        groups_total: boundedGroups.length, groups_truncated: boundedGroups.length > groupLimit,
+        windows: boundedWindows.slice(0, windowLimit).map(win => ({ id: win.id, focused: !!win.focused, state: win.state, type: win.type, incognito: !!win.incognito })),
+        groups: boundedGroups.slice(0, groupLimit).map(group => ({ id: group.id, window_id: group.windowId, title: String(group.title || "").slice(0, 256), color: group.color, collapsed: !!group.collapsed })),
+        tabs: listed
+      });
     } catch (error) { sendNative(port, portGeneration, { type: "tabs_error", request_id: message.request_id, error: String(error).slice(0, 512) }); }
     return;
   }
@@ -805,6 +895,10 @@ async function pairNative(port, portGeneration, message) {
       if (navigationGeneration !== (tabNavigationGenerations.get(tabId) || 0) || !attached || attached.status !== "complete" || attached.url !== beforeAttach.url || attachedFrame?.documentId !== beforeFrame.documentId) throw new Error("Tab " + tabId + " navigated during pairing; rediscover tabs and pair again.");
     }
     const extensionBuildId = await CONTROLLA_EXTENSION_BUILD_ID_PROMISE;
+    // A fresh, identity-checked pair is the owner-side recovery completion
+    // point. Until then the reconnect journal must remain durable.
+    nativeRecoveryPending = false;
+    await persistNativeLeaseJournal();
     sendNative(port, portGeneration, { type: "paired", request_id: message.request_id, lease_id: leaseId, targets: [...lease.tabs].map(String).sort(), extension_version: chrome.runtime.getManifest().version, extension_build_id: extensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true });
   } catch (error) {
     if (attemptGeneration !== undefined) await detachNativeLease(typeof message.lease_id === "string" && message.lease_id ? message.lease_id : message.request_id);
@@ -949,7 +1043,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (waitUntil !== "document_committed" && waitUntil !== "dom_content_loaded") throw new Error("wait_until must be document_committed or dom_content_loaded.");
       if (typeof active !== "boolean") throw new Error("active must be a boolean.");
       if (createBackgroundWindow && active) throw new Error("A Controlla-owned automation window must be requested in background mode.");
-      if (targetWindowId !== undefined && (!Number.isSafeInteger(targetWindowId) || targetWindowId <= 0 || createBackgroundWindow)) throw new Error("target_window_id must identify an existing Controlla automation window and cannot be combined with create_background_window.");
+      if (targetWindowId != null && (!Number.isSafeInteger(targetWindowId) || targetWindowId <= 0 || createBackgroundWindow)) throw new Error("target_window_id must identify an existing Controlla automation window and cannot be combined with create_background_window.");
       if (Object.values(placement).some(value => Math.abs(value) > 32768) || [placement.width, placement.height].some(value => value !== undefined && (value < 200 || value > 8192))) throw new Error("Background window placement is outside the supported bounds.");
       if (!createBackgroundWindow && Object.keys(placement).length) throw new Error("Window placement requires create_background_window.");
       const result = await openControllaTab(url, request.params?.idempotency_key, native, routeGeneration, waitUntil, active, createBackgroundWindow, placement, targetWindowId);
@@ -1072,7 +1166,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       let renderer = {};
       let rendererFailure = "";
       try {
-        const observed = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+        const observed = await sendCdpCommand({ tabId }, "Runtime.evaluate", {
           expression: "/*__controllaPresentationState*/({visibility_state:document.visibilityState,document_hidden:document.hidden,document_has_focus:document.hasFocus(),viewport:{width:innerWidth,height:innerHeight,device_scale_factor:devicePixelRatio},discarded:document.wasDiscarded===true,prerendering:document.prerendering===true})",
           returnByValue: true,
         });
@@ -1124,14 +1218,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
             respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"activation_revalidation_failed",reason:"Target identity changed during temporary tab activation."} }); return;
           }
         }
-        const checked = await chrome.debugger.sendCommand({tabId}, "Runtime.callFunctionOn", {objectId,
+        const checked = await sendCdpCommand({tabId}, "Runtime.callFunctionOn", {objectId,
           functionDeclaration:guard, arguments:[{value:index},{value:outcome}], returnByValue:true});
         finalChecked = checked?.result?.value;
         if (!finalChecked?.ok || (!activated && expectedViewport != null && finalChecked.viewport !== expectedViewport) || !Number.isFinite(finalChecked.x) || !Number.isFinite(finalChecked.y)) {
           respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"final_target_revalidation_failed",reason:finalChecked?.reason || "Target or viewport changed before pointer input."} }); return;
         }
         const point = {x:finalChecked.x,y:finalChecked.y};
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseMoved",...point});
+        await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseMoved",...point});
         const button = clickKind === "context_click" ? "right" : "left";
         const clicks = clickKind === "double_click" ? 2 : 1;
         for (let clickCount = 1; clickCount <= clicks; clickCount++) {
@@ -1142,7 +1236,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
               respond({ type:"result", id:request.id, result:{status:"unknown",dispatch_acknowledged:false,dispatch_may_have_occurred:true,
                 completed_clicks:1,reason_code:"double_click_target_changed",reason:"The first click was sent, but target identity or active-tab state changed before the second click. Inspect before retrying."} }); return;
             }
-            const secondCheck = await chrome.debugger.sendCommand({tabId}, "Runtime.callFunctionOn", {objectId,
+            const secondCheck = await sendCdpCommand({tabId}, "Runtime.callFunctionOn", {objectId,
               functionDeclaration:guard, arguments:[{value:index},{value:outcome}], returnByValue:true});
             const secondTarget = secondCheck?.result?.value;
             if (!secondTarget?.ok || secondTarget.viewport !== finalChecked.viewport ||
@@ -1153,13 +1247,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           }
           activePress = {button, clickCount, ...point};
           pressAttempted = true;
-          await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",...activePress});
-          await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress});
+          await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",...activePress});
+          await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress});
           activePress = undefined;
         }
         acknowledged = true;
       } catch (error) {
-        if (activePress) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress}).catch(() => {});
+        if (activePress) await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress}).catch(() => {});
         respond({ type:"result", id:request.id, result:{status:pressAttempted?"unknown":"not_dispatched",dispatch_acknowledged:false,reason_code:pressAttempted?"pointer_delivery_unknown":"pointer_dispatch_failed",reason:safeNativeError(String(error))} });
         return;
       } finally {
@@ -1190,7 +1284,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
       let touchStartAttempted=false,dispatchAcknowledged=false,touchReleaseAcknowledged=false,before;
       const guardCall=async phase=>{
-        const result=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+        const result=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
           arguments:[{value:index},{value:sx},{value:sy},{value:ex},{value:ey},{value:viewport},{value:phase}],returnByValue:true});
         return result?.result?.value;
       };
@@ -1212,14 +1306,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"swipe_target_changed_before_dispatch",dispatch_may_have_occurred:false}});return;
         }
         touchStartAttempted=true;
-        await chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:sx,y:sy,radiusX:1,radiusY:1,force:1}]});
-        await chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:ex,y:ey,radiusX:1,radiusY:1,force:1}]});
+        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:sx,y:sy,radiusX:1,radiusY:1,force:1}]});
+        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:ex,y:ey,radiusX:1,radiusY:1,force:1}]});
         dispatchAcknowledged=true;
       }catch(error){
         respond({type:"result",id:request.id,result:{status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"touch_delivery_unknown":"swipe_preflight_failed",dispatch_acknowledged:false,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))}});return;
       }finally{
         if(touchStartAttempted){
-          touchReleaseAcknowledged=await Promise.race([chrome.debugger.sendCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+          touchReleaseAcknowledged=await Promise.race([sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
         }
       }
       try{
@@ -1239,6 +1333,58 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"swipe_readback_unknown",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true,reason:safeNativeError(String(error))}});return;
       }
     }
+    if (request.method === "Controlla.pointerMultiTouch") {
+      const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
+      const cx=params.center_x,cy=params.center_y,startDistance=params.start_distance,endDistance=params.end_distance,viewport=params.viewport,timeoutMs=params.timeout_ms??3000;
+      const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
+      if(typeof objectId!=="string"||!objectId||objectId.length>512||!Number.isSafeInteger(index)||index<0||
+          typeof guard!=="string"||!guard.startsWith("function(index,cx,cy,startDistance,endDistance,expectedViewport)")||guard.length>12000||
+          ![cx,cy,startDistance,endDistance].every(value=>Number.isFinite(value)&&value>=0&&value<=10000)||
+          startDistance<40||startDistance>600||endDistance<20||endDistance>800||endDistance/startDistance<0.5||endDistance/startDistance>2||
+          typeof viewport!=="string"||viewport.length>256||!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("multi-touch pinch requires bounded two-finger geometry and a guarded fresh root target.");
+      const target=await chrome.tabs.get(tabId),deadline=performance.now()+timeoutMs;
+      if(!target.active){respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;}
+      const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      let touchStartAttempted=false,dispatchAcknowledged=false,releaseAcknowledged=false;
+      const guardCall=async()=>{
+        const result=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+          arguments:[{value:index},{value:cx},{value:cy},{value:startDistance},{value:endDistance},{value:viewport}],returnByValue:true});
+        return result?.result?.value;
+      };
+      const valid=value=>value?.ok===true&&value.viewport===viewport&&[value.rect?.left,value.rect?.top,value.rect?.width,value.rect?.height].every(Number.isFinite);
+      const points=distance=>[{id:1,x:cx-distance/2,y:cy,radiusX:1,radiusY:1,force:1},{id:2,x:cx+distance/2,y:cy,radiusX:1,radiusY:1,force:1}];
+      try {
+        const before=await guardCall();
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)||!valid(before)) {
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:before?.reason||"pinch_preflight_refused",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        const final=await guardCall();
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)||!valid(final)||JSON.stringify(final.rect)!==JSON.stringify(before.rect)) {
+          respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"pinch_target_changed_before_dispatch",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
+        }
+        touchStartAttempted=true;
+        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:points(startDistance)});
+        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:points(endDistance)});
+        dispatchAcknowledged=true;
+      } catch(error) {
+        respond({type:"result",id:request.id,result:{status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"touch_delivery_unknown":"pinch_preflight_failed",dispatch_acknowledged:false,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))}});return;
+      } finally {
+        if(touchStartAttempted) releaseAcknowledged=await Promise.race([sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+      }
+      if(!releaseAcknowledged){respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"touch_release_unconfirmed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;}
+      if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+          (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+          (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch)) {
+        respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"pinch_identity_changed_after_dispatch",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;
+      }
+      respond({type:"result",id:request.id,result:{status:dispatchAcknowledged?"dispatched":"unknown",reason_code:dispatchAcknowledged?undefined:"pinch_delivery_unknown",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true,gesture:"two_finger_pinch",start_distance:startDistance,end_distance:endDistance}});return;
+    }
     if (request.method === "Controlla.pointerScroll") {
       const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
       const dx=params.delta_x,dy=params.delta_y,expectedViewport=params.viewport,timeoutMs=params.timeout_ms??3000;
@@ -1254,7 +1400,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
       let descriptorId,finalDescriptorId,containerId,dispatchAttempted=false,dispatchAcknowledged=false;
       try{
-        const guarded=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+        const guarded=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
           arguments:[{value:index},{value:dx},{value:dy},{value:expectedViewport}],returnByValue:false});
         if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
             (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
@@ -1264,7 +1410,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const remote=guarded?.result;
         descriptorId=remote?.objectId;
         if(!descriptorId||remote.type!=="object")throw new Error("scroll guard omitted its receipt object.");
-        const properties=await chrome.debugger.sendCommand({tabId},"Runtime.getProperties",{objectId:descriptorId,ownProperties:true,generatePreview:false});
+        const properties=await sendCdpCommand({tabId},"Runtime.getProperties",{objectId:descriptorId,ownProperties:true,generatePreview:false});
         const fields=new Map((properties?.result||[]).map(property=>[property.name,property.value]));
         const scalar=name=>fields.get(name)?.value;
         containerId=fields.get("container")?.objectId;
@@ -1273,17 +1419,17 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         }
         const x=scalar("x"),y=scalar("y"),before={left:scalar("left"),top:scalar("top")};
         if(!Number.isFinite(before.left)||!Number.isFinite(before.top))throw new Error("scroll guard omitted initial container offsets.");
-        const beforeRead=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
+        const beforeRead=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
           functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
         const beforeValue=beforeRead?.result?.value;
         if(!beforeValue?.connected||beforeValue.left!==before.left||beforeValue.top!==before.top){
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"scroll_container_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
-        const finalGuard=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+        const finalGuard=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
           arguments:[{value:index},{value:dx},{value:dy},{value:expectedViewport},{objectId:containerId}],returnByValue:false});
         finalDescriptorId=finalGuard?.result?.objectId;
         if(!finalDescriptorId||finalGuard?.result?.type!=="object")throw new Error("final scroll guard did not retain its receipt.");
-        const finalProperties=await chrome.debugger.sendCommand({tabId},"Runtime.getProperties",{objectId:finalDescriptorId,ownProperties:true,generatePreview:false});
+        const finalProperties=await sendCdpCommand({tabId},"Runtime.getProperties",{objectId:finalDescriptorId,ownProperties:true,generatePreview:false});
         const finalFields=new Map((finalProperties?.result||[]).map(property=>[property.name,property.value]));
         const finalScalar=name=>finalFields.get(name)?.value;
         if(finalScalar("ok")!==true||finalScalar("viewport")!==expectedViewport||finalScalar("x")!==x||finalScalar("y")!==y){
@@ -1295,10 +1441,10 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"guard_deadline_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
         dispatchAttempted=true;
-        await chrome.debugger.sendCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",x,y});
-        await chrome.debugger.sendCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseWheel",x,y,deltaX:dx,deltaY:dy});
+        await sendCdpCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",x,y});
+        await sendCdpCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseWheel",x,y,deltaX:dx,deltaY:dy});
         dispatchAcknowledged=true;
-        const afterRead=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
+        const afterRead=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
           functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
         const after=afterRead?.result?.value;
         if(!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
@@ -1315,9 +1461,9 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       }catch(error){
         respond({type:"result",id:request.id,result:{status:dispatchAttempted?"unknown":"not_dispatched",reason_code:dispatchAttempted?"wheel_delivery_unknown":"scroll_preflight_failed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:dispatchAttempted,reason:safeNativeError(String(error))}});return;
       }finally{
-        if(containerId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
-        if(descriptorId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
-        if(finalDescriptorId)await chrome.debugger.sendCommand({tabId},"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
+        if(containerId)await sendCdpCommand({tabId},"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
+        if(descriptorId)await sendCdpCommand({tabId},"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
+        if(finalDescriptorId)await sendCdpCommand({tabId},"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
       }
     }
     if (request.method === "Controlla.scrollToTarget") {
@@ -1337,7 +1483,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"target_identity_changed_before_scroll",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
         evaluationAttempted=true;
-        const response=await chrome.debugger.sendCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
+        const response=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,
           arguments:[{value:index},{value:"scroll-to-target-v1"}],returnByValue:true});
         evaluationAcknowledged=true;
         const receipt=response?.result?.value;
@@ -1368,17 +1514,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
         throw new Error("frame scroll requires bounded frame identity, one-axis wheel deltas, and timeout.");
       const root={tabId},deadline=performance.now()+timeoutMs,documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
-      let containerId,descriptorId,finalDescriptorId,wheelAttempted=false,wheelAcknowledged=false;
+      let containerId,descriptorId,finalDescriptorId,frameRoute={tabId},wheelAttempted=false,wheelAcknowledged=false;
       const currentFrame=async()=>{
-        const tree=await chrome.debugger.sendCommand(root,"Page.getFrameTree",{});
+        const tree=await sendCdpCommand(root,"Page.getFrameTree",{});
         const visit=(node,ancestors=[])=>node?.frame?.id===frameId?{frame:node.frame,depth:ancestors.length,chain:[...ancestors,node.frame]}:(node?.childFrames||[]).map(child=>visit(child,[...ancestors,node.frame])).find(Boolean);
         return visit(tree.frameTree,[]);
       };
-      const sameProcessChain=async(info)=>{
-        if(!info?.chain||info.depth<1||info.depth>8||info.chain.some(frame=>!frame?.id||!frame?.loaderId))return false;
-        const sessions=await Promise.all(info.chain.slice(1).map(frame=>waitForFrameSession(tabId,frame.id,400)));
-        return sessions.every(sessionId=>!sessionId);
-      };
+      const validFrameChain=info=>!!info?.chain&&info.depth>=1&&info.depth<=8&&info.chain.every(frame=>frame?.id&&frame?.loaderId);
       const identityStillOwned=async()=>{
         if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
             (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
@@ -1391,22 +1533,23 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if(!documentId||!(await identityStillOwned())){
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
-        await chrome.debugger.sendCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
+        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
         try{
           const info=await currentFrame();
-          if(!info||info.frame.loaderId!==loaderId||!(await sameProcessChain(info)))throw new Error("Frame ancestry is stale, too deep, or includes an out-of-process frame.");
+          if(!info||info.frame.loaderId!==loaderId||!validFrameChain(info))throw new Error("Frame ancestry is stale, too deep, or unavailable.");
           const expectedChain=info.chain.map(frame=>({id:frame.id,loaderId:frame.loaderId}));
-          const frameRoute=root;
-          const ax=await chrome.debugger.sendCommand(frameRoute,"Accessibility.getFullAXTree",{frameId});
+          const frameSessionId=await waitForFrameSession(tabId,frameId,400);
+          frameRoute=frameSessionId?{tabId,sessionId:frameSessionId}:root;
+          const ax=await sendCdpCommand(frameRoute,"Accessibility.getFullAXTree",frameSessionId?{}:{frameId});
           if(!ax.nodes?.some(node=>node.backendDOMNodeId===backendNodeId))throw new Error("Frame scroll reference is stale or unavailable in this same-process frame.");
-          const resolved=await chrome.debugger.sendCommand(frameRoute,"DOM.resolveNode",{backendNodeId});
+          const resolved=await sendCdpCommand(frameRoute,"DOM.resolveNode",{backendNodeId});
           const objectId=resolved?.object?.objectId;
           if(!objectId)throw new Error("Frame scroll target could not be resolved.");
           const guard="function(dx,dy,expectedViewport,expectedContainer){const e=this,d=e?.ownerDocument,w=d?.defaultView;if(!e||!e.isConnected||!d||!w)return {ok:false,reason:'stale_reference'};const b=e.getBoundingClientRect(),s=w.getComputedStyle(e),vw=w.innerWidth,vh=w.innerHeight;if(s.display==='none'||s.visibility==='hidden'||Number.parseFloat(s.opacity||'1')<=0||b.width<=0||b.height<=0)return {ok:false,reason:'not_visible'};const x=Math.max(0,Math.min(vw-1,b.left+b.width/2)),y=Math.max(0,Math.min(vh-1,b.top+b.height/2)),hit=d.elementFromPoint(x,y);if(!hit||!(hit===e||e.contains(hit))||hit.getRootNode()!==d||hit instanceof HTMLIFrameElement)return {ok:false,reason:'obscured_or_nested_document'};const viewport=`${vw}x${vh}@${w.devicePixelRatio||1}`;if(expectedViewport&&viewport!==expectedViewport)return {ok:false,reason:'viewport_changed'};const axis=dy?'y':'x',scrollable=n=>{if(!(n instanceof Element))return false;const cs=w.getComputedStyle(n),overflow=axis==='y'?cs.overflowY:cs.overflowX;return ['auto','scroll','overlay'].includes(overflow)&&(axis==='y'?n.scrollHeight-n.clientHeight:n.scrollWidth-n.clientWidth)>1};let container=null;for(let n=hit;n&&n instanceof Element;n=n.parentElement){if(scrollable(n)){container=n;break}}if(!container&&scrollable(d.scrollingElement))container=d.scrollingElement;if(!container)return {ok:false,reason:'no_scrollable_ancestor'};if(expectedContainer&&container!==expectedContainer)return {ok:false,reason:'scroll_container_changed'};const left=container.scrollLeft,top=container.scrollTop,maxLeft=Math.max(0,container.scrollWidth-container.clientWidth),maxTop=Math.max(0,container.scrollHeight-container.clientHeight),pos=dy?top:left,max=dy?maxTop:maxLeft;if(dy<0?pos<=1:dy>0?pos>=max-1:dx<0?pos<=1:pos>=max-1)return {ok:false,reason:'nearest_scroll_container_at_boundary'};return {ok:true,x,y,width:vw,height:vh,viewport,container,left,top}}";
           const readGuard=async(expectedContainer)=>{
-            const result=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,arguments:[{value:dx},{value:dy},{value:expectedContainer?.viewport??null},...(expectedContainer?[{objectId:expectedContainer.containerId}]:[])],returnByValue:false});
+            const result=await sendCdpCommand(frameRoute,"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,arguments:[{value:dx},{value:dy},{value:expectedContainer?.viewport??null},...(expectedContainer?[{objectId:expectedContainer.containerId}]:[])],returnByValue:false});
             const id=result?.result?.objectId;if(!id||result.result.type!=="object")throw new Error("Frame scroll guard returned no retained state.");
-            const props=await chrome.debugger.sendCommand(frameRoute,"Runtime.getProperties",{objectId:id,ownProperties:true,generatePreview:false});
+            const props=await sendCdpCommand(frameRoute,"Runtime.getProperties",{objectId:id,ownProperties:true,generatePreview:false});
             const fields=new Map((props?.result||[]).map(item=>[item.name,item.value])),scalar=name=>fields.get(name)?.value;
             return {id,fields,scalar,containerId:fields.get("container")?.objectId};
           };
@@ -1414,34 +1557,34 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           const state=first.scalar;
           if(state("ok")!==true||!containerId||!Number.isFinite(state("x"))||!Number.isFinite(state("y"))||!Number.isFinite(state("width"))||!Number.isFinite(state("height")))throw new Error(state("reason")||`Frame scroll target was refused (ok=${state("ok")}, container=${!!containerId}, point=${state("x")},${state("y")}, viewport=${state("width")}x${state("height")}).`);
           const viewport=state("viewport"),before={left:state("left"),top:state("top")};
-          const beforeRead=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+          const beforeRead=await sendCdpCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
           if(!beforeRead.result?.value?.connected||beforeRead.result.value.left!==before.left||beforeRead.result.value.top!==before.top)throw new Error("Frame scroll container changed before dispatch.");
           const initialPoint=await rootPointForFrame(tabId,frameId,objectId,state("x"),state("y"),{width:state("width"),height:state("height")});
           const final=await readGuard({viewport,containerId});finalDescriptorId=final.id;
           if(final.scalar("ok")!==true||final.scalar("x")!==state("x")||final.scalar("y")!==state("y")||final.containerId!==containerId)throw new Error("Frame scroll target or nearest container changed before dispatch.");
           let finalInfo=await currentFrame();
           const sameChain=info=>info?.chain?.length===expectedChain.length&&info.chain.every((frame,index)=>frame.id===expectedChain[index].id&&frame.loaderId===expectedChain[index].loaderId);
-          if(!sameChain(finalInfo)||!(await sameProcessChain(finalInfo)))throw new Error("Frame ancestry changed or includes an out-of-process frame before wheel dispatch.");
+          if(!sameChain(finalInfo)||frameSessions.get(tabId)?.get(frameId)!==(frameSessionId||undefined))throw new Error("Frame ancestry or owner session changed before wheel dispatch.");
           finalInfo=await currentFrame();
           if(!sameChain(finalInfo))throw new Error("Frame or loader identity changed during final scroll preflight.");
           const finalPoint=await rootPointForFrame(tabId,frameId,objectId,final.scalar("x"),final.scalar("y"),{width:final.scalar("width"),height:final.scalar("height")});
           const dispatchInfo=await currentFrame();
-          if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
-          await chrome.debugger.sendCommand(root,"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",...finalPoint});
+          if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||frameSessions.get(tabId)?.get(frameId)!==(frameSessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
+          await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",...finalPoint});
           wheelAttempted=true;
-          await chrome.debugger.sendCommand(root,"Input.dispatchMouseEvent",{type:"mouseWheel",...finalPoint,deltaX:dx,deltaY:dy});
+          await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseWheel",...finalPoint,deltaX:dx,deltaY:dy});
           wheelAcknowledged=true;
-          const afterRead=await chrome.debugger.sendCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
+          const afterRead=await sendCdpCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
           const after=afterRead.result?.value;
           if(!(await identityStillOwned())||(await currentFrame())?.frame?.loaderId!==loaderId){respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"frame_scroll_identity_changed_after_dispatch",dispatch_acknowledged:true,dispatch_may_have_occurred:true}});return;}
           if(!after?.connected||!Number.isFinite(after.left)||!Number.isFinite(after.top)){respond({type:"result",id:request.id,result:{status:"inconclusive",reason_code:"frame_scroll_readback_unavailable",dispatch_acknowledged:true,dispatch_may_have_occurred:true,before,after:null}});return;}
           const moved=dx?(dx<0?after.left<before.left:after.left>before.left):(dy<0?after.top<before.top:after.top>before.top);
           respond({type:"result",id:request.id,result:{status:moved?"verified":"inconclusive",reason_code:moved?undefined:"scroll_offset_unchanged",dispatch_acknowledged:true,dispatch_may_have_occurred:true,frame_id:frameId,frame_loader_id:loaderId,root_point:finalPoint,same_container:true,before,after:{left:after.left,top:after.top},delta_x:dx,delta_y:dy}});return;
         }finally{
-          if(containerId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
-          if(descriptorId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
-          if(finalDescriptorId)await chrome.debugger.sendCommand(root,"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
-          await chrome.debugger.sendCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+          if(containerId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
+          if(descriptorId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
+          if(finalDescriptorId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
+          await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
         }
       }catch(error){
         respond({type:"result",id:request.id,result:{status:wheelAttempted?"unknown":"not_dispatched",reason_code:wheelAttempted?"wheel_delivery_unknown":"frame_scroll_preflight_rejected",dispatch_acknowledged:wheelAcknowledged,dispatch_may_have_occurred:wheelAttempted,reason:safeNativeError(String(error))}});return;
@@ -1456,7 +1599,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (!target.active || !window.focused) {
         respond({ type: "result", id: request.id, result: { status: "not_dispatched", dispatch_may_have_occurred: false, reason_code: "secure_input_requires_active_target", reason: "Secure password entry requires the target tab to be active in the focused Chrome window.", observed: { target_active: !!target.active, window_focused: !!window.focused } } }); return;
       }
-      const root = { tabId }, frameTree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+      const root = { tabId }, frameTree = await sendCdpCommand(root, "Page.getFrameTree", {});
       const findFrame = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(findFrame).find(Boolean);
       const frame = findFrame(frameTree.frameTree);
       if (!frame || frame.loaderId !== loaderId) throw new Error("Password field frame changed since its fresh snapshot.");
@@ -1468,7 +1611,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       };
       const origin = originForFrame(frame);
       if (!origin) throw new Error("Password field has no trustworthy HTTP(S) frame origin.");
-      await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
       let promptTab, promptActivationEpoch;
       const capturePromptActivation = info => {
         if (promptTab?.id === info.tabId && promptActivationEpoch === undefined) promptActivationEpoch = activationEpoch;
@@ -1484,13 +1627,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const route = () => { const sessionId = frameSessions.get(tabId)?.get(frameId); return sessionId ? { tabId, sessionId } : root; };
       const checkPassword = async () => {
         if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || !isAuthorized(tabId)) throw new Error("Target document or Controlla lease changed during secure entry.");
-        const current = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+        const current = await sendCdpCommand(root, "Page.getFrameTree", {});
         const currentFrame = findFrame(current.frameTree);
         if (currentFrame?.loaderId !== loaderId || originForFrame(currentFrame) !== origin) throw new Error("Password field origin or frame identity changed during secure entry.");
-        const resolved = await chrome.debugger.sendCommand(route(), "DOM.resolveNode", { backendNodeId });
+        const resolved = await sendCdpCommand(route(), "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Password field is no longer available.");
-        const result = await chrome.debugger.sendCommand(route(), "Runtime.callFunctionOn", { objectId,
+        const result = await sendCdpCommand(route(), "Runtime.callFunctionOn", { objectId,
           functionDeclaration: "function(){const e=this;const r=e.getBoundingClientRect(),s=getComputedStyle(e);const visible=e.isConnected&&r.width>0&&r.height>0&&r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight&&s.display!=='none'&&s.visibility!=='hidden'&&Number.parseFloat(s.opacity||'1')>0&&s.pointerEvents!=='none'&&document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)===e;return {ok:e instanceof HTMLInputElement&&e.type==='password'&&visible&&!e.disabled&&!e.readOnly&&e.getAttribute('aria-disabled')!=='true'&&e.getAttribute('aria-readonly')!=='true'&&!e.hasAttribute('data-masked')&&!e.hasAttribute('data-requires-trusted')&&e.value.length===0,reason:e.value.length?'not_empty':'not_actionable'}}",
           returnByValue: true });
         if (result.result?.value?.ok !== true) throw new Error("Password field is stale, non-empty, hidden, disabled, masked, or not an ordinary password input.");
@@ -1537,7 +1680,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
             throw new Error("Active tab changed during password field revalidation; password was not dispatched.");
           }
           passwordDispatchStarted = true;
-          const result = await chrome.debugger.sendCommand(latest.route, "Runtime.callFunctionOn", { objectId: latest.objectId,
+          const result = await sendCdpCommand(latest.route, "Runtime.callFunctionOn", { objectId: latest.objectId,
             functionDeclaration: "function(value){const e=this;if(!(e instanceof HTMLInputElement)||e.type!=='password'||!e.isConnected||e.value.length!==0||e.disabled||e.readOnly||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return {ok:false,reason:'field_changed'};const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return {ok:false,reason:'setter_unavailable'};setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:e.value===value,credential_filled:e.value===value,length:e.value.length}}",
             arguments: [{ value: password }], returnByValue: true });
           const evidence = result.result?.value;
@@ -1555,7 +1698,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         for (const [nonce, pending] of pendingSecureInputs) if (pending.tabId === tabId) { clearTimeout(pending.timer); pendingSecureInputs.delete(nonce); }
         if (promptTab?.id != null) await chrome.tabs.remove(promptTab.id).catch(() => {});
         chrome.tabs.onActivated.removeListener(capturePromptActivation);
-        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
       return;
     }
@@ -1611,7 +1754,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (request.method === "Controlla.checkIdentityMarker") {
       const { selector, expected } = request.params || {};
       if (typeof selector !== "string" || !selector || selector.length > 512 || typeof expected !== "string" || !expected || expected.length > 512) throw new Error("Identity marker requires bounded selector and expected text.");
-      const direct = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: `(()=>{const norm=s=>String(s||'').replace(/\\s+/g,' ').trim(),visible=[];for(const e of document.querySelectorAll(${JSON.stringify(selector)})){if(!e.isConnected||e.getClientRects().length===0||e.getAttribute('aria-selected')==='true'||e.getAttribute('aria-checked')==='true'||e.closest('[role="menu"],[role="listbox"],[role="option"],[role="menuitem"],[role="dialog"],[aria-modal="true"]'))continue;let shown=true;for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||n.hasAttribute('hidden')||n.hasAttribute('inert')){shown=false;break}}if(shown)visible.push(e);if(visible.length===2)break}const e=visible[0];const labelled=(e?.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.innerText||'').join(' ').trim();const name=labelled||e?.getAttribute('aria-label')||e?.innerText||e?.getAttribute('alt')||Array.from(e?.labels||[]).map(label=>label.innerText).join(' ')||e?.getAttribute('title')||e?.getAttribute('content')||'';return visible.length===1&&norm(name)===norm(${JSON.stringify(expected)})})()`, returnByValue: true });
+      const direct = await sendCdpCommand({ tabId }, "Runtime.evaluate", { expression: `(()=>{const norm=s=>String(s||'').replace(/\\s+/g,' ').trim(),visible=[];for(const e of document.querySelectorAll(${JSON.stringify(selector)})){if(!e.isConnected||e.getClientRects().length===0||e.getAttribute('aria-selected')==='true'||e.getAttribute('aria-checked')==='true'||e.closest('[role="menu"],[role="listbox"],[role="option"],[role="menuitem"],[role="dialog"],[aria-modal="true"]'))continue;let shown=true;for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||n.hasAttribute('hidden')||n.hasAttribute('inert')){shown=false;break}}if(shown)visible.push(e);if(visible.length===2)break}const e=visible[0];const labelled=(e?.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.innerText||'').join(' ').trim();const name=labelled||e?.getAttribute('aria-label')||e?.innerText||e?.getAttribute('alt')||Array.from(e?.labels||[]).map(label=>label.innerText).join(' ')||e?.getAttribute('title')||e?.getAttribute('content')||'';return visible.length===1&&norm(name)===norm(${JSON.stringify(expected)})})()`, returnByValue: true });
       if (direct.result?.value === true) {
         const currentFrame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
         if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || currentFrame?.documentId !== expectedDocumentId) throw new Error("Identity marker document changed during the root DOM check.");
@@ -1621,23 +1764,23 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       return;
     }
     if (request.method === "Controlla.fileInputSnapshot") {
-      const tree = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const tree = await sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       const inputs = await fileInputsInFrames(tabId, tree.frameTree);
-      const current = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const current = await sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || current.frameTree?.frame?.id !== tree.frameTree?.frame?.id || current.frameTree?.frame?.loaderId !== tree.frameTree?.frame?.loaderId) throw new Error("Upload target document changed during file-input baseline discovery.");
       respond({ type: "result", id: request.id, result: { inputs, document_id: expectedDocumentId } }); return;
     }
     if (request.method === "Controlla.findFileInput") {
       const baseline = request.params?.baseline;
       if (!Array.isArray(baseline) || baseline.length > 256 || baseline.some(item => typeof item?.frame_id !== "string" || typeof item?.frame_loader_id !== "string" || !Number.isSafeInteger(item?.backend_node_id))) throw new Error("Lazy-input fallback requires a bounded pre-trigger file-input baseline.");
-      const tree = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const tree = await sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       const all = await fileInputsInFrames(tabId, tree.frameTree);
       const existed = new Set(baseline.map(item => `${item.frame_id}:${item.frame_loader_id}:${item.backend_node_id}`));
       const candidates = all.filter(item => !existed.has(`${item.frame_id}:${item.frame_loader_id}:${item.backend_node_id}`));
       if (candidates.length === 0) throw new Error("No new file input appeared after the upload trigger.");
       if (candidates.length !== 1) throw new Error("Multiple new file inputs appeared after the upload trigger; refusing ambiguous selection.");
       const selected = candidates[0];
-      const current = await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const current = await sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       const currentFrame = (() => { const find = node => node?.frame?.id === selected.frame_id ? node.frame : (node?.childFrames || []).map(find).find(Boolean); return find(current.frameTree); })();
       if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || current.frameTree?.frame?.id !== tree.frameTree?.frame?.id || current.frameTree?.frame?.loaderId !== tree.frameTree?.frame?.loaderId || currentFrame?.loaderId !== selected.frame_loader_id) throw new Error("Upload target document changed during lazy file-input discovery.");
       respond({ type: "result", id: request.id, result: { ...selected, document_id: expectedDocumentId } }); return;
@@ -1647,19 +1790,19 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const { frame_id: frameId, frame_loader_id: loaderId, backend_node_id: backendNodeId } = request.params || {};
       const filePaths = request.params?.file_paths ?? [request.params?.file_path];
       if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || !Array.isArray(filePaths) || filePaths.length < 1 || filePaths.length > 5 || filePaths.some(path => typeof path !== "string" || !path || path.length > 4096)) throw new Error("Frame upload target or bounded staged paths are invalid.");
-      const readTree = () => chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree", {});
+      const readTree = () => sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
       if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated after the chooser opened.");
       const childSessionId = frameSessions.get(tabId)?.get(frameId);
       const route = childSessionId ? { tabId, sessionId: childSessionId } : { tabId };
-      const resolved = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId });
+      const resolved = await sendCdpCommand(route, "DOM.resolveNode", { backendNodeId });
       if (!resolved.object?.objectId) throw new Error("Chooser input could not be resolved for accept-filter validation.");
-      const policy = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
+      const policy = await sendCdpCommand(route, "Runtime.callFunctionOn", { objectId: resolved.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
       if (policy.result?.value?.ok !== true) throw new Error(`File selection refused before dispatch: ${policy.result?.value?.reason || "accept_filter_unverified"}.`);
-      await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId });
+      await sendCdpCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId });
       const objectId = resolved.object?.objectId;
       if (!objectId) throw new Error("Chooser input could not be resolved for file readback.");
-      const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
+      const readback = await sendCdpCommand(route, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
       if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated during file selection.");
       respond({ type: "result", id: request.id, result: { frame_id: frameId, frame_loader_id: loaderId, files: readback.result?.value, input_policy: policy.result.value } }); return;
     }
@@ -1670,7 +1813,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (typeof frameId !== "string" || !frameId || typeof loaderId !== "string" || !loaderId || !Number.isSafeInteger(triggerId) || triggerId <= 0 || !Array.isArray(filePaths) || filePaths.length < 1 || filePaths.length > 5 || filePaths.some(path => typeof path !== "string" || !path || path.length > 4096)) throw new Error("Frame upload trigger or bounded staged paths are invalid.");
       const root = { tabId };
       const readFrame = async () => {
-        const tree = await chrome.debugger.sendCommand(root, "Page.getFrameTree", {});
+        const tree = await sendCdpCommand(root, "Page.getFrameTree", {});
         const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
         return find(tree.frameTree);
       };
@@ -1680,24 +1823,24 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       fileChooserOperations.set(tabId, operation);
       let route, interceptionEnabled = false, networkEnabled = false, pressAttempted = false, dispatched = false, selectionResult;
       try {
-        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
         const sessionId = frameSessions.get(tabId)?.get(frameId) || await waitForFrameSession(tabId, frameId, 400);
         route = sessionId ? { tabId, sessionId } : root;
         operation.networkSessionId = sessionId || null;
-        await chrome.debugger.sendCommand(route, "Network.enable", {});
+        await sendCdpCommand(route, "Network.enable", {});
         networkEnabled = true;
-        const ax = await chrome.debugger.sendCommand(route, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const ax = await sendCdpCommand(route, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
         const trigger = ax.nodes?.find(node => node.backendDOMNodeId === triggerId);
         if (!trigger || !["button", "link", "option", "menuitem"].includes(trigger.role?.value)) throw new Error("Frame upload trigger is stale or is not actionable.");
-        const resolvedTrigger = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: triggerId });
+        const resolvedTrigger = await sendCdpCommand(route, "DOM.resolveNode", { backendNodeId: triggerId });
         if (!resolvedTrigger.object?.objectId) throw new Error("Frame upload trigger could not be resolved.");
         const localPoint = await frameActionablePoint(route, resolvedTrigger.object.objectId);
-        const box = await chrome.debugger.sendCommand(route, "DOM.getBoxModel", { backendNodeId: triggerId });
+        const box = await sendCdpCommand(route, "DOM.getBoxModel", { backendNodeId: triggerId });
         const quad = box.model?.content;
         if (!Array.isArray(quad) || quad.length !== 8 || (await readFrame())?.loaderId !== loaderId) throw new Error("Frame upload trigger changed before dispatch.");
         clearFileChooserState(tabId);
-        await chrome.debugger.sendCommand(route, "Page.enable", {});
-        await chrome.debugger.sendCommand(route, "Page.setInterceptFileChooserDialog", { enabled: true });
+        await sendCdpCommand(route, "Page.enable", {});
+        await sendCdpCommand(route, "Page.setInterceptFileChooserDialog", { enabled: true });
         interceptionEnabled = true;
         let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
         ({ x, y } = await rootPointForFrame(tabId, frameId, resolvedTrigger.object.objectId, localPoint.x, localPoint.y, localPoint.viewport));
@@ -1706,19 +1849,19 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         // shortcut: CDP does not identify a chooser's initiating click; add causal page instrumentation if same-frame human interaction must be distinguished during dispatch.
         operation.eventCursor = fileChooserEventSequence;
         operation.pressing = true;
-        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
         pressAttempted = true;
-        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-        await chrome.debugger.sendCommand(root, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
         dispatched = true;
         const chooser = await waitForFileChooser(tabId, expectedDocumentId, 4000, operation.eventCursor);
         if (operation.conflicted || chooser.frame_id !== frameId || chooser.frame_loader_id !== loaderId || (await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("File chooser belongs to another frame, document, or overlapping operation.");
-        const chooserNode = await chrome.debugger.sendCommand(route, "DOM.resolveNode", { backendNodeId: chooser.backend_node_id });
+        const chooserNode = await sendCdpCommand(route, "DOM.resolveNode", { backendNodeId: chooser.backend_node_id });
         if (!chooserNode.object?.objectId) throw new Error("Chooser input could not be resolved for accept-filter validation.");
-        const policy = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
+        const policy = await sendCdpCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: uploadInputPolicyFunction(), arguments: [{ value: filePaths.map(path => path.split(/[\\/]/).at(-1)) }], returnByValue: true });
         if (policy.result?.value?.ok !== true) throw new Error(`File selection refused before dispatch: ${policy.result?.value?.reason || "accept_filter_unverified"}.`);
-        await chrome.debugger.sendCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId: chooser.backend_node_id });
-        const readback = await chrome.debugger.sendCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
+        await sendCdpCommand(route, "DOM.setFileInputFiles", { files: filePaths, backendNodeId: chooser.backend_node_id });
+        const readback = await sendCdpCommand(route, "Runtime.callFunctionOn", { objectId: chooserNode.object.objectId, functionDeclaration: "function(){return Array.from(this.files||[]).map(f=>({name:f.name,size:f.size}))}", returnByValue: true });
         if ((await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("Upload frame or root document changed during file selection.");
         if (!Array.isArray(readback.result?.value) || readback.result.value.length !== filePaths.length || readback.result.value.some(file => !file?.name)) throw new Error("File input did not retain the complete selected file set for readback.");
         selectionResult = { status: "selected", files: readback.result?.value, input_policy: policy.result.value, frame_id: frameId, frame_loader_id: loaderId, document_id: expectedDocumentId, dispatch_acknowledged: true };
@@ -1734,11 +1877,11 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (networkEnabled && selectionResult?.reason?.includes("File input did not retain")) {
           selectionResult.network_observation = await waitForUploadNetwork(operation);
         }
-        if (networkEnabled) await chrome.debugger.sendCommand(route, "Network.disable", {}).catch(() => {});
+        if (networkEnabled) await sendCdpCommand(route, "Network.disable", {}).catch(() => {});
         if (selectionResult) selectionResult.network_events = operation.networkEvents;
         if (fileChooserOperations.get(tabId) === operation) fileChooserOperations.delete(tabId);
-        if (interceptionEnabled) await chrome.debugger.sendCommand(route, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
-        await chrome.debugger.sendCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        if (interceptionEnabled) await sendCdpCommand(route, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
       respond({ type: "result", id: request.id, result: selectionResult });
       return;
@@ -1752,29 +1895,29 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (["visible", "text"].includes(outcome.kind) && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512) || outcome.kind === "text" && (typeof outcome.text !== "string" || outcome.text.length > 512) || outcome.kind === "navigation" && outcome.url != null && !isExactHttpUrl(outcome.url) || ["expanded", "selected"].includes(outcome.kind) && outcome.selector != null && (typeof outcome.selector !== "string" || !outcome.selector || outcome.selector.length > 512)) throw new Error("frame click postcondition is invalid or exceeds its bound.");
       const route = { tabId };
       const frameLoader = async () => {
-        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const tree = await sendCdpCommand(route, "Page.getFrameTree", {});
         const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
         return visit(tree.frameTree);
       };
       const frameUrl = async () => {
-        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const tree = await sendCdpCommand(route, "Page.getFrameTree", {});
         const visit = node => node?.frame?.id === frameId ? node.frame.url : (node?.childFrames || []).map(visit).find(Boolean);
         return visit(tree.frameTree);
       };
-      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
       try {
         if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
         let sessionId = frameSessions.get(tabId)?.get(frameId);
         if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
         const child = sessionId ? { tabId, sessionId } : route;
         const beforeUrl = await frameUrl();
-        const ax = await chrome.debugger.sendCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const ax = await sendCdpCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
         const node = ax.nodes?.find(item => item.backendDOMNodeId === backendNodeId);
         if (!node || !["button", "link", "checkbox", "radio", "option", "menuitem", "tab", "switch"].includes(node.role?.value)) throw new Error("Frame control is stale or is not an actionable control.");
-        const box = await chrome.debugger.sendCommand(child, "DOM.getBoxModel", { backendNodeId });
+        const box = await sendCdpCommand(child, "DOM.getBoxModel", { backendNodeId });
         const quad = box.model?.content;
         if (!Array.isArray(quad) || quad.length !== 8 || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
-        const resolved = await chrome.debugger.sendCommand(child, "DOM.resolveNode", { backendNodeId });
+        const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Frame click target could not be resolved for outcome verification.");
         const localPoint = await frameActionablePoint(child, objectId);
@@ -1786,18 +1929,18 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (Math.abs(dispatchPoint.x - x) > 0.5 || Math.abs(dispatchPoint.y - y) > 0.5 || JSON.stringify(dispatchPoint.owner_signature) !== JSON.stringify(initialMapping.owner_signature) || await frameLoader() !== loaderId) throw new Error("Frame owner geometry changed before dispatch.");
         let pressAttempted = false;
         try {
-          if (inputMode === "mouse") await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+          if (inputMode === "mouse") await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
           pressAttempted = true;
           if (inputMode === "touch") {
-            await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
-            await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+            await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
+            await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           } else {
-            await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-            await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+            await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+            await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
           }
         } catch (error) {
-          if (pressAttempted && inputMode === "touch") await chrome.debugger.sendCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
-          if (pressAttempted && inputMode === "mouse") await chrome.debugger.sendCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
+          if (pressAttempted && inputMode === "touch") await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
+          if (pressAttempted && inputMode === "mouse") await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
           respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: false, dispatch_may_have_occurred: pressAttempted, verified: false, reason: String(error) } });
           return;
         }
@@ -1806,7 +1949,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
             const currentUrl = await frameUrl();
             return outcome.url == null ? currentUrl !== beforeUrl : new URL(currentUrl).href === new URL(outcome.url).href;
           }
-          const result = await chrome.debugger.sendCommand(child, "Runtime.callFunctionOn", {
+          const result = await sendCdpCommand(child, "Runtime.callFunctionOn", {
             objectId,
             functionDeclaration: "function __controllaFrameOutcome(outcome){const e=this;const q=s=>s==null?e:document.querySelector(s);switch(outcome.kind){case 'focused':return document.activeElement===e||e.contains(document.activeElement);case 'visible':{const n=q(outcome.selector);if(!n)return false;const s=getComputedStyle(n);return n.isConnected&&n.getClientRects().length>0&&s.display!=='none'&&s.visibility==='visible'&&Number.parseFloat(s.opacity||'1')>0}case 'text':{const n=q(outcome.selector);return !!n&&n.isConnected&&(n.innerText||n.textContent||'').includes(outcome.text)}case 'expanded':{const n=q(outcome.selector);return !!n&&(n.getAttribute('aria-expanded')==='true'||n.open===true)}case 'selected':{const n=q(outcome.selector);return !!n&&(n.getAttribute('aria-selected')==='true'||n.getAttribute('aria-checked')==='true'||n.checked===true||n.selected===true)}default:return false}}",
             arguments: [{ value: outcome }], returnByValue: true,
@@ -1818,8 +1961,87 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         do { verified = await verifyOutcome().catch(() => false); if (verified || Date.now() >= deadline) break; await new Promise(resolve => setTimeout(resolve, 50)); } while (Date.now() < deadline);
         respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, input_mode: inputMode, dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified, reason: verified ? undefined : "requested frame click outcome was not observed before its deadline" } });
       } finally {
-        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
+      return;
+    }
+    if (request.method === "Controlla.frameSwipe") {
+      const p=request.params||{},frameId=p.frame_id,loaderId=p.loader_id,backendNodeId=p.backend_node_id;
+      const sx=p.start_x,sy=p.start_y,ex=p.end_x,ey=p.end_y,timeoutMs=p.timeout_ms??3000;
+      const expectedActivationEpoch=p.expected_activation_epoch,expectedFocusEpoch=p.expected_focus_epoch;
+      if(typeof frameId!=="string"||!frameId||frameId.length>256||typeof loaderId!=="string"||!loaderId||loaderId.length>256||
+          !Number.isSafeInteger(backendNodeId)||backendNodeId<=0||![sx,sy,ex,ey].every(value=>Number.isFinite(value)&&value>=0&&value<=10000)||
+          Math.hypot(ex-sx,ey-sy)<20||Math.hypot(ex-sx,ey-sy)>1200||!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>10000||
+          (expectedActivationEpoch!==undefined&&!Number.isSafeInteger(expectedActivationEpoch))||(expectedFocusEpoch!==undefined&&!Number.isSafeInteger(expectedFocusEpoch)))
+        throw new Error("frame swipe requires bounded frame identity, child-viewport coordinates, and timeout.");
+      const root={tabId},deadline=performance.now()+timeoutMs,documentId=pairedTabDocumentIds.get(tabId),generation=routeGeneration;
+      const currentInfo=async()=>{
+        const tree=await sendCdpCommand(root,"Page.getFrameTree",{});
+        const visit=(node,ancestors=[])=>node?.frame?.id===frameId?{frame:node.frame,chain:[...ancestors,node.frame]}:(node?.childFrames||[]).map(child=>visit(child,[...ancestors,node.frame])).find(Boolean);
+        return visit(tree.frameTree);
+      };
+      const validChain=info=>!!info?.chain&&info.chain.length>=2&&info.chain.length<=9&&info.chain.every(frame=>frame?.id&&frame?.loaderId);
+      const safeOrigins=info=>validChain(info)&&info.chain.every(frame=>{
+        if(typeof frame.securityOrigin!=="string"||frame.securityOrigin==="null")return false;
+        try { const u=new URL(frame.url); return ["http:","https:"].includes(u.protocol)&&u.origin===frame.securityOrigin; } catch { return false; }
+      });
+      const sameChain=(a,b)=>validChain(a)&&validChain(b)&&a.chain.length===b.chain.length&&a.chain.every((frame,index)=>frame.id===b.chain[index].id&&frame.loaderId===b.chain[index].loaderId);
+      const identityStillOwned=async()=>{
+        if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
+            (nativeRoute&&resolveNativeLease(request.lease_id,tabId)?.generation!==generation)||
+            (expectedActivationEpoch!==undefined&&activationEpoch!==expectedActivationEpoch)||(expectedFocusEpoch!==undefined&&focusEpoch!==expectedFocusEpoch))return false;
+        return (await chrome.tabs.get(tabId)).active===true;
+      };
+      let sessionId,child,objectId,touchStartAttempted=false,dispatchAcknowledged=false,releaseAcknowledged=false,receipt;
+      try {
+        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
+        const initialInfo=await currentInfo();
+        if(!safeOrigins(initialInfo)||initialInfo.frame.loaderId!==loaderId)throw new Error("Frame identity or non-opaque HTTP(S) origin could not be proven.");
+        sessionId=frameSessions.get(tabId)?.get(frameId)||await waitForFrameSession(tabId,frameId,400);
+        child=sessionId?{tabId,sessionId}:root;
+        const ax=await sendCdpCommand(child,"Accessibility.getFullAXTree",sessionId?{}:{frameId});
+        if(!ax.nodes?.some(node=>node.backendDOMNodeId===backendNodeId))throw new Error("Swipe target is absent from the selected frame accessibility tree.");
+        const resolved=await sendCdpCommand(child,"DOM.resolveNode",{backendNodeId});
+        objectId=resolved.object?.objectId;
+        if(!objectId)throw new Error("Swipe target could not be resolved in its child frame.");
+        const guard="function(sx,sy,ex,ey,expectedViewport,phase){const e=this,d=e?.ownerDocument,w=d?.defaultView;if(!e||!d||!w||!e.isConnected)return {ok:false,reason:'target_stale'};const b=e.getBoundingClientRect(),vw=w.innerWidth,vh=w.innerHeight,viewport=JSON.stringify([vw,vh,w.devicePixelRatio||1]),point=(x,y)=>Number.isFinite(x)&&x>=0&&y>=0&&x<vw&&y<vh,style=w.getComputedStyle(e);if(expectedViewport&&expectedViewport!==viewport)return {ok:false,reason:'frame_viewport_changed'};if(b.width<=0||b.height<=0||style.display==='none'||style.visibility!=='visible'||style.pointerEvents==='none'||Number.parseFloat(style.opacity||'1')<=0)return {ok:false,reason:'target_not_interactable'};let scroll=null;for(let n=e;n&&n instanceof Element;n=n.parentElement){const s=w.getComputedStyle(n);if((['auto','scroll','overlay'].includes(s.overflowY)&&n.scrollHeight>n.clientHeight+1)||(['auto','scroll','overlay'].includes(s.overflowX)&&n.scrollWidth>n.clientWidth+1)){scroll={left:n.scrollLeft,top:n.scrollTop};break}}if(phase==='before'){const startInside=sx>=b.left&&sx<=b.right&&sy>=b.top&&sy<=b.bottom,hit=point(sx,sy)?d.elementFromPoint(sx,sy):null;if(!point(sx,sy)||!point(ex,ey)||!startInside||!(hit===e||e.contains(hit)))return {ok:false,reason:'swipe_target_or_endpoint_not_interactable'}}return {ok:true,viewport,rect:{left:b.left,top:b.top,width:b.width,height:b.height},scroll};}";
+        const guardCall=async(phase,expectedViewport=null)=>{
+          const result=await sendCdpCommand(child,"Runtime.callFunctionOn",{objectId,functionDeclaration:guard,arguments:[{value:sx},{value:sy},{value:ex},{value:ey},{value:expectedViewport},{value:phase}],returnByValue:true});
+          return result?.result?.value;
+        };
+        const before=await guardCall("before");
+        if(before?.ok!==true)throw new Error(before?.reason||"Frame swipe target preflight refused.");
+        const initialStart=await rootPointForFrame(tabId,frameId,objectId,sx,sy,{width:JSON.parse(before.viewport)[0],height:JSON.parse(before.viewport)[1]});
+        const initialEnd=await rootPointForFrame(tabId,frameId,objectId,ex,ey,{width:JSON.parse(before.viewport)[0],height:JSON.parse(before.viewport)[1]});
+        if(JSON.stringify(initialStart.owner_signature)!==JSON.stringify(initialEnd.owner_signature))throw new Error("Frame owner transform differed across swipe endpoints.");
+        const finalGuard=await guardCall("before",before.viewport),finalInfo=await currentInfo();
+        if(finalGuard?.ok!==true||JSON.stringify(finalGuard.rect)!==JSON.stringify(before.rect)||!sameChain(initialInfo,finalInfo)||
+            frameSessions.get(tabId)?.get(frameId)!==(sessionId||undefined))throw new Error("Frame target, loader, or session changed during swipe preflight.");
+        const finalStart=await rootPointForFrame(tabId,frameId,objectId,sx,sy,{width:JSON.parse(finalGuard.viewport)[0],height:JSON.parse(finalGuard.viewport)[1]});
+        const finalEnd=await rootPointForFrame(tabId,frameId,objectId,ex,ey,{width:JSON.parse(finalGuard.viewport)[0],height:JSON.parse(finalGuard.viewport)[1]});
+        const dispatchInfo=await currentInfo();
+        const startChanged=Math.hypot(finalStart.x-initialStart.x,finalStart.y-initialStart.y)>0.5,endChanged=Math.hypot(finalEnd.x-initialEnd.x,finalEnd.y-initialEnd.y)>0.5;
+        const ownerChanged=JSON.stringify(finalStart.owner_signature)!==JSON.stringify(initialStart.owner_signature)||JSON.stringify(finalEnd.owner_signature)!==JSON.stringify(initialEnd.owner_signature);
+        const chainChanged=!sameChain(initialInfo,dispatchInfo),originChanged=!safeOrigins(dispatchInfo),identityChanged=!(await identityStillOwned());
+        if(startChanged||endChanged||ownerChanged||chainChanged||originChanged||identityChanged)throw new Error(`Frame transform or document identity changed before trusted touch input (start=${startChanged}, end=${endChanged}, owner=${ownerChanged}, chain=${chainChanged}, origin=${originChanged}, identity=${identityChanged}).`);
+        touchStartAttempted=true;
+        await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:finalStart.x,y:finalStart.y,radiusX:1,radiusY:1,force:1}]});
+        await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:finalEnd.x,y:finalEnd.y,radiusX:1,radiusY:1,force:1}]});
+        dispatchAcknowledged=true;
+        if(!sameChain(initialInfo,await currentInfo())||frameSessions.get(tabId)?.get(frameId)!==(sessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame identity changed after swipe dispatch.");
+        const after=await guardCall("after",before.viewport);
+        if(after?.ok!==true)throw new Error("Frame swipe readback could not revalidate the target.");
+        const moved=JSON.stringify(after.rect)!==JSON.stringify(before.rect)||JSON.stringify(after.scroll)!==JSON.stringify(before.scroll);
+        receipt={status:moved?"verified":"inconclusive",reason_code:moved?undefined:"swipe_movement_not_observed",dispatch_acknowledged:true,dispatch_may_have_occurred:true,frame_id:frameId,frame_loader_id:loaderId,coordinate_space:"child_frame_css_viewport",root_start:finalStart,root_end:finalEnd,before:{rect:before.rect,scroll:before.scroll},after:{rect:after.rect,scroll:after.scroll}};
+      } catch(error) {
+        receipt={status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"frame_swipe_delivery_unknown":"frame_swipe_preflight_refused",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))};
+      } finally {
+        if(touchStartAttempted)releaseAcknowledged=await Promise.race([sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+        if(objectId&&child)await sendCdpCommand(child,"Runtime.releaseObject",{objectId}).catch(()=>{});
+        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+      }
+      if(touchStartAttempted&&!releaseAcknowledged)receipt={status:"unknown",reason_code:"touch_release_unconfirmed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true};
+      respond({type:"result",id:request.id,result:receipt||{status:"unknown",reason_code:"frame_swipe_receipt_missing",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:touchStartAttempted}});
       return;
     }
     if (request.method === "Controlla.frameFill") {
@@ -1829,21 +2051,21 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       if (typeof expected !== "string" || typeof value !== "string" || expected.length > 16384 || value.length > 16384 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 250 || timeoutMs > 10000) throw new Error("frame fill values or timeout exceed their bounds.");
       const route = { tabId };
       const frameLoader = async () => {
-        const tree = await chrome.debugger.sendCommand(route, "Page.getFrameTree", {});
+        const tree = await sendCdpCommand(route, "Page.getFrameTree", {});
         const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
         return visit(tree.frameTree);
       };
-      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
       let dispatchAttempted = false;
       try {
         if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
         let sessionId = frameSessions.get(tabId)?.get(frameId);
         if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
         const child = sessionId ? { tabId, sessionId } : route;
-        const ax = await chrome.debugger.sendCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+        const ax = await sendCdpCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
         const node = ax.nodes?.find(item => item.backendDOMNodeId === backendNodeId);
         if (!node || !["textbox", "searchbox", "combobox"].includes(node.role?.value)) throw new Error("Frame field is stale or is not an editable text control.");
-        const resolved = await chrome.debugger.sendCommand(child, "DOM.resolveNode", { backendNodeId });
+        const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Frame field could not be resolved for guarded fill.");
         if ((sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame document changed before fill dispatch.");
@@ -1851,7 +2073,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         let result;
         try {
           dispatchAttempted = true;
-          result = await chrome.debugger.sendCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration, arguments: [{ value: expected }, { value }], returnByValue: true, awaitPromise: false });
+          result = await sendCdpCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration, arguments: [{ value: expected }, { value }], returnByValue: true, awaitPromise: false });
         } catch (error) {
           respond({ type: "result", id: request.id, result: { dispatch_acknowledged: false, dispatch_may_have_occurred: dispatchAttempted, verified: false, matches_requested_value: false, reason_code: "frame_fill_delivery_uncertain", reason: String(error) } });
           return;
@@ -1864,7 +2086,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           verified: false, matches_requested_value: false, reason_code: dispatchAttempted ? "frame_fill_delivery_uncertain" : "frame_fill_preflight_rejected",
           reason: String(error) } });
       } finally {
-        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
       return;
     }
@@ -1872,14 +2094,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const frameId = request.params?.frame_id;
       if (typeof frameId !== "string" || !frameId || frameId.length > 256) throw new Error("frame_id must be a bounded nonempty string.");
       const route = { tabId };
-      await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
       try {
         const sessionId = await waitForFrameSession(tabId, frameId, 1500);
         if (!sessionId) throw new Error("No attached OOPIF session matched the requested frame.");
-        const result = await chrome.debugger.sendCommand({ tabId, sessionId }, "Accessibility.getFullAXTree", {});
+        const result = await sendCdpCommand({ tabId, sessionId }, "Accessibility.getFullAXTree", {});
         respond({ type: "result", id: request.id, result: { ...result, source_frame_id: frameId, routing: "oopif_child_session" } });
       } finally {
-        await chrome.debugger.sendCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
       return;
     }
@@ -1911,6 +2133,16 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     if (request.method === "Page.captureScreenshot" && (tabLifecycleGenerations.get(tabId) || 0) !== screenshotLifecycleGeneration) {
       throw Object.assign(new Error("Screenshot target lifecycle changed before capture dispatch."), { reason_code: "target_lifecycle_changed" });
     }
+    let renderFrame;
+    if (request.method === "Page.captureScreenshot") {
+      renderFrame = await observeFreshRendererFrame(tabId);
+      const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
+      const target = await chrome.tabs.get(tabId);
+      if (frame?.documentId !== screenshotDocumentId || screenshotTargetLifecycle(target) !== "active" ||
+          (tabLifecycleGenerations.get(tabId) || 0) !== screenshotLifecycleGeneration) {
+        throw Object.assign(new Error("Target document or lifecycle changed while waiting for a fresh renderer frame."), { reason_code: "screenshot_render_frame_stale" });
+      }
+    }
     const requestBytes = JSON.stringify({ method: request.method, params: request.params || {} }).length;
     if (!topologyStable()) {
       commandMayHaveDispatched = false;
@@ -1918,7 +2150,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         reason: "Paired tab topology changed before CDP dispatch; retry after reconciling its window." } });
       return;
     }
-    traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes }); const result = await chrome.debugger.sendCommand({ tabId }, request.method, request.params || {});
+    traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes }); const result = await sendCdpCommand({ tabId }, request.method, request.params || {}, request.deadline_ms);
     if (!topologyStable()) throw Object.assign(new Error("Paired tab topology changed during CDP dispatch."), { reason_code: "tab_topology_changed" });
     if (screenshotDocumentId && pairedTabDocumentIds.get(tabId) !== screenshotDocumentId) {
       throw Object.assign(new Error("Target document changed during screenshot capture; image bytes were discarded."), { reason_code: "screenshot_document_changed" });
@@ -1945,12 +2177,36 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         target_id: String(tabId), document_id: screenshotDocumentId,
         url: String(target.url || "").slice(0, 2048), frame_url: String(screenshotFrameAfter.url || "").slice(0, 2048), captured_at_ms: Date.now(),
         capture_started_at_ms: screenshotStartedAt, visual_revision: imageSha256, image_sha256: imageSha256,
-        render_revision: null, target_lifecycle: lifecycleAfter,
+        render_revision: `${screenshotDocumentId}:${renderFrame.timestamp_ms.toFixed(3)}`,
+        render_frame_timestamp_ms: renderFrame.timestamp_ms,
+        render_frame_provenance: "two_animation_frames_before_compositor_capture",
+        target_lifecycle: lifecycleAfter,
         dimensions: { width: image.width, height: image.height },
       };
     }
     traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result", requestBytes, responseBytes: (() => { try { return JSON.stringify(result).length; } catch { return 0; } })() }); respond({ type: "result", id: request.id, result });
   } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error), ...(error?.reason_code ? { reason_code: error.reason_code } : {}) }); }
+}
+async function observeFreshRendererFrame(tabId) {
+  const expression = "new Promise(resolve=>{let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;resolve({ready:false})}},1000);requestAnimationFrame(()=>requestAnimationFrame(timestamp=>{if(!settled){settled=true;clearTimeout(timer);resolve({ready:true,timestamp_ms:timestamp})}}))})";
+  let result, deadlineTimer;
+  try {
+    result = await Promise.race([
+      sendCdpCommand({ tabId }, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }),
+      new Promise((_, reject) => { deadlineTimer = setTimeout(() => reject(Object.assign(new Error("Timed out waiting for a fresh renderer animation frame."), { reason_code: "screenshot_render_frame_timeout" })), 1500); }),
+    ]);
+  } catch (error) {
+    throw Object.assign(new Error(error?.reason_code ? String(error.message) : "Could not observe a fresh renderer animation frame before screenshot capture."), {
+      reason_code: error?.reason_code || "screenshot_render_frame_unavailable",
+    });
+  } finally {
+    clearTimeout(deadlineTimer);
+  }
+  const frame = result?.result?.value;
+  if (frame?.ready !== true || !Number.isFinite(frame.timestamp_ms) || frame.timestamp_ms < 0) {
+    throw Object.assign(new Error("Renderer did not produce two animation frames before screenshot capture."), { reason_code: "screenshot_render_frame_unavailable" });
+  }
+  return frame;
 }
 function screenshotTargetLifecycle(tab) {
   if (!tab) return "unknown";
@@ -2214,7 +2470,7 @@ async function navigatePairedTab(tabId, url, native, generation) {
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); bindPairedTabTopology(tabId); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
 }
 function removeNativeTab(tabId) { const leaseId = nativeTabLeases.get(tabId); if (leaseId) nativeLeases.get(leaseId)?.tabs.delete(tabId); nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); }
-async function detachNativeLease(leaseId) { const lease = nativeLeases.get(leaseId); if (!lease) return; nativeLeases.delete(leaseId); nativeLeaseGenerations.delete(lease.generation); const tabs = [...lease.tabs]; for (const tabId of tabs) { if (nativeTabLeases.get(tabId) !== leaseId) continue; nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); clearDownloadLifecycleState(tabId, "native_lease_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(tabs.filter(tabId => !nativeTabLeases.has(tabId)).map(detachDebugger)); }
+async function detachNativeLease(leaseId) { const lease = nativeLeases.get(leaseId); if (!lease) return; nativeLeases.delete(leaseId); nativeLeaseGenerations.delete(lease.generation); const tabs = [...lease.tabs]; for (const tabId of tabs) { if (nativeTabLeases.get(tabId) !== leaseId) continue; nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); clearDownloadLifecycleState(tabId, "native_lease_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(tabs.filter(tabId => !nativeTabLeases.has(tabId)).map(detachDebugger)); await persistNativeLeaseJournal(); }
 async function detachPairedTab(tabId) { clearDownloadLifecycleState(tabId); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); manualAttachedTabs.delete(tabId); removeNativeTab(tabId); await detachDebugger(tabId); }
 async function detachManual(generation) { if (generation !== manualGeneration) return; const toDetach = [...manualAttachedTabs]; manualAttachedTabs = new Set(); for (const tabId of toDetach) { clearDownloadLifecycleState(tabId, "manual_bridge_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(toDetach.map(detachDebugger)); }
 async function detachNative(generation) { if (generation !== nativeGeneration) return; for (const leaseId of [...nativeLeases.keys()]) await detachNativeLease(leaseId); }
@@ -2238,7 +2494,7 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   if (message?.type === "pair") { pair(message.endpoint, message.token, message.tabIds).then(() => respond({ ok: true })).catch(error => respond({ ok: false, error: String(error) })); return true; }
   if (message?.type === "status") respond({ connected: socket?.readyState === WebSocket.OPEN, attached: [...manualAttachedTabs] });
   if (message?.type === "release") { const current = socket; const generation = ++manualGeneration; socket = undefined; current?.close(); detachManual(generation).then(() => respond({ ok: true })); return true; }
-  if (message?.type === "native-status") respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, transport: "native" });
+  if (message?.type === "native-status") { readNativeLeaseJournal().then(journal => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: journal, transport: "native" })).catch(() => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: { schema_version: 1, sequence: 0, status: "unavailable", leases: [] }, transport: "native" })); return true; }
 });
 async function pair(endpoint, token, selectedTabIds) {
   if (!Array.isArray(selectedTabIds) || selectedTabIds.length === 0 || !token || !endpoint) throw new Error("Choose tabs and provide the local pairing endpoint and token.");

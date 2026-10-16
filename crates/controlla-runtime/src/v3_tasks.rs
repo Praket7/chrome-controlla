@@ -54,6 +54,22 @@ pub enum TaskPrimitive {
         #[serde(default)]
         source: DownloadSource,
     },
+    /// One-call transfer: obtain a guarded download artifact, then select that
+    /// exact artifact for an upload and require the requested acceptance proof.
+    DownloadUpload {
+        download_reference: String,
+        #[serde(default)]
+        destination_path: Option<String>,
+        #[serde(default)]
+        source: DownloadSource,
+        selector: Option<String>,
+        trigger_reference: Option<String>,
+        #[serde(default)]
+        acceptance: Option<Value>,
+        #[serde(default)]
+        persisted: Option<Value>,
+        account_marker: (String, String),
+    },
     Repeat {
         references: Vec<String>,
         action: RepeatAction,
@@ -137,6 +153,13 @@ pub enum ExpandedStep {
         destination_path: Option<String>,
         source: DownloadSource,
     },
+    UploadPreviousDownload {
+        selector: Option<String>,
+        trigger_reference: Option<String>,
+        acceptance: Option<Value>,
+        persisted: Option<Value>,
+        account_marker: (String, String),
+    },
     Click {
         reference: String,
         outcome: Value,
@@ -150,6 +173,104 @@ pub enum ExpandedStep {
 }
 
 impl TaskPrimitive {
+    /// True only for tasks whose remaining work can be resumed by observing an
+    /// exact field value before dispatch. Clicks, saves, uploads and downloads
+    /// are deliberately excluded because their effects may not be replay-safe.
+    pub fn is_resumable_fill_only(&self) -> bool {
+        match self {
+            Self::FormDraft {
+                fields,
+                save_without_submit,
+                save_control,
+            } => {
+                !fields.is_empty()
+                    && !save_without_submit
+                    && save_control.is_none()
+                    && fields.iter().all(|field| field.reference.starts_with("@c"))
+            }
+            Self::Mutation { steps } => {
+                !steps.is_empty()
+                    && steps.iter().all(|step| {
+                        matches!(step, MutationStep::Fill { reference, .. } if reference.starts_with("@c"))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Click/save tasks are resumable only when every external action has a
+    /// stable, explicit postcondition that the runtime can freshly re-check.
+    pub fn is_resumable_with_postconditions(&self) -> bool {
+        if self.is_resumable_fill_only() {
+            return true;
+        }
+        match self {
+            Self::Upload {
+                artifact_handle,
+                artifact_handles,
+                trigger_reference: Some(trigger_reference),
+                acceptance: Some(acceptance),
+                persisted,
+                account_marker,
+                ..
+            } => {
+                let handles_valid = match (artifact_handle, artifact_handles) {
+                    (Some(handle), None) => !handle.trim().is_empty(),
+                    (None, Some(handles)) => {
+                        !handles.is_empty()
+                            && handles.len() <= 5
+                            && handles.iter().all(|handle| !handle.trim().is_empty())
+                            && handles
+                                .iter()
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .len()
+                                == handles.len()
+                    }
+                    _ => false,
+                };
+                handles_valid
+                    && trigger_reference.starts_with("@c")
+                    && !account_marker.0.trim().is_empty()
+                    && !account_marker.1.trim().is_empty()
+                    && is_identity_bound_upload_predicate(acceptance)
+                    && persisted
+                        .as_ref()
+                        .is_none_or(is_identity_bound_upload_predicate)
+            }
+            Self::FormDraft {
+                fields,
+                save_without_submit: true,
+                save_control: Some(_save),
+                ..
+            } => !fields.is_empty(),
+            Self::Mutation { steps } => {
+                !steps.is_empty()
+                    && steps.iter().all(|step| match step {
+                        MutationStep::Fill { reference, .. } => reference.starts_with("@c"),
+                        MutationStep::Click { outcome, .. } => {
+                            let Some(kind) = outcome.get("kind").and_then(Value::as_str) else {
+                                return false;
+                            };
+                            match kind {
+                                "text" => {
+                                    outcome
+                                        .get("selector")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.trim().is_empty())
+                                        && outcome
+                                            .get("text")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|s| !s.is_empty())
+                                }
+                                _ => false,
+                            }
+                        }
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Stable opaque key for task-shape lookup. Research URLs are bound at
     /// replay time by exact site scope and live structure, allowing safe
     /// same-site input variation without persisting a user's target URL.
@@ -395,6 +516,57 @@ impl TaskPrimitive {
                     source: *source,
                 }]
             }
+            Self::DownloadUpload {
+                download_reference,
+                destination_path,
+                source,
+                selector,
+                trigger_reference,
+                acceptance,
+                persisted,
+                account_marker,
+            } => {
+                if download_reference.is_empty()
+                    || destination_path.as_deref().is_some_and(|path| {
+                        path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+                    })
+                    || (selector.is_some() == trigger_reference.is_some())
+                    || selector
+                        .as_ref()
+                        .is_some_and(|value| value.is_empty() || value.len() > 512)
+                    || trigger_reference
+                        .as_ref()
+                        .is_some_and(|value| value.is_empty() || value.len() > 1024)
+                    || acceptance.as_ref().is_some_and(|value| {
+                        serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 8192)
+                    })
+                    || persisted.as_ref().is_some_and(|value| {
+                        serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 8192)
+                    })
+                    || account_marker.0.is_empty()
+                    || account_marker.0.len() > 512
+                    || account_marker.1.is_empty()
+                    || account_marker.1.len() > 512
+                {
+                    return Err(
+                        "download_upload requires bounded source/target identities and an account marker",
+                    );
+                }
+                vec![
+                    ExpandedStep::Download {
+                        reference: download_reference.clone(),
+                        destination_path: destination_path.clone(),
+                        source: *source,
+                    },
+                    ExpandedStep::UploadPreviousDownload {
+                        selector: selector.clone(),
+                        trigger_reference: trigger_reference.clone(),
+                        acceptance: acceptance.clone(),
+                        persisted: persisted.clone(),
+                        account_marker: account_marker.clone(),
+                    },
+                ]
+            }
             Self::Repeat {
                 references,
                 action,
@@ -449,6 +621,36 @@ impl TaskPrimitive {
     }
 }
 
+/// An upload can only be reconciled after interruption when the caller supplied
+/// a fresh-visible identity predicate that binds the accepted attachment to a
+/// filename and size, or a versioned app adapter that checks the full destination.
+/// Generic text/value predicates can pass because of unrelated page content.
+fn is_identity_bound_upload_predicate(predicate: &Value) -> bool {
+    match predicate.get("kind").and_then(Value::as_str) {
+        Some("attachment") => {
+            predicate
+                .get("filename")
+                .and_then(Value::as_str)
+                .is_some_and(|filename| {
+                    !filename.trim().is_empty()
+                        && filename.len() <= 255
+                        && !filename.contains(['/', '\\'])
+                })
+                && predicate.get("size").and_then(Value::as_u64).is_some()
+        }
+        Some("app_specific") => {
+            matches!(
+                predicate.get("adapter").and_then(Value::as_str),
+                Some("google_classroom_attachment_v1" | "google_drive_attachment_v1")
+            ) && predicate
+                .get("predicate")
+                .and_then(Value::as_object)
+                .is_some_and(|predicate| predicate.get("version") == Some(&Value::from(1)))
+        }
+        _ => false,
+    }
+}
+
 fn valid_http_url(url: &str) -> bool {
     if url.len() > 2_048 || url.chars().any(char::is_whitespace) {
         return false;
@@ -469,6 +671,124 @@ mod task_expansion_tests {
         TaskPrimitive,
     };
     use serde_json::Value;
+
+    #[test]
+    fn resumable_fill_only_rejects_tasks_with_non_idempotent_effects() {
+        let fill = TaskPrimitive::FormDraft {
+            fields: vec![FormField {
+                reference: "@c1".into(),
+                expected_value: "old".into(),
+                value: "new".into(),
+            }],
+            save_without_submit: false,
+            save_control: None,
+        };
+        assert!(fill.is_resumable_fill_only());
+
+        let click = TaskPrimitive::Mutation {
+            steps: vec![MutationStep::Click {
+                reference: "@c2".into(),
+                outcome: serde_json::json!({"kind":"text","selector":"#saved","text":"Saved"}),
+            }],
+        };
+        assert!(!click.is_resumable_fill_only());
+
+        let save = TaskPrimitive::FormDraft {
+            fields: vec![FormField {
+                reference: "@c1".into(),
+                expected_value: "old".into(),
+                value: "new".into(),
+            }],
+            save_without_submit: true,
+            save_control: Some(SaveControl {
+                reference: "@c2".into(),
+                confirmation_selector: "#status".into(),
+                confirmation_text: "Saved".into(),
+            }),
+        };
+        assert!(!save.is_resumable_fill_only());
+        assert!(save.is_resumable_with_postconditions());
+        assert!(click.is_resumable_with_postconditions());
+    }
+
+    #[test]
+    fn artifact_transfers_and_submit_mutations_are_not_resumable() {
+        let download = TaskPrimitive::Download {
+            reference: "@c1".into(),
+            destination_path: None,
+            source: DownloadSource::PageFetch,
+        };
+        let upload = TaskPrimitive::Upload {
+            artifact_handle: Some("artifact-1".into()),
+            artifact_handles: None,
+            selector: Some("input[type=file]".into()),
+            trigger_reference: Some("@c2".into()),
+            acceptance: Some(serde_json::json!({"kind":"visible_text","text":"Uploaded"})),
+            persisted: None,
+            account_marker: ("Account".into(), "owner".into()),
+        };
+        let download_upload = TaskPrimitive::DownloadUpload {
+            download_reference: "@c3".into(),
+            destination_path: None,
+            source: DownloadSource::PageFetch,
+            selector: Some("input[type=file]".into()),
+            trigger_reference: Some("@c4".into()),
+            acceptance: Some(serde_json::json!({"kind":"visible_text","text":"Uploaded"})),
+            persisted: None,
+            account_marker: ("Account".into(), "owner".into()),
+        };
+        let submit = TaskPrimitive::Mutation {
+            steps: vec![MutationStep::Click {
+                reference: "@c5".into(),
+                outcome: serde_json::json!({"kind":"none"}),
+            }],
+        };
+
+        for task in [download, upload, download_upload, submit] {
+            assert!(
+                !task.is_resumable_with_postconditions(),
+                "uncertain transfer/submission must fail closed rather than replay: {task:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_resume_requires_a_fresh_identity_bound_attachment_predicate() {
+        let task = |acceptance: Value| TaskPrimitive::Upload {
+            artifact_handle: Some("artifact-1".into()),
+            artifact_handles: None,
+            selector: None,
+            trigger_reference: Some("@c1".into()),
+            acceptance: Some(acceptance),
+            persisted: None,
+            account_marker: ("#account".into(), "owner".into()),
+        };
+        assert!(
+            task(serde_json::json!({
+                "kind":"attachment","filename":"report.pdf","size":1024
+            }))
+            .is_resumable_with_postconditions()
+        );
+        assert!(
+            !task(serde_json::json!({
+                "kind":"text_present","text":"Uploaded"
+            }))
+            .is_resumable_with_postconditions()
+        );
+        assert!(
+            !task(serde_json::json!({
+                "kind":"attachment","filename":"report.pdf"
+            }))
+            .is_resumable_with_postconditions()
+        );
+        assert!(
+            !task(serde_json::json!({
+                "kind":"app_specific","adapter":"google_classroom_attachment_v1",
+                "predicate":{"version":0}
+            }))
+            .is_resumable_with_postconditions()
+        );
+    }
 
     #[test]
     fn upload_expansion_preserves_single_file_and_accepts_bounded_artifact_lists() {

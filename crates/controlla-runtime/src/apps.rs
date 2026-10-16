@@ -351,7 +351,7 @@ pub fn canva_slide_review_steps_v1(predicate: &Value) -> Result<Vec<Value>, &'st
         steps.push(json!({"kind":"verify","predicate":{"kind":"app_specific","adapter":"canva_active_slide_v1","predicate":{"version":1,"design_url":predicate["design_url"],"name":name,"id_field":slide["id_field"],"stable_id":slide["stable_id"]}}}));
         let evidence_context = json!({"kind":"canva_slide_capture","design_url":predicate["design_url"],
                 "slide_name":name,"stable_id_field":slide["id_field"],"stable_id":slide["stable_id"],
-                "identity_scope":"caller_claimed_selection_bracket","renderer_freshness":"unproven",
+                "identity_scope":"runtime_verified_selection_before_and_after_capture","renderer_freshness":"two_animation_frames_before_compositor_capture",
                 "image_sources":slide["image_sources"],"ai_generated_image_labels":slide["ai_generated_image_labels"],
                 "source_metadata_scope":"caller_declared_not_independently_verified"}).to_string();
         steps.push(
@@ -1136,9 +1136,12 @@ mod semantic_adapter_tests {
         );
         assert_eq!(
             evidence_context["identity_scope"],
-            "caller_claimed_selection_bracket"
+            "runtime_verified_selection_before_and_after_capture"
         );
-        assert_eq!(evidence_context["renderer_freshness"], "unproven");
+        assert_eq!(
+            evidence_context["renderer_freshness"],
+            "two_animation_frames_before_compositor_capture"
+        );
         assert_eq!(
             evidence_context["image_sources"][0],
             "https://cdn.example.test/cover.png"
@@ -1165,6 +1168,55 @@ mod semantic_adapter_tests {
         let mut duplicate_id = slide_predicate();
         duplicate_id["slides"][1]["stable_id"] = duplicate_id["slides"][0]["stable_id"].clone();
         assert!(canva_slide_review_steps_v1(&duplicate_id).is_err());
+    }
+
+    #[test]
+    fn canva_seven_slide_capture_manifest_keeps_order_and_identity_fences() {
+        let mut predicate = slide_predicate();
+        let slides = (1..=7)
+            .map(|index| {
+                json!({
+                    "reference":format!("@slide{index}"),
+                    "index":index,
+                    "name":format!("Slide {index}"),
+                    "role":"button",
+                    "id_field":"href",
+                    "stable_id":format!("https://www.canva.com/design/abc/edit#page={index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        predicate["expected_count"] = json!(7);
+        predicate["slides"] = json!(slides);
+
+        let steps = canva_slide_review_steps_v1(&predicate).unwrap();
+        assert_eq!(
+            steps.len(),
+            36,
+            "one manifest check plus five guarded steps per slide"
+        );
+        assert_eq!(steps[0]["predicate"]["predicate"]["expected_count"], 7);
+        for index in 1..=7 {
+            let first_step = 1 + (index - 1) * 5;
+            assert_eq!(steps[first_step]["kind"], "find");
+            assert_eq!(steps[first_step + 1]["kind"], "click");
+            assert_eq!(
+                steps[first_step + 2]["predicate"]["adapter"],
+                "canva_active_slide_v1"
+            );
+            assert_eq!(steps[first_step + 3]["kind"], "probe");
+            assert_eq!(
+                steps[first_step + 3]["save_as"],
+                format!("canva_slide_{index}")
+            );
+            assert_eq!(
+                steps[first_step + 4]["predicate"]["adapter"],
+                "canva_active_slide_v1"
+            );
+            assert_eq!(
+                steps[first_step + 2]["predicate"]["predicate"]["stable_id"],
+                format!("https://www.canva.com/design/abc/edit#page={index}")
+            );
+        }
     }
 
     #[test]

@@ -2,12 +2,17 @@
   "schema_version": 1,
   "track": "phase11-realistic",
   "frozen_phase10_unchanged": true,
-  "modes": ["cold_unknown","warm_known","warm_skill"],
+  "modes": ["cold_browser","warm_browser_cold_site","warm_qualified_route","reconnect"],
+  "execution_modes": ["foreground","background","headless"],
   "concurrency": [1,2,4,8],
-  "repetitions": 10,
+  "required_environment": ["candidate_source_sha","dirty_tree_patch_sha256","runtime_binary_sha256","extension_build_sha256","chrome_version","os_build","machine_profile","model","model_settings","prompt_hash","token_budget","fixture_revision","network_profile","client_adapter_versions","account_fixture_id"],
+  "random_seed": 20261015,
+  "repetitions": 30,
+  "warmup_repetitions": 2,
   "task_classes": [
     "forms","extraction","multitab","spa","visual_canvas","virtual_list","upload",
-    "repeated_workflow","interference","stale_navigation","long_workflow","concurrent_tabs"
+    "repeated_workflow","interference","stale_navigation","long_workflow","concurrent_tabs",
+    "cross_origin_oopif","download_upload"
   ],
   "tasks": [
     {"id":"form-guarded-fill","class":"forms","fixture":"registration-form","requires_independent_verification":true},
@@ -31,7 +36,10 @@
     {"id":"artifact-register-4mb","class":"upload","fixture":"file-input","scenario":"4_mib_artifact_transfer_digest_match","requires_independent_verification":true},
     {"id":"artifact-register-10mb","class":"upload","fixture":"file-input","scenario":"10_mib_artifact_transfer_digest_match","requires_independent_verification":true},
     {"id":"react-rerender-target","class":"interference","fixture":"registration-form","scenario":"same_document_unique_replacement_then_guarded_action","requires_independent_verification":true},
-    {"id":"on-demand-frame-escalation","class":"extraction","fixture":"workflow-suite","scenario":"root_snapshot_then_targeted_frame_read","requires_independent_verification":true}
+    {"id":"on-demand-frame-escalation","class":"extraction","fixture":"workflow-suite","scenario":"root_snapshot_then_targeted_frame_read","requires_independent_verification":true},
+    {"id":"cross-site-oopif-target","class":"cross_origin_oopif","fixture":"workflow-suite","scenario":"independent_child_origin_read_and_guarded_mutation","requires_independent_verification":true},
+    {"id":"download-register-upload","class":"download_upload","fixture":"file-input","scenario":"download_then_upload_exact_bytes_and_verify_persisted_digest","requires_independent_verification":true},
+    {"id":"seven-slide-capture-manifest","class":"visual_canvas","fixture":"slide-deck","scenario":"complete_ordered_seven_slide_capture_manifest_with_independent_identity_checks","requires_independent_verification":true}
   ],
   "adapters": [
     {"id":"controlla","track":"structured"},
@@ -47,15 +55,72 @@
   "required_metrics": [
     "success","independently_verified_success","severe_wrong_target_events","authority_violations",
     "silent_stale_mutations","wall_ms","model_round_trips","model_tokens","mcp_calls","browser_ops",
-    "observation_bytes","screenshot_bytes","retries","recovery_events","cache_status","verification_ms",
-    "cpu_ms","peak_rss_bytes","focus_disruptions","clipboard_disruptions","human_interventions"
+    "prompt_to_verified_ms","prompt_to_final_ms","external_controlla_calls","model_turns",
+    "model_visible_observations","internal_model_calls","browser_cdp_commands","host_round_trips",
+    "native_host_messages_sent","native_host_messages_received","schema_bytes","prompt_input_bytes",
+    "tool_input_bytes","output_bytes","observation_bytes","screenshot_bytes","unknown_delivery_count",
+    "fallback_count","retries","timeout_count","cleanup_completed","cleanup_outcome","recovery_events",
+    "cache_status","verification_ms","cpu_ms","peak_rss_bytes","focus_disruptions",
+    "clipboard_disruptions","human_interventions"
   ],
+  "metric_measurement_contract": {
+    "missing_value": null,
+    "missingness_fields": ["missing_reason","provenance"],
+    "rules": [
+      "Every required metric must be present as an observed value or explicit null; null must include a non-empty missing_reason and provenance in the adapter evidence.",
+      "Zero is an observed measurement only. Never substitute zero for an unsupported, unavailable, incomplete, or uninstrumented boundary.",
+      "A metric with missing or partial evidence is ineligible for a performance claim that depends on that metric; retain the attempt and its other observed costs."
+    ],
+    "provenance_by_metric": {
+      "success": "acting_adapter_and_independent_verifier",
+      "independently_verified_success": "independent_verifier",
+      "severe_wrong_target_events": "independent_verifier_or_safety_event_trace",
+      "authority_violations": "independent_verifier_or_safety_event_trace",
+      "silent_stale_mutations": "independent_verifier_or_safety_event_trace",
+      "wall_ms": "benchmark_runner_monotonic_clock",
+      "prompt_to_verified_ms": "client_actual_user_submit_trace_and_independent_verifier_same_clock",
+      "prompt_to_final_ms": "client_observed_final_answer_trace_same_clock",
+      "model_round_trips": "client_model_turn_trace",
+      "model_tokens": "client_model_usage_trace",
+      "mcp_calls": "client_or_mcp_transport_call_trace",
+      "browser_ops": "client_or_browser_provider_operation_trace",
+      "external_controlla_calls": "client_adapter_call_trace",
+      "model_turns": "client_model_turn_trace",
+      "model_visible_observations": "client_model_visible_observation_trace",
+      "internal_model_calls": "runtime_model_invocation_boundary_or_explicit_no_provider_provenance",
+      "browser_cdp_commands": "browser_provider_cdp_dispatch_counter",
+      "host_round_trips": "native_host_provider_send_and_response_counter",
+      "native_host_messages_sent": "native_host_transport_send_counter",
+      "native_host_messages_received": "native_host_transport_receive_counter",
+      "schema_bytes": "client_schema_delivery_trace",
+      "prompt_input_bytes": "client_prompt_submission_boundary",
+      "tool_input_bytes": "client_or_mcp_tool_input_boundary",
+      "output_bytes": "benchmark_runner_process_output_boundary",
+      "observation_bytes": "browser_observation_serializer_or_client_trace",
+      "screenshot_bytes": "browser_visual_artifact_transfer_counter",
+      "unknown_delivery_count": "browser_mutation_delivery_outcome_trace",
+      "fallback_count": "explicit_route_fallback_counter",
+      "retries": "client_or_runtime_retry_counter",
+      "timeout_count": "benchmark_deadline_and_adapter_timeout_events",
+      "cleanup_completed": "adapter_or_fixture_cleanup_postcondition",
+      "cleanup_outcome": "adapter_or_fixture_cleanup_postcondition",
+      "recovery_events": "explicit_recovery_event_trace",
+      "cache_status": "adapter_route_cache_receipt",
+      "verification_ms": "independent_verifier_monotonic_clock",
+      "cpu_ms": "operating_system_process_accounting",
+      "peak_rss_bytes": "operating_system_process_accounting",
+      "focus_disruptions": "browser_focus_and_activation_event_trace",
+      "clipboard_disruptions": "clipboard_access_or_change_event_trace",
+      "human_interventions": "adapter_or_operator_intervention_event_trace"
+    }
+  },
   "claim_gates": {
-    "success_noninferiority_lower_bound": -0.02,
+    "success_noninferiority_lower_bound": -0.01,
     "minimum_model_round_trip_reduction": 0.30,
     "minimum_median_wall_time_reduction": 0.25,
     "maximum_severe_wrong_target_events": 0,
     "maximum_authority_violations": 0,
-    "maximum_silent_stale_mutations": 0
+    "maximum_silent_stale_mutations": 0,
+    "maximum_false_success_regression": 0
   }
 }

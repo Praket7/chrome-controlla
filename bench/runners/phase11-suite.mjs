@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadPhase11Config, parseCommand, runBenchmark } from './phase11-runner.mjs';
+import { loadPhase11Config, MAX_REPORT_BYTES, parseCommand, runBenchmark } from './phase11-runner.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -27,8 +27,12 @@ export async function runFullSuite({
   verifierCommand,
   environment,
   modes,
+  executionModes,
   concurrencyLevels,
   repetitions,
+  retainRows = true,
+  maxReportBytes = MAX_REPORT_BYTES,
+  onComparison,
   deadlineMs = 60_000,
   env = process.env,
   configPath = process.env.PHASE11_TASK_SET ?? 'bench/tasks/phase11-realistic.json',
@@ -36,6 +40,7 @@ export async function runFullSuite({
   const config = await loadPhase11Config(configPath);
   const baselines = baselineIds ?? await structuredBaselineIds(candidateId, configPath);
   const comparisons = [];
+  let retainedBytes = 0;
   for (const baselineId of baselines) {
     if (!commands?.[baselineId]) throw new Error(`missing command for structured baseline ${baselineId}`);
     const report = await runBenchmark({
@@ -47,21 +52,41 @@ export async function runFullSuite({
       verifierCommand,
       environment,
       modes,
+      executionModes,
       concurrencyLevels,
       repetitions,
+      maxReportBytes: retainRows ? maxReportBytes - retainedBytes : maxReportBytes,
       deadlineMs,
       env,
       configPath,
     });
-    comparisons.push({ baseline_adapter: baselineId, paired_rows: report.paired_rows });
+    const evidence = { baseline_adapter: baselineId, warmup_rows: report.warmup_rows,
+      paired_rows: report.paired_rows, randomization: report.randomization };
+    if (retainRows) {
+      retainedBytes += Buffer.byteLength(JSON.stringify(evidence));
+      if (retainedBytes > maxReportBytes) throw new Error(`full-suite report exceeded ${maxReportBytes} bytes`);
+      comparisons.push(evidence);
+    }
+    else {
+      if (typeof onComparison !== 'function') throw new Error('onComparison is required when retainRows is false');
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/i.test(baselineId)) throw new Error(`unsafe comparison adapter id ${baselineId}`);
+      comparisons.push({ baseline_adapter: baselineId, evidence_file: await onComparison(evidence),
+        randomization: report.randomization });
+    }
   }
-  return {
-    schema_version: 2,
+  const result = {
+    schema_version: retainRows ? 2 : 3,
     track: config.track,
     candidate_adapter: candidateId,
+    randomization: { method: 'seeded_paired_order', seed: config.random_seed },
+    ...(retainRows ? {} : { results_storage: 'comparison_files' }),
     environment,
     comparisons,
   };
+  if (retainRows && Buffer.byteLength(JSON.stringify(result)) > maxReportBytes) {
+    throw new Error(`full-suite report exceeded ${maxReportBytes} bytes`);
+  }
+  return result;
 }
 
 function argValue(name) {
@@ -76,6 +101,7 @@ async function main() {
   const environment = JSON.parse(process.env.PHASE11_ENVIRONMENT_JSON ?? '{}');
   const deadlineMs = Number(argValue('deadline-ms') ?? 60_000);
   const modes = argValue('modes')?.split(',').filter(Boolean);
+  const executionModes = argValue('execution-modes')?.split(',').filter(Boolean);
   const concurrencyLevels = argValue('concurrency')?.split(',').filter(Boolean).map(Number);
   const repetitions = argValue('repetitions') === undefined ? undefined : Number(argValue('repetitions'));
   const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
@@ -92,11 +118,22 @@ async function main() {
   }
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
-  const report = await runFullSuite({ candidateId, fixtureBaseUrl, commands, resetCommand, verifierCommand, environment, modes, concurrencyLevels, repetitions, deadlineMs, configPath });
+  const comparisonDir = `${output}.comparisons`;
+  const report = await runFullSuite({ candidateId, fixtureBaseUrl, commands, resetCommand, verifierCommand,
+    environment, modes, executionModes, concurrencyLevels, repetitions, deadlineMs, configPath, retainRows: false,
+    onComparison: async evidence => {
+      await mkdir(comparisonDir, { recursive: true });
+      const filename = `${evidence.baseline_adapter}.json`;
+      const destination = resolve(comparisonDir, filename);
+      const shard = `${JSON.stringify({ schema_version: 2, track: config.track, candidate_adapter: candidateId,
+        environment, randomization: evidence.randomization, ...evidence })}\n`;
+      if (Buffer.byteLength(shard) > MAX_REPORT_BYTES) throw new Error(`comparison shard exceeded ${MAX_REPORT_BYTES} bytes`);
+      await writeFile(destination, shard, { flag: 'wx' });
+      return relative(root, destination).replaceAll('\\', '/');
+    } });
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
-  const rows = report.comparisons.reduce((sum, comparison) => sum + comparison.paired_rows.length, 0);
-  console.log(`wrote ${rows} paired Phase 11 rows across ${report.comparisons.length} structured baselines to ${output}`);
+  console.log(`wrote a full Phase 11 evidence manifest for ${report.comparisons.length} structured baselines to ${output}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

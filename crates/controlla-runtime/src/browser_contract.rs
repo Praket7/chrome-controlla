@@ -715,6 +715,15 @@ const SHARED: &[BrowserActionCapability] = &[
     capability(
         "shared_extension",
         "foreground",
+        "multi_touch",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "guarded_trusted_two_finger_pinch",
+    ),
+    capability(
+        "shared_extension",
+        "foreground",
         "page_tool",
         ValueRequirement::Forbidden,
         false,
@@ -837,6 +846,15 @@ const SHARED: &[BrowserActionCapability] = &[
         false,
         "input",
         "guarded_touch_movement_readback",
+    ),
+    capability(
+        "shared_extension",
+        "background",
+        "multi_touch",
+        ValueRequirement::Forbidden,
+        false,
+        "input",
+        "guarded_trusted_two_finger_pinch",
     ),
     capability(
         "shared_extension",
@@ -1177,6 +1195,19 @@ mod tests {
         assert!(matches!(
             resolve_action_capability("shared_extension", "foreground", "swipe", BROWSER_ACTION_CONTRACT_VERSION),
             CapabilityResolution::Supported(capability) if capability.evidence == "guarded_touch_movement_readback"
+        ));
+        assert!(matches!(
+            resolve_action_capability("shared_extension", "foreground", "multi_touch", BROWSER_ACTION_CONTRACT_VERSION),
+            CapabilityResolution::Supported(capability) if capability.evidence == "guarded_trusted_two_finger_pinch"
+        ));
+        assert!(matches!(
+            resolve_action_capability(
+                "dedicated_headless",
+                "headless",
+                "multi_touch",
+                BROWSER_ACTION_CONTRACT_VERSION
+            ),
+            CapabilityResolution::Unsupported { .. }
         ));
         assert!(matches!(
             resolve_action_capability(

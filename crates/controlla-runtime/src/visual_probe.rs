@@ -10,6 +10,8 @@ pub const MAX_PROBES_PER_WORKFLOW: usize = 3;
 pub const MAX_EVIDENCE_BYTES: usize = 512 * 1024;
 pub const MAX_TASK_EVIDENCE_ENTRIES: usize = 64;
 pub const MAX_TASK_EVIDENCE_BYTES: usize = 32 * 1024;
+/// Maximum serialized semantic/visual descriptor retained for one evidence item.
+pub const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvidenceEntry {
@@ -20,6 +22,12 @@ pub struct EvidenceEntry {
     pub fact: String,
     pub evidence_hash: String,
     pub verified: bool,
+    /// Redacted, allowlisted observation facts retrievable through evidence_read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    /// SHA-256 of the canonical JSON encoding of `payload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
 }
 
 /// Bounded, session-local memory of verified actions and explicit evidence.
@@ -73,6 +81,18 @@ impl EvidenceTrail {
         fact: impl Into<String>,
         verified: bool,
     ) {
+        self.record_with_payload(kind, public_ref, frame_id, fact, verified, None);
+    }
+
+    pub fn record_with_payload(
+        &mut self,
+        kind: impl Into<String>,
+        public_ref: Option<String>,
+        frame_id: Option<String>,
+        fact: impl Into<String>,
+        verified: bool,
+        payload: Option<serde_json::Value>,
+    ) {
         let fact = fact.into();
         let kind = kind.into();
         if fact.len() > 2048
@@ -85,6 +105,17 @@ impl EvidenceTrail {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        let payload = payload.filter(|payload| {
+            serde_json::to_vec(payload).is_ok_and(|bytes| bytes.len() <= MAX_EVIDENCE_PAYLOAD_BYTES)
+        });
+        let payload_sha256 = payload.as_ref().and_then(|payload| {
+            serde_json::to_vec(payload).ok().map(|bytes| {
+                sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect()
+            })
+        });
         let entry = EvidenceEntry {
             step: self.next_step,
             kind,
@@ -93,6 +124,8 @@ impl EvidenceTrail {
             fact,
             evidence_hash: digest,
             verified,
+            payload,
+            payload_sha256,
         };
         self.next_step = self.next_step.saturating_add(1);
         let size = serde_json::to_vec(&entry).map_or(0, |value| value.len());

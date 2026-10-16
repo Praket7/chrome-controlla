@@ -18,7 +18,7 @@
     "check:agent-ux": "node --test packages/chrome-controlla/test-agent-ux.cjs bench/runners/stage2.5-agent-ux-score.test.mjs",
     "bench:phase11:suite": "node bench/runners/phase11-suite.mjs",
     "bench:phase11:live-sites": "node scripts/run-real-browser-benchmarks.mjs --task-set=bench/tasks/phase11-real-sites.json",
-    "check:release": "node --test scripts/check-best-chrome-release-gate.test.mjs scripts/check-v3-release-gate.test.mjs && node scripts/check-best-chrome-release-gate.mjs",
+    "check:release": "node --test scripts/check-best-chrome-release-gate.test.mjs scripts/check-v3-release-gate.test.mjs scripts/extension-package-assets.test.mjs && node scripts/check-best-chrome-release-gate.mjs",
     "check:v3": "node apps/check-client-qualification.mjs && node --test tests/clients/check-client-qualification.test.mjs && node tests/clients/check-v3-configs.mjs && node --test bench/analysis/phase12-analysis.test.mjs scripts/check-v3-release-gate.test.mjs",
     "prepare:release-candidate": "node scripts/prepare-release-candidate.mjs"
   },

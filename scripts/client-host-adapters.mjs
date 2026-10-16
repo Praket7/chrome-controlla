@@ -2,9 +2,9 @@ import { access, mkdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { delimiter, join, resolve } from 'node:path';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recordPromptTraceEvent, readPromptTrace, summarizePromptTrace } from './prompt-send-trace.mjs';
+import { recordPromptTraceEvent, readPromptTraceFiles, summarizePromptTrace } from './prompt-send-trace.mjs';
 
 const HOSTS = Object.freeze({
   codex: { executable: 'codex', kind: 'cli', support: 'non_interactive' },
@@ -41,7 +41,9 @@ export async function prepareClientHostConfig(clientId, launch, directory, trace
   const server = traceOptions?.traceFile ? {
     command: process.execPath,
     args: [fileURLToPath(new URL('./mcp-stdio-trace-proxy.mjs', import.meta.url)), launch.command, ...launch.args],
-    env: { ...launch.env, CONTROLLA_PROMPT_TRACE_FILE: traceOptions.traceFile,
+    // The host adapter and MCP proxy are separate processes. Keep their
+    // append-only streams separate and merge by monotonic timestamp later.
+    env: { ...launch.env, CONTROLLA_PROMPT_TRACE_FILE: `${traceOptions.traceFile}.mcp`,
       CONTROLLA_PROMPT_TRACE_ID: traceOptions.traceId,
       CONTROLLA_PROMPT_COLD_WARM: traceOptions.coldWarm ?? 'unknown' },
   } : { command: launch.command, args: launch.args, env: launch.env };
@@ -63,9 +65,15 @@ export function buildClientHostInvocation(clientId, { executable, workDir, mcpCo
   if (!HOSTS[clientId] || typeof executable !== 'string' || typeof workDir !== 'string' || typeof prompt !== 'string') {
     throw new Error(`invalid host invocation context for ${clientId}`);
   }
-  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${codexTomlInlineTable(mcpConfig.env)}`, '-'], stdin: prompt, promptBoundary: 'client_stdin_write' };
-  if (clientId === 'opencode') return { command: executable, args: ['run', '--format', 'json', '--dir', workDir, prompt], env: { OPENCODE_CONFIG_DIR: mcpConfig.configDir } };
-  if (clientId === 'claude-code') return { command: executable, args: ['-p', '--output-format', 'json', '--strict-mcp-config', '--mcp-config', mcpConfig.configPath, '--max-turns', '8', prompt] };
+  if (clientId === 'codex') return { command: executable, args: ['exec', '--ephemeral', '--json', '--ignore-user-config', '--approve-for-me', '--skip-git-repo-check', '-C', workDir, '-c', `mcp_servers.chrome-controlla.command=${JSON.stringify(mcpConfig.command)}`, '-c', `mcp_servers.chrome-controlla.args=${JSON.stringify(mcpConfig.args)}`, '-c', `mcp_servers.chrome-controlla.env=${codexTomlInlineTable(mcpConfig.env)}`, '-'], stdin: prompt };
+  if (clientId === 'opencode') {
+    throw new Error('OpenCode CLI has no documented stdin prompt channel; refusing to expose prompt text in process arguments');
+  }
+  if (clientId === 'claude-code') return {
+    command: executable,
+    args: ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--strict-mcp-config', '--mcp-config', mcpConfig.configPath, '--max-turns', '8'],
+    stdin: `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }] } })}\n`,
+  };
   throw new Error(`${clientId} has no supported non-interactive host invocation`);
 }
 
@@ -73,11 +81,29 @@ function codexTomlInlineTable(environment) {
   if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
     throw new Error('Codex MCP environment must be a map of string values');
   }
+  const allowedNonSecretKeys = new Set([
+    'CONTROLLA_STATE_DIR',
+    'CONTROLLA_AGENT_SURFACE',
+    'COMPTROL_CHROME_EXECUTABLE',
+    'CONTROLLA_PROMPT_TRACE_FILE',
+    'CONTROLLA_PROMPT_TRACE_ID',
+    'CONTROLLA_PROMPT_COLD_WARM',
+  ]);
   const entries = Object.entries(environment).sort(([left], [right]) => left.localeCompare(right));
   for (const [key, value] of entries) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string') {
       throw new Error('Codex MCP environment keys must be identifiers and values must be strings');
     }
+    if (!allowedNonSecretKeys.has(key)) {
+      throw new Error(`unsupported Codex MCP environment key '${key}'; command-line config accepts only allowlisted nonsecret values`);
+    }
+    const safeValue = key === 'CONTROLLA_STATE_DIR' || key === 'COMPTROL_CHROME_EXECUTABLE'
+      || key === 'CONTROLLA_PROMPT_TRACE_FILE'
+      ? isAbsolute(value)
+      : key === 'CONTROLLA_AGENT_SURFACE' ? value === 'v3-compact'
+        : key === 'CONTROLLA_PROMPT_COLD_WARM' ? ['cold', 'warm', 'unknown'].includes(value)
+          : key === 'CONTROLLA_PROMPT_TRACE_ID' && /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+    if (!safeValue) throw new Error(`unsafe Codex MCP environment value for '${key}'`);
   }
   return `{${entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ')}}`;
 }
@@ -118,9 +144,11 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
     let traceWrites = Promise.resolve();
     let lineBuffer = '';
     const hostEvents = [];
+    const clientToolDecisions = new Set();
     const queueTrace = (event, fields = {}, happenedAt = process.hrtime.bigint()) => {
       if (!traceFile) return;
-      traceWrites = traceWrites.then(() => recordPromptTraceEvent(traceFile, traceId, event, fields, happenedAt));
+      traceWrites = traceWrites.then(() => recordPromptTraceEvent(traceFile, traceId, event,
+        { clock_domain: 'local_host_monotonic', clock_offset_ms: 0, ...fields }, happenedAt));
     };
     let firstToolDecisionRecorded = false;
     let finalAnswerRecorded = false;
@@ -130,9 +158,23 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
       try { value = JSON.parse(line); } catch { return; }
       const parsed = collectToolEvents(value);
       hostEvents.push(...parsed);
-      if (parsed.length && !firstToolDecisionRecorded) {
+      const controllaTools = collectToolEventsFromHost(parsed);
+      if (controllaTools.length && !firstToolDecisionRecorded) {
         firstToolDecisionRecorded = true;
-        queueTrace('first_tool_decision', { external_tool_calls: parsed.length });
+        const firstControllaTool = controllaTools[0];
+        queueTrace('first_tool_decision', { external_tool_calls: controllaTools.length,
+          ...(typeof firstControllaTool?.id === 'string' || Number.isSafeInteger(firstControllaTool?.id)
+            ? { client_call_id: String(firstControllaTool.id).slice(0, 128) } : {}),
+          ...(typeof firstControllaTool?.name === 'string' ? { tool: firstControllaTool.name.slice(0, 80) } : {}) });
+      }
+      for (const tool of controllaTools) {
+        if (!(typeof tool.id === 'string' || Number.isSafeInteger(tool.id))) continue;
+        const clientCallId = String(tool.id).slice(0, 128);
+        const key = `${clientCallId}\u0000${tool.name}`;
+        if (clientToolDecisions.has(key)) continue;
+        clientToolDecisions.add(key);
+        queueTrace('client_tool_decision', { client_call_id: clientCallId, tool: tool.name.slice(0, 80),
+          provenance: 'client_host_tool_event' });
       }
       const type = String(value.type ?? value.event ?? '').toLowerCase();
       const nestedType = String(value.item?.type ?? value.message?.type ?? '').toLowerCase();
@@ -149,19 +191,24 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
       }
     };
     const child = spawnProcess(invocation.command, invocation.args, { cwd: workDir, env: { ...env, ...invocation.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.once('spawn', () => queueTrace('process_start', { client: clientId, child_pid: child.pid }));
     if (invocation.stdin !== undefined) {
-      // Codex exec reads `-` from stdin. The prompt is not exposed in the process list.
-      queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm,
-        prompt_boundary: invocation.promptBoundary }, process.hrtime.bigint());
+      // Codex and Claude Code accept their prompt through stdin. The prompt is not exposed in the process list.
+      child.stdin.once('finish', () => {
+        // Writable `finish` means Node flushed the complete prompt into the
+        // child stdin stream. It is still not an acknowledgement from the model.
+        // Record local pipe-write completion only. It does not prove that the
+        // client consumed the prompt or began its model turn.
+        queueTrace('prompt_input_written', { prompt_input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm,
+          prompt_boundary: 'client_stdin_write_finished', provenance: 'child_stdin_finish', clock_uncertainty_ms: 0 });
+      });
       child.stdin.end(invocation.stdin);
     } else {
-      // Other CLI adapters currently accept prompts as arguments; this is an
-      // invocation boundary, not proof of an interactive user's SEND event.
-      queueTrace('prompt_sent', { input_bytes: Buffer.byteLength(prompt), cold_warm: coldWarm,
-        prompt_boundary: 'client_process_spawn_argument' });
+      // Prompt arguments are present at process launch, but the host exposes no
+      // separate submission hook. Preserve that interval as process timing only.
       child.stdin.end();
     }
-    const stdout = []; const stderr = []; let stdoutBytes = 0; let stderrBytes = 0;
+    const stdout = []; const stderr = []; let stdoutBytes = 0; let stderrBytes = 0; let stderrTruncated = false;
     child.stdout.on('data', chunk => {
       const bounded = Buffer.from(chunk).subarray(0, Math.max(0, 4_000_000 - stdoutBytes));
       if (bounded.length) { stdout.push(bounded); stdoutBytes += bounded.length; }
@@ -172,21 +219,64 @@ export async function runClientHostTask(clientId, { executable, workDir, mcpConf
         lineBuffer = lineBuffer.slice(newline + 1);
       }
     });
-    child.stderr.on('data', chunk => { if (stderrBytes < 64_000) { const bounded = Buffer.from(chunk).subarray(0, 64_000 - stderrBytes); stderr.push(bounded); stderrBytes += bounded.length; } });
-    const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-    child.once('error', error => { clearTimeout(timer); rejectTask(error); });
-    child.once('close', code => {
+    child.stderr.on('data', chunk => {
+      if (stderrBytes >= 64_000) { stderrTruncated = true; return; }
+      const bounded = Buffer.from(chunk).subarray(0, 64_000 - stderrBytes);
+      if (bounded.length) { stderr.push(bounded); stderrBytes += bounded.length; }
+      if (bounded.length < chunk.length) stderrTruncated = true;
+    });
+    let settled = false;
+    let timedOut = false;
+    const rejectWithTrace = async (error, exitCode = null) => {
+      if (settled) return;
+      settled = true;
+      let promptTrace = null;
+      try {
+        await traceWrites;
+        if (traceFile) promptTrace = summarizePromptTrace(await readPromptTraceFiles([traceFile, `${traceFile}.mcp`], traceId));
+      } catch {
+        // Failure diagnostics must not mask the adapter's original failure.
+      }
+      // Attach only the bounded trace summary, never prompt text or raw streams.
+      error.process_id = child.pid ?? null;
+      error.exit_code = exitCode;
+      error.timed_out = timedOut;
+      error.prompt_trace = promptTrace;
+      rejectTask(error);
+    };
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, timeoutMs);
+    child.once('error', error => {
       clearTimeout(timer);
+      queueTrace('process_end');
+      void rejectWithTrace(error);
+    });
+    child.once('close', code => {
+      if (settled) return;
+      clearTimeout(timer);
+      queueTrace('process_end', Number.isInteger(code) && code >= 0 ? { exit_code: code } : {});
       const output = Buffer.concat(stdout).toString('utf8');
-      const errorOutput = Buffer.concat(stderr).toString('utf8').slice(0, 64_000);
+      const stderrOutput = Buffer.concat(stderr);
+      const stderrSha256 = createHash('sha256').update(stderrOutput).digest('hex');
       consumeLine(lineBuffer);
       void (async () => {
         await traceWrites;
-        if (code !== 0) throw new Error(`${clientId} host exited with code ${code}${errorOutput ? `: ${errorOutput}` : ''}`);
+        if (code !== 0 || timedOut) {
+          const error = new Error(timedOut
+            ? `${clientId} host exceeded its ${timeoutMs}ms deadline`
+            : `${clientId} host exited with code ${code}`);
+          error.stderr_bytes_captured = stderrOutput.length;
+          error.stderr_prefix_sha256 = stderrSha256;
+          error.stderr_truncated = stderrTruncated;
+          await rejectWithTrace(error, Number.isInteger(code) && code >= 0 ? code : null);
+          return;
+        }
         const controllaEvents = collectToolEventsFromHost(hostEvents);
-        const promptTrace = traceFile ? summarizePromptTrace(await readPromptTrace(traceFile)) : null;
+        const promptTrace = traceFile ? summarizePromptTrace(await readPromptTraceFiles([traceFile, `${traceFile}.mcp`], traceId)) : null;
+        settled = true;
         resolveTask({ client: clientId, status: controllaEvents.length ? 'host_tool_invocation_observed' : 'no_host_tool_invocation_observed', qualification_status: 'not_run', process_id: child.pid,
-          tool_events: controllaEvents, stdout_sha256: createHash('sha256').update(output).digest('hex'), stderr: errorOutput, exit_code: code,
+          tool_events: controllaEvents, stdout_sha256: createHash('sha256').update(output).digest('hex'),
+          stderr_bytes_captured: stderrOutput.length, stderr_prefix_sha256: stderrSha256,
+          stderr_truncated: stderrTruncated, exit_code: code,
           prompt_trace: promptTrace });
       })().catch(rejectTask);
     });

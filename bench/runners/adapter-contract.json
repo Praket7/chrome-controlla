@@ -2,22 +2,81 @@
   "schema_version": 1,
   "input": {
     "task_id": "string",
-    "mode": "cold_unknown|warm_known|warm_skill",
+    "mode": "cold_browser|warm_browser_cold_site|warm_qualified_route|reconnect",
+    "execution_mode": "foreground|background|headless",
     "concurrency": "1|2|4|8",
     "fixture_url": "string",
     "deadline_ms": "integer"
   },
   "output_required": [
-    "adapter","task_id","mode","concurrency","success","independently_verified_success",
+    "adapter","task_id","mode","execution_mode","concurrency","success","independently_verified_success",
     "wall_ms","model_round_trips","model_tokens","mcp_calls","browser_ops","observation_bytes",
     "screenshot_bytes","retries","recovery_events","cache_status","verification_ms","cpu_ms",
     "peak_rss_bytes","focus_disruptions","clipboard_disruptions","human_interventions",
-    "severe_wrong_target_events","authority_violations","silent_stale_mutations"
+    "severe_wrong_target_events","authority_violations","silent_stale_mutations",
+    "external_controlla_calls","model_turns","model_visible_observations","internal_model_calls",
+    "browser_cdp_commands","host_round_trips","native_host_messages_sent","native_host_messages_received",
+    "schema_bytes","prompt_input_bytes","tool_input_bytes","output_bytes","unknown_delivery_count",
+    "fallback_count","timeout_count","cleanup_completed","cleanup_outcome"
   ],
   "runner_enriched_output": [
     "prompt_to_verified_ms","prompt_to_verifier_decision_ms","prompt_to_final_ms",
     "adapter_request_to_verified_ms","adapter_request_to_verifier_decision_ms","prompt_trace"
   ],
+  "measurement_metric_fields": [
+    "success","independently_verified_success","severe_wrong_target_events","authority_violations",
+    "silent_stale_mutations","wall_ms","model_round_trips","model_tokens","mcp_calls","browser_ops",
+    "prompt_to_verified_ms","prompt_to_final_ms","external_controlla_calls","model_turns",
+    "model_visible_observations","internal_model_calls","browser_cdp_commands","host_round_trips",
+    "native_host_messages_sent","native_host_messages_received","schema_bytes","prompt_input_bytes",
+    "tool_input_bytes","output_bytes","observation_bytes","screenshot_bytes","unknown_delivery_count",
+    "fallback_count","retries","timeout_count","cleanup_completed","cleanup_outcome","recovery_events",
+    "cache_status","verification_ms","cpu_ms","peak_rss_bytes","focus_disruptions",
+    "clipboard_disruptions","human_interventions"
+  ],
+  "measurement_metric_types": {
+    "success":"boolean","independently_verified_success":"boolean",
+    "severe_wrong_target_events":"number","authority_violations":"number","silent_stale_mutations":"number",
+    "wall_ms":"number","model_round_trips":"number","model_tokens":"number","mcp_calls":"number","browser_ops":"number",
+    "prompt_to_verified_ms":"number","prompt_to_final_ms":"number",
+    "external_controlla_calls":"number","model_turns":"number","model_visible_observations":"number",
+    "internal_model_calls":"number","browser_cdp_commands":"number","host_round_trips":"number",
+    "native_host_messages_sent":"number","native_host_messages_received":"number","schema_bytes":"number",
+    "prompt_input_bytes":"number","tool_input_bytes":"number","output_bytes":"number",
+    "observation_bytes":"number","screenshot_bytes":"number","unknown_delivery_count":"number",
+    "fallback_count":"number","retries":"number","timeout_count":"number",
+    "cleanup_completed":"boolean","cleanup_outcome":"string","recovery_events":"number",
+    "cache_status":"string","verification_ms":"number","cpu_ms":"number","peak_rss_bytes":"number",
+    "focus_disruptions":"number","clipboard_disruptions":"number","human_interventions":"number"
+  },
+  "measurement_metric_provenance": {
+    "success":"acting_result_and_independent_verifier",
+    "independently_verified_success":"independent_verifier",
+    "severe_wrong_target_events":"independent_safety_trace","authority_violations":"independent_safety_trace",
+    "silent_stale_mutations":"independent_safety_trace","wall_ms":"runner_monotonic_clock",
+    "model_round_trips":"client_model_turn_trace","model_tokens":"client_model_usage_trace",
+    "mcp_calls":"client_transport_call_trace","browser_ops":"browser_provider_operation_trace",
+    "prompt_to_verified_ms":"submit_verifier_trace","prompt_to_final_ms":"final_answer_trace",
+    "external_controlla_calls":"client_call_trace","model_turns":"client_model_trace",
+    "model_visible_observations":"client_observation_trace","internal_model_calls":"runtime_model_counter",
+    "browser_cdp_commands":"browser_cdp_counter","host_round_trips":"native_host_roundtrip_counter",
+    "native_host_messages_sent":"native_host_send_counter","native_host_messages_received":"native_host_receive_counter",
+    "schema_bytes":"schema_delivery_counter","prompt_input_bytes":"prompt_submit_counter",
+    "tool_input_bytes":"tool_input_counter","output_bytes":"runner_output_counter",
+    "unknown_delivery_count":"unknown_delivery_counter","fallback_count":"fallback_counter",
+    "observation_bytes":"observation_serializer_counter","screenshot_bytes":"visual_artifact_counter",
+    "retries":"client_or_runtime_retry_counter","timeout_count":"timeout_counter",
+    "cleanup_completed":"cleanup_postcondition","cleanup_outcome":"cleanup_postcondition",
+    "recovery_events":"recovery_event_trace","cache_status":"route_cache_receipt",
+    "verification_ms":"independent_verifier_clock","cpu_ms":"process_accounting",
+    "peak_rss_bytes":"process_accounting","focus_disruptions":"focus_event_trace",
+    "clipboard_disruptions":"clipboard_event_trace","human_interventions":"intervention_event_trace"
+  },
+  "normalized_metric_evidence_encoding": {
+    "s":"status (observed or unavailable)",
+    "p":"the field's measurement_metric_provenance value",
+    "r":"required non-empty reason when status is unavailable"
+  },
   "prompt_trace_fields": [
     "prompt_sent","prompt_boundary","prompt_sent_monotonic_ns","first_tool_decision_ms","controlla_received_ms","first_browser_op_ms",
     "last_browser_op_ms","tool_result_delivered_ms","verified_outcome_ms","verifier_decision_ms","final_answer_ms",
@@ -31,6 +90,7 @@
     "computer-use is reported as a separate vision track",
     "adapters may report unsupported but may not silently replace a requested task with an easier one",
     "all mutating tasks use an independent verifier outside the acting adapter",
+    "every measurement_metric_fields entry has per-field metric_evidence provenance; null values require a non-empty missing_reason, and unavailable values are never replaced with zero",
     "runner reports prompt-to-verified only when the independent verifier passes; rejected outcomes retain prompt-to-verifier-decision latency separately. A valid client prompt-dispatch timestamp on the same monotonic clock is required, prompt-to-final comes from the client trace, and absent boundaries leave prompt spans null",
     "performance claims require prompt-to-verified and prompt-to-final evidence, complete traces, and p50/p95 non-regression"
   ]

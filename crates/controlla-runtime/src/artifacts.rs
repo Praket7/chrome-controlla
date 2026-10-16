@@ -46,16 +46,82 @@ pub fn read_local_file(path: &str) -> Result<Vec<u8>, String> {
     }
     #[cfg(unix)]
     {
-        let file = open_local_file_nofollow(path)?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "artifact file_path could not be opened".to_owned())?;
-        if !metadata.is_file() || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
-            return Err(
-                "artifact file must be a regular file no larger than 10485760 bytes".into(),
-            );
-        }
-        read_bounded(file)
+        let filename = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| "artifact file_path could not be opened".to_owned())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "artifact file_path could not be opened".to_owned())?;
+        let directory = open_local_directory_nofollow(parent)?;
+        read_local_file_at(&directory, filename)
+    }
+}
+
+/// Opens one regular bounded file beneath an already-open directory handle.
+/// Keeping the directory handle alive pins the parent inode even if its path is
+/// renamed or replaced while a browser download is in progress.
+#[cfg(unix)]
+pub fn read_local_file_at(directory: &std::fs::File, filename: &str) -> Result<Vec<u8>, String> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+
+    let path = std::path::Path::new(filename);
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return Err("artifact filename must be one path component".into());
+    };
+    if components.next().is_some() {
+        return Err("artifact filename must be one path component".into());
+    }
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| "artifact filename is invalid".to_owned())?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err("artifact file_path must not be a symlink and must be readable".into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "artifact file_path could not be opened".to_owned())?;
+    if !metadata.is_file() || metadata.len() > MAX_LOCAL_ARTIFACT_BYTES {
+        return Err("artifact file must be a regular file no larger than 10485760 bytes".into());
+    }
+    read_bounded(file)
+}
+
+#[cfg(unix)]
+pub fn open_local_directory_nofollow(path: &std::path::Path) -> Result<std::fs::File, String> {
+    open_directory_nofollow(path)
+}
+
+#[cfg(unix)]
+pub fn remove_local_file_at(directory: &std::fs::File, filename: &str) -> Result<(), String> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    let path = std::path::Path::new(filename);
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return Err("artifact filename must be one path component".into());
+    };
+    if components.next().is_some() {
+        return Err("artifact filename must be one path component".into());
+    }
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| "artifact filename is invalid".to_owned())?;
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err("artifact file could not be removed from its opened directory".into())
     }
 }
 
@@ -256,13 +322,16 @@ pub fn persist_local_file(_path: &str, _bytes: &[u8]) -> Result<ArtifactExpectat
 }
 
 #[cfg(unix)]
-fn open_local_file_nofollow(path: &std::path::Path) -> Result<std::fs::File, String> {
+fn open_directory_nofollow(path: &std::path::Path) -> Result<std::fs::File, String> {
     use std::{
         ffi::CString,
         os::{fd::FromRawFd, unix::ffi::OsStrExt},
         path::Component,
     };
 
+    if !path.is_absolute() {
+        return Err("artifact file_path must be absolute".into());
+    }
     let mut components = Vec::new();
     for component in path.components() {
         match component {
@@ -274,11 +343,7 @@ fn open_local_file_nofollow(path: &std::path::Path) -> Result<std::fs::File, Str
             Component::Prefix(_) => return Err("artifact file_path must be absolute".into()),
         }
     }
-    let (filename, parents) = components
-        .split_last()
-        .ok_or_else(|| "artifact file_path could not be opened".to_owned())?;
     let root = CString::new("/").expect("constant has no NUL");
-    // Keep each opened directory alive while opening its child so path components cannot be swapped.
     let root_fd = unsafe {
         libc::open(
             root.as_ptr(),
@@ -289,7 +354,9 @@ fn open_local_file_nofollow(path: &std::path::Path) -> Result<std::fs::File, Str
         return Err("artifact file_path could not be opened".into());
     }
     let mut directory = unsafe { std::fs::File::from_raw_fd(root_fd) };
-    for parent in parents {
+    // Keep every parent handle alive while opening its child so path components
+    // cannot be swapped to symlinks during traversal.
+    for parent in components {
         let name = CString::new(parent.as_bytes())
             .map_err(|_| "artifact file_path could not be opened".to_owned())?;
         let fd = unsafe {
@@ -304,19 +371,7 @@ fn open_local_file_nofollow(path: &std::path::Path) -> Result<std::fs::File, Str
         }
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
     }
-    let filename = CString::new(filename.as_bytes())
-        .map_err(|_| "artifact file_path could not be opened".to_owned())?;
-    let fd = unsafe {
-        libc::openat(
-            std::os::fd::AsRawFd::as_raw_fd(&directory),
-            filename.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err("artifact file_path must not be a symlink and must be readable".into());
-    }
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    Ok(directory)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -395,6 +450,36 @@ mod tests {
         assert!(receipt.matches(b""));
         assert_eq!(std::fs::read(&destination).unwrap(), b"");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_download_directory_handle_survives_path_replacement_without_following_it() {
+        let root = temporary_directory("pinned-download");
+        let download_dir = root.join("controlla-downloads");
+        let moved_dir = root.join("original-downloads");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir(&download_dir).unwrap();
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(download_dir.join("guid-123"), b"browser bytes").unwrap();
+        std::fs::write(outside_dir.join("guid-123"), b"attacker bytes").unwrap();
+
+        let directory = super::open_local_directory_nofollow(&download_dir).unwrap();
+        std::fs::rename(&download_dir, &moved_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, &download_dir).unwrap();
+
+        assert_eq!(
+            super::read_local_file_at(&directory, "guid-123").unwrap(),
+            b"browser bytes"
+        );
+        assert!(super::read_local_file_at(&directory, "../guid-123").is_err());
+        super::remove_local_file_at(&directory, "guid-123").unwrap();
+        assert!(!moved_dir.join("guid-123").exists());
+        assert_eq!(
+            std::fs::read(outside_dir.join("guid-123")).unwrap(),
+            b"attacker bytes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

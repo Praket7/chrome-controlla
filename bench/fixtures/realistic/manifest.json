@@ -7,8 +7,8 @@
     {"id":"spa-router","covers":["spa","stale_navigation","renderer_replacement"]},
     {"id":"canvas-widget","covers":["visual_canvas","canvas"]},
     {"id":"virtual-list","covers":["virtual_list","infinite_scroll"]},
-    {"id":"file-input","covers":["upload","file_download"]},
-    {"id":"workflow-suite","covers":["long_workflow","dialogs_overlays","contenteditable","shadow_dom","iframes"]}
+    {"id":"file-input","covers":["upload","file_download","download_to_upload_exact_bytes"]},
+    {"id":"workflow-suite","covers":["long_workflow","dialogs_overlays","contenteditable","shadow_dom","iframes","cross_site_oopif"]}
   ],
   "reset_contract": [
     "fresh fixture state per measured run",

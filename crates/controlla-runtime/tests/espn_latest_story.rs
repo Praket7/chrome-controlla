@@ -295,7 +295,8 @@ async fn run_latest_story(
     let workflow = client
         .call_tool(call(
             "workflow",
-            serde_json::json!({"session_id":session,"chrome_tab_id":tab,"steps":workflow_steps}),
+            serde_json::json!({"session_id":session,"chrome_tab_id":tab,"steps":workflow_steps,
+                "max_bytes":8192,"max_bytes_reason":"fixture asserts each guarded workflow step"}),
         ))
         .await;
     let result = match workflow {
@@ -326,7 +327,7 @@ async fn espn_latest_story_flow_completes_and_verifies_newest() {
     let result = run_latest_story(false, false, false, false, None).await;
     assert_eq!(result["result"]["status"], "completed", "{result}");
     assert_eq!(result["result"]["steps"], 4, "workflow step budget");
-    assert!(result["result"]["elapsed_ms"].is_number());
+    assert!(result["result"]["elapsed_ms"].is_number(), "{result}");
     assert_eq!(result["result"]["step_ms"].as_array().unwrap().len(), 4);
     assert_eq!(result["result"]["receipts"][0]["count"], 2);
     assert!(

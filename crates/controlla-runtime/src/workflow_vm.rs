@@ -3,7 +3,16 @@
 
 use crate::browser_workflow::{BrowserWorkflowStep, CompiledBrowserWorkflow};
 use crate::workflow::EffectClass;
-use std::{collections::BTreeMap, future::Future, pin::Pin};
+use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 pub const MAX_EXPANDED_STEPS: usize = 64;
 pub const MAX_FOREACH_ITEMS: usize = 32;
@@ -66,6 +75,7 @@ pub enum VmError {
     WorkLimitExceeded,
     NestingLimitExceeded,
     InvalidCondition(String),
+    RouteBudgetExceeded(crate::capability_router::RouteBudgetExceeded),
 }
 
 impl VmError {
@@ -82,7 +92,6 @@ pub trait BrowserVmHost<S: VmOperation = BrowserWorkflowStep>: Sync {
     ) -> Pin<Box<dyn Future<Output = Result<StepReceipt, VmError>> + Send + 'a>>;
 }
 
-#[derive(Default)]
 pub struct Vm {
     pub variables: BTreeMap<String, String>,
     pub step_count: usize,
@@ -90,11 +99,117 @@ pub struct Vm {
     pub receipts: Vec<StepReceipt>,
     successful_mutations: usize,
     control_work: usize,
+    route_budget: crate::capability_router::RouteBudget,
+    route_started: Instant,
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self {
+            variables: BTreeMap::new(),
+            step_count: 0,
+            probe_count: 0,
+            receipts: Vec::new(),
+            successful_mutations: 0,
+            control_work: 0,
+            route_budget: crate::capability_router::RouteBudget::new(
+                crate::capability_router::RouteBudgetLimits {
+                    internal_models: 0,
+                    visible_observations: 0,
+                    browser_commands: MAX_EXPANDED_STEPS as u32,
+                    wall_deadline_ms: 120_000,
+                    fallback_count: 1,
+                },
+            ),
+            route_started: Instant::now(),
+        }
+    }
 }
 
 impl Vm {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_route_budget(limits: crate::capability_router::RouteBudgetLimits) -> Self {
+        Self {
+            route_budget: crate::capability_router::RouteBudget::new(limits),
+            route_started: Instant::now(),
+            variables: BTreeMap::new(),
+            step_count: 0,
+            probe_count: 0,
+            receipts: Vec::new(),
+            successful_mutations: 0,
+            control_work: 0,
+        }
+    }
+
+    pub fn route_budget_usage(&self) -> crate::capability_router::RouteBudgetUsage {
+        let mut usage = self.route_budget.usage();
+        usage.elapsed_ms = self
+            .route_started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        usage
+    }
+
+    fn reserve_browser_command(&mut self) -> Result<(), VmError> {
+        self.route_budget
+            .check_deadline(
+                self.route_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            )
+            .map_err(VmError::RouteBudgetExceeded)?;
+        self.route_budget
+            .begin_browser_command()
+            .map_err(VmError::RouteBudgetExceeded)
+    }
+
+    fn ensure_browser_command_capacity(&mut self, count: usize) -> Result<(), VmError> {
+        self.route_budget
+            .check_deadline(
+                self.route_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            )
+            .map_err(VmError::RouteBudgetExceeded)?;
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        if count
+            > self
+                .route_budget
+                .limits
+                .browser_commands
+                .saturating_sub(self.route_budget.usage.browser_commands)
+        {
+            return Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::BrowserCommands,
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_fallback(&mut self) -> Result<(), VmError> {
+        self.route_budget
+            .check_deadline(
+                self.route_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            )
+            .map_err(VmError::RouteBudgetExceeded)?;
+        self.route_budget
+            .begin_fallback()
+            .map_err(VmError::RouteBudgetExceeded)
+    }
+
+    fn remaining_wall_budget(&self) -> std::time::Duration {
+        let elapsed = self.route_started.elapsed();
+        std::time::Duration::from_millis(self.route_budget.limits.wall_deadline_ms)
+            .saturating_sub(elapsed)
     }
 
     pub async fn compile_and_run<H: BrowserVmHost>(
@@ -163,6 +278,7 @@ impl Vm {
                         {
                             return Err(error);
                         }
+                        self.reserve_fallback()?;
                         return self.run_sequence_at_depth(fallback, host, depth + 1).await;
                     }
                     Ok(())
@@ -181,13 +297,56 @@ impl Vm {
                     if self.step_count.saturating_add(steps.len()) > MAX_EXPANDED_STEPS {
                         return Err(VmError::StepLimitExceeded);
                     }
-                    self.step_count += steps.len();
-                    let results = futures_util::future::try_join_all(
-                        steps
-                            .into_iter()
-                            .map(|step| host.execute(step, &self.variables)),
+                    self.ensure_browser_command_capacity(steps.len())?;
+                    let remaining = self.remaining_wall_budget();
+                    let initial_dispatch_count = self.route_budget.usage.browser_commands;
+                    let dispatch_count = Arc::new(AtomicU32::new(initial_dispatch_count));
+                    let command_limit = self.route_budget.limits.browser_commands;
+                    let variables = &self.variables;
+                    let execution = tokio::time::timeout(
+                        remaining,
+                        futures_util::future::try_join_all(
+                            steps
+                                .into_iter()
+                                .map(|step| {
+                                    let dispatch_count = Arc::clone(&dispatch_count);
+                                    async move {
+                                        let mut current = dispatch_count.load(Ordering::SeqCst);
+                                        loop {
+                                            if current >= command_limit {
+                                                return Err(VmError::RouteBudgetExceeded(
+                                                    crate::capability_router::RouteBudgetExceeded::BrowserCommands,
+                                                ));
+                                            }
+                                            match dispatch_count.compare_exchange(
+                                                current,
+                                                current + 1,
+                                                Ordering::SeqCst,
+                                                Ordering::SeqCst,
+                                            ) {
+                                                Ok(_) => break,
+                                                Err(observed) => current = observed,
+                                            }
+                                        }
+                                        host.execute(step, variables).await
+                                    }
+                                }),
+                        ),
                     )
-                    .await?;
+                    .await;
+                    self.route_budget.usage.browser_commands =
+                        dispatch_count.load(Ordering::SeqCst);
+                    self.step_count += (self.route_budget.usage.browser_commands
+                        - initial_dispatch_count) as usize;
+                    let results = match execution {
+                        Ok(Ok(results)) => results,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(VmError::RouteBudgetExceeded(
+                                crate::capability_router::RouteBudgetExceeded::WallDeadline,
+                            ));
+                        }
+                    };
                     for receipt in results {
                         self.apply_receipt(receipt);
                     }
@@ -255,11 +414,14 @@ impl Vm {
         if self.step_count >= MAX_EXPANDED_STEPS {
             return Err(VmError::StepLimitExceeded);
         }
+        self.reserve_browser_command()?;
         self.step_count += 1;
         let effect = step.effect();
-        let receipt = match host.execute(step, &self.variables).await {
-            Ok(receipt) => receipt,
-            Err(error) => {
+        let remaining = self.remaining_wall_budget();
+        let outcome = tokio::time::timeout(remaining, host.execute(step, &self.variables)).await;
+        let receipt = match outcome {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(error)) => {
                 self.receipts.push(StepReceipt {
                     status: match &error {
                         VmError::NotDispatched(_) => "not_dispatched",
@@ -269,6 +431,28 @@ impl Vm {
                     }
                     .into(),
                     value: error.detail().unwrap_or_else(|| format!("{error:?}")),
+                    variable_update: None,
+                });
+                return Err(error);
+            }
+            Err(_) => {
+                let error = if effect == EffectClass::ReadOnly {
+                    VmError::RouteBudgetExceeded(
+                        crate::capability_router::RouteBudgetExceeded::WallDeadline,
+                    )
+                } else {
+                    VmError::UnknownMutation(
+                        "workflow wall deadline elapsed while command outcome was unknown".into(),
+                    )
+                };
+                self.receipts.push(StepReceipt {
+                    status: if effect == EffectClass::ReadOnly {
+                        "failed"
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    value: format!("{error:?}"),
                     variable_update: None,
                 });
                 return Err(error);
@@ -438,6 +622,314 @@ mod tests {
         assert_eq!(host.max_active.load(Ordering::SeqCst), 2);
         assert_eq!(vm.variables.get("a").map(String::as_str), Some("@c1"));
         assert_eq!(vm.step_count, 2);
+        assert_eq!(vm.route_budget_usage().browser_commands, 2);
+    }
+
+    #[tokio::test]
+    async fn route_budget_stops_before_dispatch_and_reports_only_invoked_commands() {
+        let initial_host = host(None);
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 1,
+            wall_deadline_ms: 120_000,
+            fallback_count: 0,
+        });
+        let result = vm
+            .run_sequence(
+                vec![
+                    VmOp::Step(read_step("first")),
+                    VmOp::Step(read_step("second")),
+                ],
+                &initial_host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::BrowserCommands
+            ))
+        );
+        assert_eq!(initial_host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vm.route_budget_usage().browser_commands, 1);
+        assert_eq!(vm.step_count, 1);
+
+        let zero_budget_host = host(None);
+        let mut blocked_vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 0,
+            wall_deadline_ms: 120_000,
+            fallback_count: 0,
+        });
+        let blocked = blocked_vm
+            .run_op(VmOp::Step(read_step("blocked")), &zero_budget_host)
+            .await;
+        assert_eq!(
+            blocked,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::BrowserCommands
+            ))
+        );
+        assert_eq!(zero_budget_host.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(blocked_vm.route_budget_usage().browser_commands, 0);
+        assert_eq!(blocked_vm.step_count, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_budget_preflight_does_not_count_undispatched_steps() {
+        let host = host(None);
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 1,
+            wall_deadline_ms: 120_000,
+            fallback_count: 0,
+        });
+        let result = vm
+            .run_op(
+                VmOp::ParallelRead(vec![
+                    VmOp::Step(read_step("first")),
+                    VmOp::Step(read_step("second")),
+                ]),
+                &host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::BrowserCommands
+            ))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vm.route_budget_usage().browser_commands, 0);
+        assert_eq!(vm.step_count, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_read_failure_counts_only_started_host_invocations() {
+        let mut host = host(Some(VmError::ReadFailure("fixture read failed".into())));
+        host.fail_after = 0;
+        let mut vm = Vm::new();
+        let result = vm
+            .run_op(
+                VmOp::ParallelRead(vec![
+                    VmOp::Step(read_step("first")),
+                    VmOp::Step(read_step("second")),
+                ]),
+                &host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::ReadFailure("fixture read failed".into()))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vm.route_budget_usage().browser_commands, 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_failure_after_multiple_starts_counts_each_started_read() {
+        let mut host = host(Some(VmError::ReadFailure("second read failed".into())));
+        host.fail_after = 1;
+        let mut vm = Vm::new();
+        let result = vm
+            .run_op(
+                VmOp::ParallelRead(vec![
+                    VmOp::Step(read_step("first")),
+                    VmOp::Step(read_step("second")),
+                ]),
+                &host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::ReadFailure("second read failed".into()))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(vm.route_budget_usage().browser_commands, 2);
+        assert_eq!(vm.step_count, 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_timeout_counts_started_reads_and_steps() {
+        struct SlowHost {
+            calls: AtomicUsize,
+        }
+        impl BrowserVmHost for SlowHost {
+            fn execute<'a>(
+                &'a self,
+                _step: BrowserWorkflowStep,
+                _: &'a BTreeMap<String, String>,
+            ) -> Pin<Box<dyn Future<Output = Result<StepReceipt, VmError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(StepReceipt {
+                        status: "passed".into(),
+                        value: "ok".into(),
+                        variable_update: None,
+                    })
+                })
+            }
+        }
+
+        let host = SlowHost {
+            calls: AtomicUsize::new(0),
+        };
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 2,
+            wall_deadline_ms: 20,
+            fallback_count: 0,
+        });
+        let result = vm
+            .run_op(
+                VmOp::ParallelRead(vec![
+                    VmOp::Step(read_step("first")),
+                    VmOp::Step(read_step("second")),
+                ]),
+                &host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::WallDeadline
+            ))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(vm.route_budget_usage().browser_commands, 2);
+        assert_eq!(vm.step_count, 2);
+    }
+
+    #[tokio::test]
+    async fn route_budget_usage_reports_elapsed_time_at_readout() {
+        let vm = Vm::new();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        assert!(vm.route_budget_usage().elapsed_ms >= 1);
+    }
+
+    #[tokio::test]
+    async fn route_budget_bounds_fallback_before_running_fallback_steps() {
+        let mut host = host(Some(VmError::NotDispatched(
+            "known pre-dispatch failure".into(),
+        )));
+        host.fail_after = 0;
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 8,
+            wall_deadline_ms: 120_000,
+            fallback_count: 0,
+        });
+        let result = vm
+            .run_op(
+                VmOp::TryFallback {
+                    primary: vec![VmOp::Step(read_step("primary"))],
+                    fallback: vec![VmOp::Step(read_step("fallback"))],
+                },
+                &host,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::Fallbacks
+            ))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vm.route_budget_usage().fallback_count, 0);
+        assert_eq!(vm.route_budget_usage().browser_commands, 1);
+    }
+
+    #[tokio::test]
+    async fn nested_fallback_shares_invocation_budget_with_enclosing_workflow() {
+        struct FailTwiceHost {
+            calls: AtomicUsize,
+        }
+        impl BrowserVmHost for FailTwiceHost {
+            fn execute<'a>(
+                &'a self,
+                _step: BrowserWorkflowStep,
+                _: &'a BTreeMap<String, String>,
+            ) -> Pin<Box<dyn Future<Output = Result<StepReceipt, VmError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 || call == 2 {
+                        return Err(VmError::NotDispatched("known pre-dispatch failure".into()));
+                    }
+                    Ok(StepReceipt {
+                        status: "passed".into(),
+                        value: "ok".into(),
+                        variable_update: None,
+                    })
+                })
+            }
+        }
+        let host = FailTwiceHost {
+            calls: AtomicUsize::new(0),
+        };
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 3,
+            wall_deadline_ms: 120_000,
+            fallback_count: 1,
+        });
+
+        let result = vm
+            .run_sequence(
+                vec![
+                    VmOp::TryFallback {
+                        primary: vec![VmOp::Step(read_step("primary"))],
+                        fallback: vec![VmOp::Step(read_step("fallback"))],
+                    },
+                    VmOp::TryFallback {
+                        primary: vec![VmOp::Step(read_step("second-primary"))],
+                        fallback: vec![VmOp::Step(read_step("second-fallback"))],
+                    },
+                ],
+                &host,
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::Fallbacks
+            ))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(vm.route_budget_usage().browser_commands, 3);
+        assert_eq!(vm.route_budget_usage().fallback_count, 1);
+        assert_eq!(vm.route_budget_usage().internal_models, 0);
+        assert_eq!(vm.route_budget_usage().visible_observations, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_wall_budget_prevents_the_next_dispatch() {
+        let host = host(None);
+        let mut vm = Vm::with_route_budget(crate::capability_router::RouteBudgetLimits {
+            internal_models: 0,
+            visible_observations: 0,
+            browser_commands: 8,
+            wall_deadline_ms: 1,
+            fallback_count: 0,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let result = vm.run_op(VmOp::Step(read_step("expired")), &host).await;
+        assert_eq!(
+            result,
+            Err(VmError::RouteBudgetExceeded(
+                crate::capability_router::RouteBudgetExceeded::WallDeadline
+            ))
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vm.route_budget_usage().browser_commands, 0);
     }
 
     #[tokio::test]

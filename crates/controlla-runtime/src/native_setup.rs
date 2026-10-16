@@ -48,7 +48,7 @@ pub fn remove_pairing_request(host_id: &str, request_id: &str) -> Result<(), Str
 pub fn read_tabs() -> Result<serde_json::Value, String> {
     let path = home()?.join(".chrome-controlla/native-tabs.json");
     let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-    if !metadata.file_type().is_file() || metadata.len() > 256_000 {
+    if !metadata.file_type().is_file() || metadata.len() > 16_000_000 {
         return Err("native tab inventory is invalid".into());
     }
     #[cfg(unix)]
@@ -73,7 +73,7 @@ pub fn read_tabs() -> Result<serde_json::Value, String> {
     }
     if !body["tabs"]
         .as_array()
-        .is_some_and(|tabs| tabs.len() <= 100)
+        .is_some_and(|tabs| tabs.len() <= 5000)
     {
         return Err("native tab inventory has invalid tabs".into());
     }

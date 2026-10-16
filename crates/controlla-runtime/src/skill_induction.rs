@@ -43,6 +43,10 @@ pub struct SkillTrace {
     pub intent_fingerprint: String,
     pub structural_signature: String,
     pub input_fingerprint: String,
+    /// Fingerprint of an explicit, previously verified account marker. Never
+    /// store the marker selector or visible account text itself.
+    #[serde(default)]
+    pub account_identity_fingerprint: Option<String>,
     pub verified: bool,
     pub preconditions: BTreeSet<String>,
     pub postconditions: BTreeSet<String>,
@@ -65,6 +69,7 @@ impl SkillTrace {
             intent_fingerprint: intent_fingerprint.into(),
             structural_signature: structural_signature.into(),
             input_fingerprint: String::new(),
+            account_identity_fingerprint: None,
             verified: false,
             preconditions: BTreeSet::new(),
             postconditions: BTreeSet::new(),
@@ -144,6 +149,7 @@ impl SkillTraceStore {
         &self,
         site_scope: &str,
         intent_fingerprint: &str,
+        account_identity_fingerprint: Option<&str>,
     ) -> Result<SkillEvidenceSet, String> {
         let _guard = self.lock.lock().map_err(|_| "trace store lock poisoned")?;
         let traces = self.read()?;
@@ -151,7 +157,10 @@ impl SkillTraceStore {
             traces: traces
                 .into_iter()
                 .filter(|trace| {
-                    trace.site_scope == site_scope && trace.intent_fingerprint == intent_fingerprint
+                    trace.site_scope == site_scope
+                        && trace.intent_fingerprint == intent_fingerprint
+                        && trace.account_identity_fingerprint.as_deref()
+                            == account_identity_fingerprint
                 })
                 .rev()
                 .take(MAX_TRACES)
@@ -190,6 +199,10 @@ fn valid_trace(trace: &SkillTrace) -> bool {
         && !trace.structural_signature.is_empty()
         && trace.structural_signature.len() <= 256
         && trace.input_fingerprint.len() <= 256
+        && trace
+            .account_identity_fingerprint
+            .as_deref()
+            .is_none_or(crate::skills::valid_account_identity_fingerprint)
         && trace.steps.len() <= MAX_STEPS
         && trace.steps.iter().all(|step| {
             !step.fingerprint.is_empty()
@@ -215,6 +228,47 @@ fn valid_trace(trace: &SkillTrace) -> bool {
             .is_none_or(|(_, reason)| !reason.is_empty() && reason.len() <= 256)
 }
 
+/// Produces a bounded, domain-separated cryptographic fingerprint from an
+/// explicit visible account marker. Raw marker values are never returned.
+pub fn account_identity_fingerprint(key: &[u8], selector: &str, expected: &str) -> Option<String> {
+    if key.len() != 32
+        || selector.trim().is_empty()
+        || selector.len() > 512
+        || selector.chars().any(char::is_control)
+        || expected.trim().is_empty()
+        || expected.len() > 512
+        || expected.chars().any(char::is_control)
+    {
+        return None;
+    }
+    use sha2::Digest as _;
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for (index, byte) in key.iter().copied().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = sha2::Sha256::new();
+    inner.update(inner_pad);
+    inner.update(b"controlla-account-identity-v1\0");
+    inner.update((selector.len() as u64).to_be_bytes());
+    inner.update(selector.as_bytes());
+    inner.update((expected.len() as u64).to_be_bytes());
+    inner.update(expected.as_bytes());
+    let inner_digest = inner.finalize();
+    let mut digest = sha2::Sha256::new();
+    digest.update(outer_pad);
+    digest.update(inner_digest);
+    Some(format!(
+        "hmac-sha256:{}",
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillCandidate {
     pub definition: SkillDefinition,
@@ -235,6 +289,7 @@ pub fn induce_candidate(evidence: &SkillEvidenceSet) -> Option<SkillCandidate> {
             || !run_ids.insert(trace.run_id.as_str())
             || trace.site_scope != first.site_scope
             || trace.intent_fingerprint != first.intent_fingerprint
+            || trace.account_identity_fingerprint != first.account_identity_fingerprint
             || trace.site_scope.is_empty()
             || trace.site_scope.len() > 512
             || trace.intent_fingerprint.is_empty()
@@ -346,7 +401,15 @@ pub fn induce_candidate(evidence: &SkillEvidenceSet) -> Option<SkillCandidate> {
     }
     let workflow = common_steps[0].action.clone();
     let parameter_names = replay_template_parameters(&workflow)?;
-    let key = format!("{}\u{1f}{}", first.site_scope, first.intent_fingerprint);
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        first.site_scope,
+        first.intent_fingerprint,
+        first
+            .account_identity_fingerprint
+            .as_deref()
+            .unwrap_or("unscoped")
+    );
     let digest = sha2::Sha256::digest(key.as_bytes());
     let id = format!(
         "induced-{}",
@@ -361,6 +424,7 @@ pub fn induce_candidate(evidence: &SkillEvidenceSet) -> Option<SkillCandidate> {
         schema_version: SKILL_SCHEMA_VERSION,
         site_scope: first.site_scope.clone(),
         intent_fingerprint: first.intent_fingerprint.clone(),
+        account_identity_fingerprint: first.account_identity_fingerprint.clone(),
         parameter_names: parameter_names.into_iter().collect(),
         preconditions: preconditions.into_iter().collect(),
         workflow,
@@ -508,3 +572,86 @@ fn replay_template_parameters(workflow: &Value) -> Option<Vec<String>> {
 }
 
 use sha2::Digest;
+
+#[cfg(test)]
+mod account_scope_tests {
+    use super::*;
+    use serde_json::json;
+
+    const KEY: [u8; 32] = [7; 32];
+
+    fn trace(run_id: &str, input: &str, identity: Option<&str>, failure: bool) -> SkillTrace {
+        SkillTrace {
+            run_id: run_id.into(),
+            site_scope: "https://example.test".into(),
+            intent_fingerprint: "registration".into(),
+            structural_signature: "form-v1".into(),
+            input_fingerprint: input.into(),
+            account_identity_fingerprint: identity.map(str::to_owned),
+            verified: !failure,
+            preconditions: BTreeSet::from(["form-present".into()]),
+            postconditions: BTreeSet::from(["form-saved".into()]),
+            steps: vec![TraceStep {
+                fingerprint: "verified-template:form-fill".into(),
+                action: json!({"kind":"form_fill","fields":[{"slot":0}]}),
+                dataflow_evidence: BTreeSet::from(["input_binding:field_slot:0".into()]),
+            }],
+            failure: failure.then(|| (FailureClass::NotDispatched, "target_not_ready".into())),
+        }
+    }
+
+    #[test]
+    fn account_markers_are_fingerprinted_and_induction_separates_identities() {
+        let first =
+            account_identity_fingerprint(&KEY, "#account", "person-a@example.test").unwrap();
+        let second =
+            account_identity_fingerprint(&KEY, "#account", "person-b@example.test").unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("hmac-sha256:") && first.len() == 76);
+
+        let evidence_for = |identity: &str| SkillEvidenceSet {
+            traces: vec![
+                trace("a1", "input-a", Some(identity), false),
+                trace("a2", "input-b", Some(identity), false),
+                trace("a3", "input-c", Some(identity), false),
+                trace("a4", "input-d", Some(identity), true),
+            ],
+        };
+        let candidate_a = induce_candidate(&evidence_for(&first)).unwrap();
+        let candidate_b = induce_candidate(&evidence_for(&second)).unwrap();
+        assert_ne!(
+            candidate_a.definition.skill_id,
+            candidate_b.definition.skill_id
+        );
+        assert_eq!(
+            candidate_a
+                .definition
+                .account_identity_fingerprint
+                .as_deref(),
+            Some(first.as_str())
+        );
+
+        let mut mixed = evidence_for(&first);
+        mixed.traces[3].account_identity_fingerprint = Some(second);
+        assert!(induce_candidate(&mixed).is_none());
+    }
+
+    #[test]
+    fn persisted_trace_contains_only_the_bounded_account_fingerprint() {
+        let marker_text = "person-a@example.test";
+        let fingerprint = account_identity_fingerprint(&KEY, "#account", marker_text).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "controlla-account-traces-{}-{}.json",
+            std::process::id(),
+            fingerprint[7..15].replace(':', "")
+        ));
+        let store = SkillTraceStore::open(&path).unwrap();
+        let mut sample = trace("a1", "input-a", Some(&fingerprint), false);
+        sample.steps[0].action = json!({"kind":"form_fill","fields":[{"slot":0}]});
+        store.record(sample).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains(&fingerprint));
+        assert!(!persisted.contains(marker_text));
+        let _ = std::fs::remove_file(path);
+    }
+}

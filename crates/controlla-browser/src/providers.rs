@@ -51,6 +51,10 @@ use tokio_tungstenite::{
 
 static NEXT_PROFILE_SUFFIX: AtomicU64 = AtomicU64::new(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+// Shared command delivery must cover the extension's bounded CDP window.
+// Setup/pairing keeps the shorter startup timeout, while command replies use
+// the explicit operation deadline (or this 30 second single-command default).
+const SHARED_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-peer WS handshake + hello bound: one silent local connection must not
 /// consume the whole pairing window and starve the legitimate extension.
 const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -154,14 +158,19 @@ impl DedicatedChromeProvider {
                 self.chrome_executable.clone(),
             ));
         }
-        let mut process = ChromeProcess::launch(&self.chrome_executable, session.mode)?;
-        let endpoint = match process.wait_for_endpoint().await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                process.stop();
-                return Err(error);
-            }
-        };
+        let (startup_result, _) = crate::scheduler::telemetry::measure_startup(async {
+            let mut process = ChromeProcess::launch(&self.chrome_executable, session.mode)?;
+            let endpoint = match process.wait_for_endpoint().await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    process.stop();
+                    return Err(error);
+                }
+            };
+            Ok((process, endpoint))
+        })
+        .await;
+        let (mut process, endpoint) = startup_result?;
         let connection = match self.manager.connect(&endpoint).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -1055,7 +1064,8 @@ impl SharedExtensionSession {
             id,
             armed: true,
         };
-        let serialized = json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params}).to_string();
+        let serialized = json!({"type":"command", "id":id, "target_id":target_id, "method":method, "params":params,
+            "deadline_ms": SHARED_COMMAND_TIMEOUT.as_millis() as u64}).to_string();
         let request_bytes = serialized.len() as u64;
         crate::scheduler::telemetry::admit_browser_commands(1)
             .await
@@ -1064,21 +1074,35 @@ impl SharedExtensionSession {
             .await
             .map_err(|reason| ProviderError::Extension(reason.into()))?;
         let message = Message::Text(serialized.into());
-        if let Err(error) = self.sink.lock().await.send(message).await {
+        let send_started = Instant::now();
+        let (send_result, queue_us) = {
+            let mut sink = self.sink.lock().await;
+            let queue_us = send_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            (sink.send(message).await, queue_us)
+        };
+        if let Err(error) = send_result {
             crate::scheduler::telemetry::record_browser_command(
                 1,
                 0,
                 request_bytes,
-                0,
+                queue_us,
                 started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             )
             .await;
             return Err(ProviderError::Extension(error.to_string()));
         }
-        let result = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
-            Ok(Ok(Ok(value))) => value,
+        crate::scheduler::telemetry::record_browser_operation_dispatch().await;
+        crate::scheduler::telemetry::record_native_host_message(false).await;
+        crate::scheduler::telemetry::record_command_purpose(method, 1).await;
+        let result = match tokio::time::timeout(SHARED_COMMAND_TIMEOUT, &mut receiver).await {
+            Ok(Ok(Ok(value))) => {
+                crate::scheduler::telemetry::record_native_host_message(true).await;
+                value
+            }
             Ok(Ok(Err(error))) => {
+                crate::scheduler::telemetry::record_native_host_message(true).await;
                 crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 if cdp_command_count_is_partial(method, false) {
                     crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 }
@@ -1086,7 +1110,7 @@ impl SharedExtensionSession {
                     1,
                     1,
                     request_bytes,
-                    0,
+                    queue_us,
                     started.elapsed().as_micros().min(u64::MAX as u128) as u64,
                 )
                 .await;
@@ -1094,6 +1118,7 @@ impl SharedExtensionSession {
             }
             Ok(Err(_)) => {
                 crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 if cdp_command_count_is_partial(method, false) {
                     crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 }
@@ -1101,7 +1126,7 @@ impl SharedExtensionSession {
                     1,
                     1,
                     request_bytes,
-                    0,
+                    queue_us,
                     started.elapsed().as_micros().min(u64::MAX as u128) as u64,
                 )
                 .await;
@@ -1111,6 +1136,7 @@ impl SharedExtensionSession {
             }
             Err(_) => {
                 crate::scheduler::telemetry::record_unknown_delivery().await;
+                crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 if cdp_command_count_is_partial(method, false) {
                     crate::scheduler::telemetry::mark_cdp_commands_partial().await;
                 }
@@ -1118,7 +1144,7 @@ impl SharedExtensionSession {
                     1,
                     1,
                     request_bytes,
-                    0,
+                    queue_us,
                     started.elapsed().as_micros().min(u64::MAX as u128) as u64,
                 )
                 .await;
@@ -1139,7 +1165,7 @@ impl SharedExtensionSession {
                 1
             },
             request_bytes.saturating_add(result.to_string().len() as u64),
-            0,
+            queue_us,
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         )
         .await;
@@ -1162,6 +1188,10 @@ impl SharedExtensionSession {
         let started = Instant::now();
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         let action_count = actions.len() as u64;
+        let command_methods = actions
+            .iter()
+            .map(|action| action.method.clone())
+            .collect::<Vec<_>>();
         let wire_actions = actions
             .into_iter()
             .map(|action| json!({"method":action.method,"params":action.params,"stop_on_not_ok":action.stop_on_not_ok}))
@@ -1187,66 +1217,79 @@ impl SharedExtensionSession {
             id,
             armed: true,
         };
-        if let Err(error) = self
-            .sink
-            .lock()
-            .await
-            .send(Message::Text(serialized.into()))
-            .await
-        {
+        let send_started = Instant::now();
+        let (send_result, queue_us) = {
+            let mut sink = self.sink.lock().await;
+            let queue_us = send_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            (sink.send(Message::Text(serialized.into())).await, queue_us)
+        };
+        if let Err(error) = send_result {
             crate::scheduler::telemetry::record_browser_command(
                 1,
                 0,
                 request_bytes,
-                0,
+                queue_us,
                 started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             )
             .await;
             return Err(ProviderError::Extension(error.to_string()));
         }
-        let response = match tokio::time::timeout(STARTUP_TIMEOUT, &mut receiver).await {
-            Ok(Ok(Ok(value))) => value,
-            Ok(Ok(Err(error))) => {
-                crate::scheduler::telemetry::record_unknown_delivery().await;
-                crate::scheduler::telemetry::record_browser_command(
-                    1,
-                    0,
-                    request_bytes,
-                    0,
-                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                )
-                .await;
-                return Err(ProviderError::Extension(error));
-            }
-            Ok(Err(_)) => {
-                crate::scheduler::telemetry::record_unknown_delivery().await;
-                crate::scheduler::telemetry::record_browser_command(
-                    1,
-                    0,
-                    request_bytes,
-                    0,
-                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                )
-                .await;
-                return Err(ProviderError::Extension(
-                    "extension response channel closed".into(),
-                ));
-            }
-            Err(_) => {
-                crate::scheduler::telemetry::record_unknown_delivery().await;
-                crate::scheduler::telemetry::record_browser_command(
-                    1,
-                    0,
-                    request_bytes,
-                    0,
-                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                )
-                .await;
-                return Err(ProviderError::Extension(
-                    "extension batch timed out; delivery is unknown".into(),
-                ));
-            }
-        };
+        crate::scheduler::telemetry::record_browser_operation_dispatch().await;
+        crate::scheduler::telemetry::record_native_host_message(false).await;
+        for method in &command_methods {
+            crate::scheduler::telemetry::record_command_purpose(method, 1).await;
+        }
+        let response =
+            match tokio::time::timeout(Duration::from_millis(deadline_ms), &mut receiver).await {
+                Ok(Ok(Ok(value))) => {
+                    crate::scheduler::telemetry::record_native_host_message(true).await;
+                    value
+                }
+                Ok(Ok(Err(error))) => {
+                    crate::scheduler::telemetry::record_native_host_message(true).await;
+                    crate::scheduler::telemetry::record_unknown_delivery().await;
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                    crate::scheduler::telemetry::record_browser_command(
+                        1,
+                        0,
+                        request_bytes,
+                        queue_us,
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    )
+                    .await;
+                    return Err(ProviderError::Extension(error));
+                }
+                Ok(Err(_)) => {
+                    crate::scheduler::telemetry::record_unknown_delivery().await;
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                    crate::scheduler::telemetry::record_browser_command(
+                        1,
+                        0,
+                        request_bytes,
+                        0,
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    )
+                    .await;
+                    return Err(ProviderError::Extension(
+                        "extension response channel closed".into(),
+                    ));
+                }
+                Err(_) => {
+                    crate::scheduler::telemetry::record_unknown_delivery().await;
+                    crate::scheduler::telemetry::mark_cdp_commands_partial().await;
+                    crate::scheduler::telemetry::record_browser_command(
+                        1,
+                        0,
+                        request_bytes,
+                        0,
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    )
+                    .await;
+                    return Err(ProviderError::Extension(
+                        "extension batch timed out; delivery is unknown".into(),
+                    ));
+                }
+            };
         pending_guard.disarm();
         crate::scheduler::telemetry::record_browser_command(
             1,
@@ -1256,7 +1299,7 @@ impl SharedExtensionSession {
                 .and_then(Value::as_u64)
                 .unwrap_or(action_count),
             request_bytes.saturating_add(response.to_string().len() as u64),
-            0,
+            queue_us,
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
         )
         .await;
@@ -1301,7 +1344,14 @@ fn validate_screenshot_evidence(target_id: &str, result: &Value) -> Result<(), P
         || evidence["image_sha256"].as_str() != Some(digest.as_str())
         || evidence["visual_revision"].as_str() != Some(digest.as_str())
         || evidence["target_lifecycle"].as_str() != Some("active")
-        || !evidence["render_revision"].is_null()
+        || evidence["render_revision"].as_str().is_none_or(|revision| {
+            revision.is_empty()
+                || revision.len() > 512
+                || !revision.starts_with(&format!(
+                    "{}:",
+                    evidence["document_id"].as_str().unwrap_or_default()
+                ))
+        })
         || dimensions["width"].as_u64() != Some(png_dimensions.0.into())
         || dimensions["height"].as_u64() != Some(png_dimensions.1.into())
     {
@@ -1380,7 +1430,7 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let response = json!({"data":data,"visual_evidence":{"target_id":"41","document_id":"document-41","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":digest,"image_sha256":digest,"target_lifecycle":"active","render_revision":null,"dimensions":{"width":320,"height":180}}});
+        let response = json!({"data":data,"visual_evidence":{"target_id":"41","document_id":"document-41","url":"https://example.test/","captured_at_ms":1001,"capture_started_at_ms":1000,"visual_revision":digest,"image_sha256":digest,"target_lifecycle":"active","render_revision":"document-41:42.500","dimensions":{"width":320,"height":180}}});
         assert!(validate_screenshot_evidence("41", &response).is_ok());
         assert!(
             validate_screenshot_evidence("42", &response).is_err(),
@@ -1399,7 +1449,8 @@ mod tests {
         false_lifecycle["visual_evidence"]["target_lifecycle"] = json!("frozen");
         assert!(validate_screenshot_evidence("41", &false_lifecycle).is_err());
         let mut forged_render_revision = response.clone();
-        forged_render_revision["visual_evidence"]["render_revision"] = json!(digest);
+        forged_render_revision["visual_evidence"]["render_revision"] =
+            json!("other-document:42.500");
         assert!(validate_screenshot_evidence("41", &forged_render_revision).is_err());
         let mut malformed_png = response.clone();
         malformed_png["data"] = json!("iVBORw0KGgoAAAANSUhEUgAA");
@@ -3988,6 +4039,10 @@ list.addEventListener('scroll',render);render();
                 {
                     let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
                     if value["type"] != "ready" {
+                        assert_eq!(
+                            value["deadline_ms"], 30_000,
+                            "command deadline must cross the bridge"
+                        );
                         seen_ids.push(value["id"].as_u64().unwrap());
                         break;
                     }
@@ -3998,6 +4053,10 @@ list.addEventListener('scroll',render);render();
                     {
                         let value: Value =
                             serde_json::from_str(message.to_text().unwrap()).unwrap();
+                        assert_eq!(
+                            value["deadline_ms"], 30_000,
+                            "command deadline must cross the bridge"
+                        );
                         seen_ids.push(value["id"].as_u64().unwrap());
                         socket
                             .send(Message::Text(

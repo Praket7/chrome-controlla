@@ -14,7 +14,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/src/lib.rs",
       "destination_path": "crates/controlla-browser/src/lib.rs",
       "source_sha256": "a0ac3351279ac63fd8a5717d1b64d4c0ac98d4e6d2422072a5f1dc177b35dd74",
-      "destination_sha256": "cae10740205751454963367c6091251e63541fd8a13b451419a8c3fa5142741f",
+      "destination_sha256": "f03683d4d0fcd9335501e97b921319f73a6ae82f6ac45680a5ff41e50e8bb17d",
       "edits": "Original Phase 0 extraction was byte-for-byte; Phase 2 added target/frame generation revisions, flattened-session identity resolution, per-target scheduling and deterministic full-wave dispatch evidence, provider-backed owned-target create/close integration gated on an independent cleanup observer, shared-extension direct-CDP rejection, and post-response binding/recording for owned-target creation. Original retained tests remain listed separately.; Phase 4 exports typed guarded-input primitives; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 exports guarded CDP input types and fixture coverage; Phase 4 actual installed-Chrome headless input/readback fixture and attached-target domain bootstrap; Phase 4 follow-up adds final same-evaluation fill value guard, per-send insert/key value-focus rechecks, and focused race fixture updates; Phase 5 exports bounded DOM observation and schema-guided stable-ID extraction methods; Phase 5 serializes 128-bit target identity as strings for MCP JSON compatibility; A1–A8 follow-up updates guarded-input regression fixture with the required stable DOM node token; 2026-10-14: OOPIF attached sessions seed their frame tree before Runtime contexts; target/session lifecycle events publish after identity state updates and retain attach-before-create targets; Stage 1: shared workflow cancellation export and fenced command admission",
       "license": "Apache-2.0 (Comptrol LICENSE and NOTICE retained)"
     },
@@ -46,7 +46,7 @@
       "source_path": "../Comptrol/crates/comptrol-browser/Cargo.toml",
       "destination_path": "crates/controlla-browser/Cargo.toml",
       "source_sha256": "b6556bb46b66cb42d628602902d2e47667c1b83bc6b4636bff3306d47acc8cbc",
-      "destination_sha256": "39ce82dfd1dc2fbefbb6839781e1c6a728e849f79d7d72498d89392937ddfcf6",
+      "destination_sha256": "6559e378d2bb457df8258340fa68964d8f43c7f0a4fe11ab13310361d8857d82",
       "edits": "renamed package, inherited workspace metadata, pinned direct dependency versions including OS-random browser identity support, and included package license file",
       "license": "Apache-2.0"
     },

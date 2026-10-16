@@ -117,8 +117,8 @@ export async function runLiveClientSmokes({
         throw new Error(`${id} host adapter is available, but CONTROLLA_CLIENT_HOST_TASKS_JSON must provide read_only, verified_mutation, and mode_specific prompts; no client evidence was written`);
       }
       for (const task of requiredTasks) {
-        const traceFile = join(clientAdapter.state_dir, 'prompt-traces', `${task}.jsonl`);
         const traceId = `${runId}:${task}`;
+        const traceFile = join(clientAdapter.state_dir, 'prompt-traces', `${task}-${runId}.jsonl`);
         const hostConfig = await prepareClientHostConfig(id, clientAdapter, join(clientAdapter.state_dir, 'host-config', task),
           // A fresh MCP process does not imply a cold Chrome browser; measure its
           // warmth only when the browser fixture can establish it.

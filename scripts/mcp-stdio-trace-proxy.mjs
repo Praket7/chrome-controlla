@@ -2,6 +2,7 @@
 // Optional transparent stdio proxy for prompt-to-tool wall-time measurement.
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { pathToFileURL } from 'node:url';
 import { recordPromptTraceEvent } from './prompt-send-trace.mjs';
 
 const TRACE_FILE = process.env.CONTROLLA_PROMPT_TRACE_FILE;
@@ -37,19 +38,59 @@ function contentValues(result) {
   return [result?.structuredContent, result, ...parsed].filter(Boolean);
 }
 
-function summaryFields(result) {
+function uniqueObservedCounter(values) {
+  const reported = values.filter(value => value !== undefined && value !== null);
+  if (reported.some(value => !Number.isSafeInteger(value) || value < 0)) return null;
+  const observed = reported;
+  const distinct = [...new Set(observed)];
+  return distinct.length === 1 ? distinct[0] : null;
+}
+
+export function summaryFields(result) {
   const roots = contentValues(result);
   const metrics = collectValues(roots, value => value.metrics && typeof value.metrics === 'object').map(value => value.metrics);
-  const cdp = metrics.map(item => item.browser?.cdp_commands ?? item.cdp_commands).find(Number.isSafeInteger);
+  const cdp = uniqueObservedCounter(metrics.flatMap(item => [item.browser?.cdp_commands, item.cdp_commands]));
   const reportedInternal = collectValues(roots, value => Number.isSafeInteger(value.execution_route?.actual_cost?.reported_internal_model_calls))
-    .map(value => value.execution_route.actual_cost.reported_internal_model_calls).find(Number.isSafeInteger);
-  const internal = metrics.map(item => item.internal_model_calls).find(Number.isSafeInteger) ?? reportedInternal;
+    .map(value => value.execution_route.actual_cost.reported_internal_model_calls);
+  const internalCounts = [...metrics.map(item => item.internal_model_calls).filter(Number.isSafeInteger), ...reportedInternal];
+  const internal = uniqueObservedCounter(internalCounts);
+  const fallbackCount = uniqueObservedCounter(collectValues(roots,
+    value => Number.isSafeInteger(value.fallback_count) && value.fallback_count >= 0)
+    .map(value => value.fallback_count));
   const tier = collectValues(roots, value => value.execution_route?.selected || value.execution_route?.tier)
     .map(value => value.execution_route.selected ?? value.execution_route.tier).find(value => typeof value === 'string');
-  const fallbacks = collectValues(roots, value => typeof value.fallback_reason === 'string').length;
+  const metric = key => uniqueObservedCounter(metrics.map(item => item[key]));
+  const phaseNames = ['queue_us','startup_us','pair_us','attach_us','readiness_us','discovery_us',
+    'snapshot_us','grounding_us','dispatch_us','verification_us','artifact_transfer_us','serialization_us'];
+  const phaseValues = {};
+  const missingPhases = [];
+  for (const name of phaseNames) {
+    const values = metrics.map(item => item.phases?.[name] ?? item[name]);
+    const observed = values.some(value => value !== undefined && value !== null);
+    const phase = uniqueObservedCounter(values);
+    if (phase !== null) phaseValues[`runtime_${name}`] = phase;
+    else if (observed || values.length === 0 || values.some(value => value === undefined || value === null)) {
+      missingPhases.push(`runtime_${name}`);
+    }
+  }
+  const requiredCounters = ['host_round_trips','cdp_commands','observation_bytes','screenshot_bytes','fallback_count','internal_model_calls'];
+  const missingCounters = requiredCounters.filter(name => !Number.isSafeInteger(name === 'cdp_commands' ? cdp
+    : name === 'fallback_count' ? fallbackCount
+      : name === 'internal_model_calls' ? internal : metric(name)));
   return { ...(Number.isSafeInteger(cdp) ? { cdp_commands: cdp } : {}),
     ...(Number.isSafeInteger(internal) ? { internal_model_calls: internal } : {}),
-    ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbacks };
+    ...(typeof metrics.find(item => typeof item.operation_id === 'string')?.operation_id === 'string'
+      ? { mcp_operation_id: metrics.find(item => typeof item.operation_id === 'string').operation_id } : {}),
+    ...(Number.isSafeInteger(metric('host_round_trips')) ? { host_round_trips: metric('host_round_trips') } : {}),
+    ...(Number.isSafeInteger(metric('native_host_messages_sent')) ? { native_host_messages_sent: metric('native_host_messages_sent') } : {}),
+    ...(Number.isSafeInteger(metric('native_host_messages_received')) ? { native_host_messages_received: metric('native_host_messages_received') } : {}),
+    ...(Number.isSafeInteger(metric('first_browser_op_us')) ? { first_browser_op_us: metric('first_browser_op_us') } : {}),
+    ...(Number.isSafeInteger(metric('last_browser_op_us')) ? { last_browser_op_us: metric('last_browser_op_us') } : {}),
+    ...(Number.isSafeInteger(metric('observation_bytes')) ? { observation_bytes: metric('observation_bytes') } : {}),
+    ...(Number.isSafeInteger(metric('screenshot_bytes')) ? { screenshot_bytes: metric('screenshot_bytes') } : {}),
+    ...(tier ? { selected_execution_tier: tier } : {}), fallback_count: fallbackCount ?? null,
+    partial_counters: missingCounters.length > 0,
+    missing_counters: missingCounters.join(','), missing_phases: missingPhases.join(','), ...phaseValues };
 }
 
 function observeServerLine(line, bytes) {
@@ -64,8 +105,7 @@ function observeServerLine(line, bytes) {
   if (typeof name !== 'string' || !MODEL_CALLS.has(name)) return;
   const callId = String(message.id);
   pending.set(callId, { kind: 'tool', name, call_id: callId });
-  trace('controlla_received', { tool: name, call_id: callId, input_bytes: bytes });
-  trace('browser_operation', { tool: name, call_id: callId, input_bytes: bytes,
+  trace('controlla_received', { tool: name, call_id: callId, tool_input_bytes: bytes,
     ...(process.env.CONTROLLA_PROMPT_COLD_WARM ? { cold_warm: process.env.CONTROLLA_PROMPT_COLD_WARM } : {}) });
 }
 
@@ -91,9 +131,23 @@ function inspectServerChunk(chunk) {
         process.stdout.write(Buffer.concat([lineBytes, Buffer.from('\n')]), () => trace('tool_result_delivered', {
           output_bytes: lineBytes.length + 1,
           call_id: context.call_id,
+          ...(fields.mcp_operation_id ? { mcp_operation_id: fields.mcp_operation_id } : {}),
           ...(fields.selected_execution_tier ? { selected_execution_tier: fields.selected_execution_tier } : {}),
           ...(Number.isSafeInteger(fields.cdp_commands) ? { cdp_commands: fields.cdp_commands } : {}),
+          ...(Number.isSafeInteger(fields.native_host_messages_sent) ? { native_host_messages_sent: fields.native_host_messages_sent } : {}),
+          ...(Number.isSafeInteger(fields.native_host_messages_received) ? { native_host_messages_received: fields.native_host_messages_received } : {}),
+          ...(Number.isSafeInteger(fields.first_browser_op_us) ? { first_browser_op_us: fields.first_browser_op_us } : {}),
+          ...(Number.isSafeInteger(fields.last_browser_op_us) ? { last_browser_op_us: fields.last_browser_op_us } : {}),
+          ...(Number.isSafeInteger(fields.first_browser_op_us) || Number.isSafeInteger(fields.last_browser_op_us)
+            ? { browser_offset_clock_domain: 'mcp_operation_relative' } : {}),
           ...(Number.isSafeInteger(fields.internal_model_calls) ? { internal_model_calls: fields.internal_model_calls } : {}),
+          ...(Number.isSafeInteger(fields.host_round_trips) ? { host_round_trips: fields.host_round_trips } : {}),
+          ...(Number.isSafeInteger(fields.observation_bytes) ? { observation_bytes: fields.observation_bytes } : {}),
+          ...(Number.isSafeInteger(fields.screenshot_bytes) ? { screenshot_bytes: fields.screenshot_bytes } : {}),
+          partial_counters: fields.partial_counters,
+          missing_counters: fields.missing_counters,
+          missing_phases: fields.missing_phases,
+          ...Object.fromEntries(Object.entries(fields).filter(([key, value]) => key.startsWith('runtime_') && Number.isSafeInteger(value))),
           fallback_count: fields.fallback_count,
         }));
       }
@@ -128,4 +182,6 @@ async function main() {
   });
 }
 
-main().catch(error => { process.stderr.write(`${error.stack ?? error.message}\n`); process.exitCode = 2; });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => { process.stderr.write(`${error.stack ?? error.message}\n`); process.exitCode = 2; });
+}

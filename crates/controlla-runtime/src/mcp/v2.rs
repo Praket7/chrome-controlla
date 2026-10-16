@@ -9,6 +9,61 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 const MAX_WORKFLOW_STEPS: usize = 20;
+const DEFAULT_RECEIPT_RESPONSE_BYTES: usize = 2 * 1024;
+const MAX_RECEIPT_RESPONSE_BYTES: usize = 1024 * 1024;
+const DEFAULT_TARGETED_RESPONSE_BYTES: usize = 12 * 1024;
+const DEFAULT_BROAD_RESPONSE_BYTES: usize = 100_000;
+
+fn default_snapshot_response_bytes(targeted_compact: bool) -> usize {
+    if targeted_compact {
+        DEFAULT_TARGETED_RESPONSE_BYTES
+    } else {
+        DEFAULT_BROAD_RESPONSE_BYTES
+    }
+}
+
+fn validate_response_budget(
+    requested: Option<usize>,
+    reason: Option<&str>,
+    default_bytes: usize,
+) -> Result<(), &'static str> {
+    if requested.is_some_and(|bytes| bytes > default_bytes)
+        && !reason.is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err("max_bytes above the default response budget requires a non-empty max_bytes_reason");
+    }
+    Ok(())
+}
+
+fn select_response_budget(
+    requested: Option<usize>,
+    reason: Option<&str>,
+    default_bytes: usize,
+) -> (usize, &'static str, String) {
+    let requested = requested.map(|value| value.clamp(1024, 1_000_000));
+    let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+    match requested {
+        Some(bytes) if bytes > default_bytes && reason.is_some() => (
+            bytes,
+            "explicit",
+            reason.unwrap_or_default().chars().take(256).collect(),
+        ),
+        Some(bytes) if bytes <= default_bytes => (
+            bytes,
+            "explicit",
+            "caller requested a smaller response limit".to_owned(),
+        ),
+        _ => (
+            default_bytes,
+            "default",
+            if default_bytes == DEFAULT_TARGETED_RESPONSE_BYTES {
+                "small targeted compact observation".to_owned()
+            } else {
+                "broad or rich observation needs a larger context budget".to_owned()
+            },
+        ),
+    }
+}
 
 #[derive(Clone, Default)]
 struct SemanticTabState {
@@ -85,7 +140,10 @@ struct BrowserSnapshotArgs {
     selector: Option<String>,
     max_items: Option<usize>,
     max_text_chars: Option<usize>,
+    #[schemars(description = "Targeted compact semantic observations default to 12 KiB; broad or rich observations use a larger bounded default. Set max_bytes_reason when requesting more than the default (up to 1 MiB).")]
     max_bytes: Option<usize>,
+    #[schemars(description = "Required explanation when max_bytes exceeds the selected default response budget.")]
+    max_bytes_reason: Option<String>,
     href_hint: Option<String>,
     frame_id: Option<String>,
     #[schemars(description = "Read bounded accessibility trees from already inventoried child frames and report readable/unread coverage. This is opt-in; root snapshot remains the default.")]
@@ -227,7 +285,10 @@ struct BrowserProbeArgs {
     session_id: String,
     chrome_tab_id: String,
     selector: String,
+    #[schemars(description = "Targeted semantic probes default to 12 KiB; set max_bytes_reason when requesting more, up to 1 MiB.")]
     max_bytes: Option<usize>,
+    #[schemars(description = "Required explanation when max_bytes exceeds the 12 KiB default.")]
+    max_bytes_reason: Option<String>,
     timeout_ms: Option<u64>,
 }
 
@@ -395,6 +456,10 @@ struct BrowserWorkflowArgs {
     session_id: String,
     chrome_tab_id: String,
     steps: Vec<BrowserWorkflowStep>,
+    #[schemars(description = "Workflow receipts default to 2 KiB. Larger responses are honored only with max_bytes_reason explaining why the extra step evidence is needed; maximum 1 MiB.")]
+    max_bytes: Option<usize>,
+    #[schemars(description = "Explain why the workflow needs a receipt larger than the 2 KiB default.")]
+    max_bytes_reason: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -555,12 +620,135 @@ fn bound_snapshot_response(value: &mut Value, max_bytes: usize) -> u64 {
         "status":"incomplete",
         "reason_code":"response_byte_limit",
         "max_bytes":max_bytes,
+        "response_budget":value["response_budget"],
         "truncated":true,
         "scope_complete":false,
         "observation":{"mode":"bounded","reason":"final snapshot exceeded its byte budget","bytes":0}
     });
     let bytes = update_observation_bytes(value);
     if bytes <= max_bytes as u64 { bytes } else { 0 }
+}
+
+fn serialized_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |encoded| encoded.len())
+}
+
+fn bounded_string(value: &Value) -> Option<Value> {
+    value.as_str().map(|text| {
+        if text.len() <= 256 {
+            json!(text)
+        } else {
+            let end = text.char_indices().take_while(|(index, _)| *index < 256).map(|(index, character)| index + character.len_utf8()).last().unwrap_or(0);
+            json!(format!("{}…", &text[..end]))
+        }
+    })
+}
+
+fn compact_workflow_step(step: &Value) -> Value {
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "kind", "status", "reference", "save_as", "reason_code", "action",
+        "semantic_revision", "scope_complete", "root_scope_complete", "global_complete",
+        "truncated", "evidence_complete",
+    ] {
+        if let Some(value) = bounded_string(&step[key]) {
+            compact.insert(key.to_owned(), value);
+        } else if step[key].is_boolean() || step[key].is_number() {
+            compact.insert(key.to_owned(), step[key].clone());
+        }
+    }
+    if let Some(reason) = bounded_string(&step["reason"]) {
+        compact.insert("reason".to_owned(), reason);
+    }
+    for key in ["match", "observed", "expected", "reconciliation"] {
+        if let Some(object) = step.get(key).and_then(Value::as_object) {
+            let mut selected = serde_json::Map::new();
+            for field in [
+                "reference", "role", "name", "href", "actionable", "rendered",
+                "in_viewport", "status", "evidence_complete", "observer",
+                "document", "semantic_revision", "reason", "reason_code",
+                "causality_established", "mutation_retried",
+            ] {
+                if let Some(value) = object.get(field) {
+                    if let Some(text) = bounded_string(value) {
+                        selected.insert(field.to_owned(), text);
+                    } else if value.is_boolean() || value.is_number() {
+                        selected.insert(field.to_owned(), value.clone());
+                    } else if field == "document" {
+                        let document = ["frame_id", "loader_id", "url"]
+                            .into_iter()
+                            .filter_map(|name| {
+                                bounded_string(&value[name]).map(|text| (name.to_owned(), text))
+                            })
+                            .collect::<serde_json::Map<_, _>>();
+                        if !document.is_empty() {
+                            selected.insert(field.to_owned(), Value::Object(document));
+                        }
+                    }
+                }
+            }
+            if !selected.is_empty() {
+                compact.insert(key.to_owned(), Value::Object(selected));
+            }
+        }
+    }
+    if let Some(document) = step.get("document").and_then(Value::as_object) {
+        let identity = ["frame_id", "loader_id", "url"]
+            .into_iter()
+            .filter_map(|name| {
+                bounded_string(document.get(name).unwrap_or(&Value::Null))
+                    .map(|text| (name.to_owned(), text))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        if !identity.is_empty() {
+            compact.insert("document".to_owned(), Value::Object(identity));
+        }
+    }
+    Value::Object(compact)
+}
+
+fn bound_workflow_receipt(value: Value, requested_bytes: usize, reason: Option<&str>) -> Value {
+    let explicit_reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
+    let requested = requested_bytes.clamp(DEFAULT_RECEIPT_RESPONSE_BYTES, MAX_RECEIPT_RESPONSE_BYTES);
+    let (max_bytes, source) = if requested > DEFAULT_RECEIPT_RESPONSE_BYTES && explicit_reason.is_some() {
+        (requested, "explicit")
+    } else {
+        (DEFAULT_RECEIPT_RESPONSE_BYTES, "default")
+    };
+    let budget_reason = if source == "explicit" {
+        explicit_reason.unwrap_or_default().chars().take(256).collect::<String>()
+    } else {
+        "compact task receipt default".to_owned()
+    };
+    let original_steps = value["steps"].as_array().cloned().unwrap_or_default();
+    let original_count = original_steps.len();
+    let mut response = json!({
+        "status":value["status"],
+        "completed_steps":value["completed_steps"],
+        "reconciled_unknown_mutations":value["reconciled_unknown_mutations"],
+        "internal_model_calls":value["internal_model_calls"],
+        "steps":[],
+        "returned_steps":0,
+        "omitted_steps":original_count,
+        "truncated":original_count > 0,
+        "response_budget":{"max_bytes":max_bytes,"source":source,"reason":budget_reason}
+    });
+    for step in original_steps {
+        response["steps"].as_array_mut().expect("steps array").push(compact_workflow_step(&step));
+        let returned = response["steps"].as_array().map_or(0, Vec::len);
+        response["returned_steps"] = json!(returned);
+        response["omitted_steps"] = json!(value["completed_steps"].as_u64().unwrap_or(returned as u64).saturating_sub(returned as u64));
+        response["truncated"] = json!(response["omitted_steps"].as_u64().unwrap_or(0) > 0);
+        if serialized_bytes(&response) > max_bytes {
+            response["steps"].as_array_mut().expect("steps array").pop();
+            let returned = response["steps"].as_array().map_or(0, Vec::len);
+            response["returned_steps"] = json!(returned);
+            response["omitted_steps"] = json!(value["completed_steps"].as_u64().unwrap_or(original_count as u64).saturating_sub(returned as u64));
+            response["truncated"] = json!(true);
+            break;
+        }
+    }
+    response
 }
 
 fn query_needs_layout(query: &str) -> bool {
@@ -775,6 +963,13 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         return Err(invalid("include_frames applies to a root snapshot; use frame_id for one explicit child-frame snapshot"));
     }
     if let Some(frame_id) = args.frame_id.as_deref() {
+        validate_response_budget(args.max_bytes, args.max_bytes_reason.as_deref(), DEFAULT_TARGETED_RESPONSE_BYTES)
+            .map_err(invalid)?;
+        let (response_max_bytes, response_source, response_reason) = select_response_budget(
+            args.max_bytes,
+            args.max_bytes_reason.as_deref(),
+            DEFAULT_TARGETED_RESPONSE_BYTES,
+        );
         let Json(mut value) = app
             .legacy
             .shared_accessibility(Parameters(SharedAccessibilityArgs {
@@ -782,11 +977,15 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
                 chrome_tab_id: args.chrome_tab_id.clone(),
                 selector: None,
                 frame_id: Some(frame_id.to_owned()),
-                max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000),
+                max_bytes: response_max_bytes,
                 timeout_ms: Some(10_000),
             }))
             .await?;
-        let response_max_bytes = args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 1_000_000);
+        value["response_budget"] = json!({
+            "max_bytes": response_max_bytes,
+            "source": response_source,
+            "reason": response_reason
+        });
         attach_observation_metadata(&mut value, decision);
         let bytes = bound_snapshot_response(&mut value, response_max_bytes);
         record_observation_feedback(app, request, decision, started, &value, bytes);
@@ -798,10 +997,20 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .await;
         return Ok(value);
     }
-    let response_max_bytes = args
-        .max_bytes
-        .unwrap_or_else(snapshot_bytes)
-        .clamp(4096, 1_000_000);
+    let targeted_compact = decision.mode == crate::observation_router::ObservationMode::SemanticCompact
+        && args.goal.as_ref().and_then(|goal| goal.query.as_deref()).is_some_and(|query| !query.trim().is_empty())
+        && !args.goal.as_ref().is_some_and(|goal| goal.exhaustive);
+    validate_response_budget(
+        args.max_bytes,
+        args.max_bytes_reason.as_deref(),
+        default_snapshot_response_bytes(targeted_compact),
+    )
+    .map_err(invalid)?;
+    let (response_max_bytes, response_source, response_reason) = select_response_budget(
+        args.max_bytes,
+        args.max_bytes_reason.as_deref(),
+        default_snapshot_response_bytes(targeted_compact),
+    );
     let legacy = app
         .legacy
         .shared_snapshot(Parameters(SharedSnapshotArgs {
@@ -819,7 +1028,10 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
                     }
                 })
                 .min(6000),
-            max_bytes: response_max_bytes.min(100_000),
+            // Collect with the legacy endpoint's supported ceiling, then apply
+            // the compact public response budget after identity and deltas are
+            // assembled here.
+            max_bytes: 100_000,
             href_hint: args.href_hint.clone(),
             goal: args.goal.clone(),
             max_scan_nodes: args.max_scan_nodes,
@@ -1028,6 +1240,11 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         }
         snapshot["page_content_is_untrusted"] = json!(true);
     }
+    snapshot["response_budget"] = json!({
+        "max_bytes": response_max_bytes,
+        "source": response_source,
+        "reason": response_reason
+    });
     attach_observation_metadata(&mut snapshot, decision);
     let bytes = bound_snapshot_response(&mut snapshot, response_max_bytes);
     if snapshot["truncation_reason"] == "response_byte_limit"
@@ -1486,6 +1703,7 @@ async fn retained_mutation(
             max_items: Some(200),
             max_text_chars: Some(0),
             max_bytes: Some(100_000),
+            max_bytes_reason: None,
             href_hint: None,
             frame_id: None,
             include_frames: None,
@@ -1570,6 +1788,7 @@ async fn retained_click(
             max_items: Some(200),
             max_text_chars: Some(0),
             max_bytes: Some(100_000),
+            max_bytes_reason: None,
             href_hint: None,
             frame_id: None,
             include_frames: None,
@@ -1947,6 +2166,7 @@ async fn find_impl(app: &AppV2, args: &BrowserFindArgs) -> Result<Value, rmcp::E
                 max_items: None,
                 max_text_chars: None,
                 max_bytes: None,
+            max_bytes_reason: None,
                 href_hint: None,
                 frame_id: None,
                 include_frames: None,
@@ -2190,6 +2410,7 @@ async fn verify_impl_unmeasured(
                 max_items: Some(200),
                 max_text_chars: Some(0),
                 max_bytes: Some(1_000_000),
+            max_bytes_reason: None,
                 href_hint: None,
                 frame_id: Some(frame_id.clone()),
                 include_frames: None,
@@ -2263,6 +2484,7 @@ async fn verify_impl_unmeasured(
             max_items: None,
             max_text_chars: Some(6000),
             max_bytes: Some(60_000),
+            max_bytes_reason: None,
             href_hint: None,
             frame_id: None,
             include_frames: None,
@@ -2923,16 +3145,24 @@ impl AppV2 {
         &self,
         Parameters(args): Parameters<BrowserProbeArgs>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        self.legacy
+        let (max_bytes, source, reason) = select_response_budget(
+            args.max_bytes,
+            args.max_bytes_reason.as_deref(),
+            DEFAULT_TARGETED_RESPONSE_BYTES,
+        );
+        let Json(mut value) = self.legacy
             .shared_accessibility(Parameters(SharedAccessibilityArgs {
                 session_id: args.session_id,
                 chrome_tab_id: args.chrome_tab_id,
                 selector: Some(args.selector),
                 frame_id: None,
-                max_bytes: args.max_bytes.unwrap_or(64 * 1024).clamp(4096, 262_144),
+                max_bytes,
                 timeout_ms: args.timeout_ms,
             }))
-            .await
+            .await?;
+        value["response_budget"] = json!({"max_bytes":max_bytes,"source":source,"reason":reason});
+        bound_snapshot_response(&mut value, max_bytes);
+        Ok(Json(value))
     }
 
     #[tool(
@@ -2948,7 +3178,7 @@ impl AppV2 {
 
     #[tool(
         name = "browser_workflow",
-        description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. Find requires an exact control name, one matching reference, and complete scope evidence; unread unrelated frames are allowed only for a unique root-document exact match. After an unknown mutation, only one immediately following read-only verify step may reconcile its postcondition; no mutation is retried."
+        description = "Execute up to 20 deterministic snapshot/find/fill/select/click/verify steps with no internal model calls and no loops. Receipts default to 2 KiB; larger responses require max_bytes_reason and are capped at 1 MiB. Find requires an exact control name, one matching reference, and complete scope evidence; unread unrelated frames are allowed only for a unique root-document exact match. After an unknown mutation, only one immediately following read-only verify step may reconcile its postcondition; no mutation is retried."
     )]
     async fn browser_workflow(
         &self,
@@ -2957,8 +3187,16 @@ impl AppV2 {
         if args.steps.is_empty() || args.steps.len() > MAX_WORKFLOW_STEPS {
             return Err(invalid("workflow must contain 1..20 steps"));
         }
+        validate_response_budget(
+            args.max_bytes,
+            args.max_bytes_reason.as_deref(),
+            DEFAULT_RECEIPT_RESPONSE_BYTES,
+        )
+        .map_err(invalid)?;
         let mut vars = BTreeMap::<String, String>::new();
         let mut receipts: Vec<Value> = Vec::new();
+        let response_max_bytes = args.max_bytes.unwrap_or(DEFAULT_RECEIPT_RESPONSE_BYTES);
+        let response_reason = args.max_bytes_reason.clone();
         let mut steps = args.steps.into_iter().peekable();
         let mut unknown_receipt_to_reconcile: Option<usize> = None;
         while let Some(step) = steps.next() {
@@ -2977,6 +3215,7 @@ impl AppV2 {
                             max_items: None,
                             max_text_chars: None,
                             max_bytes: None,
+                            max_bytes_reason: None,
                             href_hint: None,
                             frame_id: None,
                             include_frames: None,
@@ -3153,13 +3392,18 @@ impl AppV2 {
                     && receipt["reconciliation"]["status"] == "postcondition_observed"
             })
             .count();
-        Ok(Json(json!({
+        let receipt = json!({
             "status": if unreconciled_unknown || terminal == "unknown" { "unknown" } else if terminal == "failed" || terminal == "not_dispatched" { "failed" } else { "completed" },
             "completed_steps": receipts.len(),
             "reconciled_unknown_mutations": reconciled_unknown_mutations,
             "internal_model_calls": 0,
             "steps": receipts
-        })))
+        });
+        Ok(Json(bound_workflow_receipt(
+            receipt,
+            response_max_bytes,
+            response_reason.as_deref(),
+        )))
     }
 
     #[tool(
@@ -3339,6 +3583,92 @@ mod tests {
             "https://example.test/a",
             "https://other.test/a"
         ));
+    }
+
+    #[test]
+    fn default_semantic_snapshot_budget_is_compact_and_keeps_actionable_identity() {
+        assert_eq!(default_snapshot_response_bytes(true), 12 * 1024);
+        assert_eq!(default_snapshot_response_bytes(false), 100_000);
+        let items = (0..80)
+            .map(|index| json!({"reference":format!("@c{index}"),"role":"button","name":format!("Open report {index}"),"rendered":true,"in_viewport":true,"actionable":true,"text":"x".repeat(256)}))
+            .collect::<Vec<_>>();
+        let mut snapshot = json!({
+            "count":items.len(), "scope_complete":true, "root_scope_complete":true,
+            "items":items, "delta":{"full":true,"upsert":items,"removed":[]},
+            "response_budget":{"max_bytes":4096,"source":"explicit","reason":"test bounded response"},
+            "observation":{"mode":"semantic_compact","reason":"default budget fixture","bytes":0}
+        });
+        let bytes = bound_snapshot_response(&mut snapshot, DEFAULT_TARGETED_RESPONSE_BYTES);
+        assert!(bytes <= 12 * 1024);
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["scope_complete"], false);
+        let first = &snapshot["items"][0];
+        assert_eq!(first["reference"], "@c0");
+        assert_eq!(first["role"], "button");
+        assert_eq!(first["name"], "Open report 0");
+        assert_eq!(first["actionable"], true);
+        assert_eq!(snapshot["count"], 80);
+        assert_eq!(snapshot["observation"]["bytes"], json!(bytes));
+        assert_eq!(snapshot["response_budget"]["reason"], "test bounded response");
+    }
+
+    #[test]
+    fn larger_semantic_observation_budget_requires_and_reports_a_reason() {
+        assert!(validate_response_budget(Some(64 * 1024), None, 12 * 1024).is_err());
+        assert!(validate_response_budget(Some(12 * 1024), None, 12 * 1024).is_ok());
+        let (bytes, source, reason) = select_response_budget(Some(64 * 1024), None, 12 * 1024);
+        assert_eq!(bytes, 12 * 1024);
+        assert_eq!(source, "default");
+        assert_eq!(reason, "small targeted compact observation");
+
+        let (bytes, source, reason) = select_response_budget(
+            Some(64 * 1024),
+            Some("inspect form fields for review"),
+            12 * 1024,
+        );
+        assert_eq!(bytes, 64 * 1024);
+        assert_eq!(source, "explicit");
+        assert_eq!(reason, "inspect form fields for review");
+    }
+
+    #[test]
+    fn default_workflow_receipt_is_bounded_and_keeps_status_and_target_identity() {
+        let response = json!({
+            "status":"completed", "completed_steps":20, "reconciled_unknown_mutations":0,
+            "internal_model_calls":0,
+            "steps":(0..20).map(|index| json!({
+                "kind":"click", "status":"completed", "reference":format!("@c{index}"),
+                "scope_complete":true,
+                "document":{"frame_id":"frame-1","loader_id":"loader-1"},
+                "page_text":"x".repeat(500), "debug":"x".repeat(300)
+            })).collect::<Vec<_>>()
+        });
+        let bounded = bound_workflow_receipt(response, DEFAULT_RECEIPT_RESPONSE_BYTES, None);
+        assert!(serialized_bytes(&bounded) <= DEFAULT_RECEIPT_RESPONSE_BYTES);
+        assert_eq!(bounded["status"], "completed");
+        assert_eq!(bounded["completed_steps"], 20);
+        assert!(bounded["steps"].as_array().unwrap().len() < 20);
+        assert_eq!(bounded["returned_steps"], bounded["steps"].as_array().unwrap().len());
+        assert!(bounded["omitted_steps"].as_u64().unwrap() > 0);
+        assert!(bounded["steps"][0]["reference"].as_str().unwrap().starts_with("@c"));
+        assert_eq!(bounded["steps"][0]["document"]["frame_id"], "frame-1");
+        assert_eq!(bounded["steps"][0]["scope_complete"], true);
+        assert!(bounded["steps"][0].get("page_text").is_none());
+        assert!(bounded["steps"][0].get("debug").is_none());
+        assert_eq!(bounded["truncated"], true);
+    }
+
+    #[test]
+    fn larger_workflow_receipt_budget_requires_and_reports_a_reason() {
+        let response = json!({"status":"completed", "completed_steps":1, "steps":[]});
+        let denied = bound_workflow_receipt(response.clone(), 4096, None);
+        assert_eq!(denied["response_budget"]["max_bytes"], DEFAULT_RECEIPT_RESPONSE_BYTES);
+        assert_eq!(denied["response_budget"]["source"], "default");
+
+        let requested = bound_workflow_receipt(response, 4096, Some("review all step evidence"));
+        assert_eq!(requested["response_budget"]["max_bytes"], 4096);
+        assert_eq!(requested["response_budget"]["reason"], "review all step evidence");
+        assert_eq!(requested["response_budget"]["source"], "explicit");
     }
 
     #[test]

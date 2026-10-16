@@ -12,6 +12,7 @@ fn success(id: &str, input: &str) -> SkillTrace {
         intent_fingerprint: "draft-form".into(),
         structural_signature: "form:v1".into(),
         input_fingerprint: input.into(),
+        account_identity_fingerprint: None,
         verified: true,
         preconditions: BTreeSet::from(["form_present".into()]),
         postconditions: BTreeSet::from(["draft_saved".into()]),
@@ -256,19 +257,17 @@ fn structured_traces_persist_and_runtime_induction_stays_a_candidate() {
             200,
         )
         .unwrap();
-    let replay = runtime
-        .replay(
-            &record.definition.skill_id,
-            "https://example.test",
-            "form:v1",
-            101,
-        )
-        .unwrap();
-    assert_eq!(replay.workflow["kind"], "form_fill_save");
-    assert_eq!(replay.workflow["fields"], json!([{"slot":0},{"slot":1}]));
-    assert_eq!(
-        replay.failure_guards,
-        vec!["read_failure:save_control_missing"]
+    // Legacy traces have no verified account marker. They remain useful as
+    // candidate evidence but cannot authorize account-sensitive replay.
+    assert!(
+        runtime
+            .replay(
+                &record.definition.skill_id,
+                "https://example.test",
+                "form:v1",
+                101,
+            )
+            .is_err()
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -1,15 +1,15 @@
 use super::{
-    AppV2, BrowserActArgs, BrowserClickOutcome, BrowserExtractArgs, BrowserFindArgs, BrowserPredicate,
-    BrowserSessionArgs, BrowserSnapshotArgs, BrowserVerifyArgs, find_impl, resolve_reference,
-    retained_mutation, snapshot_impl, tab_key, verify_impl,
+    AppV2, BrowserActArgs, BrowserClickOutcome, BrowserExtractArgs, BrowserFindArgs,
+    BrowserPredicate, BrowserSessionArgs, BrowserSnapshotArgs, BrowserVerifyArgs, find_impl,
+    resolve_reference, retained_mutation, snapshot_impl, tab_key, verify_impl,
 };
+use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
     tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
-use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -189,12 +189,17 @@ fn validate_url(url: &str) -> Result<(), rmcp::ErrorData> {
         .ok_or_else(|| invalid("URL must use HTTP(S)"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {
-        return Err(invalid("URL must contain a host and cannot contain credentials"));
+        return Err(invalid(
+            "URL must contain a host and cannot contain credentials",
+        ));
     }
     Ok(())
 }
 
-fn validate_reference_expr(reference: &str, vars: &BTreeSet<String>) -> Result<(), rmcp::ErrorData> {
+fn validate_reference_expr(
+    reference: &str,
+    vars: &BTreeSet<String>,
+) -> Result<(), rmcp::ErrorData> {
     if let Some(name) = reference.strip_prefix('$') {
         if vars.contains(name) {
             return Ok(());
@@ -208,7 +213,9 @@ fn validate_reference_expr(reference: &str, vars: &BTreeSet<String>) -> Result<(
     {
         return Ok(());
     }
-    Err(invalid("reference must be an exact @cN value or an earlier $variable"))
+    Err(invalid(
+        "reference must be an exact @cN value or an earlier $variable",
+    ))
 }
 
 fn predicate_references(predicate: &BrowserPredicate) -> Option<&str> {
@@ -218,9 +225,13 @@ fn predicate_references(predicate: &BrowserPredicate) -> Option<&str> {
         | BrowserPredicate::Value { reference, .. }
         | BrowserPredicate::Exists { reference } => Some(reference),
         BrowserPredicate::TextPresent { scope, .. } => scope.as_deref(),
-        BrowserPredicate::CountDelta { .. } | BrowserPredicate::Attachment { .. }
-        | BrowserPredicate::DownloadArtifact { .. } | BrowserPredicate::VisualRegionChanged { .. } => None,
-        BrowserPredicate::AppSpecific { predicate, .. } => predicate.get("reference").and_then(Value::as_str),
+        BrowserPredicate::CountDelta { .. }
+        | BrowserPredicate::Attachment { .. }
+        | BrowserPredicate::DownloadArtifact { .. }
+        | BrowserPredicate::VisualRegionChanged { .. } => None,
+        BrowserPredicate::AppSpecific { predicate, .. } => {
+            predicate.get("reference").and_then(Value::as_str)
+        }
         BrowserPredicate::Url { .. } | BrowserPredicate::UrlStartsWith { .. } => None,
     }
 }
@@ -257,7 +268,10 @@ fn validate_workflow(steps: &[FullWorkflowStep]) -> Result<(), rmcp::ErrorData> 
                 if query.trim().is_empty() || query.len() > 512 {
                     return Err(invalid("find query must contain 1..512 bytes"));
                 }
-                if role.as_deref().is_some_and(|role| role.is_empty() || role.len() > 128) {
+                if role
+                    .as_deref()
+                    .is_some_and(|role| role.is_empty() || role.len() > 128)
+                {
                     return Err(invalid("find role must contain 1..128 bytes when supplied"));
                 }
                 if save_as.is_empty()
@@ -375,12 +389,29 @@ fn substitute_predicate(
             equals,
         },
         BrowserPredicate::TextPresent { scope, text } => BrowserPredicate::TextPresent {
-            scope: scope.map(|reference| substitute(&reference, vars)).transpose()?, text,
+            scope: scope
+                .map(|reference| substitute(&reference, vars))
+                .transpose()?,
+            text,
         },
-        BrowserPredicate::Attribute { reference, name, equals } => BrowserPredicate::Attribute {
-            reference: substitute(&reference, vars)?, name, equals,
+        BrowserPredicate::Attribute {
+            reference,
+            name,
+            equals,
+        } => BrowserPredicate::Attribute {
+            reference: substitute(&reference, vars)?,
+            name,
+            equals,
         },
-        BrowserPredicate::CountDelta { role, before, delta } => BrowserPredicate::CountDelta { role, before, delta },
+        BrowserPredicate::CountDelta {
+            role,
+            before,
+            delta,
+        } => BrowserPredicate::CountDelta {
+            role,
+            before,
+            delta,
+        },
         BrowserPredicate::Value { reference, equals } => BrowserPredicate::Value {
             reference: substitute(&reference, vars)?,
             equals,
@@ -390,10 +421,28 @@ fn substitute_predicate(
         },
         BrowserPredicate::Url { equals } => BrowserPredicate::Url { equals },
         BrowserPredicate::UrlStartsWith { prefix } => BrowserPredicate::UrlStartsWith { prefix },
-        BrowserPredicate::Attachment { filename, size } => BrowserPredicate::Attachment { filename, size },
-        BrowserPredicate::DownloadArtifact { artifact_handle, sha256, min_bytes } => BrowserPredicate::DownloadArtifact { artifact_handle, sha256, min_bytes },
-        BrowserPredicate::VisualRegionChanged { evidence_before, evidence_after } => BrowserPredicate::VisualRegionChanged { evidence_before: substitute(&evidence_before, vars)?, evidence_after: substitute(&evidence_after, vars)? },
-        BrowserPredicate::AppSpecific { adapter, predicate } => BrowserPredicate::AppSpecific { adapter, predicate },
+        BrowserPredicate::Attachment { filename, size } => {
+            BrowserPredicate::Attachment { filename, size }
+        }
+        BrowserPredicate::DownloadArtifact {
+            artifact_handle,
+            sha256,
+            min_bytes,
+        } => BrowserPredicate::DownloadArtifact {
+            artifact_handle,
+            sha256,
+            min_bytes,
+        },
+        BrowserPredicate::VisualRegionChanged {
+            evidence_before,
+            evidence_after,
+        } => BrowserPredicate::VisualRegionChanged {
+            evidence_before: substitute(&evidence_before, vars)?,
+            evidence_after: substitute(&evidence_after, vars)?,
+        },
+        BrowserPredicate::AppSpecific { adapter, predicate } => {
+            BrowserPredicate::AppSpecific { adapter, predicate }
+        }
     })
 }
 
@@ -404,13 +453,16 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
     if text.is_empty()
         || expected.len() > MAX_TEXT
         || text.len() > MAX_TEXT
-        || !text.chars().all(|character| character.is_ascii_graphic() || character == ' ')
+        || !text
+            .chars()
+            .all(|character| character.is_ascii_graphic() || character == ' ')
     {
         return Err(invalid(
             "strict type requires nonempty ASCII text and values no longer than 16384 bytes",
         ));
     }
-    let legacy_reference = resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
+    let legacy_reference =
+        resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
     let shared = app
         .core
         .legacy
@@ -680,6 +732,7 @@ async fn strict_type(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp::E
             max_items: None,
             max_text_chars: None,
             max_bytes: None,
+            max_bytes_reason: None,
             href_hint: None,
             frame_id: None,
             include_frames: None,
@@ -701,7 +754,8 @@ async fn retained_press(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp
         .as_deref()
         .filter(|key| !key.is_empty() && key.len() <= 64 && !key.chars().any(char::is_control))
         .ok_or_else(|| invalid("press requires a bounded non-control key"))?;
-    let legacy_reference = resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
+    let legacy_reference =
+        resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
     let shared = app
         .core
         .legacy
@@ -727,7 +781,9 @@ async fn retained_press(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp
         .parse::<usize>()
         .map_err(|_| invalid("invalid retained reference index"))?;
     if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
-        return Err(invalid("stale or consumed reference; take one fresh browser_snapshot"));
+        return Err(invalid(
+            "stale or consumed reference; take one fresh browser_snapshot",
+        ));
     }
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -746,7 +802,9 @@ async fn retained_press(app: &AppFull, args: &FullActArgs) -> Result<Value, rmcp
         .map_err(invalid)?
     };
     if before != snapshot.identity {
-        return Err(invalid("document changed since snapshot; take a fresh browser_snapshot"));
+        return Err(invalid(
+            "document changed since snapshot; take a fresh browser_snapshot",
+        ));
     }
     let preflight = {
         let connection = shared.connection.as_ref().unwrap();
@@ -857,7 +915,9 @@ pub(super) fn probe_region_valid(region: ProbeRegionArgs) -> bool {
 }
 
 fn full_page_region(metrics: &Value) -> Result<ProbeRegionArgs, &'static str> {
-    let content = metrics.get("cssContentSize").or_else(|| metrics.get("contentSize"))
+    let content = metrics
+        .get("cssContentSize")
+        .or_else(|| metrics.get("contentSize"))
         .ok_or("Chrome omitted full-page content dimensions")?;
     let region = ProbeRegionArgs {
         x: 0.0,
@@ -905,13 +965,26 @@ fn decode_validate_png(data: &str, max_bytes: usize) -> Result<(Vec<u8>, u32, u3
     let mut image_bytes = 0usize;
     let mut seen_iend = false;
     while cursor < bytes.len() {
-        let length_bytes = bytes.get(cursor..cursor + 4).ok_or("PNG chunk length is truncated")?;
-        let length = u32::from_be_bytes(length_bytes.try_into().map_err(|_| "PNG chunk length is invalid")?) as usize;
-        let chunk_end = cursor.checked_add(12).and_then(|value| value.checked_add(length))
-            .filter(|end| *end <= bytes.len()).ok_or("PNG chunk is truncated")?;
+        let length_bytes = bytes
+            .get(cursor..cursor + 4)
+            .ok_or("PNG chunk length is truncated")?;
+        let length = u32::from_be_bytes(
+            length_bytes
+                .try_into()
+                .map_err(|_| "PNG chunk length is invalid")?,
+        ) as usize;
+        let chunk_end = cursor
+            .checked_add(12)
+            .and_then(|value| value.checked_add(length))
+            .filter(|end| *end <= bytes.len())
+            .ok_or("PNG chunk is truncated")?;
         let kind = &bytes[cursor + 4..cursor + 8];
         let payload = &bytes[cursor + 8..cursor + 8 + length];
-        let expected_crc = u32::from_be_bytes(bytes[cursor + 8 + length..chunk_end].try_into().map_err(|_| "PNG chunk CRC is invalid")?);
+        let expected_crc = u32::from_be_bytes(
+            bytes[cursor + 8 + length..chunk_end]
+                .try_into()
+                .map_err(|_| "PNG chunk CRC is invalid")?,
+        );
         if png_crc32(&bytes[cursor + 4..cursor + 8 + length]) != expected_crc {
             return Err("PNG chunk checksum mismatch");
         }
@@ -919,8 +992,16 @@ fn decode_validate_png(data: &str, max_bytes: usize) -> Result<(Vec<u8>, u32, u3
             if kind != b"IHDR" || length != 13 {
                 return Err("PNG must begin with a valid IHDR chunk");
             }
-            let width = u32::from_be_bytes(payload[..4].try_into().map_err(|_| "PNG width is invalid")?);
-            let height = u32::from_be_bytes(payload[4..8].try_into().map_err(|_| "PNG height is invalid")?);
+            let width = u32::from_be_bytes(
+                payload[..4]
+                    .try_into()
+                    .map_err(|_| "PNG width is invalid")?,
+            );
+            let height = u32::from_be_bytes(
+                payload[4..8]
+                    .try_into()
+                    .map_err(|_| "PNG height is invalid")?,
+            );
             let bit_depth = payload[8];
             let color_type = payload[9];
             let valid_bit_depth = match color_type {
@@ -930,9 +1011,15 @@ fn decode_validate_png(data: &str, max_bytes: usize) -> Result<(Vec<u8>, u32, u3
                 4 | 6 => matches!(bit_depth, 8 | 16),
                 _ => false,
             };
-            if width == 0 || height == 0 || width > 4096 || height > 4096
+            if width == 0
+                || height == 0
+                || width > 4096
+                || height > 4096
                 || u64::from(width) * u64::from(height) > 16_777_216
-                || !valid_bit_depth || payload[10] != 0 || payload[11] != 0 || payload[12] > 1
+                || !valid_bit_depth
+                || payload[10] != 0
+                || payload[11] != 0
+                || payload[12] > 1
             {
                 return Err("PNG dimensions or IHDR method fields are out of bounds");
             }
@@ -945,7 +1032,9 @@ fn decode_validate_png(data: &str, max_bytes: usize) -> Result<(Vec<u8>, u32, u3
                 return Err("PNG IDAT chunks are empty or noncontiguous");
             }
             seen_idat = true;
-            image_bytes = image_bytes.checked_add(length).ok_or("PNG image data length overflow")?;
+            image_bytes = image_bytes
+                .checked_add(length)
+                .ok_or("PNG image data length overflow")?;
         } else if seen_idat && kind != b"IEND" {
             idat_closed = true;
         }
@@ -975,17 +1064,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn validate_screenshot_evidence(
-    evidence: &Value,
-    tab_id: &str,
-    frame_id: &str,
-    loader_id: &str,
-    frame_url: &str,
-    image_sha256: &str,
+struct ScreenshotEvidenceExpectation<'a> {
+    tab_id: &'a str,
+    frame_id: &'a str,
+    loader_id: &'a str,
+    frame_url: &'a str,
+    image_sha256: &'a str,
     width: u32,
     height: u32,
     crop: ProbeRegionArgs,
     capture_beyond_viewport: bool,
+}
+
+fn validate_screenshot_evidence(
+    evidence: &Value,
+    expected: ScreenshotEvidenceExpectation<'_>,
 ) -> Result<Value, &'static str> {
     let _document_id = evidence["document_id"]
         .as_str()
@@ -997,38 +1090,63 @@ fn validate_screenshot_evidence(
     let capture_started_at_ms = evidence["capture_started_at_ms"]
         .as_u64()
         .ok_or("screenshot evidence omitted its capture start time")?;
-    if evidence["target_id"].as_str() != Some(tab_id)
-        || evidence["frame_url"].as_str() != Some(frame_url)
+    let render_frame_timestamp_ms = evidence["render_frame_timestamp_ms"]
+        .as_f64()
+        .filter(|timestamp| timestamp.is_finite() && *timestamp >= 0.0)
+        .ok_or("screenshot evidence omitted its renderer animation-frame timestamp")?;
+    let render_revision = evidence["render_revision"]
+        .as_str()
+        .filter(|revision| {
+            !revision.is_empty()
+                && revision.len() <= 512
+                && revision.starts_with(&format!("{_document_id}:"))
+        })
+        .ok_or("screenshot evidence omitted a document-bound renderer revision")?;
+    if evidence["target_id"].as_str() != Some(expected.tab_id)
+        || evidence["frame_url"].as_str() != Some(expected.frame_url)
         || captured_at_ms < capture_started_at_ms
-        || evidence["image_sha256"].as_str() != Some(image_sha256)
-        || evidence["visual_revision"].as_str() != Some(image_sha256)
+        || evidence["image_sha256"].as_str() != Some(expected.image_sha256)
+        || evidence["visual_revision"].as_str() != Some(expected.image_sha256)
         || evidence["target_lifecycle"].as_str() != Some("active")
-        || evidence.get("render_revision").is_none_or(|value| !value.is_null())
-        || evidence["dimensions"]["width"].as_u64() != Some(u64::from(width))
-        || evidence["dimensions"]["height"].as_u64() != Some(u64::from(height))
+        || evidence["render_frame_provenance"].as_str()
+            != Some("two_animation_frames_before_compositor_capture")
+        || evidence["dimensions"]["width"].as_u64() != Some(u64::from(expected.width))
+        || evidence["dimensions"]["height"].as_u64() != Some(u64::from(expected.height))
     {
-        return Err("screenshot evidence does not match the captured image, target, document, or active lifecycle");
+        return Err(
+            "screenshot evidence does not match the captured image, target, document, or active lifecycle",
+        );
     }
     let mut public = evidence.clone();
-    public["frame"] = json!({"frame_id":frame_id,"loader_id":loader_id,"url":frame_url});
+    public["frame"] = json!({"frame_id":expected.frame_id,"loader_id":expected.loader_id,"url":expected.frame_url});
+    public["render_revision"] = json!(render_revision);
+    public["render_frame_timestamp_ms"] = json!(render_frame_timestamp_ms);
     public["viewport_transform"] = json!({
         "coordinate_space":"css_pixels",
-        "clip":{"x":crop.x,"y":crop.y,"width":crop.width,"height":crop.height},
+        "clip":{"x":expected.crop.x,"y":expected.crop.y,"width":expected.crop.width,"height":expected.crop.height},
         "image_scale":1.0,
-        "pixel_dimensions":{"width":width,"height":height},
-        "capture_beyond_viewport":capture_beyond_viewport
+        "pixel_dimensions":{"width":expected.width,"height":expected.height},
+        "capture_beyond_viewport":expected.capture_beyond_viewport
     });
     Ok(public)
 }
 
-fn validate_visual_payload_options(save_artifact: bool, omit_image_payload: bool) -> Result<(), &'static str> {
+fn validate_visual_payload_options(
+    save_artifact: bool,
+    omit_image_payload: bool,
+) -> Result<(), &'static str> {
     if omit_image_payload && !save_artifact {
-        return Err("omit_image_payload requires save_artifact=true so the screenshot remains retrievable");
+        return Err(
+            "omit_image_payload requires save_artifact=true so the screenshot remains retrievable",
+        );
     }
     Ok(())
 }
 
-pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Value, rmcp::ErrorData> {
+pub(super) async fn visual_probe(
+    core: &AppV2,
+    args: FullProbeArgs,
+) -> Result<Value, rmcp::ErrorData> {
     let full_page = args.full_page == Some(true);
     let modes = usize::from(args.reference.is_some())
         + usize::from(args.selector.is_some())
@@ -1049,10 +1167,16 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
     }) {
         return Err(invalid("probe selector is out of bounds"));
     }
-    if args.region.is_some_and(|region| !probe_region_valid(region)) {
+    if args
+        .region
+        .is_some_and(|region| !probe_region_valid(region))
+    {
         return Err(invalid("probe region is out of bounds"));
     }
-    let max_bytes = args.max_bytes.unwrap_or(262_144).clamp(4_096, 6 * 1024 * 1024);
+    let max_bytes = args
+        .max_bytes
+        .unwrap_or(262_144)
+        .clamp(4_096, 6 * 1024 * 1024);
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
     let deadline = tokio::time::Instant::now() + timeout;
     let shared = core
@@ -1102,7 +1226,8 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
     } else if let Some(region) = args.region {
         region
     } else if let Some(reference) = args.reference.as_deref() {
-        let legacy_reference = resolve_reference(core, &args.session_id, &args.chrome_tab_id, reference).await?;
+        let legacy_reference =
+            resolve_reference(core, &args.session_id, &args.chrome_tab_id, reference).await?;
         let snapshot = shared
             .snapshots
             .get(&args.chrome_tab_id)
@@ -1114,8 +1239,14 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         let index = index
             .parse::<usize>()
             .map_err(|_| invalid("invalid retained reference index"))?;
-        if token != snapshot.token || index >= snapshot.count || snapshot.consumed || snapshot.identity != before {
-            return Err(invalid("probe reference is stale; take a fresh browser_snapshot"));
+        if token != snapshot.token
+            || index >= snapshot.count
+            || snapshot.consumed
+            || snapshot.identity != before
+        {
+            return Err(invalid(
+                "probe reference is stale; take a fresh browser_snapshot",
+            ));
         }
         let response = tokio::time::timeout_at(
             deadline,
@@ -1137,7 +1268,9 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         .map_err(|error| invalid(error.to_string()))?;
         let value = super::super::shared_value(&response).map_err(invalid)?;
         if value["ok"] != true {
-            return Err(invalid("probe reference no longer resolves to a visible element"));
+            return Err(invalid(
+                "probe reference no longer resolves to a visible element",
+            ));
         }
         ProbeRegionArgs {
             x: value["x"].as_f64().unwrap_or(-1.0),
@@ -1147,7 +1280,8 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         }
     } else {
         let selector = args.selector.as_deref().unwrap();
-        let selector_json = serde_json::to_string(selector).map_err(|error| invalid(error.to_string()))?;
+        let selector_json =
+            serde_json::to_string(selector).map_err(|error| invalid(error.to_string()))?;
         let response = tokio::time::timeout_at(
             deadline,
             connection.command(
@@ -1166,7 +1300,9 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         .map_err(|error| invalid(error.to_string()))?;
         let value = super::super::shared_value(&response).map_err(invalid)?;
         if value["ok"] != true {
-            return Err(invalid("probe selector must uniquely resolve to one visible element"));
+            return Err(invalid(
+                "probe selector must uniquely resolve to one visible element",
+            ));
         }
         ProbeRegionArgs {
             x: value["x"].as_f64().unwrap_or(-1.0),
@@ -1176,7 +1312,9 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         }
     };
     if !probe_region_valid(region) {
-        return Err(invalid("resolved probe region exceeds the bounded visual scope"));
+        return Err(invalid(
+            "resolved probe region exceeds the bounded visual scope",
+        ));
     }
     let screenshot = tokio::time::timeout_at(
         deadline,
@@ -1195,21 +1333,25 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         .as_str()
         .filter(|data| !data.is_empty())
         .ok_or_else(|| invalid("Chrome omitted targeted screenshot data"))?;
-    let (image_bytes, pixel_width, pixel_height) = decode_validate_png(data, max_bytes).map_err(invalid)?;
+    let (image_bytes, pixel_width, pixel_height) =
+        decode_validate_png(data, max_bytes).map_err(invalid)?;
     let byte_length = image_bytes.len();
     let image_sha256 = sha256_hex(&image_bytes);
     let visual_evidence = validate_screenshot_evidence(
         &screenshot["visual_evidence"],
-        &args.chrome_tab_id,
-        &before.0,
-        &before.1,
-        &before.2,
-        &image_sha256,
-        pixel_width,
-        pixel_height,
-        region,
-        full_page,
-    ).map_err(invalid)?;
+        ScreenshotEvidenceExpectation {
+            tab_id: &args.chrome_tab_id,
+            frame_id: &before.0,
+            loader_id: &before.1,
+            frame_url: &before.2,
+            image_sha256: &image_sha256,
+            width: pixel_width,
+            height: pixel_height,
+            crop: region,
+            capture_beyond_viewport: full_page,
+        },
+    )
+    .map_err(invalid)?;
     let after = tokio::time::timeout_at(
         deadline,
         super::super::shared_frame_identity(
@@ -1228,6 +1370,23 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
         ));
     }
     let observed_at_ms = visual_evidence["captured_at_ms"].as_u64().unwrap();
+    let durable_visual = if args.save_artifact == Some(true) {
+        let principal = shared.handle.principal.as_str();
+        let store = crate::evidence_store::PersistentEvidenceStore::new(
+            super::super::state_directory().join("evidence-v1.json"),
+        );
+        let stored = store
+            .store_visual_png(principal, &image_bytes)
+            .map_err(|error| invalid(format!("durable visual evidence storage failed: {error}")))?;
+        Some(json!({
+            "visual_evidence_handle":stored.handle,
+            "sha256":stored.sha256,
+            "size":stored.size,
+            "expires_at_ms":stored.expires_at_ms
+        }))
+    } else {
+        None
+    };
     let artifact = if args.save_artifact == Some(true) {
         let filename = format!("visual-{observed_at_ms}.png");
         let handle = shared.handle.clone();
@@ -1241,7 +1400,7 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
                 &image_bytes,
                 controlla_browser::sessions::ArtifactScope::GuardedSharedSession,
             )
-        .map_err(|error| invalid(format!("visual artifact registration failed: {error:?}")))?;
+            .map_err(|error| invalid(format!("visual artifact registration failed: {error:?}")))?;
         Some(json!({
             "artifact_handle":metadata.handle.opaque_id(),
             "filename":metadata.filename,
@@ -1268,6 +1427,7 @@ pub(super) async fn visual_probe(core: &AppV2, args: FullProbeArgs) -> Result<Va
             "observed_at_ms":observed_at_ms
         },
         "artifact":artifact,
+        "durable_visual":durable_visual,
         "visual_evidence":visual_evidence
     });
     if args.omit_image_payload == Some(true) {
@@ -1286,10 +1446,14 @@ async fn wait_for_selector(
     selector: &str,
     timeout_ms: u64,
 ) -> Result<Value, rmcp::ErrorData> {
-    if selector.trim().is_empty() || selector.len() > MAX_SELECTOR || !(1..=30_000).contains(&timeout_ms) {
+    if selector.trim().is_empty()
+        || selector.len() > MAX_SELECTOR
+        || !(1..=30_000).contains(&timeout_ms)
+    {
         return Err(invalid("wait_for selector or timeout is out of bounds"));
     }
-    let selector_json = serde_json::to_string(selector).map_err(|error| invalid(error.to_string()))?;
+    let selector_json =
+        serde_json::to_string(selector).map_err(|error| invalid(error.to_string()))?;
     let shared = app
         .core
         .legacy
@@ -1307,9 +1471,10 @@ async fn wait_for_selector(
         .connection
         .as_ref()
         .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
-    let before = super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, tab_id)
-        .await
-        .map_err(invalid)?;
+    let before =
+        super::super::shared_frame_identity(connection, shared.registry()?, &shared.handle, tab_id)
+            .await
+            .map_err(invalid)?;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let response = tokio::time::timeout_at(
@@ -1326,7 +1491,8 @@ async fn wait_for_selector(
             ),
         )
         .await;
-        if matches!(response, Ok(Ok(ref value)) if value.pointer("/result/value") == Some(&Value::Bool(true))) {
+        if matches!(response, Ok(Ok(ref value)) if value.pointer("/result/value") == Some(&Value::Bool(true)))
+        {
             let after = super::super::shared_frame_identity(
                 connection,
                 shared.registry()?,
@@ -1341,7 +1507,9 @@ async fn wait_for_selector(
             return Ok(json!({"status":"verified","kind":"wait_for","selector":selector}));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(json!({"status":"failed","kind":"wait_for","selector":selector,"reason":"timeout"}));
+            return Ok(
+                json!({"status":"failed","kind":"wait_for","selector":selector,"reason":"timeout"}),
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1392,9 +1560,10 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         max_items: None,
                         max_text_chars: None,
                         max_bytes: None,
+                        max_bytes_reason: None,
                         href_hint: None,
                         frame_id: None,
-            include_frames: None,
+                        include_frames: None,
                         goal: None,
                         max_scan_nodes: None,
                     },
@@ -1474,8 +1643,8 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         reference: Some(reference),
                         expected_value: None,
                         value: None,
-            expected_origin: None,
-            account_marker: None,
+                        expected_origin: None,
+                        account_marker: None,
                         outcome: Some(outcome),
                         timeout_ms: None,
                     }))
@@ -1497,8 +1666,8 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         reference: Some(reference.clone()),
                         expected_value: Some(expected_value),
                         value: Some(value),
-            expected_origin: None,
-            account_marker: None,
+                        expected_origin: None,
+                        account_marker: None,
                         outcome: None,
                         timeout_ms: None,
                     },
@@ -1563,8 +1732,8 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
                         reference: Some(reference.clone()),
                         expected_value: Some(expected_value),
                         value: Some(value),
-            expected_origin: None,
-            account_marker: None,
+                        expected_origin: None,
+                        account_marker: None,
                         outcome: None,
                         timeout_ms: None,
                     },
@@ -1577,15 +1746,20 @@ async fn execute_workflow(app: &AppFull, args: FullWorkflowArgs) -> Result<Value
             FullWorkflowStep::WaitFor {
                 selector,
                 timeout_ms,
-            } => wait_for_selector(
-                app,
-                &args.session_id,
-                &args.chrome_tab_id,
-                &selector,
-                timeout_ms,
-            )
-            .await?,
-            FullWorkflowStep::Observe { selector, max_bytes } => {
+            } => {
+                wait_for_selector(
+                    app,
+                    &args.session_id,
+                    &args.chrome_tab_id,
+                    &selector,
+                    timeout_ms,
+                )
+                .await?
+            }
+            FullWorkflowStep::Observe {
+                selector,
+                max_bytes,
+            } => {
                 let value = observe_selector(
                     app,
                     &args.session_id,
@@ -1705,6 +1879,7 @@ pub(super) async fn current_skill_context_core(
             max_items: Some(200),
             max_text_chars: Some(6_000),
             max_bytes: Some(100_000),
+            max_bytes_reason: None,
             href_hint: None,
             frame_id: None,
             include_frames: None,
@@ -1724,7 +1899,11 @@ pub(super) async fn current_skill_context_core(
         .get(&tab_key(session_id, tab_id))
         .ok_or_else(|| invalid("semantic snapshot state unavailable"))?;
     let mut items = state.items.values().collect::<Vec<_>>();
-    items.sort_by_key(|item| item.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX));
+    items.sort_by_key(|item| {
+        item.get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
     let mut hasher = Sha256::new();
     hasher.update(scope.as_bytes());
     for item in items {
@@ -1796,11 +1975,13 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
             let definition_value = args
                 .definition
                 .ok_or_else(|| invalid("definition is required"))?;
-            let definition: crate::skills::SkillDefinition = serde_json::from_value(definition_value)
-                .map_err(|error| invalid(format!("invalid skill definition: {error}")))?;
+            let definition: crate::skills::SkillDefinition =
+                serde_json::from_value(definition_value)
+                    .map_err(|error| invalid(format!("invalid skill definition: {error}")))?;
             let compiled: crate::browser_workflow::BrowserWorkflowDefinition =
-                serde_json::from_value(definition.workflow.clone())
-                    .map_err(|error| invalid(format!("skill workflow schema is invalid: {error}")))?;
+                serde_json::from_value(definition.workflow.clone()).map_err(|error| {
+                    invalid(format!("skill workflow schema is invalid: {error}"))
+                })?;
             crate::browser_workflow::compile_browser_workflow(compiled)
                 .map_err(|error| invalid(format!("skill workflow is unsafe: {error}")))?;
             let (scope, signature) = current_skill_context(app, session_id, tab_id).await?;
@@ -1845,7 +2026,9 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
                         true,
                     )
                     .map_err(|error| invalid(error.to_string()))?;
-                return Ok(json!({"status":"quarantined","reason":"structural_drift","record":record}));
+                return Ok(
+                    json!({"status":"quarantined","reason":"structural_drift","record":record}),
+                );
             }
             let predicate = args
                 .predicate
@@ -1854,7 +2037,9 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
             match args.action.as_str() {
                 "training_success" => {
                     if verification != crate::verifier::Verification::Passed {
-                        return Ok(json!({"status":"failed","reason":"fresh_runtime_verification_failed"}));
+                        return Ok(
+                            json!({"status":"failed","reason":"fresh_runtime_verification_failed"}),
+                        );
                     }
                     let run_id = required(&args.run_id, "run_id")?;
                     let record = app
@@ -1865,7 +2050,9 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
                 }
                 "validation_success" => {
                     if verification != crate::verifier::Verification::Passed {
-                        return Ok(json!({"status":"failed","reason":"fresh_runtime_verification_failed"}));
+                        return Ok(
+                            json!({"status":"failed","reason":"fresh_runtime_verification_failed"}),
+                        );
                     }
                     let run_id = required(&args.run_id, "run_id")?;
                     let record = app
@@ -1876,7 +2063,9 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
                 }
                 "qualify" => {
                     if verification != crate::verifier::Verification::Passed {
-                        return Ok(json!({"status":"failed","reason":"fresh_runtime_verification_failed"}));
+                        return Ok(
+                            json!({"status":"failed","reason":"fresh_runtime_verification_failed"}),
+                        );
                     }
                     let expires_at_ms = args
                         .expires_at_ms
@@ -1944,7 +2133,10 @@ async fn browser_skill(app: &AppFull, args: FullSkillArgs) -> Result<Value, rmcp
 
 #[tool_router]
 impl AppFull {
-    #[tool(name = "browser_session", description = "Discover, pair, connect, list, or release explicitly selected Chrome targets through Controlla's authority-preserving session broker.")]
+    #[tool(
+        name = "browser_session",
+        description = "Discover, pair, connect, list, or release explicitly selected Chrome targets through Controlla's authority-preserving session broker."
+    )]
     async fn browser_session(
         &self,
         Parameters(args): Parameters<BrowserSessionArgs>,
@@ -1952,7 +2144,10 @@ impl AppFull {
         self.core.browser_session(Parameters(args)).await
     }
 
-    #[tool(name = "browser_snapshot", description = "Return a compact semantic snapshot with stable short refs and a changed-only delta for the current document.")]
+    #[tool(
+        name = "browser_snapshot",
+        description = "Return a compact semantic snapshot with stable short refs and a changed-only delta for the current document."
+    )]
     async fn browser_snapshot(
         &self,
         Parameters(args): Parameters<BrowserSnapshotArgs>,
@@ -1960,7 +2155,10 @@ impl AppFull {
         self.core.browser_snapshot(Parameters(args)).await
     }
 
-    #[tool(name = "browser_find", description = "Find current semantic controls by role/name/value/href and return exact revision-bound @cN refs.")]
+    #[tool(
+        name = "browser_find",
+        description = "Find current semantic controls by role/name/value/href and return exact revision-bound @cN refs."
+    )]
     async fn browser_find(
         &self,
         Parameters(args): Parameters<BrowserFindArgs>,
@@ -1968,7 +2166,10 @@ impl AppFull {
         self.core.browser_find(Parameters(args)).await
     }
 
-    #[tool(name = "browser_act", description = "Act on one exact @cN ref. Supports guarded click, verified O(1) fill/select, strict sequential ASCII type, and focused key press. Unknown effects are never automatically retried.")]
+    #[tool(
+        name = "browser_act",
+        description = "Act on one exact @cN ref. Supports guarded click, verified O(1) fill/select, strict sequential ASCII type, and focused key press. Unknown effects are never automatically retried."
+    )]
     async fn browser_act(
         &self,
         Parameters(args): Parameters<FullActArgs>,
@@ -1984,8 +2185,8 @@ impl AppFull {
                         reference: args.reference,
                         expected_value: args.expected_value,
                         value: args.value,
-            expected_origin: None,
-            account_marker: None,
+                        expected_origin: None,
+                        account_marker: None,
                         outcome: args.outcome,
                         timeout_ms: args.timeout_ms,
                     }))
@@ -1994,13 +2195,20 @@ impl AppFull {
             }
             "type" => strict_type(self, &args).await?,
             "press" => retained_press(self, &args).await?,
-            _ => return Err(invalid("action must be click, fill, select, type, or press")),
+            _ => {
+                return Err(invalid(
+                    "action must be click, fill, select, type, or press",
+                ));
+            }
         };
         super::normalize_unknown_receipts(&mut value);
         Ok(Json(value))
     }
 
-    #[tool(name = "browser_extract", description = "Run bounded structured extraction from one explicitly paired tab with root frame/loader/URL freshness checks.")]
+    #[tool(
+        name = "browser_extract",
+        description = "Run bounded structured extraction from one explicitly paired tab with root frame/loader/URL freshness checks."
+    )]
     async fn browser_extract(
         &self,
         Parameters(args): Parameters<BrowserExtractArgs>,
@@ -2008,7 +2216,10 @@ impl AppFull {
         self.core.browser_extract(Parameters(args)).await
     }
 
-    #[tool(name = "browser_workflow", description = "Execute a bounded deterministic Chrome workflow. Supports navigate/find/click/fill/type/press/select/wait/observe/extract/assert/verify/checkpoint plus snapshots. Scripts fail closed on the shared route. Unknown mutation outcomes stop execution and are never automatically retried.")]
+    #[tool(
+        name = "browser_workflow",
+        description = "Execute a bounded deterministic Chrome workflow. Supports navigate/find/click/fill/type/press/select/wait/observe/extract/assert/verify/checkpoint plus snapshots. Scripts fail closed on the shared route. Unknown mutation outcomes stop execution and are never automatically retried."
+    )]
     async fn browser_workflow(
         &self,
         Parameters(args): Parameters<FullWorkflowArgs>,
@@ -2018,7 +2229,10 @@ impl AppFull {
         Ok(Json(value))
     }
 
-    #[tool(name = "browser_probe", description = "Capture a targeted PNG visual probe for exactly one @cN element, unique selector, or bounded region. Set full_page=true to capture the complete document only when its dimensions fit the strict pixel and byte limits; oversized pages are refused.")]
+    #[tool(
+        name = "browser_probe",
+        description = "Capture a targeted PNG visual probe for exactly one @cN element, unique selector, or bounded region. Set full_page=true to capture the complete document only when its dimensions fit the strict pixel and byte limits; oversized pages are refused."
+    )]
     async fn browser_probe(
         &self,
         Parameters(args): Parameters<FullProbeArgs>,
@@ -2026,7 +2240,10 @@ impl AppFull {
         Ok(Json(visual_probe(&self.core, args).await?))
     }
 
-    #[tool(name = "browser_verify", description = "Independently re-observe the selected tab with fresh runtime-owned evidence and evaluate a bounded text/value/existence/URL predicate.")]
+    #[tool(
+        name = "browser_verify",
+        description = "Independently re-observe the selected tab with fresh runtime-owned evidence and evaluate a bounded text/value/existence/URL predicate."
+    )]
     async fn browser_verify(
         &self,
         Parameters(args): Parameters<BrowserVerifyArgs>,
@@ -2034,7 +2251,10 @@ impl AppFull {
         self.core.browser_verify(Parameters(args)).await
     }
 
-    #[tool(name = "browser_skill", description = "Register, qualify, persist, inspect, verify, and replay reusable browser skills. Qualification requires distinct verified training/validation runs plus fresh runtime-owned verification; structural drift quarantines before replay.")]
+    #[tool(
+        name = "browser_skill",
+        description = "Register, qualify, persist, inspect, verify, and replay reusable browser skills. Qualification requires distinct verified training/validation runs plus fresh runtime-owned verification; structural drift quarantines before replay."
+    )]
     async fn browser_skill(
         &self,
         Parameters(args): Parameters<FullSkillArgs>,
@@ -2067,27 +2287,24 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let journal = crate::jobs::Journal::open(state_dir.join("operations.sqlite"))?;
     journal.recover_after_restart()?;
     let skills = crate::skill_runtime::SkillRuntime::new(state_dir.join("skills-v2.json"));
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async {
-        AppFull::new(
-            AppV2::new(super::super::App::with_journal(journal)),
-            skills,
-        )
-        .serve(rmcp::transport::io::stdio())
-        .await?
-        .waiting()
-        .await?;
+        AppFull::new(AppV2::new(super::super::App::with_journal(journal)), skills)
+            .serve(rmcp::transport::io::stdio())
+            .await?
+            .waiting()
+            .await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })
 }
-
 
 #[cfg(test)]
 mod screenshot_payload_tests {
     use super::{
         ProbeRegionArgs, decode_validate_png, shared_screenshot_params,
-        validate_screenshot_evidence,
-        validate_visual_payload_options,
+        validate_screenshot_evidence, validate_visual_payload_options,
     };
     use base64::Engine as _;
     use std::process::Command;
@@ -2108,45 +2325,85 @@ mod screenshot_payload_tests {
             "url":"https://fixture.test/", "frame_url":"https://fixture.test/",
             "captured_at_ms":120, "capture_started_at_ms":100,
             "visual_revision":"image-hash", "image_sha256":"image-hash",
-            "render_revision":null, "target_lifecycle":"active",
+            "render_revision":"document-7:42.500", "render_frame_timestamp_ms":42.5,
+            "render_frame_provenance":"two_animation_frames_before_compositor_capture",
+            "target_lifecycle":"active",
             "dimensions":{"width":1,"height":1}
         });
-        let crop = ProbeRegionArgs { x: 2.0, y: 3.0, width: 40.0, height: 30.0 };
+        let crop = ProbeRegionArgs {
+            x: 2.0,
+            y: 3.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        let expectation = |tab_id, image_sha256, width, height| {
+            super::ScreenshotEvidenceExpectation {
+                tab_id,
+                frame_id: "frame-4",
+                loader_id: "loader-7",
+                frame_url: "https://fixture.test/",
+                image_sha256,
+                width,
+                height,
+                crop,
+                capture_beyond_viewport: false,
+            }
+        };
         let public = validate_screenshot_evidence(
-            &evidence, "123", "frame-4", "loader-7", "https://fixture.test/", "image-hash", 1, 1,
-            crop, false,
-        ).unwrap();
+            &evidence,
+            expectation("123", "image-hash", 1, 1),
+        )
+        .unwrap();
         assert_eq!(public["document_id"], "document-7");
         assert_eq!(public["capture_started_at_ms"], 100);
         assert_eq!(public["captured_at_ms"], 120);
         assert_eq!(public["target_lifecycle"], "active");
-        assert!(public["render_revision"].is_null());
+        assert_eq!(public["render_revision"], "document-7:42.500");
+        assert_eq!(public["render_frame_timestamp_ms"], 42.5);
         assert_eq!(public["image_sha256"], "image-hash");
         assert_eq!(public["frame"]["frame_id"], "frame-4");
         assert_eq!(public["frame"]["loader_id"], "loader-7");
-        assert_eq!(public["viewport_transform"]["coordinate_space"], "css_pixels");
+        assert_eq!(
+            public["viewport_transform"]["coordinate_space"],
+            "css_pixels"
+        );
         assert_eq!(public["viewport_transform"]["image_scale"], 1.0);
         assert_eq!(public["viewport_transform"]["clip"]["x"], 2.0);
-        assert_eq!(public["viewport_transform"]["capture_beyond_viewport"], false);
+        assert_eq!(
+            public["viewport_transform"]["capture_beyond_viewport"],
+            false
+        );
 
         let mut stale = evidence.clone();
         stale["target_lifecycle"] = serde_json::json!("frozen");
-        assert!(validate_screenshot_evidence(
-            &stale, "123", "frame-4", "loader-7", "https://fixture.test/", "image-hash", 1, 1,
-            crop, false,
-        ).is_err());
-        assert!(validate_screenshot_evidence(
-            &evidence, "123", "frame-4", "loader-7", "https://fixture.test/", "wrong-hash", 1, 1,
-            crop, false,
-        ).is_err());
-        assert!(validate_screenshot_evidence(
-            &evidence, "another-tab", "frame-4", "loader-7", "https://fixture.test/", "image-hash", 1, 1,
-            crop, false,
-        ).is_err());
-        assert!(validate_screenshot_evidence(
-            &evidence, "123", "frame-4", "loader-7", "https://fixture.test/", "image-hash", 2, 1,
-            crop, false,
-        ).is_err());
+        assert!(
+            validate_screenshot_evidence(
+                &stale,
+                expectation("123", "image-hash", 1, 1),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_screenshot_evidence(
+                &evidence,
+                expectation("123", "wrong-hash", 1, 1),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_screenshot_evidence(
+                &evidence,
+                expectation("another-tab", "image-hash", 1, 1),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_screenshot_evidence(
+                &evidence,
+                expectation("123", "image-hash", 2, 1),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2154,24 +2411,35 @@ mod screenshot_payload_tests {
         let (bytes, width, height) = decode_validate_png(ONE_PIXEL_PNG, 1024).unwrap();
         assert_eq!((width, height), (1, 1));
         assert_eq!(bytes.len(), 68);
-        assert!(decode_validate_png(ONE_PIXEL_PNG, 67).is_err(), "decoded byte cap applies to actual image bytes");
+        assert!(
+            decode_validate_png(ONE_PIXEL_PNG, 67).is_err(),
+            "decoded byte cap applies to actual image bytes"
+        );
 
-        let mut corrupt = base64::engine::general_purpose::STANDARD.decode(ONE_PIXEL_PNG).unwrap();
+        let mut corrupt = base64::engine::general_purpose::STANDARD
+            .decode(ONE_PIXEL_PNG)
+            .unwrap();
         corrupt[37] ^= 1;
         let corrupt = base64::engine::general_purpose::STANDARD.encode(corrupt);
-        assert_eq!(decode_validate_png(&corrupt, 1024), Err("PNG chunk checksum mismatch"));
+        assert_eq!(
+            decode_validate_png(&corrupt, 1024),
+            Err("PNG chunk checksum mismatch")
+        );
         assert!(decode_validate_png(&ONE_PIXEL_PNG[..ONE_PIXEL_PNG.len() - 4], 1024).is_err());
         assert!(decode_validate_png("iVBORw0KGgo", 1024).is_err());
     }
 
     #[test]
     fn runtime_generated_screenshot_request_passes_extension_validator() {
-        let params = shared_screenshot_params(ProbeRegionArgs {
-            x: 12.0,
-            y: 24.0,
-            width: 320.0,
-            height: 180.0,
-        }, false);
+        let params = shared_screenshot_params(
+            ProbeRegionArgs {
+                x: 12.0,
+                y: 24.0,
+                width: 320.0,
+                height: 180.0,
+            },
+            false,
+        );
         assert_eq!(params["captureBeyondViewport"], false);
         let extension_harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../extensions/chrome-controlla/test-background.cjs");
@@ -2192,18 +2460,25 @@ mod screenshot_payload_tests {
     fn full_page_capture_is_bounded_and_explicitly_extends_beyond_viewport() {
         let region = super::full_page_region(&serde_json::json!({
             "cssContentSize":{"width":1200,"height":3000}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(region.width, 1200.0);
         assert_eq!(region.height, 3000.0);
         let params = shared_screenshot_params(region, true);
         assert_eq!(params["captureBeyondViewport"], true);
         assert_eq!(params["clip"]["x"], 0.0);
         assert_eq!(params["clip"]["y"], 0.0);
-        assert!(super::full_page_region(&serde_json::json!({
-            "cssContentSize":{"width":1200,"height":5000}
-        })).is_err());
-        assert!(super::full_page_region(&serde_json::json!({
-            "cssContentSize":{"width":4096,"height":4097}
-        })).is_err());
+        assert!(
+            super::full_page_region(&serde_json::json!({
+                "cssContentSize":{"width":1200,"height":5000}
+            }))
+            .is_err()
+        );
+        assert!(
+            super::full_page_region(&serde_json::json!({
+                "cssContentSize":{"width":4096,"height":4097}
+            }))
+            .is_err()
+        );
     }
 }

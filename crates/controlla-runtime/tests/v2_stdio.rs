@@ -189,6 +189,15 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
     }
     let workflow_text = serde_json::to_string(&schema("workflow")).unwrap();
     assert!(schema("workflow")["properties"].get("program").is_some());
+    assert_eq!(
+        schema("workflow")["properties"]["retain_text_evidence"]["type"],
+        "boolean"
+    );
+    assert!(
+        schema("workflow")["properties"]["retain_text_evidence"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("may include sensitive data"))
+    );
     for step in [
         "snapshot", "find", "click", "fill", "type", "press", "extract", "verify", "upload",
     ] {
@@ -198,13 +207,26 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         );
     }
     let schema_bytes = serde_json::to_vec(&tools.tools).unwrap().len();
+    let schema_sizes = tools
+        .tools
+        .iter()
+        .map(|tool| {
+            let value = serde_json::to_value(tool).unwrap();
+            format!(
+                "{}={}",
+                value["name"],
+                serde_json::to_vec(&value).unwrap().len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     eprintln!(
         "default MCP tool schemas: {schema_bytes} bytes ({} KiB budget)",
         (60 * 1024) / 1024
     );
     assert!(
         schema_bytes <= 60 * 1024,
-        "default tool schema budget is {schema_bytes} bytes"
+        "default tool schema budget is {schema_bytes} bytes ({schema_sizes})"
     );
 
     let described = client
@@ -345,8 +367,8 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .unwrap();
     let receipt = result.structured_content.unwrap();
     assert_eq!(receipt["status"], "unsupported", "{receipt}");
-    assert_eq!(receipt["steps"], 1);
-    assert_eq!(receipt["receipts"][0]["verified"], false);
+    assert_eq!(receipt["steps"], 1, "{receipt}");
+    assert_eq!(receipt["receipts"][0]["verified"], false, "{receipt}");
 
     let research = serde_json::json!({"action":"task","session_id":"unpaired","chrome_tab_id":"123",
         "task":{"kind":"research","urls":["https://example.test/a","https://example.test/b"],"selector":"article"}});

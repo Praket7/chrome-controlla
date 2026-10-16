@@ -34,6 +34,7 @@ pub mod skill_runtime;
 pub mod skill_store;
 pub mod skills;
 pub mod slides_deck;
+pub mod task_checkpoints;
 pub mod v3;
 pub mod v3_runtime;
 pub mod v3_tasks;

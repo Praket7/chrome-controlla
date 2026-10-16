@@ -17,6 +17,19 @@ Default shape:
 
 `most specific destination -> one targeted observation only if needed -> one deterministic workflow -> verification only if still needed -> release`
 
+## Agent decision ladder
+
+Choose the route from the user's intent, not from trial and error:
+
+1. **New URL or new target:** `browser(action="open")` with an idempotency key.
+2. **Existing session or tab:** `browser(action="task")` for a bounded goal, or `act` for one known mutation.
+3. **Need fresh page evidence:** one `snapshot`; use its exact references and observed `href` values.
+4. **Several known steps:** one `workflow` so reads and writes share a bounded operation budget.
+5. **Effect not proven:** one read-only `verify`; never replay the mutation.
+6. **Finished:** `browser(action="release")` and keep the user's tab open.
+
+Action modes are predictable: background handles semantic DOM work and wheel scroll; foreground handles trusted pointer, touch, swipe, pinch, hover, IME, and native dialogs. If a receipt says `not_dispatched`, follow its `reason_code` and `next_action`. If it says `unknown`, reconcile once and do not retry the write.
+
 Do not visit a homepage when a specific destination is user-provided, observed, or available through qualified Controlla route memory. Do not take duplicate broad snapshots. Do not send deterministic intermediate state back to the model merely so it can issue the obvious next action.
 
 ## Use `browser` first
@@ -82,7 +95,7 @@ Private headless sessions are isolated. For one-call mode, use a read-only `Rese
 
 For a headless `Download` task, optionally provide `destination_path` to save the verified bytes to an absolute, new local file. Unix supports this with symlink/traversal rejection, atomic no-overwrite creation, and a digest receipt. Other platforms return `not_dispatched` for that destination request; omit the field to keep the verified bytes behind the opaque artifact handle. A download receipt proves Chrome completion and byte integrity, not that the source website's content is trustworthy.
 
-Background mode opens or keeps the selected tab inactive. A guarded pointer click may temporarily activate the target tab within its Chrome window, dispatch CDP mouse input, then restore the prior tab. This works without focusing Chrome when another app is in front; it does not raise or steal focus for the Chrome window. Controlla reports before/after activation and focus. Navigation can use an observed exact `href` without pointer input. Visual clicks, hover/drag gestures, and map pans remain unsupported in background mode. Background form fills remain supported only with fresh semantic references and independent readback.
+Background mode opens or keeps the selected tab inactive. Pointer input never activates a user-owned inactive tab. For background pointer work, open or reuse an active tab inside an explicitly Controlla-owned unfocused automation window; otherwise the result is `not_dispatched` with `activation_forbidden`. This preserves the user's selected tab and Chrome focus. Navigation can use an observed exact `href` without pointer input. Visual clicks, hover/drag gestures, and map pans remain unsupported in background mode. Background form fills remain supported only with fresh semantic references and independent readback.
 
 Cross-origin iframe DOM is blocked by the page's same-origin policy. Root snapshots therefore report unread frames instead of pretending to inspect them. When frame content is relevant, use `include_frames=true` for a bounded accessibility aggregation over up to eight inventoried child frames, or use the explicit `frame_id` path to inspect one frame. Each returned tree carries its source frame and loader identity; unread, stale, or capped frames keep global coverage incomplete. This path does not prove complete shadow-root or same-origin DOM coverage. If an unread frame could contain a matching destination, the result cannot claim exhaustive first-party coverage.
 

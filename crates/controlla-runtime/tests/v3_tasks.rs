@@ -166,6 +166,59 @@ fn form_draft_can_save_without_submitting() {
 }
 
 #[test]
+fn five_field_form_is_one_bounded_task_with_per_field_preconditions() {
+    let task = TaskPrimitive::FormDraft {
+        fields: (0..5)
+            .map(|index| FormField {
+                reference: format!("@c{index}"),
+                expected_value: String::new(),
+                value: format!("value-{index}"),
+            })
+            .collect(),
+        save_without_submit: false,
+        save_control: None,
+    };
+    let steps = task.expand().unwrap();
+    assert_eq!(steps.len(), 5);
+    for (index, step) in steps.iter().enumerate() {
+        assert!(
+            matches!(step, ExpandedStep::Fill { reference, expected_value, value }
+            if reference == &format!("@c{index}") && expected_value.is_empty() && value == &format!("value-{index}"))
+        );
+    }
+}
+
+#[test]
+fn download_upload_is_one_bounded_task_with_explicit_artifact_dataflow() {
+    let task: TaskPrimitive = serde_json::from_value(json!({
+        "kind":"download_upload",
+        "download_reference":"@c1",
+        "source":"page_fetch",
+        "trigger_reference":"@c2",
+        "acceptance":{"kind":"text","reference":"@c3","equals":"Accepted"},
+        "persisted":{"kind":"text","reference":"@c4","equals":"Saved"},
+        "account_marker":["#account","fixture-account"]
+    }))
+    .unwrap();
+    let steps = task.expand().unwrap();
+    assert!(matches!(steps.as_slice(), [
+        ExpandedStep::Download { reference, .. },
+        ExpandedStep::UploadPreviousDownload { trigger_reference: Some(trigger), acceptance: Some(_), persisted: Some(_), .. }
+    ] if reference == "@c1" && trigger == "@c2"));
+
+    let invalid: TaskPrimitive = serde_json::from_value(json!({
+        "kind":"download_upload", "download_reference":"@c1", "source":"page_fetch",
+        "trigger_reference":"@c2", "selector":"#file",
+        "account_marker":["#account","fixture-account"]
+    }))
+    .unwrap();
+    assert!(
+        invalid.expand().is_err(),
+        "exactly one upload target is required"
+    );
+}
+
+#[test]
 fn repeated_actions_are_bounded() {
     let task = TaskPrimitive::Repeat {
         references: vec!["@c1".into(), "@c2".into()],

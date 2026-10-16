@@ -24,6 +24,10 @@ pub struct SkillDefinition {
     pub schema_version: u32,
     pub site_scope: String,
     pub intent_fingerprint: String,
+    /// Optional installation-keyed HMAC of an explicitly verified account marker.
+    /// Raw marker selector/text must never be persisted in a reusable skill.
+    #[serde(default)]
+    pub account_identity_fingerprint: Option<String>,
     pub parameter_names: Vec<String>,
     pub preconditions: Vec<String>,
     pub workflow: Value,
@@ -41,6 +45,10 @@ impl SkillDefinition {
             && !self.skill_id.trim().is_empty()
             && !self.site_scope.trim().is_empty()
             && !self.intent_fingerprint.trim().is_empty()
+            && self
+                .account_identity_fingerprint
+                .as_deref()
+                .is_none_or(valid_account_identity_fingerprint)
             && !self.workflow.is_null()
             && !self.preconditions.is_empty()
             && !self.postconditions.is_empty()
@@ -83,6 +91,21 @@ impl SkillDefinition {
             SkillRisk::ReadOnly
         }
     }
+
+    /// Whether replay must be bound to a verified current account identity.
+    pub fn requires_account_identity(&self) -> bool {
+        self.risk_tier() != SkillRisk::ReadOnly
+    }
+}
+
+pub(crate) fn valid_account_identity_fingerprint(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("hmac-sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +308,7 @@ mod tests {
             schema_version: SKILL_SCHEMA_VERSION,
             site_scope: "https://example.test".into(),
             intent_fingerprint: "registration-form".into(),
+            account_identity_fingerprint: None,
             parameter_names: vec!["email".into()],
             preconditions: vec!["signed_in".into()],
             workflow: json!({"steps":["find","fill","verify"]}),
@@ -316,6 +340,17 @@ mod tests {
         assert!(record.replay_allowed(150));
         assert!(!record.replay_allowed(200));
         assert_eq!(record.status, SkillStatus::Expired);
+    }
+
+    #[test]
+    fn account_identity_scope_accepts_only_bounded_hmac_fingerprints() {
+        let mut definition = definition();
+        definition.account_identity_fingerprint = Some(format!("hmac-sha256:{}", "a".repeat(64)));
+        assert!(definition.valid());
+        definition.account_identity_fingerprint = Some("person@example.test".into());
+        assert!(!definition.valid());
+        definition.account_identity_fingerprint = Some(format!("hmac-sha256:{}", "A".repeat(64)));
+        assert!(!definition.valid());
     }
 
     #[test]

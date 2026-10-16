@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveExtensionPackageAssets } from './extension-package-assets.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'dist', 'release-candidate');
@@ -33,6 +34,23 @@ const packageDir = path.join(root, 'packages/chrome-controlla/dist');
 const packageJson = JSON.parse(await readFile(path.join(packageDir, 'package.json'), 'utf8'));
 const extensionManifest = JSON.parse(await readFile(path.join(root, 'extensions/chrome-controlla/manifest.json'), 'utf8'));
 if (extensionManifest.version !== packageJson.version) throw new Error('MCP package and Chrome extension versions must match');
+const extensionBackground = await readFile(path.join(root, 'extensions/chrome-controlla/background.js'), 'utf8');
+const buildAssetDeclaration = extensionBackground.match(/const CONTROLLA_EXTENSION_BUILD_ASSETS = (\[[\s\S]*?\]);/);
+if (!buildAssetDeclaration) throw new Error('Chrome extension build asset manifest is missing from background.js');
+const extensionBuildAssets = JSON.parse(buildAssetDeclaration[1]);
+async function listExtensionFiles(directory, prefix = '') {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const relative = path.posix.join(prefix, entry.name);
+    if (entry.isDirectory()) files.push(...await listExtensionFiles(path.join(directory, entry.name), relative));
+    else if (entry.isFile()) files.push(relative);
+  }
+  return files;
+}
+const allExtensionFiles = await listExtensionFiles(path.join(root, 'extensions/chrome-controlla'));
+const extensionFiles = resolveExtensionPackageAssets(extensionManifest, extensionBuildAssets, allExtensionFiles);
+for (const file of extensionFiles) await access(path.join(root, 'extensions/chrome-controlla', file));
 const target = `${process.platform}-${process.arch}`;
 const rustTarget = {
   'darwin-arm64': 'aarch64-apple-darwin',
@@ -55,7 +73,6 @@ const packageArchive = (await readdir(out)).find((name) => name.endsWith('.tgz')
 if (!packageArchive) throw new Error('npm pack did not produce an archive');
 
 const extensionArchive = `chrome-controlla-extension-${packageJson.version}.tar.gz`;
-const extensionFiles = ['manifest.json', 'background.js', 'popup.html', 'popup.js', 'secure-input.html', 'secure-input.js', 'secure-input.css', 'open-recovery.html', 'README.md'];
 const extensionArchivePath = path.join(out, extensionArchive);
 run('tar', ['-czf', extensionArchivePath, '-C', path.join(root, 'extensions/chrome-controlla'), ...extensionFiles]);
 const archivedExtensionFiles = new Set(run('tar', ['-tzf', extensionArchivePath], { stdio: 'pipe' }).trim().split('\n'));

@@ -31,6 +31,7 @@ fn definition() -> SkillDefinition {
         skill_id: "fault-skill".into(),
         schema_version: SKILL_SCHEMA_VERSION,
         site_scope: "https://example.test".into(),
+        account_identity_fingerprint: None,
         intent_fingerprint: "fill".into(),
         parameter_names: vec![],
         preconditions: vec!["ready".into()],

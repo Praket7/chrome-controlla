@@ -1,3 +1,15 @@
+export const REQUIRED_METRIC_EVIDENCE_FIELDS = [
+  'success','independently_verified_success','severe_wrong_target_events','authority_violations',
+  'silent_stale_mutations','wall_ms','model_round_trips','model_tokens','mcp_calls','browser_ops',
+  'prompt_to_verified_ms','prompt_to_final_ms','external_controlla_calls','model_turns',
+  'model_visible_observations','internal_model_calls','browser_cdp_commands','host_round_trips',
+  'native_host_messages_sent','native_host_messages_received','schema_bytes','prompt_input_bytes',
+  'tool_input_bytes','output_bytes','observation_bytes','screenshot_bytes','unknown_delivery_count',
+  'fallback_count','retries','timeout_count','cleanup_completed','cleanup_outcome','recovery_events',
+  'cache_status','verification_ms','cpu_ms','peak_rss_bytes','focus_disruptions',
+  'clipboard_disruptions','human_interventions'
+];
+
 export function median(values) {
   if (!values.length) return NaN;
   const sorted = [...values].sort((a, b) => a - b);
@@ -58,16 +70,30 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
   }
   const candidateWall = rows.map(row => row.candidate.wall_ms);
   const baselineWall = rows.map(row => row.baseline.wall_ms);
-  const promptToVerified = rows.map(row => [row.candidate.prompt_to_verified_ms, row.baseline.prompt_to_verified_ms]);
-  const hasPromptToVerified = promptToVerified.every(([candidate, baseline]) =>
-    Number.isFinite(candidate) && candidate >= 0 && Number.isFinite(baseline) && baseline >= 0);
-  const candidatePromptVerified = hasPromptToVerified ? promptToVerified.map(([candidate]) => candidate) : [];
-  const baselinePromptVerified = hasPromptToVerified ? promptToVerified.map(([, baseline]) => baseline) : [];
-  const promptToFinal = rows.map(row => [row.candidate.prompt_to_final_ms, row.baseline.prompt_to_final_ms]);
-  const hasPromptToFinal = promptToFinal.every(([candidate, baseline]) =>
-    Number.isFinite(candidate) && candidate >= 0 && Number.isFinite(baseline) && baseline >= 0);
-  const candidatePromptFinal = hasPromptToFinal ? promptToFinal.map(([candidate]) => candidate) : [];
-  const baselinePromptFinal = hasPromptToFinal ? promptToFinal.map(([, baseline]) => baseline) : [];
+  const missingMetricEvidence = [];
+  for (const [rowIndex, row] of rows.entries()) for (const sideName of ['candidate', 'baseline']) {
+    const side = row[sideName];
+    for (const field of REQUIRED_METRIC_EVIDENCE_FIELDS) {
+      const evidence = side?.metric_evidence?.[field];
+      const observed = side && Object.hasOwn(side, field) && side[field] !== null && side[field] !== undefined
+        && evidence && typeof evidence === 'object' && !Array.isArray(evidence)
+        && evidence.s === 'observed' && typeof evidence.p === 'string' && evidence.p.trim().length > 0
+        && !Object.hasOwn(evidence, 'r');
+      if (!observed) missingMetricEvidence.push(`${sideName}[${rowIndex}].${field}`);
+    }
+  }
+  const candidateVerifiedRows = rows.filter(row => effectiveSuccess(row.candidate)).map(row => row.candidate);
+  const baselineVerifiedRows = rows.filter(row => effectiveSuccess(row.baseline)).map(row => row.baseline);
+  const hasPromptToVerified = candidateVerifiedRows.length > 0 && baselineVerifiedRows.length > 0
+    && [...candidateVerifiedRows, ...baselineVerifiedRows].every(result =>
+      Number.isFinite(result.prompt_to_verified_ms) && result.prompt_to_verified_ms >= 0);
+  const candidatePromptVerified = hasPromptToVerified ? candidateVerifiedRows.map(result => result.prompt_to_verified_ms) : [];
+  const baselinePromptVerified = hasPromptToVerified ? baselineVerifiedRows.map(result => result.prompt_to_verified_ms) : [];
+  const hasPromptToFinal = candidateVerifiedRows.length > 0 && baselineVerifiedRows.length > 0
+    && [...candidateVerifiedRows, ...baselineVerifiedRows].every(result =>
+      Number.isFinite(result.prompt_to_final_ms) && result.prompt_to_final_ms >= 0);
+  const candidatePromptFinal = hasPromptToFinal ? candidateVerifiedRows.map(result => result.prompt_to_final_ms) : [];
+  const baselinePromptFinal = hasPromptToFinal ? baselineVerifiedRows.map(result => result.prompt_to_final_ms) : [];
   const sumMetric = select => {
     const values = rows.map(select);
     return values.every(Number.isFinite) ? values.reduce((sum, value) => sum + value, 0) : null;
@@ -79,24 +105,86 @@ export function analyzePaired(rows, { iterations = 4000, seed = 11 } = {}) {
   const stale = sumMetric(row => row.candidate.silent_stale_mutations);
   const candidateVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.candidate)), 0);
   const baselineVerified = rows.reduce((sum, row) => sum + Number(effectiveSuccess(row.baseline)), 0);
+  const attemptTiming = side => {
+    const values = rows.map(row => {
+      const result = row[side];
+      return effectiveSuccess(result) ? result.prompt_to_verified_ms : result.prompt_to_verifier_decision_ms;
+    });
+    const complete = values.every(value => Number.isFinite(value) && value >= 0);
+    const successful = rows.filter(row => effectiveSuccess(row[side])).map(row => row[side].prompt_to_verified_ms);
+    const successfulComplete = successful.length > 0 && successful.every(value => Number.isFinite(value) && value >= 0);
+    return {
+      allAttemptComplete: complete,
+      allAttemptMedian: complete ? median(values) : null,
+      allAttemptP95: complete ? quantile(values, 0.95) : null,
+      successConditionedComplete: successfulComplete,
+      successConditionedCount: successful.length,
+      successConditionedMedian: successfulComplete ? median(successful) : null,
+      successConditionedP95: successfulComplete ? quantile(successful, 0.95) : null,
+    };
+  };
+  const candidateTiming = attemptTiming('candidate');
+  const baselineTiming = attemptTiming('baseline');
+  const allAttemptMedianReduction = candidateTiming.allAttemptComplete && baselineTiming.allAttemptComplete
+    ? 1 - candidateTiming.allAttemptMedian / baselineTiming.allAttemptMedian : null;
+  const allAttemptP95Reduction = candidateTiming.allAttemptComplete && baselineTiming.allAttemptComplete
+    ? 1 - candidateTiming.allAttemptP95 / baselineTiming.allAttemptP95 : null;
+  const reliability = side => {
+    const groups = new Map();
+    for (const [index, row] of rows.entries()) {
+      const key = JSON.stringify([row.task_id ?? row.taskId ?? `row-${index}`, row.mode ?? null,
+        row.execution_mode ?? null, row.concurrency ?? null]);
+      const values = groups.get(key) ?? [];
+      values.push(effectiveSuccess(row[side]));
+      groups.set(key, values);
+    }
+    return [...groups.values()].filter(values => values.length > 1).length === 0 ? null
+      : [...groups.values()].filter(values => values.length > 1 && values.every(Boolean)).length
+        / [...groups.values()].filter(values => values.length > 1).length;
+  };
+  const falseSuccessCount = side => rows.every(row => typeof row[side]?.independently_verified_success === 'boolean')
+    ? rows.filter(row => Boolean(row[side]?.success) && !row[side].independently_verified_success).length : null;
+  const candidateReliability = reliability('candidate');
+  const baselineReliability = reliability('baseline');
   return {
     paired_rows: rows.length,
     paired_task_clusters: clusters.size,
+    metric_evidence_complete: missingMetricEvidence.length === 0,
+    missing_metric_evidence: missingMetricEvidence,
     candidate_verified_successes: candidateVerified,
     baseline_verified_successes: baselineVerified,
     success_delta: (candidateVerified - baselineVerified) / rows.length,
+    candidate_false_successes: falseSuccessCount('candidate'),
+    baseline_false_successes: falseSuccessCount('baseline'),
+    repeated_run_reliability_complete: candidateReliability !== null && baselineReliability !== null,
+    candidate_repeated_run_reliability: candidateReliability,
+    baseline_repeated_run_reliability: baselineReliability,
+    all_attempt_time_to_outcome_complete: candidateTiming.allAttemptComplete && baselineTiming.allAttemptComplete,
+    candidate_median_all_attempt_time_to_outcome_ms: candidateTiming.allAttemptMedian,
+    baseline_median_all_attempt_time_to_outcome_ms: baselineTiming.allAttemptMedian,
+    candidate_p95_all_attempt_time_to_outcome_ms: candidateTiming.allAttemptP95,
+    baseline_p95_all_attempt_time_to_outcome_ms: baselineTiming.allAttemptP95,
+    all_attempt_time_to_outcome_median_reduction: allAttemptMedianReduction,
+    all_attempt_time_to_outcome_p95_reduction: allAttemptP95Reduction,
+    success_conditioned_latency_complete: candidateTiming.successConditionedComplete && baselineTiming.successConditionedComplete,
+    candidate_success_conditioned_attempts: candidateTiming.successConditionedCount,
+    baseline_success_conditioned_attempts: baselineTiming.successConditionedCount,
+    candidate_median_success_conditioned_prompt_to_verified_ms: candidateTiming.successConditionedMedian,
+    baseline_median_success_conditioned_prompt_to_verified_ms: baselineTiming.successConditionedMedian,
+    candidate_p95_success_conditioned_prompt_to_verified_ms: candidateTiming.successConditionedP95,
+    baseline_p95_success_conditioned_prompt_to_verified_ms: baselineTiming.successConditionedP95,
     success_delta_lower_95: quantile(successDeltas, 0.025),
     success_delta_upper_95: quantile(successDeltas, 0.975),
     candidate_median_wall_ms: median(candidateWall),
     baseline_median_wall_ms: median(baselineWall),
     median_wall_time_reduction: 1 - median(candidateWall) / median(baselineWall),
     prompt_to_verified_evidence_complete: hasPromptToVerified,
-    candidate_median_prompt_to_verified_ms: hasPromptToVerified ? median(candidatePromptVerified) : null,
-    baseline_median_prompt_to_verified_ms: hasPromptToVerified ? median(baselinePromptVerified) : null,
-    candidate_p95_prompt_to_verified_ms: hasPromptToVerified ? quantile(candidatePromptVerified, 0.95) : null,
-    baseline_p95_prompt_to_verified_ms: hasPromptToVerified ? quantile(baselinePromptVerified, 0.95) : null,
-    prompt_to_verified_median_reduction: hasPromptToVerified ? 1 - median(candidatePromptVerified) / median(baselinePromptVerified) : null,
-    prompt_to_verified_p95_reduction: hasPromptToVerified ? 1 - quantile(candidatePromptVerified, 0.95) / quantile(baselinePromptVerified, 0.95) : null,
+    candidate_median_prompt_to_verified_ms: hasPromptToVerified ? candidateTiming.successConditionedMedian : null,
+    baseline_median_prompt_to_verified_ms: hasPromptToVerified ? baselineTiming.successConditionedMedian : null,
+    candidate_p95_prompt_to_verified_ms: hasPromptToVerified ? candidateTiming.successConditionedP95 : null,
+    baseline_p95_prompt_to_verified_ms: hasPromptToVerified ? baselineTiming.successConditionedP95 : null,
+    prompt_to_verified_median_reduction: hasPromptToVerified ? 1 - candidateTiming.successConditionedMedian / baselineTiming.successConditionedMedian : null,
+    prompt_to_verified_p95_reduction: hasPromptToVerified ? 1 - candidateTiming.successConditionedP95 / baselineTiming.successConditionedP95 : null,
     prompt_to_final_evidence_complete: hasPromptToFinal,
     candidate_median_prompt_to_final_ms: hasPromptToFinal ? median(candidatePromptFinal) : null,
     baseline_median_prompt_to_final_ms: hasPromptToFinal ? median(baselinePromptFinal) : null,
@@ -123,13 +211,19 @@ export function evaluateClaimGate(report, gates = {}) {
     maximum_severe_wrong_target_events: 0,
     maximum_authority_violations: 0,
     maximum_silent_stale_mutations: 0,
+    minimum_median_all_attempt_time_reduction: 0,
+    minimum_p95_all_attempt_time_reduction: 0,
     ...gates,
   };
   const checks = {
+    metric_evidence: report.metric_evidence_complete === true,
     success_noninferior: report.success_delta_lower_95 > required.success_noninferiority_lower_bound,
     model_round_trips: report.model_round_trip_reduction >= required.minimum_model_round_trip_reduction,
     wall_time: report.median_wall_time_reduction >= required.minimum_median_wall_time_reduction,
     prompt_to_verified_evidence: report.prompt_to_verified_evidence_complete === true,
+    all_attempt_time_to_outcome_evidence: report.all_attempt_time_to_outcome_complete === true,
+    all_attempt_time_to_outcome_median: report.all_attempt_time_to_outcome_median_reduction >= required.minimum_median_all_attempt_time_reduction,
+    all_attempt_time_to_outcome_p95: report.all_attempt_time_to_outcome_p95_reduction >= required.minimum_p95_all_attempt_time_reduction,
     prompt_to_verified_median: report.prompt_to_verified_median_reduction >= required.minimum_median_prompt_to_verified_reduction,
     prompt_to_verified_p95: report.prompt_to_verified_p95_reduction >= required.minimum_p95_prompt_to_verified_reduction,
     prompt_to_final_evidence: report.prompt_to_final_evidence_complete === true,

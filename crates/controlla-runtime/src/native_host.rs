@@ -124,7 +124,16 @@ impl ScreenshotAssembler {
             || visual_evidence["captured_at_ms"].as_u64().is_none()
             || visual_evidence["capture_started_at_ms"].as_u64().is_none()
             || visual_evidence["target_lifecycle"].as_str() != Some("active")
-            || !visual_evidence["render_revision"].is_null()
+            || visual_evidence["render_revision"]
+                .as_str()
+                .is_some_and(|revision| {
+                    revision.is_empty()
+                        || revision.len() > 512
+                        || !revision.starts_with(&format!(
+                            "{}:",
+                            visual_evidence["document_id"].as_str().unwrap_or_default()
+                        ))
+                })
             || dimensions["width"]
                 .as_u64()
                 .is_none_or(|value| value == 0 || value > MAX_SCREENSHOT_EDGE)
@@ -305,13 +314,31 @@ pub async fn run() -> Result<(), String> {
     let mut active = HashMap::<String, mpsc::Sender<Result<Value, String>>>::new();
     let mut pairing_tasks = JoinSet::<(String, Result<(), String>, bool)>::new();
     let mut extension_protocol_version = 0_u32;
+    let mut inventory_tabs = Vec::<Value>::new();
+    let mut inventory_in_progress = false;
+    let mut inventory_started_at = None::<tokio::time::Instant>;
     let mut inventory_poll = tokio::time::interval(Duration::from_secs(5));
     // Pairing requests are tiny local files. Check often enough to keep cold
     // pairing responsive without adding a filesystem watcher dependency.
     let mut pairing_poll = tokio::time::interval(Duration::from_millis(75));
     loop {
         tokio::select! {
-            _ = inventory_poll.tick() => request_inventory_shared(&output).await?,
+            _ = inventory_poll.tick() => {
+                // A service worker can be restarting while the native port is
+                // already open. If the first inventory request is lost at that
+                // boundary, do not leave the host permanently stuck in the
+                // in-progress state; retry on the next poll cycle.
+                if inventory_in_progress
+                    && inventory_started_at
+                        .is_some_and(|started| started.elapsed() < Duration::from_secs(4))
+                {
+                    continue;
+                }
+                inventory_tabs.clear();
+                inventory_in_progress = true;
+                inventory_started_at = Some(tokio::time::Instant::now());
+                request_inventory_shared(&output).await?;
+            },
             _ = pairing_poll.tick() => {
                 let max_pairings = if extension_protocol_version >= 2 { usize::MAX } else { 1 };
                 match find_new_pairings(&pairing_path, &mut consumed, max_pairings).await {
@@ -345,8 +372,57 @@ pub async fn run() -> Result<(), String> {
                 let message = native.ok_or("native port closed")??;
                 match message["type"].as_str() {
                     Some("capabilities") => extension_protocol_version = message["protocol_version"].as_u64().and_then(|version| u32::try_from(version).ok()).unwrap_or(0),
-                    Some("tabs") if message["request_id"] == "inventory" => save_tabs_snapshot(&message, &host_id).await?,
-                    Some("tabs_error") if message["request_id"] == "inventory" => {},
+                    Some("tabs") if message["request_id"] == "inventory" => {
+                        let Some(page) = message["tabs"].as_array() else { inventory_in_progress = false; inventory_started_at = None; continue; };
+                        if inventory_tabs.len().saturating_add(page.len()) > 5000 {
+                            inventory_in_progress = false;
+                            inventory_started_at = None;
+                            inventory_tabs.clear();
+                            continue;
+                        }
+                        inventory_tabs.extend(page.iter().cloned());
+                        if inventory_tabs.len() == 5000 {
+                            inventory_in_progress = false;
+                            inventory_started_at = None;
+                            let mut bounded = message.clone();
+                            bounded["tabs"] = json!(std::mem::take(&mut inventory_tabs));
+                            bounded["offset"] = json!(0);
+                            bounded["truncated"] = json!(message["next_offset"].is_number());
+                            save_tabs_snapshot(&bounded, &host_id).await?;
+                        } else if let Some(next_offset) = message["next_offset"].as_u64() {
+                            write_shared_message(&output, &json!({"type":"list_tabs","request_id":"inventory","offset":next_offset,"page_size":100})).await?;
+                        } else {
+                            inventory_in_progress = false;
+                            inventory_started_at = None;
+                            let mut complete = message.clone();
+                            complete["tabs"] = json!(std::mem::take(&mut inventory_tabs));
+                            complete["offset"] = json!(0);
+                            complete["truncated"] = json!(false);
+                            save_tabs_snapshot(&complete, &host_id).await?;
+                        }
+                    },
+                    Some("tabs_error") if message["request_id"] == "inventory" => { inventory_in_progress = false; inventory_started_at = None; inventory_tabs.clear(); },
+                    Some("recovery_status") => {
+                        // A native reconnect cannot safely replay a lease: the
+                        // original provider token/session is intentionally not
+                        // persisted in the extension journal. Acknowledge the
+                        // sequenced status so the extension can clear the
+                        // inspection record, and make the required repair
+                        // action explicit to the owning client.
+                        if message["schema_version"].as_u64() == Some(1)
+                            && message["status"].as_str() == Some("recovery_required")
+                            && message["sequence"].as_u64().is_some()
+                        {
+                            write_shared_message(&output, &json!({
+                                "type":"recovery_ack",
+                                "schema_version":1,
+                                "sequence":message["sequence"],
+                                "accepted":true,
+                                "recovery_action":"rediscover_and_repair",
+                                "replay_supported":false
+                            })).await?;
+                        }
+                    },
                     _ => {
                         if message["type"] == "paired" {
                             extension_protocol_version = extension_protocol_version.max(message["protocol_version"].as_u64().and_then(|version| u32::try_from(version).ok()).unwrap_or(0));
@@ -378,7 +454,7 @@ async fn request_inventory_shared<W: AsyncWrite + Unpin>(
 ) -> Result<(), String> {
     write_shared_message(
         output,
-        &json!({"type":"list_tabs","request_id":"inventory"}),
+        &json!({"type":"list_tabs","request_id":"inventory","offset":0,"page_size":100}),
     )
     .await
 }
@@ -433,7 +509,7 @@ async fn find_new_pairings(
 async fn request_inventory<W: AsyncWrite + Unpin>(output: &mut W) -> Result<(), String> {
     write_message(
         output,
-        &json!({"type":"list_tabs","request_id":"inventory"}),
+        &json!({"type":"list_tabs","request_id":"inventory","offset":0,"page_size":100}),
     )
     .await
 }
@@ -601,7 +677,10 @@ fn validate_extension_compatibility(
         ));
     }
     let expected_build_id = env!("CONTROLLA_EXTENSION_BUILD_ID").to_owned();
-    if extension_build_id != Some(expected_build_id.as_str()) {
+    let runtime_fallback = format!("controlla-chrome-extension:{extension_version}:runtime");
+    if extension_build_id != Some(expected_build_id.as_str())
+        && extension_build_id != Some(runtime_fallback.as_str())
+    {
         return Err(format!(
             "extension build identity mismatch: expected {expected_build_id}; reload the matching Controlla extension"
         ));
@@ -780,7 +859,7 @@ async fn save_tabs_snapshot(message: &Value, host_id: &str) -> Result<(), String
     let Some(tabs) = message["tabs"].as_array() else {
         return Err("extension sent an invalid tabs snapshot".into());
     };
-    if tabs.len() > 100 {
+    if tabs.len() > 5000 {
         return Err("extension tabs snapshot exceeds limit".into());
     }
     let now = SystemTime::now()
@@ -790,10 +869,16 @@ async fn save_tabs_snapshot(message: &Value, host_id: &str) -> Result<(), String
     let bytes = serde_json::to_vec(&json!({
         "tabs":tabs,"last_seen_unix":now,"host_id":host_id,
         "truncated":message["truncated"].as_bool().unwrap_or(false),
-        "last_focused_window_id":message["last_focused_window_id"].as_u64()
+        "last_focused_window_id":message["last_focused_window_id"].as_u64(),
+        "windows":message["windows"].as_array().cloned().unwrap_or_default(),
+        "windows_total":message["windows_total"].as_u64(),
+        "windows_truncated":message["windows_truncated"].as_bool().unwrap_or(false),
+        "groups":message["groups"].as_array().cloned().unwrap_or_default(),
+        "groups_total":message["groups_total"].as_u64(),
+        "groups_truncated":message["groups_truncated"].as_bool().unwrap_or(false)
     }))
     .map_err(|_| "cannot encode tabs snapshot".to_owned())?;
-    if bytes.len() > 256_000 {
+    if bytes.len() > 16_000_000 {
         return Err("tabs snapshot exceeds size limit".into());
     }
     let path = crate::native_setup::pairing_path(host_id)?.with_file_name("native-tabs.json");
@@ -1067,7 +1152,7 @@ mod tests {
         let request: Value = read_message(&mut reader).await.unwrap();
         assert_eq!(
             request,
-            json!({"type":"list_tabs","request_id":"inventory"})
+            json!({"type":"list_tabs","request_id":"inventory","offset":0,"page_size":100})
         );
 
         let expires = SystemTime::now()

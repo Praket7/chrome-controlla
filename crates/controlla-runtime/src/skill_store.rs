@@ -140,6 +140,7 @@ mod tests {
             schema_version: SKILL_SCHEMA_VERSION,
             site_scope: "https://example.test".into(),
             intent_fingerprint: "intent".into(),
+            account_identity_fingerprint: None,
             parameter_names: vec![],
             preconditions: vec!["ready".into()],
             workflow: json!({"steps":[]}),

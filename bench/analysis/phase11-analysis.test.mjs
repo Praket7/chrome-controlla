@@ -1,10 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzePaired, effectiveSuccess, evaluateClaimGate } from './phase11-analysis.mjs';
+import { analyzePaired, effectiveSuccess, evaluateClaimGate, REQUIRED_METRIC_EVIDENCE_FIELDS } from './phase11-analysis.mjs';
+
+function completeMetricEvidence(result) {
+  const values = Object.fromEntries(REQUIRED_METRIC_EVIDENCE_FIELDS.map(field => [field,
+    ['success','independently_verified_success','cleanup_completed'].includes(field) ? true
+      : ['cache_status','cleanup_outcome'].includes(field) ? 'observed' : 1]));
+  return {
+    ...values,
+    ...result,
+    metric_evidence: Object.fromEntries(REQUIRED_METRIC_EVIDENCE_FIELDS.map(field => [field,
+      { s: 'observed', p: `fixture_${field}` }]))
+  };
+}
 
 const winningRows = Array.from({ length: 24 }, (_, index) => ({
   task_id: `task-${index}`,
-    candidate: {
+    candidate: completeMetricEvidence({
       success: true,
       wall_ms: 700,
       prompt_to_verified_ms: 800,
@@ -13,8 +25,8 @@ const winningRows = Array.from({ length: 24 }, (_, index) => ({
     severe_wrong_target_events: 0,
     authority_violations: 0,
     silent_stale_mutations: 0,
-  },
-  baseline: {
+  }),
+  baseline: completeMetricEvidence({
       success: true,
       wall_ms: 1000,
       prompt_to_verified_ms: 1200,
@@ -23,7 +35,7 @@ const winningRows = Array.from({ length: 24 }, (_, index) => ({
     severe_wrong_target_events: 0,
     authority_violations: 0,
     silent_stale_mutations: 0,
-  },
+  }),
 }));
 
 test('phase11 gates allow only a paired safety-clean measured win', () => {
@@ -86,6 +98,30 @@ test('missing prompt-to-verified evidence cannot qualify a release claim', () =>
   assert.equal(gate.checks.prompt_to_verified_evidence, false);
 });
 
+test('claim eligibility requires every required metric to be observed with provenance', () => {
+  const absentMetric = structuredClone(winningRows);
+  delete absentMetric[0].candidate.external_controlla_calls;
+  const absentGate = evaluateClaimGate(analyzePaired(absentMetric, { iterations: 100, seed: 10 }));
+  assert.equal(absentGate.eligible, false);
+  assert.equal(absentGate.checks.metric_evidence, false);
+
+  const unavailableMetric = structuredClone(winningRows);
+  unavailableMetric[0].candidate.output_bytes = null;
+  unavailableMetric[0].candidate.metric_evidence.output_bytes = {
+    s: 'unavailable', p: 'runner_output_counter', r: 'output boundary was not observed'
+  };
+  const unavailableGate = evaluateClaimGate(analyzePaired(unavailableMetric, { iterations: 100, seed: 10 }));
+  assert.equal(unavailableGate.eligible, false);
+  assert.equal(unavailableGate.checks.metric_evidence, false);
+  assert.equal(unavailableMetric[0].candidate.output_bytes, null, 'unavailable output bytes must not be converted to zero');
+
+  const missingProvenance = structuredClone(winningRows);
+  delete missingProvenance[0].candidate.metric_evidence.browser_cdp_commands.p;
+  const provenanceGate = evaluateClaimGate(analyzePaired(missingProvenance, { iterations: 100, seed: 10 }));
+  assert.equal(provenanceGate.eligible, false);
+  assert.equal(provenanceGate.checks.metric_evidence, false);
+});
+
 test('one severe wrong-target event blocks the superiority gate', () => {
   const rows = structuredClone(winningRows);
   rows[0].candidate.severe_wrong_target_events = 1;
@@ -101,6 +137,33 @@ test('latency accounting retains failed runs rather than conditioning on success
   const report = analyzePaired(rows, { iterations: 500, seed: 5 });
   assert.equal(report.paired_rows, 4);
   assert.ok(report.candidate_median_wall_ms >= 700);
+});
+
+test('phase11 reports all-attempt time, success-conditioned latency, repeated reliability, and false successes', () => {
+  const rows = Array.from({ length: 10 }, (_, index) => {
+    const task_id = `task-${Math.floor(index / 5)}`;
+    const candidateSuccess = index !== 0;
+    const baselineSuccess = true;
+    return {
+      task_id,
+      mode: 'warm_qualified_route', execution_mode: 'background', concurrency: 1,
+      candidate: { success: true, independently_verified_success: candidateSuccess,
+        wall_ms: candidateSuccess ? 500 : 5000, prompt_to_verified_ms: candidateSuccess ? 400 : null,
+        prompt_to_verifier_decision_ms: 5000, model_round_trips: 1, severe_wrong_target_events: 0,
+        authority_violations: 0, silent_stale_mutations: 0 },
+      baseline: { success: true, independently_verified_success: baselineSuccess,
+        wall_ms: 900, prompt_to_verified_ms: 800, prompt_to_verifier_decision_ms: 850,
+        model_round_trips: 2, severe_wrong_target_events: 0, authority_violations: 0, silent_stale_mutations: 0 },
+    };
+  });
+  const report = analyzePaired(rows, { iterations: 100, seed: 43 });
+  assert.equal(report.candidate_false_successes, 1);
+  assert.equal(report.baseline_false_successes, 0);
+  assert.equal(report.candidate_repeated_run_reliability, 0.5);
+  assert.equal(report.baseline_repeated_run_reliability, 1);
+  assert.equal(report.candidate_median_all_attempt_time_to_outcome_ms, 400);
+  assert.equal(report.candidate_median_success_conditioned_prompt_to_verified_ms, 400);
+  assert.equal(report.candidate_success_conditioned_attempts, 9);
 });
 
 test('independent verification overrides a self-reported acting success', () => {
