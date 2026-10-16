@@ -8782,12 +8782,16 @@ mod tests {
                     )),
                 )
                 .await;
+            let artifact = artifact.expect("artifact registration should be supported on Windows");
             assert!(
-                match artifact {
-                    Err(_) => true,
-                    Ok(result) => result.is_error.unwrap_or(false),
-                },
-                "Windows must fail closed for artifacts"
+                !artifact.is_error.unwrap_or(false),
+                "Windows artifact staging must succeed"
+            );
+            assert!(
+                artifact
+                    .structured_content
+                    .as_ref()
+                    .is_some_and(|value| value["size"] == 2)
             );
         }
         let observed = client.call_tool(CallToolRequestParams::new("observe").with_arguments(args(json!({"session_id":session_id,"target_ref":target_ref,"spec":{"selector":"p","fields":{"text":"p"},"max_items":10,"max_text_chars":100,"max_bytes":4096,"cursor":null}})))).await.unwrap();
