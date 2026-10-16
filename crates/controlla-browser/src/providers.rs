@@ -1688,14 +1688,18 @@ mod tests {
                 .launch(&mut registry, &session, "about:blank")
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !marker.is_file() {
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(state) = std::fs::read_to_string(&marker)
+                    && state.lines().count() >= 2
+                {
+                    break state;
+                }
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        let state = std::fs::read_to_string(marker).unwrap();
         let mut lines = state.lines();
         let profile = PathBuf::from(lines.next().unwrap());
         let pid: u32 = lines.next().unwrap().parse().unwrap();
