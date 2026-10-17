@@ -5801,7 +5801,7 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
+        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `open` returns `route_selection` with every attached source-tab candidate, its probe result and rejection reason, and the selected tab before dispatch. If no candidate is usable, the error includes the same bounded report so recovery does not require an opaque retry. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
     )]
     async fn shared_tab(
         &self,
@@ -6222,12 +6222,13 @@ impl App {
             .connection
             .as_ref()
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
-        let source = if args.action == "open" {
+        let route_selection = if args.action == "open" {
             let candidates = connection.selected_targets().clone();
             let registry = shared.registry()?;
             let probe = async {
+                let mut report = Vec::with_capacity(candidates.len());
                 for target in candidates {
-                    if connection
+                    match connection
                         .command(
                             registry,
                             &shared.handle,
@@ -6236,23 +6237,58 @@ impl App {
                             Value::Null,
                         )
                         .await
-                        .is_ok()
                     {
-                        return Some(target);
+                        Ok(tree) => {
+                            let observed_url = tree
+                                .pointer("/result/frameTree/frame/url")
+                                .or_else(|| tree.pointer("/frameTree/frame/url"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            report.push(json!({
+                                "tab_id": target,
+                                "accepted": true,
+                                "reason_code": "selected",
+                                "reason": "Page.getFrameTree succeeded",
+                                "observed_url": observed_url,
+                            }));
+                            return (Some(target), report);
+                        }
+                        Err(error) => {
+                            report.push(json!({
+                                "tab_id": target,
+                                "accepted": false,
+                                "reason_code": "probe_failed",
+                                "reason": error.to_string(),
+                            }));
+                        }
                     }
                 }
-                None
+                (None, report)
             };
-            tokio::time::timeout(Duration::from_secs(5), probe)
+            let (source, candidates) = tokio::time::timeout(Duration::from_secs(5), probe)
                 .await
-                .map_err(|_| invalid("timed out finding an attached source tab"))?
-                .ok_or_else(|| invalid("shared session has no currently attached source tab"))?
+                .map_err(|_| invalid("timed out finding an attached source tab; route selection exceeded its 5 second budget"))?;
+            let report = route_selection_report(candidates, source.as_deref());
+            if source.is_none() {
+                return Err(invalid(format!(
+                    "shared session has no currently attached source tab; route_selection={report}"
+                )));
+            }
+            report
+        } else {
+            Value::Null
+        };
+        let source = if args.action == "open" {
+            route_selection["selected_tab_id"]
+                .as_str()
+                .ok_or_else(|| invalid("route selection returned no source tab"))?
+                .to_owned()
         } else {
             args.chrome_tab_id
                 .clone()
                 .ok_or_else(|| invalid("chrome_tab_id is required for navigation"))?
         };
-        let result = shared
+        let mut result = shared
             .connection
             .as_ref()
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?
@@ -6265,6 +6301,9 @@ impl App {
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
+        if args.action == "open" {
+            result["route_selection"] = route_selection;
+        }
         let tab_id = result["tab_id"]
             .as_str()
             .filter(|id| id.parse::<u32>().is_ok())
@@ -6867,6 +6906,19 @@ fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
     Ok(output)
 }
 
+/// Make automatic source-tab routing inspectable before the requested tab action is dispatched.
+///
+/// The candidate entries intentionally contain only stable tab identity and bounded probe
+/// metadata. Page content is never needed to choose the attached transport source.
+fn route_selection_report(candidates: Vec<Value>, selected_tab_id: Option<&str>) -> Value {
+    json!({
+        "strategy": "first_probeable_attached_tab",
+        "selection_completed_before_dispatch": true,
+        "selected_tab_id": selected_tab_id,
+        "candidates": candidates,
+    })
+}
+
 fn validate_shared_url(url: &str) -> Result<(), rmcp::ErrorData> {
     let uri = url
         .parse::<axum::http::Uri>()
@@ -7382,6 +7434,23 @@ mod tests {
             "outcome_verification_timeout"
         );
         assert_eq!(click_unknown_reason_code(false), "click_dispatch_uncertain");
+    }
+
+    #[test]
+    fn route_selection_report_preserves_rejected_candidates_before_dispatch() {
+        use super::route_selection_report;
+        let report = route_selection_report(
+            vec![
+                json!({"tab_id":"11","accepted":false,"reason_code":"probe_failed","reason":"target closed"}),
+                json!({"tab_id":"12","accepted":true,"reason_code":"selected","reason":"Page.getFrameTree succeeded"}),
+            ],
+            Some("12"),
+        );
+        assert_eq!(report["strategy"], "first_probeable_attached_tab");
+        assert_eq!(report["selection_completed_before_dispatch"], true);
+        assert_eq!(report["selected_tab_id"], "12");
+        assert_eq!(report["candidates"][0]["reason_code"], "probe_failed");
+        assert_eq!(report["candidates"][1]["accepted"], true);
     }
 
     #[test]

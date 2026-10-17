@@ -139,3 +139,17 @@ Load additional material only when the task actually requires it:
 - `references/recovery.md` only after a real failure
 
 Normal browser tasks should require **zero repository reads, zero schema/describe calls, zero separate model-visible discovery calls, zero homepage detours when a qualified direct route exists, and normally no more than one model-visible observation before deterministic execution**. Guarded cold open performs one fresh tab inventory internally as part of the open call.
+# Fast path
+
+Use the smallest Controlla call that can prove the requested outcome.
+
+1. For a new URL, use `browser action=open` and include bounded `steps` when the action and verification are known.
+2. For an exact existing tab, use its stable decimal `chrome_tab_id` with the current `session_id`; never open a replacement tab.
+3. Use `snapshot` only when a fresh semantic reference is required. Prefer direct observed hrefs for navigation.
+4. Use one action plus one typed verification predicate. Do not poll, replay an unknown mutation, or rediscover after every call.
+5. A URL-fragment change is same-document navigation. Controlla preserves the tab lease and document identity and returns a complete receipt immediately.
+6. On `not_dispatched`, follow the returned `recovery` value. On `unknown`, inspect or verify once before doing anything else.
+
+For `shared_tab` with `action="open"`, inspect the returned `route_selection` before follow-up work. It lists every attached source-tab candidate, its probe result, a machine-readable `reason_code`, and the selected stable tab ID. If no candidate is usable, the same bounded report is included in the error, so repair or select the named candidate instead of retrying blindly.
+
+Receipts expose `status`, `reason_code`, `dispatch_may_have_occurred`, `document_changed`, and `next_action`. Treat those fields as the recovery contract; do not infer recovery from prose.

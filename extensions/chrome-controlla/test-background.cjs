@@ -137,6 +137,7 @@ let fileReadbackFiles;
 let fileInputPolicyFixture;
 let childFrameUrl = "https://picker.example.test/";
 let rootFrameSecurityOrigin = "https://example.test";
+const markerTextByTab = new Map();
 let changeRootOriginOnPasswordCheck = false;
 let switchTabDuringPasswordRevalidation = false;
 let navigateFrameOnClick = false;
@@ -217,6 +218,13 @@ const chrome = {
       const priorUrl = tabUrlOverrides.get(tabId) || tab.url;
       const priorDocumentId = tabDocumentOverrides.get(tabId) || `document-${tabId}`;
       tab.url = url;
+      const priorWithoutHash = priorUrl.split("#", 1)[0];
+      const nextWithoutHash = url.split("#", 1)[0];
+      if (priorWithoutHash === nextWithoutHash && priorUrl !== url) {
+        tabUrlOverrides.set(tabId, url);
+        tabDocumentOverrides.set(tabId, priorDocumentId);
+        return tab;
+      }
       const currentNavigationStart = nextWebNavigationTimeStamp++;
       navigationBefore?.({ tabId, frameId: 0, url, timeStamp: currentNavigationStart });
       if (overlapSameUrlNextNavigation) {
@@ -354,6 +362,9 @@ const chrome = {
       }
       if (method === "Runtime.evaluate" && params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")) {
         return { result: { value: { ready: !rendererFrameUnavailable, timestamp_ms: rendererFrameUnavailable ? undefined : 42.5 } } };
+      }
+      if (method === "Runtime.evaluate" && params?.expression === "document.body.dataset.controllaMarker") {
+        return { result: { result: { type: "string", value: markerTextByTab.get(target.tabId) || "" } } };
       }
       if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased" && changePointerAfterFirstClickRelease) {
         changePointerAfterFirstClickRelease = false;
@@ -849,6 +860,42 @@ async function waitFor(predicate, description) {
   assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
+
+  // Regression: a non-active same-site target must remain addressable by its
+  // stable Chrome tab ID after Chrome reorders the surrounding tabs.
+  const markerTabs = [
+    { id: 1200, windowId: 1, active: true, status: "complete", url: "https://example.test/marker-a", title: "marker-a" },
+    { id: 1201, windowId: 1, active: false, status: "complete", url: "https://example.test/marker-b", title: "marker-b" },
+    { id: 1202, windowId: 1, active: false, status: "complete", url: "https://example.test/marker-c", title: "marker-c" },
+  ];
+  for (const tab of markerTabs) { tabList.push(tab); markerTextByTab.set(tab.id, tab.title); }
+  const priorFocusedWindowActiveTabId = focusedWindowActiveTabId;
+  focusedWindowActiveTabId = 1200;
+  native.hostMessage({ type: "pair", request_id: "pair-marker-tabs", lease_id: "pair-marker-tabs", tab_ids: markerTabs.map(tab => tab.id),
+    expected_urls: Object.fromEntries(markerTabs.map(tab => [tab.id, tab.url])),
+    expected_document_ids: Object.fromEntries(markerTabs.map(tab => [tab.id, `document-${tab.id}`])) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(Array.from(native.sent.find(message => message.request_id === "pair-marker-tabs")?.targets || []), ["1200", "1201", "1202"]);
+  const markerCommand = (id, requestId) => native.hostMessage({ type: "command", id: requestId, lease_id: "pair-marker-tabs", target_id: String(id),
+    method: "Runtime.evaluate", params: { expression: "document.body.dataset.controllaMarker", returnByValue: true } });
+  markerCommand(1201, "marker-before-reorder");
+  await waitFor(() => native.sent.some(message => message.id === "marker-before-reorder"), "marker before reorder");
+  assert.equal(native.sent.find(message => message.id === "marker-before-reorder")?.result?.result?.result?.value, "marker-b", JSON.stringify(native.sent.find(message => message.id === "marker-before-reorder")));
+  const markerOrder = tabList.indexOf(markerTabs[1]);
+  tabList.splice(markerOrder, 1);
+  tabList.splice(tabList.indexOf(markerTabs[2]) + 1, 0, markerTabs[1]);
+  tabsMoved(1201, { windowId: 1, fromIndex: markerOrder, toIndex: tabList.indexOf(markerTabs[1]) });
+  markerCommand(1201, "marker-after-reorder");
+  await waitFor(() => native.sent.some(message => message.id === "marker-after-reorder"), "marker after reorder");
+  const markerAfterReorder = native.sent.find(message => message.id === "marker-after-reorder");
+  assert.equal(markerAfterReorder?.result?.result?.result?.value, "marker-b",
+    "the same non-active target still receives the action after tab reorder");
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Runtime.evaluate" && call.params?.expression === "document.body.dataset.controllaMarker").slice(-2).map(call => call.target.tabId), [1201, 1201],
+    "both calls dispatch to the stable Chrome tab ID rather than the tab index");
+  native.hostMessage({ type: "release", lease_id: "pair-marker-tabs" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  focusedWindowActiveTabId = priorFocusedWindowActiveTabId;
+  for (const tab of markerTabs) { markerTextByTab.delete(tab.id); tabList.splice(tabList.indexOf(tab), 1); }
   assert.equal(JSON.stringify(native.sent.find(message => message.request_id === "pair-1")), JSON.stringify({ type: "paired", request_id: "pair-1", lease_id: "pair-1", targets: ["41", "43", "47"], extension_version: "0.1.0", extension_build_id: expectedExtensionBuildId, protocol_version: 2, document_identity: true, batch_execution: true, batch_deadline: true }));
   const discardedTab = tabList.find(tab => tab.id === 41);
   discardedTab.discarded = true;
@@ -1799,6 +1846,18 @@ async function waitFor(predicate, description) {
   assert.equal(navigated.result.tab_id, "503");
   assert.equal(navigated.result.url, "https://www.espn.com/nfl/");
   assert.equal(navigated.result.document_id, "document-503-next-next");
+  const hashNavigationStarted = Date.now();
+  native.hostMessage({ type: "command", id: "navigate-same-document-hash", target_id: "503", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/#controlla-marker" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const sameDocumentHash = native.sent.findLast(message => message.id === "navigate-same-document-hash");
+  assert.ok(sameDocumentHash?.result, JSON.stringify(sameDocumentHash));
+  assert.equal(sameDocumentHash.result.tab_id, "503");
+  assert.equal(sameDocumentHash.result.url, "https://www.espn.com/nfl/#controlla-marker");
+  assert.equal(sameDocumentHash.result.document_id, "document-503-next-next");
+  assert.equal(sameDocumentHash.result.status, "complete");
+  assert.equal(sameDocumentHash.result.document_changed, false);
+  assert.equal(sameDocumentHash.result.next_action, "none");
+  assert.ok(Date.now() - hashNavigationStarted < 1000, "same-document hash navigation does not wait for a new DOMContentLoaded event");
   delayedNextCommitMs = 100;
   native.hostMessage({ type: "command", id: "navigate-after-stale-ready", target_id: "503", method: "Controlla.navigate", params: { url: "https://www.espn.com/nfl/team/" } });
   await new Promise(resolve => setTimeout(resolve, 20));

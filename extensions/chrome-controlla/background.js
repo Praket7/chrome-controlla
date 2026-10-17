@@ -1382,7 +1382,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       traceSharedCommand("settled", request, tabId, startedAt, { outcome: result.status, completedChars: result.completed_chars, keyEvents: result.key_events, cdpCommands: result.cdp_commands });
       respond({ type: "result", id: request.id, result }); return;
     }
-    if (request.method === "Controlla.navigate") { const url = validateNavigationUrl(request.params?.url); await navigatePairedTab(tabId, url, nativeRoute, routeGeneration); respond({ type: "result", id: request.id, result: { tab_id: String(tabId), ...(await nativePageIdentity(tabId)) } }); return; }
+    if (request.method === "Controlla.navigate") { const url = validateNavigationUrl(request.params?.url); const navigation = await navigatePairedTab(tabId, url, nativeRoute, routeGeneration); respond({ type: "result", id: request.id, result: { tab_id: String(tabId), ...(navigation || await nativePageIdentity(tabId)) } }); return; }
     if (request.method === "Controlla.presentationState") {
       const tab = await chrome.tabs.get(tabId);
       const win = await chrome.windows.get(tab.windowId);
@@ -2503,6 +2503,14 @@ function screenshotTargetLifecycle(tab) {
   return "unknown";
 }
 function validateNavigationUrl(value) { if (typeof value !== "string" || value.length > 2048) throw new Error("URL must be a bounded HTTP(S) URL."); const url = new URL(value); if (!(url.protocol === "http:" || url.protocol === "https:") || !url.hostname || url.username || url.password) throw new Error("URL must be HTTP(S) and cannot contain credentials."); return url.href; }
+function isSameDocumentUrl(previous, next) {
+  try {
+    const before = new URL(previous), after = new URL(next);
+    return before.protocol === after.protocol && before.username === after.username && before.password === after.password
+      && before.host === after.host && before.pathname === after.pathname && before.search === after.search
+      && before.hash !== after.hash;
+  } catch (_) { return false; }
+}
 async function nativePageIdentity(tabId) {
   for (let attempt = 0; attempt < 26; attempt++) {
     const tab = await chrome.tabs.get(tabId);
@@ -2748,12 +2756,25 @@ async function navigatePairedTab(tabId, url, native, generation) {
   clearFileChooserState(tabId, "Target navigated before the file chooser opened.");
   const before = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
   if (!before?.documentId) throw new Error("Cannot navigate a paired tab without a current document identity.");
+  const beforeTab = await chrome.tabs.get(tabId);
+  if (isSameDocumentUrl(beforeTab.url, url)) {
+    await chrome.tabs.update(tabId, { url });
+    if (!routeActive(native, generation)) throw new Error("Shared session ended during same-document navigation.");
+    const identity = await nativePageIdentity(tabId);
+    if (identity.document_id !== before.documentId) throw new Error("Same-document navigation unexpectedly replaced the target document; pair the tab again.");
+    pairedTabUrls.set(tabId, identity.url);
+    pairedTabDocumentIds.set(tabId, identity.document_id);
+    bindPairedTabTopology(tabId);
+    if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
+    return { ...identity, status: "complete", dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified: true, document_changed: false, next_action: "none" };
+  }
   const ready = waitForTabDOMContentLoaded(tabId, before.documentId);
   (native ? nativeAttachedTabs : manualAttachedTabs).delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); await detachDebugger(tabId); await chrome.tabs.update(tabId, { url }); await ready;
   if (!routeActive(native, generation)) throw new Error("Shared session ended during tab navigation.");
   const identity = await nativePageIdentity(tabId); await attachDebugger(tabId); const attachedIdentity = await nativePageIdentity(tabId).catch(() => undefined);
   if (!routeActive(native, generation) || !await pendingNavigationMatchesDocument(tabId, attachedIdentity?.document_id) || attachedIdentity?.url !== identity.url || attachedIdentity?.document_id !== identity.document_id) { await detachDebugger(tabId); throw new Error("Tab changed during attachment; retry from a fresh inventory."); }
   pairedTabUrls.set(tabId, attachedIdentity.url); pairedTabDocumentIds.set(tabId, attachedIdentity.document_id); bindPairedTabTopology(tabId); if (native) addNativeTab(tabId, generation); else manualAttachedTabs.add(tabId);
+  return { ...attachedIdentity, status: "complete", dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified: true, document_changed: attachedIdentity.document_id !== before.documentId, next_action: "none" };
 }
 function removeNativeTab(tabId) { const leaseId = nativeTabLeases.get(tabId); if (leaseId) nativeLeases.get(leaseId)?.tabs.delete(tabId); nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); }
 async function detachNativeLease(leaseId) { const lease = nativeLeases.get(leaseId); if (!lease) return; nativeLeases.delete(leaseId); nativeLeaseGenerations.delete(lease.generation); const tabs = [...lease.tabs]; for (const tabId of tabs) { if (nativeTabLeases.get(tabId) !== leaseId) continue; nativeTabLeases.delete(tabId); nativeAttachedTabs.delete(tabId); clearDownloadLifecycleState(tabId, "native_lease_ended"); clearFileChooserState(tabId); clearFrameSessions(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); } await Promise.all(tabs.filter(tabId => !nativeTabLeases.has(tabId)).map(detachDebugger)); await persistNativeLeaseJournal(); }

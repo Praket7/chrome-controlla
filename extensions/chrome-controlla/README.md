@@ -17,3 +17,17 @@ The host accepts one native session at a time; that session may include multiple
 After acceptance, `shared_tab` supports `action:"open"` with `url` to create an active tab in the same session, and `action:"navigate"` with the exact `chrome_tab_id` and destination `url`. URLs must be HTTP(S), at most 2048 characters, and contain no credentials. Both actions return the tab ID, final URL, and fresh document ID. A navigation failure may leave its target detached; rediscover and pair again before using it.
 
 Fixture tests cover authentication, selected-tab binding, command routing, and grant revocation. On 2026-10-09, the current native route paired an explicitly selected local fixture tab, completed guarded fill/type/click and mock in-memory post actions, invalidated the session after navigation, re-paired, read the new document, and released/closed the fixture. A file-input attempt was blocked and no file was uploaded. This verifies only the disposable fixture, not real app acceptance or persistence. Classroom writes, app acceptance/persistence, browser-version coverage, and platform-specific focus/foreground behavior remain unqualified. The extension uses Chrome's debugger permission and indicator; separate browser-side approval for each tab is not established.
+# Fast path
+
+Use the stable decimal Chrome tab ID returned by a fresh inventory. Reuse the
+same session and tab ID across calls. Use one targeted snapshot only when a
+fresh semantic reference is required, then batch the action and verification
+when possible. URL-fragment navigation stays on the same document and returns
+without waiting for a new `DOMContentLoaded` event. Treat `status`,
+`reason_code`, `dispatch_may_have_occurred`, `document_changed`, and
+`next_action` in every receipt as the recovery contract.
+
+For `shared_tab` `action:"open"`, inspect `route_selection` before follow-up
+work. It lists each attached source-tab candidate, its probe result, a
+machine-readable rejection code and reason, and the selected stable tab ID.
+When no candidate is usable, the same bounded report is included in the error.
