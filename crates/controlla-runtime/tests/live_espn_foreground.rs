@@ -78,6 +78,11 @@ async fn live_espn_open_newest(mode: &str) {
     );
 
     let workflow = &opened["workflow"];
+    assert_eq!(
+        workflow["receipts"].as_array().map(Vec::len),
+        Some(4),
+        "the four deterministic newest-story steps should stay inside this single open MCP call: {opened}"
+    );
     let chosen_href = workflow["receipts"][2]["selected"]["href"]
         .as_str()
         .unwrap_or_default()
