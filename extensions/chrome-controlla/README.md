@@ -27,7 +27,8 @@ without waiting for a new `DOMContentLoaded` event. Treat `status`,
 `reason_code`, `dispatch_may_have_occurred`, `document_changed`, and
 `next_action` in every receipt as the recovery contract.
 
-For `shared_tab` `action:"open"`, inspect `route_selection` before follow-up
-work. It lists each attached source-tab candidate, its probe result, a
-machine-readable rejection code and reason, and the selected stable tab ID.
-When no candidate is usable, the same bounded report is included in the error.
+For `browser` `action:"open"`, inspect the compact `route_selection` before
+follow-up work. A cold open creates its own tab and lists why existing tabs
+were not used as transport. An explicit session open accepts only a
+Controlla-owned source tab. If none is safe, the receipt contains the
+rejected candidates and directs the caller to a cold owned-tab open.

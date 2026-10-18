@@ -296,6 +296,7 @@ pub async fn run() -> Result<(), String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    crate::native_setup::publish_current_host(&host_id)?;
     let pairing_path = crate::native_setup::pairing_path(&host_id)?;
     let mut input = tokio::io::stdin();
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
@@ -327,6 +328,9 @@ pub async fn run() -> Result<(), String> {
     loop {
         tokio::select! {
             _ = inventory_poll.tick() => {
+                if let Err(error) = crate::native_setup::publish_current_host(&host_id) {
+                    eprintln!("Native host heartbeat failed: {error}");
+                }
                 // A service worker can be restarting while the native port is
                 // already open. If the first inventory request is lost at that
                 // boundary, do not leave the host permanently stuck in the
@@ -343,6 +347,19 @@ pub async fn run() -> Result<(), String> {
                 request_inventory_shared(&output).await?;
             },
             _ = pairing_poll.tick() => {
+                match find_new_create_requests(&pairing_path).await {
+                    Ok(requests) => for request in requests {
+                        let mut command = request;
+                        command["type"] = json!("create_tab");
+                        if let Some(request_id) = command["request_id"].as_str() {
+                            let _ = crate::native_setup::record_create_event(&host_id, request_id, "dispatch");
+                        }
+                        if let Err(error) = write_shared_message(&output, &command).await {
+                            eprintln!("Native tab creation dispatch failed: {error}");
+                        }
+                    },
+                    Err(error) => eprintln!("Native tab creation scan failed: {error}"),
+                }
                 let max_pairings = if extension_protocol_version >= 2 { usize::MAX } else { 1 };
                 match find_new_pairings(&pairing_path, &mut consumed, max_pairings).await {
                     Ok(pairings) => for pairing in pairings {
@@ -435,6 +452,18 @@ pub async fn run() -> Result<(), String> {
                         }
                     },
                     Some("tabs_error") if message["request_id"] == "inventory" => { inventory_in_progress = false; inventory_started_at = None; inventory_tabs.clear(); },
+                    Some("created_tab") => {
+                        if let Some(request_id) = message["request_id"].as_str() {
+                            let _ = crate::native_setup::record_create_event(&host_id, request_id, "response");
+                        }
+                        write_create_result(&pairing_path, &message).await?;
+                        // The new document must be present in the inventory
+                        // before the MCP server can pair to it.
+                        inventory_tabs.clear();
+                        inventory_in_progress = true;
+                        inventory_started_at = Some(tokio::time::Instant::now());
+                        request_inventory_shared(&output).await?;
+                    },
                     Some("recovery_status") => {
                         // A native reconnect cannot safely replay a lease: the
                         // original provider token/session is intentionally not
@@ -490,6 +519,119 @@ async fn request_inventory_shared<W: AsyncWrite + Unpin>(
         &json!({"type":"list_tabs","request_id":"inventory","offset":0,"page_size":100}),
     )
     .await
+}
+
+async fn find_new_create_requests(pairing_path: &Path) -> Result<Vec<Value>, String> {
+    let dir = pairing_path
+        .parent()
+        .ok_or("native bridge directory is missing")?;
+    let host_id = pairing_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("native-pairing-"))
+        .ok_or("native host ID is missing")?;
+    let prefix = format!("native-create-{host_id}-");
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut requests = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if requests.len() >= 8 {
+            break;
+        }
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        let Some(request_id) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if request_id.len() != 32 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = entry.path();
+        let claimed = path.with_extension(format!("json.{}.claim", std::process::id()));
+        if tokio::fs::rename(&path, &claimed).await.is_err() {
+            continue;
+        }
+        let metadata = tokio::fs::symlink_metadata(&claimed)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_file() || metadata.len() > 4096 {
+            let _ = tokio::fs::remove_file(&claimed).await;
+            continue;
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let _ = tokio::fs::remove_file(&claimed).await;
+            continue;
+        }
+        let bytes = tokio::fs::read(&claimed)
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = tokio::fs::remove_file(&claimed).await;
+        if bytes.len() > 4096 {
+            continue;
+        }
+        let Ok(request) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if request["request_id"] != request_id
+            || request["expires_at_unix"]
+                .as_u64()
+                .is_none_or(|expires| expires < now || expires > now + 30)
+        {
+            continue;
+        }
+        requests.push(request);
+    }
+    Ok(requests)
+}
+
+async fn write_create_result(pairing_path: &Path, message: &Value) -> Result<(), String> {
+    let host_id = pairing_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("native-pairing-"))
+        .ok_or("native host ID is missing")?;
+    let request_id = message["request_id"]
+        .as_str()
+        .ok_or("tab creation response has no request ID")?;
+    if request_id.len() != 32 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("tab creation response ID is invalid".into());
+    }
+    let dir = pairing_path
+        .parent()
+        .ok_or("native bridge directory is missing")?;
+    let path = dir.join(format!("native-create-result-{host_id}-{request_id}.json"));
+    let temp = dir.join(format!("native-create-result-{host_id}-{request_id}.tmp"));
+    let bytes = serde_json::to_vec(message).map_err(|error| error.to_string())?;
+    if bytes.len() > 8192 {
+        return Err("tab creation receipt exceeds size limit".into());
+    }
+    tokio::fs::write(&temp, bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(temp, path)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn find_new_pairings(
@@ -1003,6 +1145,48 @@ where
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn ownerless_native_create_requests_are_host_bound_and_one_shot() {
+        let host = "0123456789abcdef0123456789abcdef";
+        let dir =
+            std::env::temp_dir().join(format!("controlla-native-create-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let pairing = dir.join(format!("native-pairing-{host}.json"));
+        let request_id = "abcdef0123456789abcdef0123456789";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request = json!({"request_id":request_id,"url":"https://example.test/","idempotency_key":"one-logical-open",
+            "active":false,"expires_at_unix":now + 10});
+        let request_path = dir.join(format!("native-create-{host}-{request_id}.json"));
+        tokio::fs::write(&request_path, request.to_string())
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let found = find_new_create_requests(&pairing).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["request_id"], request_id);
+        assert!(find_new_create_requests(&pairing).await.unwrap().is_empty());
+        write_create_result(
+            &pairing,
+            &json!({"type":"created_tab","request_id":request_id,
+            "result":{"tab_id":"23","document_id":"doc-23"}}),
+        )
+        .await
+        .unwrap();
+        let receipt = tokio::fs::read_to_string(
+            dir.join(format!("native-create-result-{host}-{request_id}.json")),
+        )
+        .await
+        .unwrap();
+        assert!(receipt.contains("doc-23"));
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
 
     #[test]
     fn extension_pairing_requires_matching_protocol_version_and_build_identity() {

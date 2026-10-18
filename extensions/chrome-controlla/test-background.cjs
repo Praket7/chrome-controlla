@@ -632,7 +632,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
 
@@ -697,6 +697,11 @@ function testWatcherStateMirrorContracts() {
   state = applyWatcherStateEvent(state, { kind: "tab_updated", tab_id: 4, change_info: { status: "complete" } });
   assert.equal(watcherStateMatches(state, 4, beforeFocusRevision), true,
     "completion settling does not invalidate a stable document binding");
+  const stableRevision = state.tabs.find(tab => tab.id === 5).target_revision;
+  state = applyWatcherStateEvent(state, { kind: "window_updated", window: { id: 2, focused: false, state: "minimized" } });
+  state = applyWatcherStateEvent(state, { kind: "group_updated", group: { id: 8, windowId: 2, color: "blue" } });
+  assert.equal(watcherStateMatches(state, 5, stableRevision, "doc-5"), true,
+    "window and group presentation changes do not stale a document-bound tab");
   state = applyWatcherStateEvent(state, { kind: "tab_removed", tab_id: 4 });
   assert.equal(watcherStateMatches(state, 4, state.revision, "doc-1"), false,
     "tab removal evicts the target binding");
@@ -3273,6 +3278,29 @@ async function waitFor(predicate, description) {
     /topology changed while resolving child sessions|topology changed during parallel document reads/,
     "parallel frame inventory discards a result after an in-flight target detach"
   );
+
+  const originalUserTabUrl = tabList.find(tab => tab.id === 42).url;
+  const originalTabCount = tabList.length;
+  const nativeCreate = {url:"https://example.test/owned-new",idempotency_key:"owned-open-fixture",active:false,
+    create_background_window:false,expires_at_unix:21};
+  const owned = await backgroundContext.__testHooks.createOwnedTabFromNative(nativeCreate);
+  assert.equal(owned.created_by_controlla, true);
+  assert.equal(owned.url, nativeCreate.url);
+  assert.equal(tabList.length, originalTabCount + 1, "new URL creates its own tab");
+  assert.equal(tabList.find(tab => tab.id === 42).url, originalUserTabUrl,
+    "native open never navigates the unrelated user tab");
+  const reusedOwned = await backgroundContext.__testHooks.createOwnedTabFromNative(nativeCreate);
+  assert.equal(reusedOwned.tab_id, owned.tab_id);
+  assert.equal(reusedOwned.idempotent_reuse, true);
+  assert.equal(tabList.length, originalTabCount + 1, "same logical open cannot duplicate the tab");
+  const inOtherWindow = await backgroundContext.__testHooks.createOwnedTabFromNative({
+    url:"https://example.test/placed",idempotency_key:"placed-open-fixture",active:false,
+    create_background_window:false,target_window_id:2,target_window_policy:"existing_window",expires_at_unix:21
+  });
+  assert.equal(inOtherWindow.window_id, 2, "explicit window placement creates the tab in that window");
+  assert.equal(inOtherWindow.tab_active, false, "background placement does not select the new tab");
+  assert.equal(tabList.find(tab => tab.id === 42).url, originalUserTabUrl,
+    "explicit placement does not navigate an existing tab");
 
   const cdpStarted = Date.now();
   await assert.rejects(backgroundContext.__testHooks.sendCdpCommand({ tabId: 1 }, "Test.never", {}, 10), error =>

@@ -366,7 +366,7 @@ test('background newest-story goals navigate to the selected href without activa
 
 test('runtime instructions forbid schema probing for ordinary MCP browser tasks', () => {
   const runtimeSource = fs.readFileSync(path.resolve(__dirname, '../../crates/controlla-runtime/src/mcp/v3_full.rs'), 'utf8');
-  const instructions = runtimeSource.match(/\.with_instructions\("([\s\S]*?)"\)/)?.[1] ?? '';
+  const instructions = runtimeSource.match(/\.with_instructions\(r#"([\s\S]*?)"#\)/)?.[1] ?? '';
   assert.match(instructions, /MCP already supplies the six tool schemas/i);
   assert.match(instructions, /Do not call action=schema/i);
   assert.match(instructions, /call browser action=open directly/i);

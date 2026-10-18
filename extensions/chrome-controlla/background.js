@@ -84,6 +84,7 @@ let nativeError;
 let reconnectExhausted = false;
 let reconnectTimer;
 let reconnectAttempts = 0;
+let nativeConnectStartedAt = 0;
 const reconnectStateReady = chrome.storage.session.get(RECONNECT_STORAGE_KEY).then(state => {
   reconnectAttempts = Number.isSafeInteger(state[RECONNECT_STORAGE_KEY])
     ? Math.max(0, Math.min(state[RECONNECT_STORAGE_KEY], MAX_RECONNECT_ATTEMPTS)) : 0;
@@ -195,7 +196,14 @@ function applyWatcherStateEvent(previous, event) {
     case "snapshot": {
       bumpRevision();
       tabs.clear(); windows.clear(); groups.clear();
-      for (const raw of (event.tabs || []).slice(0, WATCHER_MAX_TABS)) { const tab = safeWatcherTab(raw); if (tab) tabs.set(tab.id, { ...tab, target_revision: nextRevision }); }
+      for (const raw of (event.tabs || []).slice(0, WATCHER_MAX_TABS)) {
+        const tab = safeWatcherTab(raw); if (!tab) continue;
+        const previousTab = state.tabs?.find(item => item.id === tab.id);
+        const stable = previousTab && previousTab.window_id === tab.window_id
+          && previousTab.document_id && previousTab.document_id === tab.document_id
+          && previousTab.status === "complete" && tab.status === "complete";
+        tabs.set(tab.id, { ...tab, target_revision: stable ? previousTab.target_revision : nextRevision });
+      }
       for (const raw of (event.windows || []).slice(0, WATCHER_MAX_WINDOWS)) { const window = safeWatcherWindow(raw); if (window) windows.set(window.id, window); }
       for (const raw of (event.groups || []).slice(0, WATCHER_MAX_GROUPS)) { const group = safeWatcherGroup(raw); if (group) groups.set(group.id, group); }
       break;
@@ -206,9 +214,6 @@ function applyWatcherStateEvent(previous, event) {
       const info = event.change_info || {};
       if (!["status", "url", "groupId", "frozen", "discarded"].some(key => Object.prototype.hasOwnProperty.call(info, key))) return state;
       const identityChanged = Object.prototype.hasOwnProperty.call(info, "url")
-        || Object.prototype.hasOwnProperty.call(info, "groupId")
-        || Object.prototype.hasOwnProperty.call(info, "frozen")
-        || Object.prototype.hasOwnProperty.call(info, "discarded")
         || info.status === "loading";
       if (identityChanged) bumpRevision();
       const next = { ...old };
@@ -224,7 +229,7 @@ function applyWatcherStateEvent(previous, event) {
     }
     case "tab_attached": { bumpRevision(); const old = tabs.get(event.tab_id); if (old && Number.isSafeInteger(event.window_id)) tabs.set(event.tab_id, { ...old, window_id: event.window_id, target_revision: nextRevision }); break; }
     case "tab_detached": { bumpRevision(); const old = tabs.get(event.tab_id); if (old) { const next = { ...old }; delete next.window_id; delete next.document_id; next.target_revision = nextRevision; tabs.set(event.tab_id, next); } break; }
-    case "tab_moved": { bumpRevision(); const old = tabs.get(event.tab_id); if (old && Number.isSafeInteger(event.index)) tabs.set(event.tab_id, { ...old, index: event.index, target_revision: nextRevision }); break; }
+    case "tab_moved": { bumpRevision(); const old = tabs.get(event.tab_id); if (old && Number.isSafeInteger(event.index)) tabs.set(event.tab_id, { ...old, index: event.index }); break; }
     case "tab_activated": {
       const selected = tabs.get(event.tab_id);
       if (selected && Number.isSafeInteger(event.window_id)) {
@@ -249,10 +254,10 @@ function applyWatcherStateEvent(previous, event) {
       }
       break;
     }
-    case "window_updated": { bumpRevision(); const window = safeWatcherWindow(event.window); if (window) { windows.set(window.id, window); for (const [id, tab] of tabs) if (tab.window_id === window.id) tabs.set(id, { ...tab, target_revision: nextRevision }); } break; }
+    case "window_updated": { bumpRevision(); const window = safeWatcherWindow(event.window); if (window) windows.set(window.id, window); break; }
     case "window_removed": bumpRevision(); windows.delete(event.window_id); for (const [id, tab] of tabs) if (tab.window_id === event.window_id) tabs.delete(id); for (const [id, group] of groups) if (group.window_id === event.window_id) groups.delete(id); break;
-    case "group_updated": { bumpRevision(); const group = safeWatcherGroup(event.group); if (group) { groups.set(group.id, group); for (const [id, tab] of tabs) if (tab.group_id === group.id) tabs.set(id, { ...tab, target_revision: nextRevision }); } break; }
-    case "group_removed": bumpRevision(); groups.delete(event.group_id); for (const [id, tab] of tabs) if (tab.group_id === event.group_id) { const next = { ...tab, target_revision: nextRevision }; delete next.group_id; tabs.set(id, next); } break;
+    case "group_updated": { bumpRevision(); const group = safeWatcherGroup(event.group); if (group) groups.set(group.id, group); break; }
+    case "group_removed": bumpRevision(); groups.delete(event.group_id); for (const [id, tab] of tabs) if (tab.group_id === event.group_id) { const next = { ...tab }; delete next.group_id; tabs.set(id, next); } break;
   }
   const complete = event?.kind === "snapshot"
     ? Array.isArray(event.tabs) && event.tabs.length <= WATCHER_MAX_TABS
@@ -283,6 +288,7 @@ let watcherState = createWatcherStateMirror();
 let watcherStateWrite = Promise.resolve();
 let watcherPersistTimer;
 let inventoryDirtyNoticePending = false;
+let topologyEventWindowStart = Date.now(), topologyEventCount = 0, topologyEventWarned = false;
 const watcherStateReady = chrome.storage.session.get(WATCHER_STATE_KEY).then(saved => {
   const previous = saved[WATCHER_STATE_KEY];
   if (previous?.schema_version === 1 && Array.isArray(previous.tabs) && Array.isArray(previous.windows) && Array.isArray(previous.groups)) {
@@ -296,6 +302,17 @@ const watcherStateReady = chrome.storage.session.get(WATCHER_STATE_KEY).then(sav
   }
 }).catch(() => {});
 function queueWatcherStateEvent(event) {
+  if (event?.kind === "window_updated" || event?.kind === "group_updated") {
+    const now = Date.now();
+    if (now - topologyEventWindowStart > 10_000) {
+      topologyEventWindowStart = now; topologyEventCount = 0; topologyEventWarned = false;
+    }
+    topologyEventCount++;
+    if (!topologyEventWarned && topologyEventCount >= 50) {
+      topologyEventWarned = true;
+      console.warn("[Chrome Controlla] window/group event burst", {events:topologyEventCount,window_ms:10_000});
+    }
+  }
   if (!inventoryDirtyNoticePending && nativeReady && nativePort) {
     inventoryDirtyNoticePending = true;
     Promise.resolve().then(() => {
@@ -957,10 +974,10 @@ chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM)
 function connectNative() {
   if (nativePort || reconnectExhausted) return;
   try {
-    const port = chrome.runtime.connectNative(NATIVE_HOST); nativePort = port; const portGeneration = ++nativePortGeneration; nativeReady = false;
+    const port = chrome.runtime.connectNative(NATIVE_HOST); nativePort = port; nativeConnectStartedAt = Date.now(); const portGeneration = ++nativePortGeneration; nativeReady = false;
     port.onMessage.addListener(message => { void handleNativeMessage(port, portGeneration, message); });
     port.onDisconnect.addListener(() => {
-      if (nativePort !== port) return; nativeError = safeNativeError(chrome.runtime.lastError?.message); nativePort = undefined; nativeReady = false;
+      if (nativePort !== port) return; nativeError = safeNativeError(chrome.runtime.lastError?.message); nativePort = undefined; nativeConnectStartedAt = 0; nativeReady = false;
       const generation = ++nativeGeneration; nativeRecoveryPending = nativeLeases.size > 0;
       void queueNativeMutation(async () => { await persistNativeLeaseJournal(); await detachNative(generation); }); scheduleNativeReconnect();
     });
@@ -972,7 +989,7 @@ async function handleNativeMessage(port, portGeneration, message) {
     try {
       const extensionBuildId = await CONTROLLA_EXTENSION_BUILD_ID_PROMISE;
       if (port !== nativePort || portGeneration !== nativePortGeneration) return;
-      nativeReady = true; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false;
+      nativeReady = true; nativeConnectStartedAt = 0; nativeError = undefined; reconnectAttempts = 0; reconnectExhausted = false;
       void chrome.storage.session.remove(RECONNECT_STORAGE_KEY).catch(() => {});
       sendNative(port, portGeneration, { type: "capabilities", protocol_version: 2, contract_version: CONTROLLA_PROTOCOL_CONTRACT.version, authorized_method_count: CONTROLLA_PROTOCOL_CONTRACT.authorized_methods.length, extension_build_id: extensionBuildId, multi_session_leases: true });
       const journal = await readNativeLeaseJournal();
@@ -1008,6 +1025,18 @@ async function handleNativeMessage(port, portGeneration, message) {
     }
     return;
   }
+  if (message.type === "create_tab") {
+    const requestId = typeof message.request_id === "string" && /^[0-9a-f]{32}$/i.test(message.request_id) ? message.request_id : undefined;
+    if (!requestId) return;
+    try {
+      if (!nativeReady || nativeRecoveryPending) throw new Error("Native bridge is not ready for new tab creation.");
+      const result = await createOwnedTabFromNative(message);
+      sendNative(port, portGeneration, { type: "created_tab", request_id: requestId, result });
+    } catch (error) {
+      sendNative(port, portGeneration, { type: "created_tab", request_id: requestId, error: safeNativeError(String(error)) });
+    }
+    return;
+  }
   if (message.type === "list_tabs") {
     try {
       const offset = Number.isSafeInteger(message.offset) && message.offset >= 0 && message.offset <= 1000000 ? message.offset : 0;
@@ -1031,12 +1060,16 @@ async function handleNativeMessage(port, portGeneration, message) {
           - (Number.isFinite(left.lastAccessed) ? left.lastAccessed : 0);
         return accessDelta || left.id - right.id;
       });
+      const openReceipts = ((await chrome.storage.local.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {});
+      const ownedDocuments = new Map(Object.values(openReceipts).filter(receipt => receipt?.status === "complete" && receipt.document_id)
+        .map(receipt => [Number(receipt.tab_id), receipt]));
       let listed = await Promise.all(prioritized.slice(offset, offset + pageSize).map(async tab => {
         const firstFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
         const current = await boundedNativeApi(chrome.tabs.get(tab.id), undefined);
         const lastFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
         const stableDocument = current?.status === "complete" && /^https?:\/\//i.test(current.url || "") && firstFrame?.documentId && firstFrame.documentId === lastFrame?.documentId && lastFrame.url === current.url;
-        return { id: tab.id, window_id: current?.windowId, group_id: Number.isSafeInteger(current?.groupId) && current.groupId >= 0 ? current.groupId : null, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, watcher_target_revision: watcherState.tabs.find(entry => entry.id === tab.id)?.target_revision ?? null, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
+        const owned = ownedDocuments.get(tab.id);
+        return { id: tab.id, window_id: current?.windowId, group_id: Number.isSafeInteger(current?.groupId) && current.groupId >= 0 ? current.groupId : null, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, owned_by_controlla: !!owned && owned.document_id === lastFrame?.documentId && owned.url === current?.url, watcher_target_revision: watcherState.tabs.find(entry => entry.id === tab.id)?.target_revision ?? null, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
       }));
       const [windows, groups] = await Promise.all([
         chrome.windows.getAll({ windowTypes: ["normal", "popup"] }).catch(() => []),
@@ -2611,7 +2644,10 @@ async function nativePageIdentity(tabId) {
 async function waitForTabDOMContentLoaded(tabId, afterDocumentId) {
   const currentDocumentReady = async () => {
     const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => undefined);
-    return !!frame?.documentId && frame.documentId !== afterDocumentId && domReadyDocuments.get(tabId) === frame.documentId;
+    if (!frame?.documentId || frame.documentId === afterDocumentId) return false;
+    if (domReadyDocuments.get(tabId) === frame.documentId) return true;
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    return tab?.status === "complete" && tab.url === frame.url;
   };
   if (await currentDocumentReady()) return;
   await new Promise((resolve, reject) => {
@@ -2708,6 +2744,88 @@ async function assertOwnedAutomationWindow(windowId) {
     && receipt.create_background_window === true && receipt.window_id === windowId);
   if (!owned) throw new Error("Selected window has no completed Controlla automation-window ownership receipt.");
   return window;
+}
+
+async function createOwnedTabFromNative(request) {
+  const url = validateNavigationUrl(request.url);
+  const key = `ownerless:${request.idempotency_key}`;
+  if (typeof request.idempotency_key !== "string" || request.idempotency_key.length < 8 || request.idempotency_key.length > 256
+    || /[\u0000-\u001f\u007f]/.test(request.idempotency_key)) throw new Error("Native tab creation requires a bounded idempotency key.");
+  const active = request.active === true;
+  if (typeof request.active !== "boolean") throw new Error("Native tab creation requires an explicit active boolean.");
+  const backgroundWindow = request.create_background_window === true;
+  const targetWindowId = request.target_window_id == null ? undefined : Number(request.target_window_id);
+  const targetWindowPolicy = targetWindowId === undefined ? undefined : request.target_window_policy;
+  if ((targetWindowId !== undefined && (!Number.isSafeInteger(targetWindowId) || targetWindowId <= 0 || backgroundWindow))
+    || (backgroundWindow && active)
+    || (targetWindowId !== undefined && !["existing_window", "existing_automation_window"].includes(targetWindowPolicy)))
+    throw new Error("Native tab creation window policy is invalid.");
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(request.expires_at_unix) || request.expires_at_unix < now || request.expires_at_unix > now + 30) throw new Error("Native tab creation request expired.");
+  const operation = openTabQueue.then(async () => {
+    const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
+    const receipts = saved[OPEN_RECEIPTS_KEY] || {};
+    let receipt = receipts[key];
+    if (receipt && (receipt.requested_url !== url || receipt.active !== active || receipt.create_background_window !== backgroundWindow || receipt.target_window_id !== targetWindowId || receipt.target_window_policy !== targetWindowPolicy))
+      throw new Error("Idempotency key is already bound to a different tab creation request.");
+    if (receipt?.status === "complete") {
+      const tab = await chrome.tabs.get(Number(receipt.tab_id)).catch(() => undefined);
+      const identity = tab && await nativePageIdentity(tab.id).catch(() => undefined);
+      if (!identity || identity.document_id !== receipt.document_id || identity.url !== receipt.url)
+        throw new Error(`Owned tab ${receipt.tab_id} changed after creation; inspect it before retrying.`);
+      if (targetWindowId !== undefined && tab.windowId !== targetWindowId)
+        throw new Error(`Owned tab ${receipt.tab_id} moved from the requested window; inspect it before retrying.`);
+      const window = await chrome.windows.get(tab.windowId);
+      return { tab_id:receipt.tab_id, window_id:tab.windowId, url:identity.url, document_id:identity.document_id,
+        idempotent_reuse:true, created_by_controlla:true, created_background_window:backgroundWindow,
+        tab_active:!!tab.active, window_focused:!!window.focused };
+    }
+    const markerUrl = `${chrome.runtime.getURL("open-recovery.html")}#${encodeURIComponent(key)}`;
+    let tab = receipt?.tab_id && await chrome.tabs.get(Number(receipt.tab_id)).catch(() => undefined);
+    if (receipt && !tab) throw new Error(`Owned tab ${receipt.tab_id} disappeared during creation; no duplicate was opened.`);
+    if (tab && tab.url !== markerUrl && tab.url !== url) throw new Error("Owned recovery tab changed before completion; no duplicate was opened.");
+    if (targetWindowPolicy === "existing_automation_window") await assertOwnedAutomationWindow(targetWindowId);
+    else if (targetWindowId !== undefined) await chrome.windows.get(targetWindowId);
+    if (!tab && backgroundWindow) {
+      const window = await chrome.windows.create({url:markerUrl,focused:false,type:"normal"});
+      tab = window?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
+    } else if (!tab && targetWindowId !== undefined) {
+      tab = await chrome.tabs.create({windowId:targetWindowId,url:markerUrl,active});
+    } else if (!tab) {
+      tab = await chrome.tabs.create({url:markerUrl,active});
+    }
+    if (!tab || !Number.isSafeInteger(tab.id)) throw new Error("Chrome did not return a new owned tab.");
+    receipts[key] = {status:"creating",tab_id:String(tab.id),window_id:tab.windowId,target_window_id:targetWindowId,target_window_policy:targetWindowPolicy,
+      url,requested_url:url,marker_url:markerUrl,active,create_background_window:backgroundWindow,created_ms:receipt?.created_ms || Date.now()};
+    await chrome.storage.local.set({[OPEN_RECEIPTS_KEY]:receipts});
+    try {
+      const marker = await nativePageIdentity(tab.id);
+      if (marker.url !== url) {
+        await chrome.tabs.update(tab.id, {url});
+        await waitForTabDOMContentLoaded(tab.id, marker.document_id);
+      } else {
+        await waitForTabDOMContentLoaded(tab.id, null);
+      }
+      const identity = await nativePageIdentity(tab.id);
+      if (identity.url !== url) throw new Error("Created tab navigated away before identity verification.");
+      const [current, window] = await Promise.all([chrome.tabs.get(tab.id),chrome.windows.get(tab.windowId)]);
+      if (targetWindowId !== undefined && current.windowId !== targetWindowId) throw new Error("Selected window changed during tab creation.");
+      if (targetWindowPolicy === "existing_automation_window" && (window.focused || !current.active)) throw new Error("Selected automation window changed during tab creation.");
+      const latest = (await chrome.storage.local.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {};
+      latest[key] = {...receipts[key],status:"complete",url:identity.url,document_id:identity.document_id,window_id:current.windowId};
+      await chrome.storage.local.set({[OPEN_RECEIPTS_KEY]:latest});
+      return {tab_id:String(tab.id),window_id:current.windowId,url:identity.url,document_id:identity.document_id,
+        idempotent_reuse:false,created_by_controlla:true,created_background_window:backgroundWindow,
+        tab_active:!!current.active,window_focused:!!window.focused};
+    } catch (error) {
+      const latest = (await chrome.storage.local.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {};
+      latest[key] = {...receipts[key],status:"failed"};
+      await chrome.storage.local.set({[OPEN_RECEIPTS_KEY]:latest});
+      throw new Error(`Owned tab ${tab.id} remains open for inspection after creation failed: ${safeNativeError(String(error))}`);
+    }
+  });
+  openTabQueue = operation.catch(() => {});
+  return operation;
 }
 async function createControllaTab(url, native, generation, tab, markerUrl, reused = false, waitUntil = "dom_content_loaded", active = true, createBackgroundWindow = false, placement = {}) {
   tab ||= await chrome.tabs.create({ url: markerUrl, active });
@@ -2889,7 +3007,17 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   if (message?.type === "pair") { pair(message.endpoint, message.token, message.tabIds).then(() => respond({ ok: true })).catch(error => respond({ ok: false, error: String(error) })); return true; }
   if (message?.type === "status") respond({ connected: socket?.readyState === WebSocket.OPEN, attached: [...manualAttachedTabs] });
   if (message?.type === "release") { const current = socket; const generation = ++manualGeneration; socket = undefined; current?.close(); detachManual(generation).then(() => respond({ ok: true })); return true; }
-  if (message?.type === "native-status") { readNativeLeaseJournal().then(journal => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: journal, transport: "native" })).catch(() => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: { schema_version: 1, sequence: 0, status: "unavailable", leases: [] }, transport: "native" })); return true; }
+  if (message?.type === "native-status") {
+    // MV3 can suspend a worker between the top-level reconnect promise and a
+    // popup wakeup. Re-arm the bridge on the status request so opening the
+    // popup is itself a bounded liveness probe rather than a stale snapshot.
+    if (nativePort && !nativeReady && nativeConnectStartedAt && Date.now() - nativeConnectStartedAt > 2000) {
+      try { nativePort.disconnect(); } catch {}
+      nativePort = undefined; nativeConnectStartedAt = 0;
+    }
+    if (!nativePort && !reconnectExhausted) connectNative();
+    readNativeLeaseJournal().then(journal => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: journal, transport: "native" })).catch(() => respond({ connected: nativeReady, attached: [...nativeAttachedTabs], error: nativeError, retry_exhausted: reconnectExhausted, recovery_journal: { schema_version: 1, sequence: 0, status: "unavailable", leases: [] }, transport: "native" })); return true;
+  }
 });
 async function pair(endpoint, token, selectedTabIds) {
   if (!Array.isArray(selectedTabIds) || selectedTabIds.length === 0 || !token || !endpoint) throw new Error("Choose tabs and provide the local pairing endpoint and token.");

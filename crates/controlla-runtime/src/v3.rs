@@ -36,7 +36,7 @@ impl BrowserMode {
             Self::Background => BrowserModePolicy {
                 uses_real_profile: true,
                 may_activate_window: false,
-                requires_visible_window: true,
+                requires_visible_window: false,
                 semantic_parity_required: true,
             },
             Self::Headless => BrowserModePolicy {

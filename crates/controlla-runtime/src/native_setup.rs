@@ -8,6 +8,119 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HOST_NAME: &str = "chrome_controlla_bridge";
 
+fn current_host_record_path() -> Result<PathBuf, String> {
+    Ok(home()?.join(".chrome-controlla/native-host-current.json"))
+}
+
+pub fn publish_current_host(host_id: &str) -> Result<(), String> {
+    let path = current_host_record_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    let temp = path.with_extension("json.tmp");
+    let mut value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|current| current["host_id"] == host_id)
+        .unwrap_or_else(|| json!({}));
+    value["schema_version"] = json!(1);
+    value["host_id"] = json!(host_id);
+    value["pid"] = json!(std::process::id());
+    value["heartbeat_unix"] = json!(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs()
+    );
+    fs::write(
+        &temp,
+        serde_json::to_vec(&value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
+    fs::rename(temp, path).map_err(|e| e.to_string())
+}
+
+/// Keep bounded, non-sensitive create-tab observability beside the host lease.
+/// This is intentionally request-ID/timestamp only so a stalled ownerless open
+/// can be diagnosed without persisting URLs, credentials, or page content.
+pub fn record_create_event(host_id: &str, request_id: &str, field: &str) -> Result<(), String> {
+    if request_id.len() != 32 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid native create request ID".into());
+    }
+    if !matches!(field, "dispatch" | "response" | "error") {
+        return Err("invalid native create event".into());
+    }
+    let path = current_host_record_path()?;
+    let mut value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|current| current["host_id"] == host_id)
+        .unwrap_or_else(|| json!({"schema_version":1,"host_id":host_id,"pid":std::process::id()}));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    value["heartbeat_unix"] = json!(now.as_secs());
+    value[format!("last_create_{field}_request_id")] = json!(request_id);
+    value[format!("last_create_{field}_unix_ms")] =
+        json!(now.as_millis().min(u64::MAX as u128) as u64);
+    let temp = path.with_extension("json.tmp");
+    fs::write(
+        &temp,
+        serde_json::to_vec(&value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
+    fs::rename(temp, path).map_err(|e| e.to_string())
+}
+
+pub fn current_host_id() -> Result<String, String> {
+    let path = current_host_record_path()?;
+    let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 {
+        return Err("current native host record is invalid".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("current native host record permissions are too broad".into());
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let seen = value["heartbeat_unix"]
+        .as_u64()
+        .ok_or("current native host record has no heartbeat")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    if now.saturating_sub(seen) > 15 || seen > now + 2 {
+        return Err("current native host record is stale".into());
+    }
+    let host_id = value["host_id"]
+        .as_str()
+        .ok_or("current native host record has no host ID")?;
+    pairing_path(host_id)?;
+    Ok(host_id.to_owned())
+}
+
 fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -83,6 +196,102 @@ pub fn read_tabs() -> Result<serde_json::Value, String> {
             .ok_or("native tab inventory has no host ID")?,
     )?;
     Ok(body)
+}
+
+/// Ask the already-connected native host to create an owned Chrome tab before
+/// pairing. No existing user tab is attached or used as a command transport.
+pub async fn create_owned_tab(
+    host_id: &str,
+    url: &str,
+    idempotency_key: &str,
+    active: bool,
+    create_background_window: bool,
+    target_window_id: Option<u64>,
+    target_window_policy: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let live_host_id = current_host_id().unwrap_or_else(|_| host_id.to_owned());
+    let base = pairing_path(&live_host_id)?;
+    if idempotency_key.len() < 8
+        || idempotency_key.len() > 256
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err("idempotency_key must be 8..256 printable characters".into());
+    }
+    let request_id = new_pairing_request_id()?;
+    let dir = base.parent().ok_or("invalid native bridge directory")?;
+    let request = dir.join(format!("native-create-{live_host_id}-{request_id}.json"));
+    let response = dir.join(format!(
+        "native-create-result-{live_host_id}-{request_id}.json"
+    ));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let body = json!({"request_id":request_id,"url":url,"idempotency_key":idempotency_key,
+        "active":active,"create_background_window":create_background_window,
+        "target_window_id":target_window_id,"target_window_policy":target_window_policy,
+        "expires_at_unix":now + 20});
+    let temp = dir.join(format!("native-create-{host_id}-{request_id}.tmp"));
+    fs::write(
+        &temp,
+        serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    fs::rename(temp, &request).map_err(|error| error.to_string())?;
+    let mut created = None;
+    for _ in 0..400 {
+        if created.is_none()
+            && let Ok(bytes) = fs::read(&response)
+        {
+            let _ = fs::remove_file(&response);
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if value["request_id"] != request_id {
+                return Err("native create response ID changed".into());
+            }
+            if let Some(error) = value["error"].as_str() {
+                return Err(error.to_owned());
+            }
+            if value["result"]["tab_id"].as_str().is_none() {
+                return Err("native create response omitted tab ID".into());
+            }
+            created = Some(value["result"].clone());
+        }
+        if let Some(result) = &created {
+            let tab_id = result["tab_id"]
+                .as_str()
+                .ok_or("native create response omitted tab ID")?;
+            // Pairing still requires a fresh extension inventory that includes
+            // the new document identity; do not trust only the create ACK.
+            if let Ok(snapshot) = read_tabs()
+                && snapshot["host_id"] == live_host_id
+                && snapshot["tabs"].as_array().is_some_and(|tabs| {
+                    tabs.iter().any(|tab| {
+                        tab["id"].as_u64().map(|id| id.to_string()).as_deref() == Some(tab_id)
+                            && tab["document_id"] == result["document_id"]
+                    })
+                })
+            {
+                return Ok(result.clone());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = fs::remove_file(request);
+    Err(if let Some(result) = created {
+        format!(
+            "created tab {} is not in a fresh native inventory; inspect it before retrying the same key",
+            result["tab_id"]
+        )
+    } else {
+        "native tab creation timed out; inspect the browser before retrying with the same idempotency_key".into()
+    })
 }
 
 pub fn bootstrap_tab_id(snapshot: &serde_json::Value) -> Option<String> {

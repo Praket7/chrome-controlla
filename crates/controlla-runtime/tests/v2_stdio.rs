@@ -33,6 +33,42 @@ fn state_dir() -> PathBuf {
 }
 
 #[tokio::test]
+async fn invalid_tool_arguments_return_readable_tool_errors() {
+    let state_dir = state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_controlla-v2"));
+    command.env("CONTROLLA_STATE_DIR", &state_dir);
+    let client = Client
+        .serve(TokioChildProcess::new(command).unwrap())
+        .await
+        .unwrap();
+    let bad_args = serde_json::json!({"action":"open","url":"https://example.test/","idempotency_key":"bad-args","unknown_field":true});
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("browser")
+                .with_arguments(bad_args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let payload = result.structured_content.unwrap();
+    assert_eq!(payload["reason_code"], "invalid_tool_request");
+    assert!(
+        payload["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown_field")
+    );
+    assert!(
+        payload["next_action"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    client.cancel().await.unwrap();
+    std::fs::remove_dir_all(state_dir).ok();
+}
+
+#[tokio::test]
 async fn compact_v3_advertises_task_route_and_guarded_tools() {
     let state_dir = state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -281,23 +317,25 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
                 .clone(),
         ))
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        invalid_cold_open
-            .to_string()
-            .contains("absolute HTTP(S) URL without credentials"),
-        "reject invalid navigation before pairing: {invalid_cold_open}"
+        invalid_cold_open.is_error == Some(true)
+            && serde_json::to_string(&invalid_cold_open)
+                .unwrap()
+                .contains("absolute HTTP(S) URL without credentials"),
+        "reject invalid navigation before pairing: {invalid_cold_open:?}"
     );
     let invalid_open_workflow = client
         .call_tool(CallToolRequestParams::new("browser").with_arguments(
             serde_json::json!({"action":"open","mode":"foreground","url":"https://example.test/","steps":[]})
                 .as_object().unwrap().clone(),
         ))
-        .await.unwrap_err();
+        .await.unwrap();
     assert!(
-        invalid_open_workflow
-            .to_string()
-            .contains("workflow requires 1..40 steps")
+        invalid_open_workflow.is_error == Some(true)
+            && serde_json::to_string(&invalid_open_workflow)
+                .unwrap()
+                .contains("workflow requires 1..40 steps")
     );
 
     let pair = serde_json::json!({"action":"pair_shared","target_ids":["123"],"mode":"foreground"});
@@ -324,10 +362,13 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
                 .with_arguments(missing_open_key.as_object().unwrap().clone()),
         )
         .await
-        .expect_err("retry-safe open requires a stable idempotency key");
+        .expect("retry-safe open error is returned as an MCP tool result");
     assert!(
-        error.to_string().contains("requires idempotency_key"),
-        "{error}"
+        error.is_error == Some(true)
+            && serde_json::to_string(&error)
+                .unwrap()
+                .contains("requires idempotency_key"),
+        "{error:?}"
     );
     let open = serde_json::json!({"action":"open","mode":"foreground","session_id":session_id,"url":"https://example.test/","idempotency_key":"stdio-open-123456"});
     let error = client
@@ -335,12 +376,13 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             CallToolRequestParams::new("browser").with_arguments(open.as_object().unwrap().clone()),
         )
         .await
-        .expect_err("unaccepted shared session cannot open a tab");
+        .expect("unaccepted shared session error is returned as an MCP tool result");
     assert!(
-        error
-            .to_string()
-            .contains("shared extension session has not been accepted"),
-        "{error}"
+        error.is_error == Some(true)
+            && serde_json::to_string(&error)
+                .unwrap()
+                .contains("shared extension session has not been accepted"),
+        "{error:?}"
     );
     let background_open = serde_json::json!({"action":"open","mode":"background","session_id":session_id,"url":"https://example.test/","idempotency_key":"stdio-bg-open-123456"});
     let error = client
@@ -349,12 +391,13 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
                 .with_arguments(background_open.as_object().unwrap().clone()),
         )
         .await
-        .expect_err("background mode cannot activate a new tab");
+        .expect("background mode error is returned as an MCP tool result");
     assert!(
-        error
-            .to_string()
-            .contains("session was not created in the requested browser mode"),
-        "a background open must use a background-paired session: {error}"
+        error.is_error == Some(true)
+            && serde_json::to_string(&error)
+                .unwrap()
+                .contains("session was not created in the requested browser mode"),
+        "a background open must use a background-paired session: {error:?}"
     );
     let request = serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":"123",
         "task":{"kind":"download","reference":"@c1"}});
@@ -378,8 +421,14 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
                 .with_arguments(research.as_object().unwrap().clone()),
         )
         .await
-        .expect_err("a V2/unknown session must be rejected before task dispatch");
-    assert!(result.to_string().contains("V3 browser route"), "{result}");
+        .expect("unknown session error is returned as an MCP tool result");
+    assert!(
+        result.is_error == Some(true)
+            && serde_json::to_string(&result)
+                .unwrap()
+                .contains("V3 browser route"),
+        "{result:?}"
+    );
 
     client.cancel().await.unwrap();
     std::fs::remove_dir_all(state_dir).unwrap();

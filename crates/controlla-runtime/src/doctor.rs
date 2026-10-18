@@ -31,6 +31,113 @@ struct HealthReply {
     policy_revision: u64,
 }
 
+#[derive(Deserialize)]
+struct StdioRuntime {
+    schema_version: u32,
+    service_pid: u32,
+    heartbeat_unix_seconds: u64,
+    binary_version: String,
+}
+
+pub fn publish_stdio_runtime(state_dir: &Path, version: &str) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let payload = serde_json::json!({"schema_version":1,"service_pid":std::process::id(),
+        "heartbeat_unix_seconds":now,"binary_version":version});
+    let path = state_dir.join("stdio-runtime.json");
+    let temp = state_dir.join("stdio-runtime.json.tmp");
+    std::fs::write(
+        &temp,
+        serde_json::to_vec(&payload).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(temp, path).map_err(|error| error.to_string())
+}
+
+fn probe_stdio_runtime(state_dir: &Path, report: &mut DoctorReport) {
+    let path = state_dir.join("stdio-runtime.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        report.errors.push(format!(
+            "no HTTP or stdio runtime record in {}",
+            state_dir.display()
+        ));
+        return;
+    };
+    let Ok(runtime) = serde_json::from_slice::<StdioRuntime>(&bytes) else {
+        report.configured = State::Failed;
+        report.errors.push("stdio runtime record is invalid".into());
+        return;
+    };
+    if runtime.schema_version != 1
+        || runtime.service_pid == 0
+        || runtime.binary_version != report.binary_version
+    {
+        report.configured = State::Failed;
+        report
+            .errors
+            .push("stdio runtime record does not match this binary".into());
+        return;
+    }
+    report.configured = State::Healthy;
+    let (process, error) = process_probe(runtime.service_pid);
+    report.process = process;
+    if let Some(error) = error {
+        report.errors.push(error);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    report.heartbeat_age_seconds = now.checked_sub(runtime.heartbeat_unix_seconds);
+    report.heartbeat = if report.heartbeat_age_seconds.is_some_and(|age| age <= 15) {
+        State::Healthy
+    } else {
+        State::Failed
+    };
+    match crate::native_setup::read_tabs() {
+        Ok(snapshot) => {
+            report.transport = State::Healthy;
+            report.principal_correlation = snapshot["host_id"].as_str().map(str::to_owned);
+        }
+        Err(error) => {
+            report.transport = State::Failed;
+            report
+                .errors
+                .push(format!("native bridge probe failed: {error}"));
+        }
+    }
+    // A fresh inventory proves the extension bridge, not that the MCP client
+    // loaded this server or that a tool round trip succeeded.
+    report.live_round_trip = State::Unknown;
+}
+
+#[cfg(test)]
+mod stdio_tests {
+    use super::*;
+
+    #[test]
+    fn stdio_runtime_record_gives_doctor_process_and_heartbeat_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("controlla-stdio-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        publish_stdio_runtime(&dir, "test-version").unwrap();
+        let report = report(&dir, "test-version");
+        assert_eq!(report.configured, State::Healthy);
+        assert_eq!(report.process, State::Healthy);
+        assert_eq!(report.heartbeat, State::Healthy);
+        assert_eq!(report.live_round_trip, State::Unknown);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 pub fn report(state_dir: &Path, version: &str) -> DoctorReport {
     report_for_client(state_dir, version, None)
 }
@@ -64,16 +171,14 @@ pub fn report_for_client(state_dir: &Path, version: &str, client: Option<&str>) 
     let bytes = match std::fs::read(&config_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            report
-                .errors
-                .push(if error.kind() == std::io::ErrorKind::NotFound {
-                    format!("configuration not found: {}", config_path.display())
-                } else {
-                    format!(
-                        "configuration read failed: {}: {error}",
-                        config_path.display()
-                    )
-                });
+            if error.kind() == std::io::ErrorKind::NotFound {
+                probe_stdio_runtime(state_dir, &mut report);
+                return report;
+            }
+            report.errors.push(format!(
+                "configuration read failed: {}: {error}",
+                config_path.display()
+            ));
             return report;
         }
     };

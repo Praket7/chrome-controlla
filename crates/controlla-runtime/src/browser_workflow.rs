@@ -25,6 +25,8 @@ pub fn resolve_workflow_reference(
             .get(name)
             .cloned()
             .ok_or_else(|| format!("workflow variable ${name} is unresolved"))
+    } else if let Some(value) = variables.get(reference) {
+        Ok(value.clone())
     } else {
         Ok(reference.to_owned())
     }
@@ -261,6 +263,9 @@ fn validate_predicate(
 }
 
 fn validate_reference(reference: &str, variables: &BTreeSet<String>) -> Result<(), String> {
+    if variables.contains(reference) {
+        return Ok(());
+    }
     if let Some(name) = reference.strip_prefix('$') {
         validate_variable_name(name)?;
         if variables.contains(name) {
@@ -275,7 +280,7 @@ fn validate_reference(reference: &str, variables: &BTreeSet<String>) -> Result<(
     {
         return Ok(());
     }
-    Err("reference must be an exact @cN value or an earlier $variable".into())
+    Err("reference must be an exact @cN value or an earlier saved name (name or $name)".into())
 }
 
 fn validate_variable_name(name: &str) -> Result<(), String> {
@@ -356,6 +361,10 @@ mod tests {
         let variables = BTreeMap::from([("title".into(), "@c1".into())]);
         assert_eq!(
             resolve_workflow_reference("$title", &variables).unwrap(),
+            "@c1"
+        );
+        assert_eq!(
+            resolve_workflow_reference("title", &variables).unwrap(),
             "@c1"
         );
         assert_eq!(

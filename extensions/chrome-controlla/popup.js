@@ -26,6 +26,10 @@ async function refreshNativeStatus() {
 refreshNativeStatus();
 const statusPoll = setInterval(refreshNativeStatus, 1000);
 window.addEventListener("unload", () => clearInterval(statusPoll), { once: true });
+document.querySelector("#reload-bridge").addEventListener("click", async () => {
+  await chrome.storage.session.remove("nativeReconnectAttempts").catch(() => {});
+  chrome.runtime.reload();
+});
 
 chrome.tabs.query({}).then(tabs => {
   for (const tab of tabs.filter(item => Number.isInteger(item.id) && item.url?.startsWith("http"))) {

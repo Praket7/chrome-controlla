@@ -6226,10 +6226,28 @@ impl App {
             let candidates = connection.selected_targets().to_vec();
             let (eligible, rejected) =
                 route_anchor_plan(&candidates, args.chrome_tab_id.as_deref());
+            // A stale inventory is evidence that no safe source can be
+            // selected, not a reason to turn a bounded route refusal into a
+            // generic protocol error. Treat it as an empty owned set so the
+            // structured no_safe_open_transport fallback remains actionable.
+            let inventory = crate::native_setup::read_tabs().unwrap_or_else(|_| json!({"tabs":[]}));
+            let owned_ids = inventory["tabs"]
+                .as_array()
+                .ok_or_else(|| invalid("native inventory omitted tabs"))?
+                .iter()
+                .filter(|tab| tab["owned_by_controlla"] == true)
+                .filter_map(|tab| tab["id"].as_u64().map(|id| id.to_string()))
+                .collect::<std::collections::BTreeSet<_>>();
             let registry = shared.registry()?;
             let probe = async {
                 let mut report = rejected;
                 for target in eligible {
+                    if !owned_ids.contains(&target) {
+                        report.push(json!({"tab_id":target,"accepted":false,
+                            "reason_code":"user_tab_not_used_as_open_transport",
+                            "reason":"new URL creation never borrows an unrelated user tab"}));
+                        continue;
+                    }
                     match connection
                         .command(
                             registry,
@@ -6241,17 +6259,18 @@ impl App {
                         .await
                     {
                         Ok(tree) => {
-                            let observed_url = tree
+                            let observed_origin = tree
                                 .pointer("/result/frameTree/frame/url")
                                 .or_else(|| tree.pointer("/frameTree/frame/url"))
                                 .and_then(Value::as_str)
-                                .map(str::to_owned);
+                                .and_then(|url| url::Url::parse(url).ok())
+                                .map(|url| url.origin().ascii_serialization());
                             report.push(json!({
                                 "tab_id": target,
                                 "accepted": true,
                                 "reason_code": "selected",
                                 "reason": "Page.getFrameTree succeeded",
-                                "observed_url": observed_url,
+                                "observed_origin": observed_origin,
                             }));
                             return (Some(target), report);
                         }
@@ -6275,9 +6294,13 @@ impl App {
                 report["requested_tab_id"] = json!(requested);
             }
             if source.is_none() {
-                return Err(invalid(format!(
-                    "shared session has no safe attached source tab; route_selection={report}"
-                )));
+                return Ok(rmcp::handler::server::wrapper::Json(json!({
+                    "status":"not_dispatched",
+                    "reason_code":"no_safe_open_transport",
+                    "dispatch_may_have_occurred":false,
+                    "route_selection":report,
+                    "next_action":"Call browser action=open without session_id to create and pair a new Controlla-owned tab."
+                })));
             }
             report
         } else {
@@ -6946,8 +6969,8 @@ fn route_anchor_plan(candidates: &[String], requested: Option<&str>) -> (Vec<Str
 fn route_selection_report(candidates: Vec<Value>, selected_tab_id: Option<&str>) -> Value {
     json!({
         "strategy": "explicit_or_unique_attached_tab",
-        "explanation": if selected_tab_id.is_some() { "exact attached source tab passed the identity probe" } else { "no unique safe attached source tab passed the identity probe" },
-        "fallback": if selected_tab_id.is_some() { "create new tab in the selected authorized window when no destination tab is a safe match" } else { "select and pair an exact stable tab in the intended Chrome window, then open a new tab; do not guess an anchor" },
+        "explanation": if selected_tab_id.is_some() { "exact Controlla-owned source tab passed the identity probe" } else { "no Controlla-owned source tab passed the identity probe" },
+        "fallback": if selected_tab_id.is_some() { "create the requested tab in the selected authorized window" } else { "call browser action=open without session_id to create and pair a new Controlla-owned tab; do not borrow a user tab" },
         "selection_completed_before_dispatch": true,
         "selected_tab_id": selected_tab_id,
         "candidates": candidates,
@@ -7498,7 +7521,7 @@ mod tests {
             no_match["fallback"]
                 .as_str()
                 .unwrap()
-                .contains("pair an exact stable tab")
+                .contains("new Controlla-owned tab")
         );
         assert_eq!(report["candidates"][0]["reason_code"], "probe_failed");
         assert_eq!(report["candidates"][1]["accepted"], true);

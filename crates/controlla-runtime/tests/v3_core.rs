@@ -28,6 +28,7 @@ fn foreground_background_and_headless_keep_semantic_parity() {
     assert!(headless.semantic_parity_required);
     assert!(foreground.may_activate_window);
     assert!(!background.may_activate_window);
+    assert!(!background.requires_visible_window);
     assert!(!headless.requires_visible_window);
     assert_eq!(
         BrowserMode::Headless.default_provider(),
