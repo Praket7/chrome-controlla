@@ -1,5 +1,9 @@
 # Build progress
 
+## Comprehensive Chrome audit implementation — 2026-10-18
+
+Implemented document-bound tab grouping, ungrouping, moving/reordering and explicit closure in the V3 `browser action=tabs` path, with live native-lease checks and post-action topology verification. Corrected hidden screenshot liveness evidence and runtime validation, incomplete watcher inventories, direct-action cancellation leases, background DOM readback and secret transitions, human typing budgets, and proxy concurrency/context routing. The route report now gives a concise selected source and rejected candidates, plus the exact-tab pairing fallback when no safe source exists. Benchmark acceptance now refuses forgeable fixture events; no comparative result is qualified. See [the audit](audit-2026-10-18.md) and [verification matrix](verification-matrix.md). The full Rust workspace suite, strict Clippy, extension and DOM fixtures, and benchmark integrity suite pass locally; independent Luna Medium review approved the current diff. The code and local fixtures remain separate from installed-extension and real-application qualification.
+
 ## Architectural completion pass — 2026-10-16
 
 Added the code-level architecture contracts for the remaining Stage 3 gaps: bounded `TaskCapsule` validation with required postconditions and output retention, revisioned target graph bindings, safe same-origin JSON network-candidate classification, a compact three-concept public catalog over the six-tool compatibility surface, and a Rust-owned extension protocol contract. The MV3 worker now advertises the contract version and bounded method count during capability negotiation. These are local code and wiring changes; live Chrome background/minimized behavior and matched competitor qualification remain separate evidence gates.
@@ -582,3 +586,7 @@ Checkpoint operations now hold a stable OS file lock across disk refresh and ato
 ### Stage 3 final smoke correction — 2026-10-15
 
 The ignored isolated shared-bridge Chrome fixture exercises the complete public local download/upload route plus fast and paced typing. Response compaction retains `typing_mode` but intentionally omits lengthy or sensitive field readback; the fixture verifies the field directly in Chrome. An uncertain HumanKeys result goes through the public fresh-predicate reconciliation path before a subsequent write, proving the 120-second cross-process lock is retained until reconciliation. The fixture passed with `RUST_MIN_STACK=8388608`; no installed extension, signed-in site, vendor account, Codex reload, or live workflow was used.
+
+### Comprehensive Chrome audit follow-up — 2026-10-18
+
+The three isolated private-Chrome headless `v2_stdio` fixtures pass for download bytes, research/draft/repeat, and widget drag/drop. The multi-page research fixture exposed receipt compaction that silently dropped URL identity; compact task receipts now retain exact short URLs or explicitly mark a long URL prefix and digest, with byte-cap regressions. The long debug task fixture launches its test server with an 8 MiB worker stack. Installed-extension, signed-in Chrome, minimized-window, and real-app persistence qualification remain open.

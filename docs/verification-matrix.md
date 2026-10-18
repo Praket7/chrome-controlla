@@ -1,5 +1,16 @@
 # Verification matrix
 
+## Comprehensive audit local evidence — 2026-10-18
+
+| Gate | Result | Limit |
+| --- | --- | --- |
+| Baseline | Prior to changes, `cargo test --workspace --locked` and the extension/agent UX Node suites passed. | Baseline coverage did not reveal the later negative controls. |
+| Native tab/group operation | Extension dispatcher/harness passed a document-bound ungroup and refused a released lease. `check:topology` covers grouping, ungrouping, move order/window, close inventory, stale IDs and uncertain replies. | Installed extension and user window behavior are unqualified. |
+| Background DOM and hidden screenshot | Nine isolated real Chrome DOM cases passed; extension harness covers hidden clock sample and unavailable renderer refusal. Runtime screenshot evidence validator agrees with the new provenance. | A renderer clock sample proves liveness, not a new paint; frozen/minimized user-profile qualification remains open. |
+| Proxy and direct-action safety | 21 agent UX child-process cases passed and independent Luna Medium review approved. Lease drop/unknown and cancellation tests were added; final `cargo test --workspace --locked` and `cargo clippy --workspace --all-targets --locked -- -D warnings` passed locally. | No configured-client reload or external account operation was performed. |
+| Benchmark integrity | 31 bounded benchmark adapter/runner tests passed, including forged terminal-event rejection and extension hash collision. A full paired benchmark was not run; no speed superiority result exists. | Fixture `/__event` remains writable by the acting browser, so convenience adapter and verifier fail closed as unqualified. |
+| Docs, package and static checks | Docs links, provenance, client configs, apps, release structure, V3 schema, package/archive/upgrade checks passed locally; the final release package rebuild is recorded separately when complete. | Hosted CI and published package status are not inferred from local checks. |
+
 ## Stage 3 implementation continuation — 2026-10-15
 
 The reusable `RouteBudget` contract has typed limits and usage for internal models, visible observations, browser commands, wall deadline, and fallback count. The V3 workflow VM enforces browser-command, fallback, and wall-time limits at its dispatch boundary and returns scoped usage in success/failure receipts. Direct measured browser routes now enter the same task-local browser/CDP command and wall-time budget before dispatch; nested routes reuse the enclosing limits. The runtime has no internal model invocation provider, so model-call and internal-model-visible-observation zeros are code-proven with provenance; caller-side model turns and inspection remain `null` because they are outside this process. MCP responses count at most one page-evidence packet at the structured return boundary and mark that source/completeness explicitly. This counts emitted evidence, not model inspection; no independent observation budget can be enforced without a runtime model boundary. Focused regressions cover these boundaries, partial model counters, and zero-evidence responses.
@@ -1030,3 +1041,7 @@ and installed-Chrome qualification remain open.
 | Revisioned target graph | Unit tests reject stale graph revisions and bump changed target revisions | Chrome restart and multi-window qualification pending |
 | Network read acceleration | Unit tests allow only same-origin successful JSON GET candidates with opaque handles | First-party app response qualification pending |
 | Compact catalog and protocol contract | Rust unit tests plus MV3 capability handshake assertions | Client discovery migration pending |
+
+### Comprehensive Chrome audit follow-up — 2026-10-18
+
+The isolated real-Chrome private headless suite passed all three ignored `v2_stdio` fixtures: downloaded artifact bytes, research/draft/repeat, and widget drag/drop. The research fixture requests a reasoned 16 KiB response budget so all page receipts and exact short URLs remain available; compact responses mark longer URL identity with a prefix, digest, and `url_truncated`. Its debug server uses an 8 MiB worker stack, consistent with earlier long async fixture qualification. These tests do not exercise the installed extension or signed-in Chrome profile. Full workspace Rust tests, strict Clippy, JavaScript checks, and package checks are recorded separately for this branch.

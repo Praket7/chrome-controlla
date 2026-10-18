@@ -98,6 +98,7 @@ let navigationError;
 let screenshotDataOverride;
 let screenshotDataSequence;
 let rendererFrameUnavailable = false;
+let rendererClockUnavailable = false;
 let navigateDuringScreenshot;
 let freezeDuringScreenshot;
 let failPresentationEvaluation;
@@ -200,6 +201,7 @@ const chrome = {
       if (query.active && Number.isSafeInteger(query.windowId)) return tabList.filter(tab => tab.active && tab.windowId === query.windowId);
       return tabList;
     },
+    async ungroup(ids) { for (const id of Array.isArray(ids) ? ids : [ids]) { const tab=tabList.find(tab=>tab.id===id); if (!tab) throw Error("missing tab"); tab.groupId=-1; } },
     async create({ url, active = true, windowId }) { const id = nextCreatedTab++; const tab = { id, windowId: windowId ?? 1, title: "New tab", url, status: "complete", frozen: false, active }; if (active) createdTabPreviousActive.set(id, focusedWindowActiveTabId); tabList.push(tab); if (active) { for (const sibling of tabList) if (sibling.windowId === tab.windowId && sibling.id !== tab.id) sibling.active = false; tab.active = true; focusedWindowActiveTabId = tab.id; if (emitActivationEvents) emitTabsActivated({ tabId: tab.id, windowId: tab.windowId }); } if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
     async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) { const [removed] = tabList.splice(index, 1); if (removed.active && focusedWindowActiveTabId === tabId) { const previous = tabList.find(tab => tab.id === createdTabPreviousActive.get(tabId) && tab.windowId === removed.windowId); if (previous) { for (const sibling of tabList) if (sibling.windowId === removed.windowId) sibling.active = false; previous.active = true; focusedWindowActiveTabId = previous.id; if (emitActivationEvents) emitTabsActivated({ tabId: previous.id, windowId: previous.windowId }); } } } createdTabPreviousActive.delete(tabId); },
     async move(tabId, { windowId }) {
@@ -362,6 +364,10 @@ const chrome = {
       }
       if (method === "Runtime.evaluate" && params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")) {
         return { result: { value: { ready: !rendererFrameUnavailable, timestamp_ms: rendererFrameUnavailable ? undefined : 42.5 } } };
+      }
+      if (method === "Runtime.evaluate" && params?.expression === "performance.now()") {
+        if (rendererClockUnavailable) throw new Error("renderer unavailable");
+        return { result: { value: 42.5 } };
       }
       if (method === "Runtime.evaluate" && params?.expression === "document.body.dataset.controllaMarker") {
         return { result: { result: { type: "string", value: markerTextByTab.get(target.tabId) || "" } } };
@@ -696,6 +702,21 @@ function testWatcherStateMirrorContracts() {
     "tab removal evicts the target binding");
   assert.equal(watcherRevisionReceipt(5, 1)?.reason_code,
     "stale_watcher_revision", "removed or invalidated mirror state refuses an old mutation revision");
+  for (const [collection, limit, event] of [
+    ["tabs", 2048, { kind: "tab_created", tab: { id: 3000, windowId: 1, status: "complete" } }],
+    ["windows", 128, { kind: "window_updated", window: { id: 3000 } }],
+    ["groups", 512, { kind: "group_updated", group: { id: 3000, windowId: 1 } }],
+  ]) {
+    const inventory = { kind: "snapshot", tabs: [{ id: 0, windowId: 1, status: "complete" }], windows: [{ id: 1 }], groups: [] };
+    inventory[collection] = Array.from({ length: limit }, (_, id) => ({ id, windowId: 1, status: "complete" }));
+    const full = applyWatcherStateEvent(createWatcherStateMirror(), inventory);
+    assert.equal(full.complete, true);
+    const overflow = applyWatcherStateEvent(full, event);
+    assert.equal(overflow.complete, false, `${collection} overflow invalidates incremental inventory`);
+    assert.equal(watcherStateMatches(overflow, 0, overflow.tabs[0].target_revision), false);
+    assert.equal(applyWatcherStateEvent(overflow, { kind: "tab_removed", tab_id: 3000 }).complete, false,
+      "only a fresh full snapshot can restore completeness");
+  }
   const oversizedSnapshot = applyWatcherStateEvent(createWatcherStateMirror(), {
     kind: "snapshot",
     tabs: Array.from({ length: 2049 }, (_, id) => ({ id, windowId: 1, status: "complete" })),
@@ -990,10 +1011,23 @@ async function waitFor(predicate, description) {
   assert.equal(screenshotChunks[0].visual_evidence.target_lifecycle, "active");
   assert.equal(screenshotChunks[0].visual_evidence.render_revision, "document-41:42.500", "fresh renderer frame is bound to the screenshot document");
   assert.equal(screenshotChunks[0].visual_evidence.render_frame_timestamp_ms, 42.5);
-  assert.equal(screenshotChunks[0].visual_evidence.render_frame_provenance, "two_animation_frames_before_compositor_capture");
+  assert.equal(screenshotChunks[0].visual_evidence.render_frame_provenance, "hidden_tab_renderer_clock_sample");
   assert.ok(debuggerCalls.some(call => call.method === "Runtime.evaluate" && call.params?.expression?.includes("requestAnimationFrame(()=>requestAnimationFrame")),
     "extension waits for a new renderer animation frame before screenshot dispatch");
   screenshotDataOverride = undefined;
+  const hiddenFramesBefore = debuggerCalls.filter(call => call.params?.expression?.includes("requestAnimationFrame")).length;
+  native.hostMessage({ type: "command", id: "hidden-clock-only", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  await waitForCommandResult("hidden-clock-only");
+  assert.equal(debuggerCalls.filter(call => call.params?.expression?.includes("requestAnimationFrame")).length, hiddenFramesBefore,
+    "hidden capture must not wait on suspended animation frames");
+  rendererClockUnavailable = true;
+  const clockFailureCaptureCount = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
+  native.hostMessage({ type: "command", id: "hidden-clock-failed", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
+  const failedClock = await waitForCommandResult("hidden-clock-failed");
+  assert.equal(failedClock.reason_code, "screenshot_render_frame_unavailable");
+  assert.equal(debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length, clockFailureCaptureCount,
+    "an unavailable renderer must not fabricate a timestamp and capture");
+  rendererClockUnavailable = false;
   screenshotDataSequence = ["not-a-png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"];
   const malformedCaptureBefore = debuggerCalls.filter(call => call.method === "Page.captureScreenshot").length;
   native.hostMessage({ type: "command", id: "hidden-malformed-fallback", target_id: "41", method: "Page.captureScreenshot", params: runtimeScreenshotParams });
@@ -2006,9 +2040,18 @@ async function waitFor(predicate, description) {
   assert.equal(attached.filter(tabId => tabId === 60).length, overlapAttachCount,
     "overlapping ownership is rejected without a duplicate debugger attach");
   assert.equal(detached.includes(60), false, "a rejected overlapping lease cannot detach the existing owner's target");
+  native.hostMessage({ type: "command", lease_id: "codex-a", id: "manage-tabs-ungroup", target_id: "60", method: "Controlla.manageTabs",
+    params: { kind:"ungroup",targets:[{tab_id:"60",document_id:"document-60"}],background:false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const managed = native.sent.find(item=>item.id==="manage-tabs-ungroup")?.result;
+  assert.equal(managed?.status,"verified", "native command dispatch reaches the document-bound topology operation");
   native.hostMessage({ type: "release", lease_id: "codex-a" });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.ok(detached.includes(60), "releasing one Codex lease detaches only its tab");
+  native.hostMessage({ type: "command", lease_id: "codex-a", id: "released-lease-topology", target_id: "60", method: "Controlla.manageTabs",
+    params: { kind:"ungroup",targets:[{tab_id:"60",document_id:"document-60"}],background:false } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.notEqual(native.sent.find(item=>item.id==="released-lease-topology")?.result?.status,"verified", "released lease cannot reuse captured tab authorization");
   assert.equal(detached.includes(61), false, "releasing one Codex lease preserves another client's tab");
   native.hostMessage({ type: "command", lease_id: "codex-b", id: "codex-b-still-live", target_id: "61", method: "DOM.getDocument", params: {} });
   await new Promise(resolve => setTimeout(resolve, 0));

@@ -155,6 +155,22 @@ pub const BROWSER_OPERATIONS: &[BrowserOperationCapability] = &[
     BrowserOperationCapability {
         provider: "shared_extension",
         mode: "foreground",
+        action: "tabs",
+        effect: "tab_topology_mutation",
+        evidence: "fresh_document_and_topology",
+        dispatch: "tabs",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "background",
+        action: "tabs",
+        effect: "tab_topology_mutation",
+        evidence: "fresh_document_and_topology",
+        dispatch: "tabs",
+    },
+    BrowserOperationCapability {
+        provider: "shared_extension",
+        mode: "foreground",
         action: "discover_shared_tabs",
         effect: "observation",
         evidence: "fresh_inventory",

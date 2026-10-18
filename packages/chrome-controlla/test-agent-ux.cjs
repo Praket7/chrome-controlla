@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
+const readline = require('node:readline');
 const test = require('node:test');
 const browserSkill = fs.readFileSync(path.join(__dirname, 'plugin/skills/browser-control/SKILL.md'), 'utf8');
 const advancedBrowserSkill = fs.readFileSync(path.join(__dirname, 'plugin/skills/browser-control/references/advanced.md'), 'utf8');
@@ -17,6 +19,7 @@ const {
   compileNewestWorkflow,
   routeKey
 } = require('./plugin/agent-ux-proxy.cjs');
+const { startAgentUxProxy } = require('./plugin/mcp-agent-ux-launch.cjs');
 
 function fakeTools() {
   return SIX_TOOLS.map(name => ({
@@ -71,6 +74,136 @@ test('headless guidance keeps browser lifecycle mode separate from page tools', 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'controlla-agent-ux-'));
 }
+
+function startProxyFixture() {
+  const dir = tempDir();
+  const serverPath = path.join(dir, 'server.cjs');
+  const driverPath = path.join(dir, 'driver.cjs');
+  fs.writeFileSync(serverPath, `
+    const readline = require('node:readline');
+    const rl = readline.createInterface({ input: process.stdin });
+    const tools = ${JSON.stringify(fakeTools())};
+    let heldWorkflow;
+    let activeSnapshots = 0;
+    let maxSnapshots = 0;
+    rl.on('line', line => {
+      const request = JSON.parse(line);
+      if (request.method === 'tools/list') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools } }) + '\\n');
+        return;
+      }
+      if (request.method !== 'tools/call') return;
+      const { name, arguments: args = {} } = request.params;
+      if (name === 'act' && args.invalidate === true) {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) + '\\n');
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'completed' } } }) + '\\n');
+        return;
+      }
+      if (name === 'browser') {
+        const tab = args.url.endsWith('/a') ? '11' : '22';
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'verified', session_id: 'session-' + tab, tab_id: tab, url: args.url } } }) + '\\n');
+        return;
+      }
+      if (name === 'workflow' && args.cancel === true) {
+        heldWorkflow?.();
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'cancelled', session_id: args.session_id, chrome_tab_id: args.chrome_tab_id } } }) + '\\n');
+        return;
+      }
+      if (name === 'workflow' && args.hold === true) {
+        heldWorkflow = () => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'cancelled' } } }) + '\\n');
+        return;
+      }
+      if (name === 'snapshot') {
+        activeSnapshots++;
+        maxSnapshots = Math.max(maxSnapshots, activeSnapshots);
+        setTimeout(() => {
+          activeSnapshots--;
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'observed', session_id: args.session_id, chrome_tab_id: args.chrome_tab_id, max_snapshots: maxSnapshots } } }) + '\\n');
+        }, 60);
+        return;
+      }
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { status: 'ok' } } }) + '\\n');
+    });
+  `);
+  fs.writeFileSync(driverPath, `
+    const { spawn } = require('node:child_process');
+    const { startAgentUxProxy } = require(${JSON.stringify(path.resolve(__dirname, 'plugin/mcp-agent-ux-launch.cjs'))});
+    const child = spawn(process.execPath, [${JSON.stringify(serverPath)}], { stdio: ['pipe', 'pipe', 'inherit'] });
+    startAgentUxProxy(child, { stateDir: ${JSON.stringify(dir)} });
+  `);
+  const driver = spawn(process.execPath, [driverPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const lines = readline.createInterface({ input: driver.stdout });
+  const waiters = new Map();
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    const waiter = waiters.get(message.id);
+    if (!waiter) return;
+    waiters.delete(message.id);
+    waiter(message);
+  });
+  let nextId = 1;
+  return {
+    dir,
+    async request(method, params) {
+      const id = nextId++;
+      let timeout;
+      const response = new Promise((resolve, reject) => {
+        waiters.set(id, message => { clearTimeout(timeout); resolve(message); });
+        timeout = setTimeout(() => {
+          waiters.delete(id);
+          reject(new Error(`proxy request ${id} timed out`));
+        }, 1500);
+      });
+      driver.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      return response;
+    },
+    close() {
+      driver.stdin.end();
+      driver.kill();
+      lines.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+}
+
+test('proxy dispatches cancellation and distinct contexts while a child workflow is pending', async t => {
+  const proxy = startProxyFixture();
+  t.after(() => proxy.close());
+  const listed = await proxy.request('tools/list', {});
+  assert.equal(listed.error, undefined);
+  const openA = await proxy.request('tools/call', { name: 'browser', arguments: { action: 'open', url: 'https://example.test/a' } });
+  const openB = await proxy.request('tools/call', { name: 'browser', arguments: { action: 'open', url: 'https://example.test/b' } });
+  const contextA = openA.result.structuredContent.context;
+  const contextB = openB.result.structuredContent.context;
+
+  const held = proxy.request('tools/call', { name: 'workflow', arguments: { context: contextA, advanced: { hold: true } } });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const cancel = await proxy.request('tools/call', { name: 'workflow', arguments: { context: contextA, advanced: { cancel: true } } });
+  assert.equal(cancel.result.structuredContent.status, 'cancelled', 'cancel must reach child before held workflow completes');
+  assert.equal((await held).result.structuredContent.status, 'cancelled');
+
+  const [snapshotA, snapshotB] = await Promise.all([
+    proxy.request('tools/call', { name: 'snapshot', arguments: { context: contextA } }),
+    proxy.request('tools/call', { name: 'snapshot', arguments: { context: contextB } })
+  ]);
+  assert.equal(snapshotA.result.structuredContent.session_id, 'session-11');
+  assert.equal(snapshotA.result.structuredContent.chrome_tab_id, '11');
+  assert.equal(snapshotB.result.structuredContent.session_id, 'session-22');
+  assert.equal(snapshotB.result.structuredContent.chrome_tab_id, '22');
+  assert.equal(snapshotA.result.structuredContent.max_snapshots, 2, 'independent child calls should overlap');
+});
+
+test('proxy fails closed when the child schema changes during a pending mutation', async t => {
+  const proxy = startProxyFixture();
+  t.after(() => proxy.close());
+  await proxy.request('tools/list', {});
+  const result = await proxy.request('tools/call', { name: 'act', arguments: { advanced: {
+    session_id: 'schema-test-session', chrome_tab_id: 'schema-test-tab', invalidate: true
+  } } });
+  assert.equal(result.error.code, -32000);
+  assert.match(result.error.message, /outcome is unknown/);
+  assert.equal((await proxy.request('tools/list', {})).error, undefined, 'the next request should use refreshed schemas');
+});
 
 test('public plugin surface keeps six eager tools but hides routine bookkeeping', () => {
   const tools = compactTools(fakeTools());
@@ -257,6 +390,73 @@ test('follow-up tools can use only the opaque context handle', async () => {
   assert.equal(calls[1].args.session_id, 's1');
   assert.equal(calls[1].args.chrome_tab_id, '8');
   assert.equal(calls[1].args.context, undefined);
+});
+
+test('context-bound tools infer the sole active context when context is omitted', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    if (name === 'browser') return { structuredContent: { status: 'verified', session_id: 's1', tab_id: '8' } };
+    return { structuredContent: { status: 'ok' } };
+  }});
+  runtime.setServerTools(fakeTools());
+  await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/' });
+  await runtime.handleToolCall('snapshot', { max_items: 1 });
+  assert.equal(calls[1].args.session_id, 's1');
+  assert.equal(calls[1].args.chrome_tab_id, '8');
+});
+
+test('context-bound tools reject omitted context when multiple contexts are active', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    return { structuredContent: { status: 'verified', session_id: `s${calls.length}`, tab_id: String(calls.length) } };
+  }});
+  runtime.setServerTools(fakeTools());
+  await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/a' });
+  await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/b' });
+  await assert.rejects(runtime.handleToolCall('snapshot', {}), /context is required when multiple/);
+  assert.equal(calls.length, 2, 'ambiguous call must not reach child');
+});
+
+test('context-bound tools reject omitted context when no context or explicit target IDs exist', async () => {
+  let calls = 0;
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async () => { calls++; return {}; } });
+  runtime.setServerTools(fakeTools());
+  await assert.rejects(runtime.handleToolCall('snapshot', {}), /context or explicit session_id and chrome_tab_id are required/);
+  assert.equal(calls, 0, 'unbound call must not reach child');
+});
+
+test('context-bound tools allow a complete explicit target pair with no registered context', async () => {
+  let dispatched;
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (_name, args) => { dispatched = args; return {}; } });
+  runtime.setServerTools(fakeTools());
+  await runtime.handleToolCall('snapshot', { advanced: { session_id: 's-explicit', chrome_tab_id: 'tab-explicit' } });
+  assert.equal(dispatched.session_id, 's-explicit');
+  assert.equal(dispatched.chrome_tab_id, 'tab-explicit');
+});
+
+test('explicit context rejects conflicting direct and advanced target IDs', async () => {
+  const calls = [];
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async (name, args) => {
+    calls.push({ name, args: structuredClone(args) });
+    if (name === 'browser') return { structuredContent: { status: 'verified', session_id: 's1', tab_id: '8' } };
+    return { structuredContent: { status: 'ok' } };
+  }});
+  runtime.setServerTools(fakeTools());
+  const opened = await runtime.handleToolCall('browser', { action: 'open', url: 'https://example.test/' });
+  const context = opened.structuredContent.context;
+  await assert.rejects(runtime.handleToolCall('snapshot', { context, session_id: 'other-session' }), /conflicts with context/);
+  await assert.rejects(runtime.handleToolCall('snapshot', { context, advanced: { chrome_tab_id: '99' } }), /conflicts with context/);
+  assert.equal(calls.length, 1, 'conflicting IDs must not reach child');
+});
+
+test('an unknown explicit context fails closed without dispatching an unbound call', async () => {
+  let calls = 0;
+  const runtime = new AgentUxRuntime({ stateDir: tempDir(), callTool: async () => { calls++; return {}; } });
+  runtime.setServerTools(fakeTools());
+  await assert.rejects(runtime.handleToolCall('snapshot', { context: 'ctx_expired' }), /unknown Controlla context/);
+  assert.equal(calls, 0);
 });
 
 test('structured failed snapshots trigger context recovery instead of false success', async () => {

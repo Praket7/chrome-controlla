@@ -1,5 +1,9 @@
 # Blockers and external dependencies
 
+## Comprehensive Chrome audit qualification boundary — 2026-10-18
+
+Code and local fixture work is recorded in [the audit](audit-2026-10-18.md). The exact installed native host and extension have not been reloaded or qualified through a live user Chrome session. New group/move/close behavior, minimized/frozen-window behavior, secret entry prompt, site acceptance for uploads/downloads, and cross-window workflows require that separate acceptance run. CAPTCHA/Cloudflare/MFA cannot be promised as universal automated bypasses. Purchases require the user's exact final authorization; a runtime approval token is still an open enforcement gate. The Phase 11 fixture has no independent success oracle, and the convenience adapter is intentionally unqualified. There is no matched prompt-to-verified competitor result or Luna multi-tab acceptance evidence, so fastest/best claims remain blocked.
+
 ## Stage 3 final qualification boundary — 2026-10-15
 
 Continuation correction — 2026-10-15: principal-scoped durable screenshot bytes, fill-only plus exact click/save verified-state resume, cross-process checkpoint locking, and caller-opt-in bounded workflow text evidence are now implemented with local coverage. These are no longer code blockers. App-specific render correctness, pixel-to-slide identity, app persistence, client hooks, external measurements, hosted CI, and live qualification remain open.

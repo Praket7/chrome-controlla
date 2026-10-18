@@ -537,10 +537,13 @@ async fn private_headless_task_research_draft_and_repeat() {
     let state_dir = state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_controlla-v2"));
-    command.env("CONTROLLA_STATE_DIR", &state_dir).env(
-        "COMPTROL_CHROME_EXECUTABLE",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    );
+    command
+        .env("CONTROLLA_STATE_DIR", &state_dir)
+        .env("RUST_MIN_STACK", "8388608")
+        .env(
+            "COMPTROL_CHROME_EXECUTABLE",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        );
     let client = Client
         .serve(TokioChildProcess::new(command).unwrap())
         .await
@@ -595,6 +598,7 @@ async fn private_headless_task_research_draft_and_repeat() {
         .call_tool(call(
             "browser",
             serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,
+        "max_bytes":16000,"max_bytes_reason":"verify all multi-page research receipts",
         "task":{"kind":"research","urls":[url_a,url_b],"selector":"main"}}),
         ))
         .await
@@ -602,7 +606,7 @@ async fn private_headless_task_research_draft_and_repeat() {
         .structured_content
         .unwrap();
     assert_eq!(research["status"], "completed", "{research}");
-    assert_eq!(research["receipts"][1]["url"], url_a);
+    assert_eq!(research["receipts"][1]["url"], url_a, "{research}");
     assert_eq!(
         research["receipts"][1]["title"], "Fixture Fact A",
         "{research}"

@@ -456,17 +456,30 @@ class AgentUxRuntime {
   prepareArgs(name, args) {
     const original = args ?? {};
     const prepared = mergeAdvanced(original);
-    if (name !== 'browser') {
-      const resolved = this.contexts.resolve(original.context);
-      if (resolved) {
-        prepared.session_id ??= resolved.session_id;
-        prepared.chrome_tab_id ??= resolved.chrome_tab_id;
+    let contextId = original.context;
+    let resolved = null;
+    if (!contextId && name !== 'browser') {
+      const contextCount = this.contexts.size();
+      if (contextCount > 1) throw new Error('Controlla context is required when multiple browser contexts are active');
+      if (contextCount === 1) {
+        contextId = 'the sole active context';
+        resolved = this.contexts.resolve();
+      } else if (![prepared.session_id, prepared.chrome_tab_id].every(value => value != null && String(value).length > 0)) {
+        throw new Error('Controlla context or explicit session_id and chrome_tab_id are required');
       }
-    } else if (original.context) {
-      const resolved = this.contexts.resolve(original.context);
+    }
+    if (contextId) {
+      resolved ??= this.contexts.resolve(original.context);
       if (!resolved) throw new Error(`unknown Controlla context: ${original.context}`);
-      prepared.session_id ??= resolved.session_id;
-      prepared.chrome_tab_id ??= resolved.chrome_tab_id;
+      for (const [name, bound, supplied] of [
+        ['session_id', resolved.session_id, prepared.session_id],
+        ['chrome_tab_id', resolved.chrome_tab_id, prepared.chrome_tab_id]
+      ]) {
+        if (supplied != null && String(supplied) !== String(bound)) {
+          throw new Error(`${name} conflicts with context ${contextId}`);
+        }
+        prepared[name] = bound;
+      }
     }
     if (name === 'browser' && prepared.action === 'open' && !prepared.idempotency_key) {
       prepared.idempotency_key = this.openKeys.keyFor(prepared);

@@ -11,7 +11,7 @@
 
 Controlla's six V3 tools are a stable agent contract: `browser`, `snapshot`, `act`, `workflow`, `extract`, and `verify`. The compact browser skill is `packages/chrome-controlla/plugin/skills/browser-control/SKILL.md`.
 
-For ordinary browser tasks, **act first**. If the six tools are already exposed by the client, do not list MCP servers, inspect schemas, call `browser describe`, read `MEMORY.md`, search this repository, or open Rust/JavaScript source to learn how Controlla works. Do not reread the browser skill between normal calls. Tool/schema/source inspection is recovery-only after an explicit `schema_mismatch`, `tool_unavailable`, malformed-tool error, or other diagnostic that cannot be resolved from the returned receipt.
+For ordinary browser tasks, **use the exposed browser tools immediately**. If the six tools are already exposed by the client, do not list MCP servers, inspect schemas, call `browser describe`, read `MEMORY.md`, search this repository, or open Rust/JavaScript source to learn how Controlla works. Do not reread the browser skill between normal calls. Tool/schema/source inspection is recovery-only after an explicit `schema_mismatch`, `tool_unavailable`, malformed-tool error, or other diagnostic that cannot be resolved from the returned receipt.
 
 Default execution policy:
 
@@ -20,11 +20,12 @@ Default execution policy:
 3. Observe only what the next decision needs. Prefer one targeted semantic snapshot with bounded items, scan nodes, and `max_text_chars:0` when body text is unnecessary. Do not take broad duplicate snapshots.
 4. Put deterministic multi-step work in one `browser open` with `steps` or one `workflow`. Do not bounce intermediate deterministic state through the model.
 5. Verify consequential mutations only when the action/workflow receipt does not already prove the requested postcondition. Never replay an `unknown` mutation.
-6. Release the shared session without closing the user's tab.
+6. For exact selected tab or group changes, use `browser action=tabs` with fresh `document_id` for each target and verify the topology receipt.
+7. Release the shared session without closing the user's tab.
 
 For newest/latest content, the preferred shape is **direct destination -> one targeted candidate read -> choose by observed publication evidence -> click -> verify**. Avoid homepage navigation, repeated general snapshots, source-code inspection, and manual schema discovery. If exact timestamps are unavailable, report the actual freshness evidence used rather than inventing precision.
 
-A normal browser task should have zero repository reads, zero schema/describe calls, zero model-visible MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known or can be safely routed. Guarded cold open performs its fresh target inventory internally as part of `browser action=open`; do not call discovery separately unless intentionally selecting a particular existing tab. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
+A normal browser task should have zero repository reads, zero schema/describe calls, zero model-visible MCP-discovery calls, and at most one model-visible observation before a deterministic workflow whenever the target is already known or can be safely routed. If no existing destination tab safely matches, `browser action=open` creates a new tab in the selected authorized window. If no attached source tab passes the identity probe, select and pair an exact stable tab in the intended window before opening. Guarded cold open performs its fresh target inventory internally as part of `browser action=open`; do not call discovery separately unless intentionally selecting a particular existing tab. Treat unnecessary repo reads, documentation searches, broad snapshots, and navigation detours as performance bugs.
 
 Successful speculative routes become reusable only after independent page-identity verification. Persisted route/skill memory must be bounded, origin-scoped, expiring, and quarantined on structural drift or repeated verification failure. Failed, ambiguous, credential-bearing, or sensitive routes must not be learned or replayed.
 

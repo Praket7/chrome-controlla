@@ -1111,7 +1111,7 @@ fn validate_screenshot_evidence(
         || !matches!(
             evidence["render_frame_provenance"].as_str(),
             Some("two_animation_frames_before_compositor_capture")
-                | Some("hidden_tab_renderer_clock_fallback")
+                | Some("hidden_tab_renderer_clock_sample")
         )
         || evidence["dimensions"]["width"].as_u64() != Some(u64::from(expected.width))
         || evidence["dimensions"]["height"].as_u64() != Some(u64::from(expected.height))
@@ -2379,7 +2379,7 @@ mod screenshot_payload_tests {
 
         let mut hidden = evidence.clone();
         hidden["render_frame_provenance"] =
-            serde_json::json!("hidden_tab_renderer_clock_fallback");
+            serde_json::json!("hidden_tab_renderer_clock_sample");
         let hidden_public = validate_screenshot_evidence(
             &hidden,
             expectation("123", "image-hash", 1, 1),
@@ -2387,7 +2387,7 @@ mod screenshot_payload_tests {
         .unwrap();
         assert_eq!(
             hidden_public["render_frame_provenance"],
-            "hidden_tab_renderer_clock_fallback"
+            "hidden_tab_renderer_clock_sample"
         );
 
         let mut stale = evidence.clone();

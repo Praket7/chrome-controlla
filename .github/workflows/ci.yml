@@ -28,6 +28,8 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/google-chrome.deb && sudo apt-get update && sudo apt-get install -y /tmp/google-chrome.deb
+      - run: npm ci --ignore-scripts
+      - run: npm run check:background-dom
       - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
       - run: node extensions/chrome-controlla/test-background.cjs --reconnect-only
       - run: for run in {1..8}; do node extensions/chrome-controlla/test-background.cjs; done
@@ -83,6 +85,7 @@ jobs:
       - run: npm run check:release
       - run: npm run check:v3
       - run: node extensions/chrome-controlla/test-background.cjs
+      - run: npm run check:topology
       - run: node extensions/chrome-controlla/test-v3-batch.cjs
       - run: node --check extensions/chrome-controlla/background.js
       - run: ./scripts/check-dependencies.sh

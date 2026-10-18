@@ -5801,7 +5801,7 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `open` returns `route_selection` with every attached source-tab candidate, its probe result and rejection reason, and the selected tab before dispatch. If no candidate is usable, the error includes the same bounded report so recovery does not require an opaque retry. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
+        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `open` uses a requested source tab, or the sole attached tab; several attached tabs require an explicit chrome_tab_id. The compact `route_selection` records the selected source and each rejected candidate before dispatch. If no candidate is usable, the error includes the same bounded report so recovery does not require an opaque retry. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
     )]
     async fn shared_tab(
         &self,
@@ -6223,11 +6223,13 @@ impl App {
             .as_ref()
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
         let route_selection = if args.action == "open" {
-            let candidates = connection.selected_targets().clone();
+            let candidates = connection.selected_targets().to_vec();
+            let (eligible, rejected) =
+                route_anchor_plan(&candidates, args.chrome_tab_id.as_deref());
             let registry = shared.registry()?;
             let probe = async {
-                let mut report = Vec::with_capacity(candidates.len());
-                for target in candidates {
+                let mut report = rejected;
+                for target in eligible {
                     match connection
                         .command(
                             registry,
@@ -6253,12 +6255,12 @@ impl App {
                             }));
                             return (Some(target), report);
                         }
-                        Err(error) => {
+                        Err(_) => {
                             report.push(json!({
                                 "tab_id": target,
                                 "accepted": false,
                                 "reason_code": "probe_failed",
-                                "reason": error.to_string(),
+                                "reason": "Page.getFrameTree failed",
                             }));
                         }
                     }
@@ -6268,10 +6270,13 @@ impl App {
             let (source, candidates) = tokio::time::timeout(Duration::from_secs(5), probe)
                 .await
                 .map_err(|_| invalid("timed out finding an attached source tab; route selection exceeded its 5 second budget"))?;
-            let report = route_selection_report(candidates, source.as_deref());
+            let mut report = route_selection_report(candidates, source.as_deref());
+            if let Some(requested) = args.chrome_tab_id.as_deref() {
+                report["requested_tab_id"] = json!(requested);
+            }
             if source.is_none() {
                 return Err(invalid(format!(
-                    "shared session has no currently attached source tab; route_selection={report}"
+                    "shared session has no safe attached source tab; route_selection={report}"
                 )));
             }
             report
@@ -6910,9 +6915,39 @@ fn fit_aggregate(mut output: Value, max_bytes: usize) -> Result<Value, String> {
 ///
 /// The candidate entries intentionally contain only stable tab identity and bounded probe
 /// metadata. Page content is never needed to choose the attached transport source.
+fn route_anchor_plan(candidates: &[String], requested: Option<&str>) -> (Vec<String>, Vec<Value>) {
+    let mut rejected = Vec::new();
+    if let Some(requested) = requested {
+        for candidate in candidates {
+            if candidate != requested {
+                rejected.push(json!({"tab_id":candidate,"accepted":false,"reason_code":"not_requested_anchor"}));
+            }
+        }
+        return (
+            candidates
+                .iter()
+                .filter(|candidate| candidate.as_str() == requested)
+                .cloned()
+                .collect(),
+            rejected,
+        );
+    }
+    if candidates.len() == 1 {
+        return (candidates.to_vec(), rejected);
+    }
+    for candidate in candidates {
+        rejected.push(
+            json!({"tab_id":candidate,"accepted":false,"reason_code":"explicit_anchor_required"}),
+        );
+    }
+    (Vec::new(), rejected)
+}
+
 fn route_selection_report(candidates: Vec<Value>, selected_tab_id: Option<&str>) -> Value {
     json!({
-        "strategy": "first_probeable_attached_tab",
+        "strategy": "explicit_or_unique_attached_tab",
+        "explanation": if selected_tab_id.is_some() { "exact attached source tab passed the identity probe" } else { "no unique safe attached source tab passed the identity probe" },
+        "fallback": if selected_tab_id.is_some() { "create new tab in the selected authorized window when no destination tab is a safe match" } else { "select and pair an exact stable tab in the intended Chrome window, then open a new tab; do not guess an anchor" },
         "selection_completed_before_dispatch": true,
         "selected_tab_id": selected_tab_id,
         "candidates": candidates,
@@ -7446,11 +7481,41 @@ mod tests {
             ],
             Some("12"),
         );
-        assert_eq!(report["strategy"], "first_probeable_attached_tab");
+        assert_eq!(report["strategy"], "explicit_or_unique_attached_tab");
         assert_eq!(report["selection_completed_before_dispatch"], true);
         assert_eq!(report["selected_tab_id"], "12");
+        assert!(
+            report["explanation"]
+                .as_str()
+                .unwrap()
+                .contains("identity probe")
+        );
+        let no_match = route_selection_report(
+            vec![json!({"tab_id":"11","accepted":false,"reason_code":"probe_failed"})],
+            None,
+        );
+        assert!(
+            no_match["fallback"]
+                .as_str()
+                .unwrap()
+                .contains("pair an exact stable tab")
+        );
         assert_eq!(report["candidates"][0]["reason_code"], "probe_failed");
         assert_eq!(report["candidates"][1]["accepted"], true);
+    }
+
+    #[test]
+    fn route_anchor_requires_the_requested_tab_when_several_are_attached() {
+        let candidates = vec!["11".to_owned(), "12".to_owned()];
+        let (eligible, rejected) = super::route_anchor_plan(&candidates, Some("12"));
+        assert_eq!(eligible, vec!["12"]);
+        assert_eq!(rejected[0]["reason_code"], "not_requested_anchor");
+        let (eligible, rejected) = super::route_anchor_plan(&candidates, None);
+        assert!(eligible.is_empty());
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0]["reason_code"], "explicit_anchor_required");
+        let (eligible, _) = super::route_anchor_plan(&["11".to_owned()], None);
+        assert_eq!(eligible, vec!["11"]);
     }
 
     #[test]

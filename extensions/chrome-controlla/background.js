@@ -260,7 +260,7 @@ function applyWatcherStateEvent(previous, event) {
       && Array.isArray(event.groups) && event.groups.length <= WATCHER_MAX_GROUPS
     : state.complete === true;
   return { schema_version: 1, revision: nextRevision,
-    complete,
+    complete: complete && tabs.size <= WATCHER_MAX_TABS && windows.size <= WATCHER_MAX_WINDOWS && groups.size <= WATCHER_MAX_GROUPS,
     tabs: [...tabs.values()].slice(0, WATCHER_MAX_TABS), windows: [...windows.values()].slice(0, WATCHER_MAX_WINDOWS),
     groups: [...groups.values()].slice(0, WATCHER_MAX_GROUPS), updated_at_ms: Date.now() };
 }
@@ -814,6 +814,11 @@ function decodeScreenshotPng(data) {
   if (!width || width > 4096 || !height || height > 4096 || width * height > 16_777_216) throw new Error("Screenshot dimensions exceeded the supported bounds.");
   return { bytes, width, height };
 }
+function nativeLeaseAuthorizes(leaseId, lease, tabId, commandGeneration) {
+  if (nativeGeneration !== commandGeneration) return false;
+  if (lease) return nativeLeases.get(lease.id) === lease && (lease.tabs.has(tabId) || lease.unrestricted);
+  return !leaseId && nativeAttachedTabs.has(tabId);
+}
 function resolveNativeLease(leaseId, tabId) { if (leaseId) return nativeLeases.get(leaseId); const owner = nativeTabLeases.get(tabId); if (owner) return nativeLeases.get(owner); return nativeLeases.size === 1 ? nativeLeases.values().next().value : undefined; }
 function safeNativeError(value) { if (typeof value !== "string" || !value) return undefined; return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 256); }
 function safeErrorClass(error) { try { const name = error?.name; return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : "Error"; } catch { return "Error"; } }
@@ -1076,7 +1081,7 @@ async function handleNativeMessage(port, portGeneration, message) {
   if (message.type === "command" || message.type === "batch") {
     const commandGeneration = nativeGeneration; const leaseId = message.lease_id; const startedAt = Date.now();
     const lease = resolveNativeLease(leaseId, Number(message.target_id));
-    const authorize = tabId => nativeGeneration === commandGeneration && (lease ? lease.tabs.has(tabId) || lease.unrestricted : nativeAttachedTabs.has(tabId));
+    const authorize = tabId => nativeLeaseAuthorizes(leaseId, lease, tabId, commandGeneration);
     const reply = response => {
       const envelope = { ...response, ...(leaseId ? { lease_id: leaseId } : {}) };
       const screenshot = message.method === "Page.captureScreenshot" && response.type === "result";
@@ -1214,6 +1219,98 @@ function waitForUploadNetwork(operation, maxWaitMs = 10000) {
     else quietTimer = setTimeout(() => finish("upload_response_not_observed"), operation.networkRequests.size ? 1200 : 2500);
   });
 }
+async function manageTabTopology(params, authorize) {
+  let dispatched = false;
+  let groupId;
+  const ids = [];
+  const refuse = reason => ({ status: "not_dispatched", reason_code: reason, dispatch_may_have_occurred: false });
+  try {
+    const { kind, targets, background } = params || {};
+    if (!["group", "ungroup", "move", "close"].includes(kind) || typeof background !== "boolean"
+        || !Array.isArray(targets) || targets.length < 1 || targets.length > 16) return refuse("invalid_tab_operation");
+    const allowed = new Set(["kind", "targets", "background", ...(kind === "group" ? ["group_id", "title", "color", "collapsed"] : kind === "move" ? ["window_id", "index"] : [])]);
+    if (Object.keys(params).some(key => !allowed.has(key))) return refuse("unexpected_tab_operation_field");
+    for (const target of targets) {
+      if (!target || Object.keys(target).some(key => !["tab_id", "document_id"].includes(key))
+          || typeof target.tab_id !== "string" || !/^[1-9][0-9]*$/.test(target.tab_id)
+          || !Number.isSafeInteger(Number(target.tab_id)) || ids.includes(Number(target.tab_id))
+          || typeof target.document_id !== "string" || !target.document_id || target.document_id.length > 512) return refuse("invalid_tab_target");
+      ids.push(Number(target.tab_id));
+    }
+    if (ids.some(id => !authorize(id) || pairedTabsInTransit.has(id))) return refuse("target_not_authorized_or_moving");
+    if (kind === "move" && (!Number.isInteger(params.index) || params.index < -1 || params.index > 100000
+        || params.window_id !== undefined && (!Number.isSafeInteger(params.window_id) || params.window_id <= 0))) return refuse("invalid_tab_placement");
+    if (kind === "group" && (params.group_id !== undefined && (!Number.isSafeInteger(params.group_id) || params.group_id < 0)
+        || params.title !== undefined && (typeof params.title !== "string" || params.title.length > 256)
+        || params.color !== undefined && !["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"].includes(params.color)
+        || params.collapsed !== undefined && typeof params.collapsed !== "boolean")) return refuse("invalid_tab_group");
+    const before = await Promise.all(ids.map(id => chrome.tabs.get(id)));
+    const windows = await Promise.all(before.map(tab => chrome.windows.get(tab.windowId)));
+    if (kind === "group" && (before.some(tab => tab.pinned) || new Set(before.map(tab => tab.windowId)).size !== 1)) return refuse("group_requires_unpinned_same_window_tabs");
+    if (background && before.some(tab => tab.active) && (kind === "close" || kind === "move" || params.collapsed === true)) return refuse("activation_forbidden");
+    if (kind === "move" && params.window_id !== undefined) {
+      const destination = await chrome.windows.get(params.window_id);
+      if (!windows.some(window => window.id === destination.id)) windows.push(destination);
+      if (destination.type !== "normal" || before.some(tab => !!tab.incognito !== !!destination.incognito)) return refuse("incompatible_destination_window");
+    }
+    if (kind === "group" && params.group_id !== undefined) {
+      const group = await chrome.tabGroups.get(params.group_id);
+      if (before.some(tab => tab.windowId !== group.windowId)) return refuse("group_window_mismatch");
+      if (background && params.collapsed === true && (await chrome.tabs.query({ groupId: group.id })).some(tab => tab.active)) return refuse("activation_forbidden");
+    }
+    // Re-read every document and tab after asynchronous topology preflight.
+    for (let index = 0; index < ids.length; index++) {
+      const identity = await nativePageIdentity(ids[index]);
+      const tab = await chrome.tabs.get(ids[index]);
+      if (!authorize(ids[index]) || identity.document_id !== targets[index].document_id
+          || tab.windowId !== before[index].windowId || tab.index !== before[index].index
+          || tab.groupId !== before[index].groupId || tab.active !== before[index].active) return refuse("stale_tab_topology_or_document");
+    }
+    if (ids.some(id => !authorize(id))) return refuse("target_authorization_changed");
+    for (const id of ids) { bumpPairedTabTopology(id); pairedTabsInTransit.add(id); }
+    dispatched = true;
+    if (kind === "group") {
+      groupId = await chrome.tabs.group({ tabIds: ids, ...(params.group_id === undefined ? {} : { groupId: params.group_id }) });
+      const updates = Object.fromEntries(["title", "color", "collapsed"].filter(key => params[key] !== undefined).map(key => [key, params[key]]));
+      if (Object.keys(updates).length) {
+        if (ids.some(id => !authorize(id))) throw Error("authorization_changed_after_group");
+        await chrome.tabGroups.update(groupId, updates);
+      }
+    } else if (kind === "ungroup") await chrome.tabs.ungroup(ids);
+    else if (kind === "move") await chrome.tabs.move(ids, { index: params.index, ...(params.window_id === undefined ? {} : { windowId: params.window_id }) });
+    else await chrome.tabs.remove(ids);
+    const after = [];
+    // A failed tabs.get is not evidence of absence: require a successful inventory.
+    const remaining = kind === "close" ? await chrome.tabs.query({}) : null;
+    for (let index = 0; index < ids.length; index++) {
+      if (kind === "close") { if (remaining.some(tab => tab.id === ids[index])) throw Error("close_unverified"); continue; }
+      const tab = await chrome.tabs.get(ids[index]);
+      if (!tab || !authorize(ids[index]) || (await nativePageIdentity(ids[index])).document_id !== targets[index].document_id) throw Error("document_changed_after_dispatch");
+      if (kind === "group" && tab.groupId !== groupId || kind === "ungroup" && tab.groupId !== -1) throw Error("group_membership_unverified");
+      if (kind === "move" && tab.windowId !== (params.window_id ?? before[index].windowId)) throw Error("destination_unverified");
+      if (background && tab.active !== before[index].active) throw Error("activation_changed");
+      after.push({ tab_id: String(tab.id), document_id: targets[index].document_id, window_id: tab.windowId, index: tab.index, group_id: tab.groupId });
+    }
+    if (kind === "move" && params.index >= 0 && after[0]?.index !== params.index) throw Error("insertion_index_unverified");
+    if (kind === "move" && after.some((tab,index) => index > 0 && tab.index !== after[index-1].index + 1)) throw Error("move_order_unverified");
+    if (kind === "group") {
+      const group = await chrome.tabGroups.get(groupId);
+      if (["title", "color", "collapsed"].some(key => params[key] !== undefined && group[key] !== params[key])) throw Error("group_properties_unverified");
+    }
+    if (background) {
+      for (const previous of windows) if ((await chrome.windows.get(previous.id)).focused !== previous.focused) throw Error("focus_changed");
+    }
+    return { status: "verified", verified: true, kind, dispatch_may_have_occurred: true, topology_verified: true,
+      ...(groupId === undefined ? {} : { group_id: groupId }), tabs: after, ...(kind === "close" ? { closed_tab_ids: ids.map(String) } : {}) };
+  } catch (_) {
+    return { status: dispatched ? "unknown" : "not_dispatched", reason_code: dispatched ? "tab_topology_outcome_uncertain" : "tab_topology_preflight_failed",
+      dispatch_may_have_occurred: dispatched, ...(groupId === undefined ? {} : { group_id: groupId }),
+      next_action: dispatched ? "inspect current tabs and groups; do not replay the mutation" : "refresh tab inventory and correct the request" };
+  } finally {
+    if (dispatched) for (const id of ids) pairedTabsInTransit.delete(id);
+  }
+}
+
 async function dispatchCommand(request, isAuthorized, respond, nativeMessage = false) {
   const tabId = Number(request.target_id); const startedAt = Date.now();
   const nativeLease = nativeMessage ? resolveNativeLease(request.lease_id, tabId) : undefined;
@@ -1295,6 +1392,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       receipts[operationKey] = { ...receipt, status: "closed", closed_ms: Date.now() };
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
       respond({ type: "result", id: request.id, result: { status: "closed", tab_id: String(ownedTabId), window_id: tab.windowId, document_id: identity.document_id, topology_verified: true, idempotent_reuse: false } }); return;
+    }
+    if (request.method === "Controlla.manageTabs") {
+      if (!nativeRoute) throw new Error("Tab management requires a native session.");
+      const result = await queueNativeMutation(() => manageTabTopology(request.params, leaseAuthorized));
+      // Deliberate topology changes invalidate the old command anchor. The
+      // operation already verified each selected document and final topology.
+      sendResponse({ type: "result", id: request.id, result }); return;
     }
     if (request.method === "Controlla.activateOwnedTab") {
       const ownedTabId = Number(request.params?.owned_tab_id);
@@ -2395,6 +2499,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     traceSharedCommand("dispatch", request, tabId, startedAt, { requestBytes });
     let result;
+    let screenshotRetried = false;
     try {
       result = await sendCdpCommand({ tabId }, request.method, request.params || {}, request.deadline_ms);
     } catch (error) {
@@ -2402,6 +2507,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       // screenshot is read-only, so retry once against the view surface after
       // the same identity/lifecycle checks above have passed.
       if (request.method !== "Page.captureScreenshot" || !screenshotIsHidden || request.params?.fromSurface !== true) throw error;
+      screenshotRetried = true;
       result = await sendCdpCommand({ tabId }, request.method, { ...request.params, fromSurface: false }, request.deadline_ms);
     }
     let decodedScreenshot;
@@ -2413,7 +2519,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         // misleading invalid-image failure.
         decodedScreenshot = decodeScreenshotPng(result?.data);
       } catch (error) {
-        if (!screenshotIsHidden || request.params?.fromSurface !== true) throw error;
+        if (screenshotRetried || !screenshotIsHidden || request.params?.fromSurface !== true) throw error;
         result = await sendCdpCommand({ tabId }, request.method, { ...request.params, fromSurface: false }, request.deadline_ms);
         decodedScreenshot = decodeScreenshotPng(result?.data);
       }
@@ -2454,46 +2560,28 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     traceSharedCommand("settled", request, tabId, startedAt, { outcome: "result", requestBytes, responseBytes: (() => { try { return JSON.stringify(result).length; } catch { return 0; } })() }); respond({ type: "result", id: request.id, result });
   } catch (error) { traceSharedCommand("settled", request, tabId, startedAt, { outcome: "error", errorClass: safeErrorClass(error) }); respond({ type: "result", id: request.id, error: String(error), ...(error?.reason_code ? { reason_code: error.reason_code } : {}) }); }
 }
-async function observeFreshRendererFrame(tabId, allowHiddenFallback = false) {
-  const expression = "new Promise(resolve=>{let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;resolve({ready:false})}},1000);requestAnimationFrame(()=>requestAnimationFrame(timestamp=>{if(!settled){settled=true;clearTimeout(timer);resolve({ready:true,timestamp_ms:timestamp})}}))})";
-  let result, deadlineTimer;
+async function observeFreshRendererFrame(tabId, hidden = false) {
+  // Hidden documents suspend RAF. Sample the renderer directly without
+  // activation; this proves liveness, not an application paint or persistence.
+  const expression = hidden ? "performance.now()" : "new Promise(resolve=>{let settled=false;const timer=setTimeout(()=>{if(!settled){settled=true;resolve({ready:false})}},1000);requestAnimationFrame(()=>requestAnimationFrame(timestamp=>{if(!settled){settled=true;clearTimeout(timer);resolve({ready:true,timestamp_ms:timestamp})}}))})";
+  let result;
   try {
-    result = await Promise.race([
-      sendCdpCommand({ tabId }, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }),
-      new Promise((_, reject) => { deadlineTimer = setTimeout(() => reject(Object.assign(new Error("Timed out waiting for a fresh renderer animation frame."), { reason_code: "screenshot_render_frame_timeout" })), 1500); }),
-    ]);
-  } catch (error) {
-    if (allowHiddenFallback) {
-      // Chrome throttles requestAnimationFrame in background tabs. A hidden
-      // tab can still have an active, stable renderer and a valid compositor
-      // surface, so use a renderer clock sample instead of requiring two RAF
-      // ticks. Document and lifecycle identity are rechecked by the caller
-      // immediately before and after capture.
-      let timestampMs = Date.now();
-      try {
-        const clock = await sendCdpCommand({ tabId }, "Runtime.evaluate", {
-          expression: "performance.now()",
-          returnByValue: true,
-        });
-        if (Number.isFinite(clock?.result?.value)) timestampMs = clock.result.value;
-      } catch (_) {}
-      return { ready: true, timestamp_ms: timestampMs, provenance: "hidden_tab_renderer_clock_fallback" };
-    }
-    throw Object.assign(new Error(error?.reason_code ? String(error.message) : "Could not observe a fresh renderer animation frame before screenshot capture."), {
-      reason_code: error?.reason_code || "screenshot_render_frame_unavailable",
+    result = await sendCdpCommand({ tabId }, "Runtime.evaluate", {
+      expression, awaitPromise: !hidden, returnByValue: true,
+    }, 1500);
+  } catch (_) {
+    throw Object.assign(new Error("Could not observe the renderer before screenshot capture."), {
+      reason_code: "screenshot_render_frame_unavailable",
     });
-  } finally {
-    clearTimeout(deadlineTimer);
   }
-  const frame = result?.result?.value;
-  if (frame?.ready !== true || !Number.isFinite(frame.timestamp_ms) || frame.timestamp_ms < 0) {
-    if (allowHiddenFallback) {
-      return { ready: true, timestamp_ms: Date.now(), provenance: "hidden_tab_renderer_clock_fallback" };
-    }
-    throw Object.assign(new Error("Renderer did not produce two animation frames before screenshot capture."), { reason_code: "screenshot_render_frame_unavailable" });
+  const value = result?.result?.value;
+  const frame = hidden ? { ready: true, timestamp_ms: value, provenance: "hidden_tab_renderer_clock_sample" } : value;
+  if (result?.exceptionDetails || frame?.ready !== true || !Number.isFinite(frame.timestamp_ms) || frame.timestamp_ms < 0) {
+    throw Object.assign(new Error("Renderer did not supply valid capture evidence."), { reason_code: "screenshot_render_frame_unavailable" });
   }
   return frame;
 }
+
 function screenshotTargetLifecycle(tab) {
   if (!tab) return "unknown";
   if (tab.discarded) return "discarded";

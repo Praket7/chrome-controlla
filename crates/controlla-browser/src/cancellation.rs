@@ -98,25 +98,15 @@ pub async fn admit_browser_command(
 
 pub fn may_mutate(method: &str) -> bool {
     method.starts_with("Input.")
-        || matches!(
-            method,
-            "Page.navigate"
-                | "DOM.setFileInputFiles"
-                | "Runtime.callFunctionOn"
-                | "Runtime.evaluate"
-                | "Controlla.fastType"
-                | "Controlla.humanTypeCharacter"
-                | "Controlla.securePasswordFill"
-                | "Controlla.frameClick"
-                | "Controlla.frameFill"
-                | "Controlla.frameSelectFile"
-                | "Controlla.setFrameFileInputFiles"
-                | "Controlla.openTab"
-                | "Controlla.navigate"
-                | "Controlla.closeOwnedTab"
-                | "Controlla.moveOwnedTab"
-                | "Controlla.activateOwnedTab"
-        )
+        // New extension commands are fenced by default. Only established
+        // observation commands may run after cancellation for reconciliation.
+        || (method.starts_with("Controlla.") && !matches!(method,
+            "Controlla.presentationState" | "Controlla.checkIdentityMarker"
+            | "Controlla.fileInputSnapshot" | "Controlla.findFileInput"
+            | "Controlla.frameAccessibility" | "Controlla.newTabs"
+            | "Controlla.waitForFileChooser"))
+        || matches!(method, "Page.navigate" | "DOM.setFileInputFiles"
+            | "Runtime.callFunctionOn" | "Runtime.evaluate")
 }
 
 #[cfg(test)]
@@ -146,6 +136,40 @@ mod tests {
             0,
             "cancellation during preflight prevents the side effect at the dispatch boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_fences_all_extension_mutations_and_future_commands() {
+        let cancellation = Arc::new(WorkflowCancellation::default());
+        cancellation.cancel().await;
+        with_workflow_cancellation(cancellation, async {
+            for method in [
+                "Controlla.pointerClick",
+                "Controlla.pointerScroll",
+                "Controlla.pointerSwipe",
+                "Controlla.pointerMultiTouch",
+                "Controlla.frameScroll",
+                "Controlla.frameSwipe",
+                "Controlla.scrollToTarget",
+                "Controlla.futureMutation",
+            ] {
+                assert!(
+                    admit_browser_command(method).await.is_err(),
+                    "{method} escaped cancellation"
+                );
+            }
+            for method in [
+                "Controlla.presentationState",
+                "Controlla.checkIdentityMarker",
+                "Page.getFrameTree",
+            ] {
+                assert!(
+                    admit_browser_command(method).await.is_ok(),
+                    "read-only reconciliation {method} blocked"
+                );
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

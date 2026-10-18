@@ -1,15 +1,146 @@
 #!/usr/bin/env node
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-const root=resolve(fileURLToPath(new URL('..',import.meta.url))); const stateDir=await mkdtemp(join(tmpdir(),'controlla-phase11-')); const stateFile=join(stateDir,'state.json');
-const server=spawn(process.execPath,[resolve(root,'bench/fixtures/realistic/server.mjs'), '--port=0'],{cwd:root,env:{...process.env,PHASE11_STATE_FILE:stateFile},stdio:['ignore','pipe','inherit']});
-let line=''; const base=await new Promise((resolveBase,reject)=>{const timer=setTimeout(()=>reject(new Error('fixture server startup timeout')),10000); server.stdout.on('data',chunk=>{line+=chunk; const idx=line.indexOf('\n'); if(idx<0)return; clearTimeout(timer); try{resolveBase(JSON.parse(line.slice(0,idx)).base_url)}catch(e){reject(e)}}); server.on('error',reject)});
-const adapters=['controlla','controlla-1','controlla-2-pre-stage2','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use']; const binary=process.env.PHASE11_CONTROLLA_BINARY??resolve(root,'target/release/controlla-v2'); const sha=path=>createHash('sha256').update(readFileSync(path)).digest('hex'); const patchSha=createHash('sha256').update(execFileSync('git',['diff','--binary'],{cwd:root})).digest('hex'); const env={...process.env,PHASE11_BASELINE_IDS:process.env.PHASE11_BASELINE_IDS??'playwright-mcp',PHASE11_FIXTURE_BASE_URL:base,PHASE11_STATE_FILE:stateFile,PHASE11_CODEX_PATH:process.env.PHASE11_CODEX_PATH??'/Users/pcg/.local/bin/codex',PHASE11_CONTROLLA_BINARY:binary,PHASE11_CHROME_PATH:process.env.PHASE11_CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',PHASE11_ENVIRONMENT_JSON:JSON.stringify({candidate_source_sha:execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim(),dirty_tree_patch_sha256:patchSha,runtime_binary_sha256:sha(binary),extension_build_sha256:sha(resolve(root,'extensions/chrome-controlla/manifest.json')),chrome_version:'local',os_build:process.platform,machine_profile:`${process.platform}-${process.arch}`,model:process.env.PHASE11_MODEL??'gpt-6-luna',model_settings:'default',prompt_hash:'adapter-generated',token_budget:32000,fixture_revision:'local-realistic-v1',network_profile:'loopback-only',account_fixture_id:'phase11-local-disposable',browser_version:'local',machine:`${process.platform}-${process.arch}`,run_mode:'headless',verifier_version:'local-independent-state-v1',client_adapter_versions:Object.fromEntries(adapters.map(a=>[a,'local-command-adapter-v1']))}) ,PHASE11_RESET_COMMAND_JSON:JSON.stringify([process.execPath,resolve(root,'bench/adapters/phase11-reset.mjs')]),PHASE11_VERIFIER_COMMAND_JSON:JSON.stringify([process.execPath,resolve(root,'bench/adapters/phase11-verifier.mjs')]),...(process.env.PHASE11_BASELINE_IDS?{PHASE11_BASELINE_IDS:process.env.PHASE11_BASELINE_IDS}: {})};
-for(const id of ['controlla',...adapters.slice(1)]) env[`PHASE11_${id.toUpperCase().replace(/[^A-Z0-9]+/g,'_')}_COMMAND_JSON`]=JSON.stringify([process.execPath,resolve(root,'bench/adapters/phase11-command.mjs'),id]);
-const args=['bench/runners/phase11-suite.mjs',`--modes=${process.env.PHASE11_MODES??'cold_browser,warm_browser_cold_site,warm_qualified_route,reconnect'}`,`--execution-modes=${process.env.PHASE11_EXECUTION_MODES??'headless'}`,`--concurrency=${process.env.PHASE11_CONCURRENCY??'1,2,4,8'}`,`--repetitions=${process.env.PHASE11_REPETITIONS??'1'}`,`--deadline-ms=${process.env.PHASE11_DEADLINE_MS??'15000'}`,`--baseline-ids=${process.env.PHASE11_BASELINE_IDS??'playwright-mcp'}`,`--output=${process.env.PHASE11_OUTPUT??'bench/reports/phase11-suite-local.json'}`];
-try{const code=await new Promise(done=>{const child=spawn(process.execPath,args,{cwd:root,env,stdio:'inherit'}); child.on('close',done)}); process.exitCode=code;} finally {server.kill('SIGTERM'); await rm(stateDir,{recursive:true,force:true});}
+
+export async function hashDirectory(directory) {
+  const entries = [];
+  async function walk(current) {
+    for (const item of (await readdir(current, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(current, item.name);
+      if (item.isDirectory()) await walk(path);
+      else if (item.isFile()) entries.push([relative(directory, path).split('\\').join('/'), await readFile(path)]);
+      else throw new Error(`unsupported extension build asset type: ${path}`);
+    }
+  }
+  await walk(directory);
+  if (entries.length === 0) throw new Error('extension build asset directory is empty');
+  const hash = createHash('sha256');
+  for (const [path, bytes] of entries) {
+    const pathBytes = Buffer.from(path, 'utf8');
+    const pathLength = Buffer.alloc(8);
+    const contentLength = Buffer.alloc(8);
+    pathLength.writeBigUInt64BE(BigInt(pathBytes.length));
+    contentLength.writeBigUInt64BE(BigInt(bytes.length));
+    hash.update(pathLength);
+    hash.update(pathBytes);
+    hash.update(contentLength);
+    hash.update(bytes);
+  }
+  return hash.digest('hex');
+}
+
+export function requireCleanTree(root) {
+  const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], { cwd: root, encoding: 'utf8' });
+  if (status.trim()) throw new Error('qualified convenience run requires a clean Git tree, including staged and untracked files');
+  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+}
+
+export function parseAdapterVersions(raw, adapters) {
+  if (!raw) throw new Error('PHASE11_CLIENT_ADAPTER_VERSIONS_JSON must provide exact observed versions for every configured adapter');
+  let versions;
+  try { versions = JSON.parse(raw); } catch { throw new Error('PHASE11_CLIENT_ADAPTER_VERSIONS_JSON must be valid JSON'); }
+  for (const id of adapters) {
+    if (typeof versions?.[id] !== 'string' || !versions[id].trim() || /^(local|unknown|latest|test)(-|$)/i.test(versions[id])) {
+      throw new Error(`exact observed client adapter version required for ${id}`);
+    }
+  }
+  return versions;
+}
+
+async function main() {
+  const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+  const adapters = ['controlla','controlla-1','controlla-2-pre-stage2','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use'];
+  const candidateSourceSha = requireCleanTree(root);
+  const clientVersions = parseAdapterVersions(process.env.PHASE11_CLIENT_ADAPTER_VERSIONS_JSON, adapters);
+  const stateDir = await mkdtemp(join(tmpdir(), 'controlla-phase11-'));
+  const stateFile = join(stateDir, 'state.json');
+  const fixture = spawn(process.execPath, [resolve(root, 'bench/fixtures/realistic/server.mjs'), '--port=0'], {
+    cwd: root, env: { ...process.env, PHASE11_STATE_FILE: stateFile }, stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  try {
+    const base = await new Promise((resolveBase, reject) => {
+      let buffer = '';
+      const timer = setTimeout(() => reject(new Error('fixture server startup timeout')), 10000);
+      fixture.stdout.setEncoding('utf8');
+      fixture.stdout.on('data', chunk => {
+        buffer += chunk;
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        clearTimeout(timer);
+        try { resolveBase(JSON.parse(buffer.slice(0, newline)).base_url); } catch (error) { reject(error); }
+      });
+      fixture.once('error', reject);
+    });
+    const binary = process.env.PHASE11_CONTROLLA_BINARY ?? resolve(root, 'target/release/controlla-v2');
+    const chrome = process.env.PHASE11_CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    const codex = process.env.PHASE11_CODEX_PATH ?? '/Users/pcg/.local/bin/codex';
+    const sha = async path => createHash('sha256').update(await readFile(path)).digest('hex');
+    const [runtimeHash, extensionHash] = await Promise.all([
+      sha(binary), hashDirectory(resolve(root, 'extensions/chrome-controlla')),
+    ]);
+    const chromeVersion = execFileSync(chrome, ['--version'], { encoding: 'utf8' }).trim();
+    if (!chromeVersion) throw new Error('Chrome did not report its version');
+    const codexVersion = execFileSync(codex, ['--version'], { encoding: 'utf8' }).trim();
+    if (!codexVersion) throw new Error('Codex did not report its version');
+    const dirtyTreeHash = createHash('sha256').update('').digest('hex');
+    const env = {
+      ...process.env,
+      PHASE11_BASELINE_IDS: process.env.PHASE11_BASELINE_IDS ?? 'playwright-mcp',
+      PHASE11_FIXTURE_BASE_URL: base,
+      PHASE11_STATE_FILE: stateFile,
+      PHASE11_CODEX_PATH: codex,
+      PHASE11_CONTROLLA_BINARY: binary,
+      PHASE11_CHROME_PATH: chrome,
+      PHASE11_ENVIRONMENT_JSON: JSON.stringify({
+        candidate_source_sha: candidateSourceSha,
+        dirty_tree_patch_sha256: dirtyTreeHash,
+        runtime_binary_sha256: runtimeHash,
+        extension_build_sha256: extensionHash,
+        chrome_version: chromeVersion,
+        browser_version: chromeVersion,
+        codex_version: codexVersion,
+        os_build: `${process.platform}-${process.arch}`,
+        machine_profile: `${process.platform}-${process.arch}`,
+        model: process.env.PHASE11_MODEL ?? 'gpt-6-luna',
+        model_settings: process.env.PHASE11_MODEL_SETTINGS ?? 'unspecified',
+        prompt_hash: process.env.PHASE11_PROMPT_HASH ?? 'adapter-generated',
+        token_budget: Number(process.env.PHASE11_TOKEN_BUDGET ?? 32000),
+        fixture_revision: 'local-realistic-v1',
+        network_profile: 'loopback-only',
+        account_fixture_id: 'phase11-local-disposable',
+        client_adapter_versions: clientVersions,
+      }),
+      PHASE11_RESET_COMMAND_JSON: JSON.stringify([process.execPath, resolve(root, 'bench/adapters/phase11-reset.mjs')]),
+      PHASE11_VERIFIER_COMMAND_JSON: JSON.stringify([process.execPath, resolve(root, 'bench/adapters/phase11-verifier.mjs')]),
+    };
+    for (const id of adapters) env[`PHASE11_${id.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_COMMAND_JSON`] = JSON.stringify([process.execPath, resolve(root, 'bench/adapters/phase11-command.mjs'), id]);
+    const args = [
+      'bench/runners/phase11-suite.mjs',
+      `--modes=${process.env.PHASE11_MODES ?? 'cold_browser,warm_browser_cold_site,warm_qualified_route,reconnect'}`,
+      `--execution-modes=${process.env.PHASE11_EXECUTION_MODES ?? 'headless'}`,
+      `--concurrency=${process.env.PHASE11_CONCURRENCY ?? '1'}`,
+      `--repetitions=${process.env.PHASE11_REPETITIONS ?? '1'}`,
+      `--deadline-ms=${process.env.PHASE11_DEADLINE_MS ?? '15000'}`,
+      `--baseline-ids=${process.env.PHASE11_BASELINE_IDS ?? 'playwright-mcp'}`,
+      `--output=${process.env.PHASE11_OUTPUT ?? 'bench/reports/phase11-suite-local.json'}`,
+    ];
+    const code = await new Promise(done => {
+      const child = spawn(process.execPath, args, { cwd: root, env, stdio: 'inherit' });
+      child.once('close', done);
+      child.once('error', () => done(1));
+    });
+    process.exitCode = code;
+  } finally {
+    fixture.kill('SIGTERM');
+    await rm(stateDir, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+  main().catch(error => { console.error(error.stack ?? error.message); process.exit(1); });
+}

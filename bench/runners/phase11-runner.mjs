@@ -265,7 +265,7 @@ async function independentlyVerify(verifierCommand, input, actingResult, timeout
 
 async function runOne({ adapter, command, task, mode, executionMode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env }) {
   const fixtureUrl = task.url ? liveTaskUrl(task) : (() => { const url = new URL(task.fixture, fixtureBaseUrl); url.searchParams.set('task', task.id); if (task.scenario) url.searchParams.set('scenario', task.scenario); return url.toString(); })();
-  const input = { task_id: task.id, scenario: task.scenario, mode, execution_mode: executionMode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
+  const input = { task_id: task.id, task_class: task.class, scenario: task.scenario, mode, execution_mode: executionMode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
   const adapterRequestStartedNs = process.hrtime.bigint();
   const invocationMetrics = {};
@@ -487,6 +487,7 @@ export async function runBenchmark({
   for (const mode of selectedModes) if (!config.modes.includes(mode)) throw new Error(`unsupported mode ${mode}`);
   for (const executionMode of selectedExecutionModes) if (!config.execution_modes.includes(executionMode)) throw new Error(`unsupported execution mode ${executionMode}`);
   for (const value of selectedConcurrency) if (!config.concurrency.includes(value)) throw new Error(`unsupported concurrency ${value}`);
+  if (selectedConcurrency.some(value => value > 1)) throw new Error('concurrency levels above 1 are unsupported: the runner executes paired adapter commands sequentially');
   const candidateCommand = commands?.[candidateId];
   const baselineCommand = commands?.[baselineId];
   if (!candidateCommand || !baselineCommand || !resetCommand || !verifierCommand) throw new Error('candidate, baseline, reset, and verifier commands are required');

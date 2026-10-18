@@ -8,10 +8,13 @@ function startAgentUxProxy(child, options = {}) {
   const clientLines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let internalId = 1;
   let schemaStale = true;
+  let schemaRevision = 0;
+  let refreshPromise = null;
   let serverTools = [];
   let closed = false;
   let closingPromise = null;
   const pending = new Map();
+  const inFlight = new Set();
 
   const sendServer = message => {
     if (closed || !child.stdin.writable) throw new Error('Controlla MCP process is closed');
@@ -31,34 +34,53 @@ function startAgentUxProxy(child, options = {}) {
     });
   }
 
-  const runtime = new AgentUxRuntime({
-    callTool: async (name, args) => {
-      try {
-        return await rpc('tools/call', { name, arguments: args });
-      } catch (error) {
-        if (error?.code !== -32602) throw error;
-        schemaStale = true;
-        await refreshTools();
-        return rpc('tools/call', { name, arguments: args });
+  async function callServerTool(name, args) {
+    async function callAtCurrentRevision() {
+      const revision = schemaRevision;
+      const result = await rpc('tools/call', { name, arguments: args });
+      if (revision !== schemaRevision) {
+        throw Object.assign(new Error('Controlla schema changed while tool call was pending; outcome is unknown'), { code: -32000 });
       }
-    },
+      return result;
+    }
+    try {
+      return await callAtCurrentRevision();
+    } catch (error) {
+      if (error?.code !== -32602) throw error;
+      schemaStale = true;
+      await refreshTools();
+      return callAtCurrentRevision();
+    }
+  }
+
+  const runtime = new AgentUxRuntime({
+    callTool: callServerTool,
     stateDir: options.stateDir
   });
 
-  async function refreshTools() {
-    const tools = [];
-    let cursor;
-    do {
-      const page = await rpc('tools/list', cursor ? { cursor } : {});
-      tools.push(...(page?.tools ?? []));
-      cursor = page?.nextCursor;
-    } while (cursor);
-    const names = new Set(tools.map(tool => tool.name));
-    const missing = SIX_TOOLS.filter(name => !names.has(name));
-    if (missing.length) throw new Error(`Controlla server is missing required V3 tools: ${missing.join(', ')}`);
-    serverTools = tools;
-    runtime.setServerTools(tools);
-    schemaStale = false;
+  function refreshTools() {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+      while (true) {
+        const revision = schemaRevision;
+        const tools = [];
+        let cursor;
+        do {
+          const page = await rpc('tools/list', cursor ? { cursor } : {});
+          tools.push(...(page?.tools ?? []));
+          cursor = page?.nextCursor;
+        } while (cursor);
+        if (revision !== schemaRevision) continue;
+        const names = new Set(tools.map(tool => tool.name));
+        const missing = SIX_TOOLS.filter(name => !names.has(name));
+        if (missing.length) throw new Error(`Controlla server is missing required V3 tools: ${missing.join(', ')}`);
+        serverTools = tools;
+        runtime.setServerTools(tools);
+        schemaStale = false;
+        return;
+      }
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
   }
 
   async function ensureTools() {
@@ -82,14 +104,14 @@ function startAgentUxProxy(child, options = {}) {
     }
     if (message.method === 'notifications/tools/list_changed') {
       schemaStale = true;
+      schemaRevision++;
       return;
     }
     sendClient(message);
   });
 
-  let chain = Promise.resolve();
   clientLines.on('line', line => {
-    chain = chain.then(async () => {
+    const task = (async () => {
       let request;
       try { request = JSON.parse(line); }
       catch {
@@ -121,13 +143,15 @@ function startAgentUxProxy(child, options = {}) {
         return;
       }
       sendServer(request);
-    }).catch(error => process.stderr.write(`Chrome Controlla proxy request failed: ${error.stack ?? error}\n`));
+    })().catch(error => process.stderr.write(`Chrome Controlla proxy request failed: ${error.stack ?? error}\n`));
+    inFlight.add(task);
+    task.finally(() => inFlight.delete(task));
   });
 
   async function closeProxy() {
     if (closingPromise) return closingPromise;
     closingPromise = (async () => {
-      await chain;
+      await Promise.allSettled([...inFlight]);
       clientLines.close();
       serverLines.close();
       if (!closed && child.stdin.writable) child.stdin.end();
@@ -141,6 +165,7 @@ function startAgentUxProxy(child, options = {}) {
 
   child.on('exit', (code, signal) => {
     closed = true;
+    schemaRevision++;
     for (const item of pending.values()) {
       clearTimeout(item.timer);
       item.reject(new Error(`Controlla MCP exited (${signal ?? code})`));

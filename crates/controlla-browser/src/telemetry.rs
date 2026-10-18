@@ -479,6 +479,7 @@ pub async fn record_command_purpose(method: &str, count: u64) {
         "Controlla.activateOwnedTab"
         | "Controlla.closeOwnedTab"
         | "Controlla.moveOwnedTab"
+        | "Controlla.manageTabs"
         | "Controlla.openTab"
         | "Controlla.navigate"
         | "Controlla.newTabs" => "target_lifecycle",

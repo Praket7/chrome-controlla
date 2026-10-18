@@ -30,7 +30,7 @@ To use a downloaded source archive instead, open the GitHub **Code** menu, choos
 
 ### 2. Install prerequisites
 
-- Chrome 125 or later.
+- Chrome 132 or later (the extension uses Chrome’s frozen-tab lifecycle signal).
 - Rust 1.99.0 with Cargo.
 - Node.js 24.19.0 or later.
 
