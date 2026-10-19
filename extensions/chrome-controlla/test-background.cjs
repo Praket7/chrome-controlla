@@ -636,7 +636,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
 }
 runBackground();
 
@@ -667,7 +667,7 @@ function testOpenShadowFrameActionGuard() {
 testOpenShadowFrameActionGuard();
 
 function testWatcherStateMirrorContracts() {
-  const { createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt } = backgroundContext.__testHooks;
+  const { createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, setWatcherStateForTest } = backgroundContext.__testHooks;
   let state = createWatcherStateMirror();
   state = applyWatcherStateEvent(state, { kind: "snapshot", tabs: [
     { id: 4, windowId: 2, groupId: 8, document_id: "doc-1", status: "complete", active: true },
@@ -709,10 +709,11 @@ function testWatcherStateMirrorContracts() {
   state = applyWatcherStateEvent(state, { kind: "tab_removed", tab_id: 4 });
   assert.equal(watcherStateMatches(state, 4, state.revision, "doc-1"), false,
     "tab removal evicts the target binding");
-  assert.equal(watcherRevisionReceipt(5, 1)?.reason_code,
-    "stale_watcher_revision", "removed or invalidated mirror state refuses an old mutation revision");
-  assert.equal(watcherRevisionReceipt(5, 1)?.dispatch_may_have_occurred, false);
-  assert.equal(watcherRevisionReceipt(5, 1)?.next_action, "refresh_and_reacquire_once");
+  setWatcherStateForTest(state);
+  assert.equal(watcherRevisionReceipt(5, 1), null,
+    "an unrelated topology revision does not fence a still-paired document");
+  assert.equal(watcherRevisionReceipt(5, 1, "doc-5"), null,
+    "document-bound commands ignore unrelated global revision churn");
   for (const [collection, limit, event] of [
     ["tabs", 2048, { kind: "tab_created", tab: { id: 3000, windowId: 1, status: "complete" } }],
     ["windows", 128, { kind: "window_updated", window: { id: 3000 } }],
@@ -3299,6 +3300,11 @@ async function waitFor(predicate, description) {
   assert.equal(reusedOwned.tab_id, owned.tab_id);
   assert.equal(reusedOwned.idempotent_reuse, true);
   assert.equal(tabList.length, originalTabCount + 1, "same logical open cannot duplicate the tab");
+  tabUrlOverrides.set(Number(owned.tab_id), "https://example.test/owned-new/next");
+  tabDocumentOverrides.set(Number(owned.tab_id), "document-owned-new-next");
+  const ownedAfterNavigation = await message({ type: "list_tabs", offset: 0, page_size: 100 });
+  assert.equal(ownedAfterNavigation.tabs.find(tab => tab.id === Number(owned.tab_id))?.owned_by_controlla, true,
+    "a Controlla-created tab remains owned after navigation replaces its original document");
   const inOtherWindow = await backgroundContext.__testHooks.createOwnedTabFromNative({
     url:"https://example.test/placed",idempotency_key:"placed-open-fixture",active:false,
     create_background_window:false,target_window_id:2,target_window_policy:"existing_window",expires_at_unix:21

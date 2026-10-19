@@ -6,6 +6,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
@@ -37,6 +38,19 @@ struct StdioRuntime {
     service_pid: u32,
     heartbeat_unix_seconds: u64,
     binary_version: String,
+    process_generation: Option<String>,
+    extension_build_id: Option<String>,
+}
+
+fn process_generation() -> &'static str {
+    static GENERATION: OnceLock<String> = OnceLock::new();
+    GENERATION.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{started}", std::process::id())
+    })
 }
 
 pub fn publish_stdio_runtime(state_dir: &Path, version: &str) -> Result<(), String> {
@@ -44,8 +58,10 @@ pub fn publish_stdio_runtime(state_dir: &Path, version: &str) -> Result<(), Stri
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_secs();
-    let payload = serde_json::json!({"schema_version":1,"service_pid":std::process::id(),
-        "heartbeat_unix_seconds":now,"binary_version":version});
+    let payload = serde_json::json!({"schema_version":2,"service_pid":std::process::id(),
+        "heartbeat_unix_seconds":now,"binary_version":version,
+        "process_generation":process_generation(),
+        "extension_build_id":option_env!("CONTROLLA_EXTENSION_BUILD_ID").unwrap_or("unpaired")});
     let path = state_dir.join("stdio-runtime.json");
     let temp = state_dir.join("stdio-runtime.json.tmp");
     std::fs::write(
@@ -76,7 +92,7 @@ fn probe_stdio_runtime(state_dir: &Path, report: &mut DoctorReport) {
         report.errors.push("stdio runtime record is invalid".into());
         return;
     };
-    if runtime.schema_version != 1
+    if !(runtime.schema_version == 1 || runtime.schema_version == 2)
         || runtime.service_pid == 0
         || runtime.binary_version != report.binary_version
     {
@@ -87,6 +103,12 @@ fn probe_stdio_runtime(state_dir: &Path, report: &mut DoctorReport) {
         return;
     }
     report.configured = State::Healthy;
+    report.process_generation = runtime.process_generation;
+    report.extension_build_id = Some(runtime.extension_build_id.unwrap_or_else(|| {
+        option_env!("CONTROLLA_EXTENSION_BUILD_ID")
+            .unwrap_or("unpaired")
+            .to_owned()
+    }));
     let (process, error) = process_probe(runtime.service_pid);
     report.process = process;
     if let Some(error) = error {
@@ -106,6 +128,8 @@ fn probe_stdio_runtime(state_dir: &Path, report: &mut DoctorReport) {
         Ok(snapshot) => {
             report.transport = State::Healthy;
             report.principal_correlation = snapshot["host_id"].as_str().map(str::to_owned);
+            report.bridge_host_id = snapshot["host_id"].as_str().map(str::to_owned);
+            report.bridge_tab_count = snapshot["tabs"].as_array().map(Vec::len);
         }
         Err(error) => {
             report.transport = State::Failed;
@@ -134,6 +158,14 @@ mod stdio_tests {
         assert_eq!(report.process, State::Healthy);
         assert_eq!(report.heartbeat, State::Healthy);
         assert_eq!(report.live_round_trip, State::Unknown);
+        assert!(
+            report.process_generation.is_some(),
+            "doctor must expose the live worker generation"
+        );
+        assert!(
+            report.extension_build_id.is_some(),
+            "doctor must expose the extension build identity"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -156,6 +188,14 @@ pub fn report_for_client(state_dir: &Path, version: &str, client: Option<&str>) 
         authentication: State::Unknown,
         heartbeat: State::Unknown,
         heartbeat_age_seconds: None,
+        process_generation: None,
+        extension_build_id: Some(
+            option_env!("CONTROLLA_EXTENSION_BUILD_ID")
+                .unwrap_or("unpaired")
+                .to_owned(),
+        ),
+        bridge_host_id: None,
+        bridge_tab_count: None,
         live_round_trip: State::Unknown,
         policy_revision: None,
         expected_mcp_surface: "v3-compact".to_owned(),

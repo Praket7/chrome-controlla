@@ -1843,7 +1843,7 @@ fn pre_dispatch_reacquisition_needed(receipt: &Value) -> bool {
     receipt["status"] == "not_dispatched"
         && (matches!(
             receipt["reason_code"].as_str(),
-            Some("changed_target" | "stale_watcher_revision")
+            Some("changed_target" | "stale_watcher_revision" | "stale_watcher_document")
         ) || receipt["readback"]["reason"] == "target_replaced")
 }
 
@@ -2894,10 +2894,12 @@ fn record_workflow_receipt(
     let receipt_index = receipts.len();
     receipts.push(receipt);
     match status.as_deref() {
-        Some("unknown") if next_step.is_some_and(is_workflow_reconciliation_step) => {
+        Some("unknown" | "dispatched_pending_verification")
+            if next_step.is_some_and(is_workflow_reconciliation_step) =>
+        {
             WorkflowReceiptProgress::ReconcileUnknown(receipt_index)
         }
-        Some("unknown") => WorkflowReceiptProgress::StopUnknown,
+        Some("unknown" | "dispatched_pending_verification") => WorkflowReceiptProgress::StopUnknown,
         Some("failed" | "not_dispatched") => WorkflowReceiptProgress::StopFailed,
         _ => WorkflowReceiptProgress::Continue,
     }
@@ -2941,7 +2943,7 @@ fn normalize_unknown_receipts(value: &mut Value) {
                     && object.get("status").and_then(Value::as_str) == Some("not_dispatched")
                 {
                     let next_action = match object.get("reason_code").and_then(Value::as_str) {
-                        Some("stale_watcher_revision") => "refresh_and_reacquire_once",
+                        Some("stale_watcher_revision" | "stale_watcher_document") => "refresh_and_reacquire_once",
                         Some("stale_reference" | "stale_document" | "changed_target") => {
                             "take_fresh_snapshot_and_retry"
                         }
@@ -4107,6 +4109,38 @@ mod tests {
                 value: "mutate".into(),
             }
         ));
+    }
+
+    #[test]
+    fn pending_navigation_requires_immediate_read_only_reconciliation() {
+        let verify = BrowserWorkflowStep::Verify {
+            predicate: BrowserPredicate::UrlStartsWith {
+                prefix: "https://example.test/".into(),
+            },
+        };
+        let click = BrowserWorkflowStep::Click {
+            reference: "@c1".into(),
+            outcome: BrowserClickOutcome::Navigation { url: None },
+        };
+        let mut receipts = Vec::new();
+        assert_eq!(
+            record_workflow_receipt(
+                &mut receipts,
+                json!({"status":"dispatched_pending_verification","dispatch_acknowledged":true}),
+                None,
+                Some(&verify),
+            ),
+            WorkflowReceiptProgress::ReconcileUnknown(0)
+        );
+        assert_eq!(
+            record_workflow_receipt(
+                &mut receipts,
+                json!({"status":"dispatched_pending_verification","dispatch_acknowledged":true}),
+                None,
+                Some(&click),
+            ),
+            WorkflowReceiptProgress::StopUnknown
+        );
     }
 
     #[test]

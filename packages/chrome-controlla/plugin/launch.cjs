@@ -24,8 +24,45 @@ if (process.env.CONTROLLA_V2_BIN) {
   process.stderr.write('CONTROLLA_V2_BIN is deprecated; use CONTROLLA_BIN.\n');
 }
 
-const child = spawn(binary, ['mcp'], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
-child.stderr.pipe(process.stderr);
+async function spawnWithStartupRetry() {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const child = spawn(binary, ['mcp'], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+    child.stderr.pipe(process.stderr);
+    const earlyExit = await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        resolve(false);
+      }, 400);
+      child.once('error', error => {
+        if (settled) return;
+        clearTimeout(timer);
+        settled = true;
+        reject(error);
+      });
+      child.once('exit', () => {
+        if (settled) return;
+        clearTimeout(timer);
+        settled = true;
+        resolve(true);
+      });
+    });
+    if (!earlyExit) return child;
+    if (attempt < maxAttempts) await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+  }
+  throw new Error(`Chrome Controlla worker exited during startup after ${maxAttempts} attempts`);
+}
+
+async function main() {
+  let child;
+  try {
+    child = await spawnWithStartupRetry();
+  } catch (error) {
+    process.stderr.write(`Could not start Chrome Controlla: ${error.message}\n`);
+    process.exitCode = 127;
+    return;
+  }
 const proxy = startAgentUxProxy(child, { stateDir: process.env.CONTROLLA_STATE_DIR });
 let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -48,4 +85,10 @@ child.on('exit', (code, signal) => {
   } else if (!stopping) {
     process.exitCode = code ?? 1;
   }
+});
+}
+
+main().catch(error => {
+  process.stderr.write(`Chrome Controlla launcher failed: ${error.stack ?? error}\n`);
+  process.exitCode = 1;
 });

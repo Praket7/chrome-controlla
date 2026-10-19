@@ -375,6 +375,16 @@ test('runtime instructions forbid schema probing for ordinary MCP browser tasks'
   assert.match(instructions, /presentation_warning=chrome_window_not_focused/i);
   assert.match(instructions, /unknown means dispatch may have happened/i);
   assert.doesNotMatch(instructions, /Read these tool schemas once per session/i);
+  assert.doesNotMatch(instructions, /"kind":"find"[^}]*"exhaustive"/i,
+    'canonical find recipe must contain only fields accepted by the live workflow schema');
+  assert.match(instructions, /no safe existing tab matches.*no_safe_tab_match/i);
+});
+
+test('packaged launcher retries only startup failures before proxy dispatch', () => {
+  const launchSource = fs.readFileSync(path.resolve(__dirname, 'plugin/launch.cjs'), 'utf8');
+  assert.match(launchSource, /maxAttempts = 3/);
+  assert.match(launchSource, /setTimeout\(resolve, 100 \* attempt\)/);
+  assert.match(launchSource, /startAgentUxProxy\(child/);
 });
 
 test('follow-up tools can use only the opaque context handle', async () => {

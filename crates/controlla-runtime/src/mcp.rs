@@ -4813,6 +4813,18 @@ impl App {
                 "mouse dispatch/release uncertain; inspect state before deciding any further action"
             );
         }
+        if result["status"] == "unknown"
+            && acknowledged
+            && matches!(&args.outcome, SharedClickOutcome::Navigation { .. })
+        {
+            result["status"] = json!("dispatched_pending_verification");
+            result["verification_status"] = json!("pending");
+            result["verified"] = json!(false);
+            result["next_action"] = json!("verify_destination_once");
+            result["reason"] = json!(
+                "Navigation dispatch was acknowledged but the destination was not observable before the bounded wait; verify once and do not replay the click."
+            );
+        }
         if pointer_activation.is_object() {
             result["pointer_activation"] = pointer_activation;
         }

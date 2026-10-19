@@ -276,11 +276,18 @@ function watcherStateMatches(state, tabId, expectedRevision, expectedDocumentId)
   if (tab.target_revision !== expectedRevision) return false;
   return expectedDocumentId === undefined || (typeof expectedDocumentId === "string" && tab.document_id === expectedDocumentId);
 }
-function watcherRevisionReceipt(tabId, expectedRevision) {
+function watcherRevisionReceipt(tabId, expectedRevision, expectedDocumentId) {
   if (expectedRevision === undefined) return null;
-  if (!Number.isSafeInteger(expectedRevision) || !watcherStateMatches(watcherState, tabId, expectedRevision)) {
+  const tab = watcherState?.tabs?.find(item => item.id === tabId);
+  // The global watcher revision is a topology hint, not a document identity.
+  // Window/group events legitimately advance it for every tab. The command
+  // route already revalidates the paired document before dispatch, so do not
+  // turn unrelated topology churn into a false stale-target refusal.
+  const sameDocument = typeof expectedDocumentId === "string" && expectedDocumentId.length > 0
+    && tab?.document_id === expectedDocumentId;
+  if (!sameDocument && (!Number.isSafeInteger(expectedRevision) || !tab || tab.status !== "complete" || !tab.document_id)) {
     return { status: "not_dispatched", dispatch_acknowledged: false, dispatch_may_have_occurred: false,
-      reason_code: "stale_watcher_revision", reason: "The browser topology changed after discovery; refresh the selected tab and reacquire the target once.",
+      reason_code: "stale_watcher_document", reason: "The selected tab no longer has a stable paired document; refresh and reacquire the target once.",
       next_action: "refresh_and_reacquire_once" };
   }
   return null;
@@ -1062,15 +1069,22 @@ async function handleNativeMessage(port, portGeneration, message) {
         return accessDelta || left.id - right.id;
       });
       const openReceipts = ((await chrome.storage.local.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {});
-      const ownedDocuments = new Map(Object.values(openReceipts).filter(receipt => receipt?.status === "complete" && receipt.document_id)
-        .map(receipt => [Number(receipt.tab_id), receipt]));
+      const ownedDocuments = new Map(Object.entries(openReceipts)
+        .filter(([, receipt]) => receipt?.status === "complete")
+        .map(([operationKey, receipt]) => [Number(receipt.tab_id), { ...receipt, operation_key: operationKey }]));
       let listed = await Promise.all(prioritized.slice(offset, offset + pageSize).map(async tab => {
         const firstFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
         const current = await boundedNativeApi(chrome.tabs.get(tab.id), undefined);
         const lastFrame = await boundedNativeApi(chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 }), undefined);
         const stableDocument = current?.status === "complete" && /^https?:\/\//i.test(current.url || "") && firstFrame?.documentId && firstFrame.documentId === lastFrame?.documentId && lastFrame.url === current.url;
         const owned = ownedDocuments.get(tab.id);
-        return { id: tab.id, window_id: current?.windowId, group_id: Number.isSafeInteger(current?.groupId) && current.groupId >= 0 ? current.groupId : null, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive, owned_by_controlla: !!owned && owned.document_id === lastFrame?.documentId && owned.url === current?.url, watcher_target_revision: watcherState.tabs.find(entry => entry.id === tab.id)?.target_revision ?? null, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
+        return { id: tab.id, window_id: current?.windowId, group_id: Number.isSafeInteger(current?.groupId) && current.groupId >= 0 ? current.groupId : null, last_accessed: Number.isFinite(current?.lastAccessed) ? current.lastAccessed : undefined, title: String(current?.title || tab.title || "").slice(0, 256), url: String(current?.url || tab.url).slice(0, 2048), active_for_open: current?.id === lastFocusedActive,
+          // Ownership follows the tab receipt for its lifetime. Navigation and
+          // document replacement update the bound target, but do not silently
+          // turn a Controlla-created tab into a user tab.
+          owned_by_controlla: !!owned,
+          ownership_key: owned ? String(owned.operation_key || owned.requested_url || "controlla") : undefined,
+          watcher_target_revision: watcherState.tabs.find(entry => entry.id === tab.id)?.target_revision ?? null, ...(stableDocument ? { document_id: lastFrame.documentId } : {}) };
       }));
       const [windows, groups] = await Promise.all([
         chrome.windows.getAll({ windowTypes: ["normal", "popup"] }).catch(() => []),
@@ -1552,7 +1566,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.pointerClick") {
       const params = request.params || {}, objectId = params.object_id, index = params.index, outcome = params.outcome;
-      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision, params.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const clickKind = params.click_kind || "click";
       const guard = params.function_declaration, expectedViewport = params.viewport;
@@ -1633,7 +1647,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.pointerSwipe") {
       const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
-      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision, params.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const sx=params.start_x,sy=params.start_y,ex=params.end_x,ey=params.end_y,viewport=params.viewport,timeoutMs=params.timeout_ms??3000;
       const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
@@ -1700,7 +1714,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.pointerMultiTouch") {
       const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
-      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision, params.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const cx=params.center_x,cy=params.center_y,startDistance=params.start_distance,endDistance=params.end_distance,viewport=params.viewport,timeoutMs=params.timeout_ms??3000;
       const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
@@ -1754,7 +1768,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.pointerScroll") {
       const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
-      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision, params.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const dx=params.delta_x,dy=params.delta_y,expectedViewport=params.viewport,timeoutMs=params.timeout_ms??3000;
       const expectedActivationEpoch=params.expected_activation_epoch??undefined,expectedFocusEpoch=params.expected_focus_epoch??undefined;
@@ -1837,7 +1851,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.scrollToTarget") {
       const params=request.params||{},objectId=params.object_id,index=params.index,guard=params.guard_function;
-      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, params.expected_target_revision, params.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const timeoutMs=params.timeout_ms??3000,expectedActivationEpoch=params.expected_activation_epoch,expectedFocusEpoch=params.expected_focus_epoch;
       if(typeof objectId!=="string"||!objectId||objectId.length>512||!Number.isSafeInteger(index)||index<0||
@@ -1877,7 +1891,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
     }
     if (request.method === "Controlla.frameScroll") {
       const p=request.params||{},frameId=p.frame_id,loaderId=p.loader_id,backendNodeId=p.backend_node_id;
-      const watcherRefusal = watcherRevisionReceipt(tabId, p.expected_target_revision);
+      const watcherRefusal = watcherRevisionReceipt(tabId, p.expected_target_revision, p.expected_document_id);
       if (watcherRefusal) { respond({ type: "result", id: request.id, result: watcherRefusal }); return; }
       const dx=p.delta_x,dy=p.delta_y,timeoutMs=p.timeout_ms??3000;
       const expectedActivationEpoch=p.expected_activation_epoch,expectedFocusEpoch=p.expected_focus_epoch;

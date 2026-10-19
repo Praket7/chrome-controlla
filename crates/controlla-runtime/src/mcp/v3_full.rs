@@ -5561,6 +5561,9 @@ fn compact_workflow_receipt(
 }
 
 const DEFAULT_V3_WORKFLOW_RECEIPT_BYTES: usize = 2 * 1024;
+const DEFAULT_V3_WORKFLOW_SNAPSHOT_ITEMS: usize = 40;
+const DEFAULT_V3_WORKFLOW_SNAPSHOT_TEXT_CHARS: usize = 4_096;
+const DEFAULT_V3_WORKFLOW_SNAPSHOT_SCAN_NODES: usize = 8_192;
 const MAX_V3_WORKFLOW_RECEIPT_BYTES: usize = 1024 * 1024;
 
 fn v3_workflow_response_size(value: &Value) -> usize {
@@ -18370,15 +18373,15 @@ impl AppV3 {
                         session_id: args.session_id.clone(),
                         chrome_tab_id: args.chrome_tab_id.clone(),
                         selector: None,
-                        max_items,
-                        max_text_chars,
+                        max_items: max_items.or(Some(DEFAULT_V3_WORKFLOW_SNAPSHOT_ITEMS)),
+                        max_text_chars: max_text_chars.or(Some(DEFAULT_V3_WORKFLOW_SNAPSHOT_TEXT_CHARS)),
                         max_bytes: None,
                         max_bytes_reason: None,
                         href_hint: href_hint.clone(),
                         frame_id: None,
                         include_frames: None,
                         goal,
-                        max_scan_nodes,
+                        max_scan_nodes: max_scan_nodes.or(Some(DEFAULT_V3_WORKFLOW_SNAPSHOT_SCAN_NODES)),
                     },
                 )
                 .await?;
