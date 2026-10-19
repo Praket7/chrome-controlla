@@ -29,6 +29,12 @@ Default shape:
 
 `most specific destination -> one targeted observation only if needed -> one deterministic workflow -> verification only if still needed -> release`
 
+### Compact execution contract
+
+Background is the default execution mode. Semantic snapshot, find, extract, click, fill, select, type, press, and scroll work when Chrome is unfocused, minimized, hidden, or another app is active; they do not raise Chrome. `foreground` asks to show Chrome and may return `presentation_warning: chrome_window_not_focused` while still running semantic steps. Secure password entry, native dialogs, trusted visual pointer/gesture input, and inactive user-owned-tab pointer input retain their explicit capability gates.
+
+On `not_dispatched`, follow the returned `next_action`. A `stale_watcher_revision` is refreshed and semantically reacquired once inside Controlla when the same unique tab/document target remains valid; do not rediscover or replay the action yourself. On `unknown`, dispatch may have happened: verify read-only once and never replay the mutation. If no safe existing tab matches, use the bounded `route_selection` candidates; open the exact URL in a new Controlla-owned tab for a new-target request, or return/accept `no_safe_tab_match` and ask for an exact tab selection when an existing tab is required.
+
 ## Agent decision ladder
 
 Choose the route from the user's intent, not from trial and error:

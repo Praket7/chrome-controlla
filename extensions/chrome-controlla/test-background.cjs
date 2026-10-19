@@ -711,6 +711,8 @@ function testWatcherStateMirrorContracts() {
     "tab removal evicts the target binding");
   assert.equal(watcherRevisionReceipt(5, 1)?.reason_code,
     "stale_watcher_revision", "removed or invalidated mirror state refuses an old mutation revision");
+  assert.equal(watcherRevisionReceipt(5, 1)?.dispatch_may_have_occurred, false);
+  assert.equal(watcherRevisionReceipt(5, 1)?.next_action, "refresh_and_reacquire_once");
   for (const [collection, limit, event] of [
     ["tabs", 2048, { kind: "tab_created", tab: { id: 3000, windowId: 1, status: "complete" } }],
     ["windows", 128, { kind: "window_updated", window: { id: 3000 } }],

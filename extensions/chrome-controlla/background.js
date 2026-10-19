@@ -280,7 +280,8 @@ function watcherRevisionReceipt(tabId, expectedRevision) {
   if (expectedRevision === undefined) return null;
   if (!Number.isSafeInteger(expectedRevision) || !watcherStateMatches(watcherState, tabId, expectedRevision)) {
     return { status: "not_dispatched", dispatch_acknowledged: false, dispatch_may_have_occurred: false,
-      reason_code: "stale_watcher_revision", reason: "The browser topology changed after discovery; refresh list_tabs and reacquire the target." };
+      reason_code: "stale_watcher_revision", reason: "The browser topology changed after discovery; refresh the selected tab and reacquire the target once.",
+      next_action: "refresh_and_reacquire_once" };
   }
   return null;
 }

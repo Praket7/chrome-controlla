@@ -1668,7 +1668,7 @@ async fn retained_mutation(
     action: &str,
 ) -> Result<Value, rmcp::ErrorData> {
     let first = retained_mutation_once(app, args, reference, allow_password, action).await?;
-    if first["status"] != "not_dispatched" || first["readback"]["reason"] != "target_replaced" {
+    if !mutation_needs_reacquisition(&first) {
         return Ok(first);
     }
 
@@ -1832,7 +1832,19 @@ async fn retained_click(
 }
 
 fn click_needs_reacquisition(receipt: &Value) -> bool {
-    receipt["status"] == "not_dispatched" && receipt["reason_code"] == "changed_target"
+    pre_dispatch_reacquisition_needed(receipt)
+}
+
+fn mutation_needs_reacquisition(receipt: &Value) -> bool {
+    pre_dispatch_reacquisition_needed(receipt)
+}
+
+fn pre_dispatch_reacquisition_needed(receipt: &Value) -> bool {
+    receipt["status"] == "not_dispatched"
+        && (matches!(
+            receipt["reason_code"].as_str(),
+            Some("changed_target" | "stale_watcher_revision")
+        ) || receipt["readback"]["reason"] == "target_replaced")
 }
 
 async fn retained_click_once(
@@ -2836,6 +2848,8 @@ fn substitute_reference(
         vars.get(name)
             .cloned()
             .ok_or_else(|| invalid(format!("workflow variable ${name} is unresolved")))
+    } else if let Some(value) = vars.get(reference) {
+        Ok(value.clone())
     } else {
         Ok(reference.to_owned())
     }
@@ -2922,6 +2936,22 @@ fn normalize_unknown_receipts(value: &mut Value) {
                     object
                         .entry("next_action")
                         .or_insert_with(|| json!("inspect_current_state_once_before_retrying"));
+                }
+                if receipt
+                    && object.get("status").and_then(Value::as_str) == Some("not_dispatched")
+                {
+                    let next_action = match object.get("reason_code").and_then(Value::as_str) {
+                        Some("stale_watcher_revision") => "refresh_and_reacquire_once",
+                        Some("stale_reference" | "stale_document" | "changed_target") => {
+                            "take_fresh_snapshot_and_retry"
+                        }
+                        Some("activation_forbidden") => "use_a_controlla_owned_automation_window_or_navigate_by_observed_href",
+                        Some("challenge_handoff_required") => "let_the_user_complete_the_challenge_then_observe_again",
+                        _ => "correct_the_named_cause_before_retrying",
+                    };
+                    object
+                        .entry("next_action")
+                        .or_insert_with(|| json!(next_action));
                 }
                 for key in ["receipts", "steps"] {
                     if let Some(child) = object.get_mut(key) {
@@ -4041,6 +4071,19 @@ mod tests {
     }
 
     #[test]
+    fn undispatched_receipts_expose_a_concrete_next_action() {
+        let mut receipt = json!({
+            "status":"not_dispatched",
+            "reason_code":"stale_watcher_revision",
+            "dispatch_may_have_occurred":false,
+            "page_content":{"status":"not_dispatched"}
+        });
+        normalize_unknown_receipts(&mut receipt);
+        assert_eq!(receipt["next_action"], "refresh_and_reacquire_once");
+        assert!(receipt["page_content"].get("next_action").is_none());
+    }
+
+    #[test]
     fn only_an_immediate_verify_step_can_follow_an_unknown_workflow_action() {
         let verify = BrowserWorkflowStep::Verify {
             predicate: BrowserPredicate::TextPresent {
@@ -4176,6 +4219,7 @@ mod tests {
     fn workflow_variable_substitution_fails_closed() {
         let vars = BTreeMap::from([("email".to_owned(), "@c2".to_owned())]);
         assert_eq!(substitute_reference("$email", &vars).unwrap(), "@c2");
+        assert_eq!(substitute_reference("email", &vars).unwrap(), "@c2");
         assert!(substitute_reference("$missing", &vars).is_err());
         assert_eq!(substitute_reference("@c1", &vars).unwrap(), "@c1");
     }
@@ -4197,6 +4241,12 @@ mod tests {
     fn click_reacquisition_only_follows_a_typed_pre_dispatch_target_change() {
         assert!(click_needs_reacquisition(
             &json!({"status":"not_dispatched","reason_code":"changed_target"})
+        ));
+        assert!(click_needs_reacquisition(
+            &json!({"status":"not_dispatched","reason_code":"stale_watcher_revision"})
+        ));
+        assert!(mutation_needs_reacquisition(
+            &json!({"status":"not_dispatched","readback":{"reason":"target_replaced"}})
         ));
         assert!(!click_needs_reacquisition(
             &json!({"status":"unknown","reason_code":"changed_target"})
