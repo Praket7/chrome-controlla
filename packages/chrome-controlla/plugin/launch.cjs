@@ -63,7 +63,10 @@ async function main() {
     process.exitCode = 127;
     return;
   }
-const proxy = startAgentUxProxy(child, { stateDir: process.env.CONTROLLA_STATE_DIR });
+const proxy = startAgentUxProxy(child, {
+  stateDir: process.env.CONTROLLA_STATE_DIR,
+  restart: spawnWithStartupRetry,
+});
 let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {

@@ -385,6 +385,9 @@ test('packaged launcher retries only startup failures before proxy dispatch', ()
   assert.match(launchSource, /maxAttempts = 3/);
   assert.match(launchSource, /setTimeout\(resolve, 100 \* attempt\)/);
   assert.match(launchSource, /startAgentUxProxy\(child/);
+  const proxySource = fs.readFileSync(path.resolve(__dirname, 'plugin/mcp-agent-ux-launch.cjs'), 'utf8');
+  assert.match(proxySource, /options\.restart/);
+  assert.match(proxySource, /pending mutations were not replayed/);
 });
 
 test('follow-up tools can use only the opaque context handle', async () => {
