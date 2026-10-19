@@ -124,6 +124,10 @@ Background mode opens or keeps the selected tab inactive. Semantic DOM click, fi
 
 Cross-origin iframe DOM is blocked by the page's same-origin policy. Root snapshots therefore report unread frames instead of pretending to inspect them. When frame content is relevant, use `include_frames=true` for a bounded accessibility aggregation over up to eight inventoried child frames, or use the explicit `frame_id` path to inspect one frame. Each returned tree carries its source frame and loader identity; unread, stale, or capped frames keep global coverage incomplete. This path does not prove complete shadow-root or same-origin DOM coverage. If an unread frame could contain a matching destination, the result cannot claim exhaustive first-party coverage.
 
+## Route selection and visual stability
+
+Use semantic page controls first, then a live qualified page tool, then fresh bounded visual evidence. Add `wait_stable` before a visual mutation when a bounded region is animating; it is read-only and a timeout means inspect again without dispatching the mutation. Use desktop fallback only when the server advertises that platform capability and the target is an owned foreground or automation window. Never use it for secrets, orders, challenge bypass, or user-owned background activation. If no existing tab is a safe match, rely on the bounded candidate/reason receipt: open the exact requested URL in a new Controlla-owned tab, or ask for an exact selection when the task requires an existing tab.
+
 ## Cleanup
 
 Release the shared session when finished while preserving the user's tab:

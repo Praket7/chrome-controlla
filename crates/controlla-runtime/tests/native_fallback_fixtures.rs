@@ -12,7 +12,8 @@ fn native_action_fixtures_cover_identity_capability_and_delivery_outcomes() {
     let unowned = json!({"reason_code":"unowned_session","status":"not_dispatched"});
     let unavailable = json!({"reason_code":"capability_unavailable","status":"not_dispatched"});
     let acknowledged = json!({"status":"completed","dispatch_acknowledged":true,"dispatch_may_have_occurred":true});
-    let uncertain = json!({"status":"unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true});
+    let uncertain =
+        json!({"status":"unknown","dispatch_acknowledged":false,"dispatch_may_have_occurred":true});
 
     assert_eq!(valid["action"]["kind"], "click");
     assert_eq!(stale["reason_code"], "stale_visual_reference");

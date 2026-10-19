@@ -9,6 +9,8 @@ Load this only after a normal fast-path call returns an error or an ambiguous mu
 - `dispatched`: input was acknowledged but the requested page-level outcome is not proved. Verify once.
 - schema/tool mismatch: only here may the agent inspect the live schema or diagnose MCP registration. Do not probe random argument combinations.
 
+For `visual_stability_timeout`, inspect the same tab and choose a fresh bounded region; the failed wait dispatched no mutation. For `stale_visual_reference`, capture and register a new image before native fallback. If the current platform reports `capability_unavailable`, use semantic/page-tool routes or ask the user to complete a browser-chrome-only action. Native fallback never performs coordinate clicks, drags, or page-field typing; use fresh semantic extension actions for those. If no existing tab is a safe match, use the bounded candidate/reason receipt: open the exact URL in a new Controlla-owned tab, or ask for an exact tab selection when the task requires an existing tab.
+
 ## Recovery order
 
 1. Use `reason_code`, `retry_class`, and `next_action` from the receipt.

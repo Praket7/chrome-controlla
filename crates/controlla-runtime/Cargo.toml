@@ -24,6 +24,7 @@ url = "=2.5.8"
 futures-util = "=0.3.34"
 tokio-tungstenite = "=0.28.0"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "futures"] }
+png = "=0.17.16"
 
 [build-dependencies]
 sha2 = "=0.11.0"

@@ -954,6 +954,19 @@ impl SessionRegistry {
                 .is_some_and(|tabs| tabs.contains_key(target_id))
     }
 
+    /// True only for a live provider-created tab in the exact current session.
+    /// Borrowed/adopted targets and targets the user has changed are excluded.
+    pub fn owns_target(&self, session: &SessionHandle, target_id: &str) -> bool {
+        self.sessions.get(&session.id) == Some(session)
+            && !self.inactive_sessions.contains(&session.id)
+            && self.grants.allows(session.provider)
+            && self
+                .tabs
+                .get(&session.id)
+                .and_then(|tabs| tabs.get(target_id))
+                .is_some_and(|tab| tab.ownership == Ownership::Owned && !tab.user_changed)
+    }
+
     pub(crate) fn selected_targets(&self, session_id: &str) -> Option<BTreeSet<String>> {
         self.tabs
             .get(session_id)
@@ -1766,6 +1779,36 @@ mod tests {
             ),
             Err(StaleTarget::TargetChanged)
         );
+    }
+
+    #[test]
+    fn owns_target_requires_current_session_and_provider_owned_tab() {
+        let mut registry = SessionRegistry::new(ProviderGrants {
+            dedicated_headed: true,
+            ..ProviderGrants::default()
+        });
+        let session = registry
+            .create_session(
+                SessionSpec {
+                    mode: SessionMode::Headed,
+                    selected_target_ids: Vec::new(),
+                },
+                "alice",
+            )
+            .unwrap();
+        add_owned_fixture(&mut registry, &session.id, "owned");
+        registry
+            .register_tab(&session.id, "borrowed", Ownership::Borrowed)
+            .unwrap();
+        assert!(registry.owns_target(&session, "owned"));
+        assert!(!registry.owns_target(&session, "borrowed"));
+        let forged = SessionHandle {
+            principal: "mallory".into(),
+            ..session.clone()
+        };
+        assert!(!registry.owns_target(&forged, "owned"));
+        registry.mark_user_changed(&session.id, "owned").unwrap();
+        assert!(!registry.owns_target(&session, "owned"));
     }
 
     #[test]

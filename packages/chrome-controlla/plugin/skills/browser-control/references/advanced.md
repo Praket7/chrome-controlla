@@ -27,3 +27,8 @@ Headless is isolated browser lifecycle mode, not an `open` mode. For one private
 ## Passwords
 
 Snapshots expose password controls only as redacted credential inputs. Password values must never be persisted to workflows, skill/route memory, logs, benchmark fixtures, or receipts. Require explicit user authorization before filling or submitting credentials.
+# Visual settling and desktop fallback
+
+Use `ready_when: {"kind":"visual_stable","quiet_ms":300,"timeout_ms":3000}` on `browser action=open`, or `{"kind":"wait_stable","quiet_ms":300,"timeout_ms":3000}` inside a workflow. Add a bounded integer-pixel `region` when only part of the viewport matters. The step is read-only: if it times out, inspect the current page and do not dispatch the planned visual mutation from that receipt.
+
+Use native fallback only when the live capability report advertises it and the task needs foreground pointer movement/scrolling or a non-submitting key. It refuses coordinate clicks, drags, all text entry, and navigation because native visual evidence cannot establish safe intent. Use fresh semantic extension actions for page controls and navigation; keep order confirmation, credential entry, challenge hand-off, and background actions on their guarded extension routes. See `docs/desktop-fallback.md` for exact platform status.

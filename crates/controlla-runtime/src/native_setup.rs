@@ -32,6 +32,10 @@ pub fn publish_current_host(host_id: &str) -> Result<(), String> {
     value["schema_version"] = json!(1);
     value["host_id"] = json!(host_id);
     value["pid"] = json!(std::process::id());
+    #[cfg(target_os = "macos")]
+    {
+        value["browser_process_id"] = json!(std::os::unix::process::parent_id());
+    }
     value["heartbeat_unix"] = json!(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -119,6 +123,48 @@ pub fn current_host_id() -> Result<String, String> {
         .ok_or("current native host record has no host ID")?;
     pairing_path(host_id)?;
     Ok(host_id.to_owned())
+}
+
+/// Return the browser process that launched the live native messaging host,
+/// but only while the current-host record still names this exact host.
+#[cfg(target_os = "macos")]
+pub fn browser_process_id_for_host(host_id: &str) -> Result<u32, String> {
+    let path = current_host_record_path()?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 {
+        return Err("current native host record is invalid".into());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err("current native host record permissions are too broad".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if value["host_id"].as_str() != Some(host_id) {
+        return Err("native host changed since this session paired".into());
+    }
+    let seen = value["heartbeat_unix"]
+        .as_u64()
+        .ok_or("current native host record has no heartbeat")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    if now.saturating_sub(seen) > 15 || seen > now + 2 {
+        return Err("native host process identity is stale".into());
+    }
+    let pid = value["browser_process_id"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or("native host record has no browser process identity")?;
+    Ok(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn browser_process_id_for_host(_host_id: &str) -> Result<u32, String> {
+    Err("native browser process identity is unavailable on this platform".into())
 }
 
 fn home() -> Result<PathBuf, String> {

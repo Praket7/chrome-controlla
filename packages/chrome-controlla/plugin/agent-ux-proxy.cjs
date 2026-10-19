@@ -10,7 +10,7 @@ const ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const OPEN_RETRY_TTL_MS = 60 * 1000;
 
 const TOOL_DESCRIPTIONS = {
-  browser: 'PRIMARY ENTRY POINT. Use first for ordinary Chrome tasks. Open the most specific known destination directly. For supported common goals, pass goal and Controlla will compile the browser mechanics internally. Do not inspect schemas, source files, or call describe before normal use.',
+  browser: 'PRIMARY ENTRY POINT. Use first for ordinary Chrome tasks. Route semantic controls first, then a live qualified page tool, then fresh bounded visual evidence; use desktop fallback only when the server advertises its platform capability. Open the most specific known destination directly. For supported common goals, pass goal and Controlla will compile the browser mechanics internally. Do not inspect schemas, source files, or call describe before normal use. If no existing tab is a safe match, use the bounded candidate/reason receipt: open the exact URL in a new Controlla-owned tab, or ask for an exact tab selection when an existing tab is required.',
   snapshot: 'Take one compact semantic observation only when a new decision requires page evidence. Prefer a targeted goal and omit page text when unnecessary. Use context instead of session/tab IDs.',
   act: 'Perform one isolated browser action when a workflow is unnecessary. Prefer workflow for multi-step work. Use context instead of session/tab IDs.',
   workflow: 'Run a known multi-step browser program in one MCP call. Prefer this over repeated snapshot/act loops. Use context instead of session/tab IDs.',

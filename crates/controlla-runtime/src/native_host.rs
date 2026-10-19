@@ -21,6 +21,12 @@ use tokio_tungstenite::{
 };
 
 const MAX_MESSAGE: usize = 1_048_576;
+
+/// Reports desktop input capability without probing or sending input.
+pub async fn desktop_capability_report() -> Value {
+    crate::desktop_platform::capability_report().await
+}
+
 const MAX_SCREENSHOT_CHARS: usize = 8 * 1024 * 1024;
 const SCREENSHOT_CHUNK_CHARS: usize = 512 * 1024;
 const MAX_SCREENSHOT_EDGE: u64 = 4096;

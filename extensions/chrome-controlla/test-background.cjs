@@ -317,6 +317,10 @@ const chrome = {
         }
       }
       const tab = tabList.find(item => item.id === tabId);
+      // Chromium may withhold frame identity for extension recovery documents;
+      // native-owned open must navigate through them without requiring an ID.
+      if (tab.url.startsWith("chrome-extension://") && tab.url.includes("open-recovery.html")
+        && tab.url.includes("ownerless%3A")) return undefined;
       return { documentId: tabDocumentOverrides.get(tabId) || `document-${tabId}`,
         url: tabUrlOverrides.get(tabId) || tab.url };
     },

@@ -2,6 +2,8 @@
 
 pub const CONTRACT_VERSION: u16 = 3;
 pub const MAX_NATIVE_MESSAGE_BYTES: usize = 900 * 1024;
+pub const DESKTOP_FALLBACK_ENVELOPE_VERSION: u16 = 1;
+pub const MAX_DESKTOP_FALLBACK_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const AUTHORIZED_METHODS: &[&str] = &[
     "Page.getFrameTree",
     "Page.getLayoutMetrics",

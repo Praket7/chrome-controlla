@@ -1,5 +1,7 @@
 # Chrome Controlla
 
+Controlla can wait for bounded visual regions to settle through `ready_when: {"kind":"visual_stable",...}` or workflow step `{"kind":"wait_stable",...}`. It hashes normalized pixels, verifies the same active document on each sample, and returns an incomplete timeout without dispatching a mutation. `browser action=describe` includes a compact route manifest. If no existing tab is a safe match, use its bounded candidate/reason receipt and open the exact requested URL in a new Controlla-owned tab, or request an exact tab selection when an existing tab is required. See [native desktop fallback limits](docs/desktop-fallback.md) and the [roadmap](docs/ROADMAP.md).
+
 Chrome Controlla is a Chrome-only browser MCP for agents that need fast, verifiable browser control. It connects an MCP client to an unpacked Manifest V3 extension through Chrome Native Messaging, keeps an exact tab identity, and returns action plus verification evidence.
 
 The current V3 server exposes six tools:

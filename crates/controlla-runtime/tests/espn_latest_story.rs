@@ -235,6 +235,9 @@ async fn run_latest_story(
     } else {
         base.clone()
     };
+    // Headless Chrome may report the newly created target before a remote
+    // navigation has committed. Launch blank, then navigate with one bounded
+    // research call; the workflow's first snapshot supplies the task evidence.
     let launch_url = if live_url.is_some() {
         "about:blank"
     } else {
@@ -264,13 +267,17 @@ async fn run_latest_story(
     } else {
         serde_json::json!({"session_id":session,"chrome_tab_id":tab,"max_items":20,"max_text_chars":0})
     };
-    let snapshot = client
-        .call_tool(call("snapshot", snapshot_args))
-        .await
-        .unwrap()
-        .structured_content
-        .unwrap();
-    if !live_shape {
+    let snapshot = if live_url.is_some() {
+        serde_json::Value::Null
+    } else {
+        client
+            .call_tool(call("snapshot", snapshot_args.clone()))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap()
+    };
+    if !live_shape && live_url.is_none() {
         assert_eq!(
             snapshot["scope_complete"], true,
             "fixture story candidates need a complete freshness scope: {snapshot}"
@@ -316,7 +323,8 @@ async fn run_latest_story(
     let _ = server.join();
     let _ = std::fs::remove_dir_all(state);
     let workflow_steps = result["steps"].as_u64().unwrap_or(0);
-    serde_json::json!({"launch":launch,"live_navigation":live_navigation,"result":result,"candidate_snapshot":snapshot,"mcp_calls":4,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
+    let mcp_calls = 2 + usize::from(live_navigation.is_some()) + usize::from(live_url.is_none()); // launch, navigation, optional standalone snapshot, workflow
+    serde_json::json!({"launch":launch,"live_navigation":live_navigation,"result":result,"candidate_snapshot":snapshot,"mcp_calls":mcp_calls,"workflow_steps":workflow_steps,"elapsed_ms":started.elapsed().as_millis()})
 }
 
 #[cfg(target_os = "macos")]
@@ -428,6 +436,10 @@ async fn live_shaped_story_task_survives_natural_query_scoreboard_and_unread_emb
         "relevance-ranked stories must precede scoreboard links within the bounded result: {snapshot}"
     );
     let execution = &result["result"];
+    assert!(
+        result["mcp_calls"].as_u64().is_some_and(|calls| calls <= 3),
+        "live Bills flow must use at most three MCP calls: {result}"
+    );
     assert_eq!(execution["status"], "completed", "{result}");
     assert_eq!(
         execution["receipts"][1]["coverage_complete"], true,
@@ -471,6 +483,15 @@ async fn live_espn_headless_latest_story_smoke() {
         Some("https://www.espn.com/nfl/team/_/name/buf/buffalo-bills".into()),
     )
     .await;
+    eprintln!(
+        "live ESPN headless evidence: mcp_calls={} total_elapsed_ms={} workflow_elapsed_ms={} workflow_steps={} startup_us={} workflow_metrics={}",
+        result["mcp_calls"],
+        result["elapsed_ms"],
+        result["result"]["elapsed_ms"],
+        result["workflow_steps"],
+        result["launch"]["metrics"]["startup_us"],
+        result["result"]["metrics"],
+    );
     let execution = &result["result"];
     assert_eq!(execution["status"], "completed", "{result}");
     assert_eq!(

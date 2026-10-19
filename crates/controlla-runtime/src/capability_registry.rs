@@ -64,6 +64,14 @@ pub struct CapabilityRegistry {
 }
 
 impl CapabilityRegistry {
+    pub fn len(&self) -> usize {
+        self.capabilities.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, String> {
         let path = path.into();
         let stored = match std::fs::read(&path) {

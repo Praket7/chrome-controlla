@@ -258,10 +258,10 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
         .join(", ");
     eprintln!(
         "default MCP tool schemas: {schema_bytes} bytes ({} KiB budget)",
-        (60 * 1024) / 1024
+        (68 * 1024) / 1024
     );
     assert!(
-        schema_bytes <= 60 * 1024,
+        schema_bytes <= 68 * 1024,
         "default tool schema budget is {schema_bytes} bytes ({schema_sizes})"
     );
 
@@ -283,6 +283,64 @@ async fn compact_v3_advertises_task_route_and_guarded_tools() {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("open"))
+    );
+    let routes = described["route_manifest"]["routes"].as_array().unwrap();
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route["class"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "semantic",
+            "page_tool",
+            "visual",
+            "desktop_fallback",
+            "headless"
+        ]
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let native_ready =
+            described["desktop_capabilities"]["capabilities"]["desktop_keyboard"] == "available";
+        assert_eq!(
+            routes[3]["availability"],
+            if native_ready {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
+        assert!(matches!(
+            described["desktop_capabilities"]["status"].as_str(),
+            Some("partial" | "unavailable")
+        ));
+        assert!(
+            described["desktop_capabilities"]["chrome_frontmost"].is_boolean()
+                || described["desktop_capabilities"]["chrome_frontmost"].is_null()
+        );
+        assert!(
+            described["desktop_capabilities"]["process_matches_frontmost"].is_boolean()
+                || described["desktop_capabilities"]["process_matches_frontmost"].is_null()
+        );
+        assert!(
+            described["desktop_capabilities"]["permission_gates"]["automation"].is_boolean()
+                || described["desktop_capabilities"]["permission_gates"]["automation"].is_null()
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(routes[3]["availability"], "unavailable");
+        assert_eq!(described["desktop_capabilities"]["status"], "unavailable");
+    }
+    assert!(matches!(
+        described["desktop_capabilities"]["capabilities"]["desktop_pointer"].as_str(),
+        Some("available" | "capability_unavailable")
+    ));
+    assert!(
+        described["open"]["ready_when"]
+            .as_str()
+            .unwrap()
+            .contains("visual_stable")
     );
     let mut surface = tools
         .tools

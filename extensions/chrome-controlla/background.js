@@ -2799,13 +2799,15 @@ async function createOwnedTabFromNative(request) {
       url,requested_url:url,marker_url:markerUrl,active,create_background_window:backgroundWindow,created_ms:receipt?.created_ms || Date.now()};
     await chrome.storage.local.set({[OPEN_RECEIPTS_KEY]:receipts});
     try {
-      const marker = await nativePageIdentity(tab.id);
-      if (marker.url !== url) {
+      // Chrome does not reliably expose webNavigation frame/document identity
+      // for extension-owned recovery pages (especially immediately after tab
+      // creation). Do not wait on that transient page: navigate the owned tab
+      // directly, then bind only to the requested destination's stable
+      // document identity after DOMContentLoaded.
+      if (tab.url !== url) {
         await chrome.tabs.update(tab.id, {url});
-        await waitForTabDOMContentLoaded(tab.id, marker.document_id);
-      } else {
-        await waitForTabDOMContentLoaded(tab.id, null);
       }
+      await waitForTabDOMContentLoaded(tab.id, null);
       const identity = await nativePageIdentity(tab.id);
       if (identity.url !== url) throw new Error("Created tab navigated away before identity verification.");
       const [current, window] = await Promise.all([chrome.tabs.get(tab.id),chrome.windows.get(tab.windowId)]);
