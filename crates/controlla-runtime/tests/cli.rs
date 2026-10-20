@@ -137,11 +137,11 @@ fn doctor_reports_stale_heartbeat_separately_from_live_process_and_authenticated
     write_doctor_config(&root, addr, std::process::id(), now - 900);
     let report = run_doctor(&root);
     assert_eq!(report["configured"], "Healthy");
-    // The current local-process probe is implemented on Unix. On other
-    // platforms, the doctor must report Unknown rather than imply liveness.
-    #[cfg(unix)]
+    // The local-process probe is implemented on Unix and Windows. Other
+    // platforms report Unknown rather than implying liveness.
+    #[cfg(any(unix, windows))]
     assert_eq!(report["process"], "Healthy");
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     assert_eq!(report["process"], "Unknown");
     assert_eq!(report["transport"], "Healthy");
     assert_eq!(report["authentication"], "Healthy");
@@ -174,7 +174,11 @@ fn doctor_reports_fresh_heartbeat_but_dead_process_and_unreachable_loopback() {
             (report["transport"] == "Failed").then_some(report)
         })
         .expect("could not reserve a reliably unreachable loopback port");
-    let unavailable_process_probe = if cfg!(unix) { "Failed" } else { "Unknown" };
+    let unavailable_process_probe = if cfg!(any(unix, windows)) {
+        "Failed"
+    } else {
+        "Unknown"
+    };
     assert_eq!(report["process"], unavailable_process_probe);
     assert_eq!(report["transport"], "Failed");
     assert_eq!(report["authentication"], "Unknown");
