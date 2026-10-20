@@ -31,6 +31,8 @@ let detachDuringInventory = false;
 let releaseBlockedFrame;
 const nativePorts = [];
 const reconnectTimers = [];
+let backgroundGeneration = 0;
+let activeBackgroundGeneration = 0;
 const alarms = [];
 const sessionStorage = {};
 const localStorage = {};
@@ -171,7 +173,9 @@ class FakeWebSocket {
 }
 class FakeNativePort {
   constructor(name) {
+    this.id = nativePorts.length;
     this.name = name; this.sent = [];
+    this.owner = activeBackgroundGeneration;
     this.onMessage = { addListener: callback => { this.receive = callback; } };
     this.onDisconnect = { addListener: callback => { this.disconnected = callback; } };
   }
@@ -619,8 +623,19 @@ for (const name of extensionBuildAssets) expectedExtensionDigest.update(name).up
 const expectedExtensionBuildId = `controlla-chrome-extension:0.1.0:${expectedExtensionDigest.digest("hex")}`;
 let backgroundContext;
 function runBackground() {
+  const owner = ++backgroundGeneration;
+  activeBackgroundGeneration = owner;
+  const scopedRuntime = Object.create(chrome.runtime);
+  scopedRuntime.connectNative = name => {
+    const port = new FakeNativePort(name);
+    port.owner = owner;
+    nativePorts.push(port);
+    return port;
+  };
+  const scopedChrome = Object.create(chrome);
+  scopedChrome.runtime = scopedRuntime;
   backgroundContext = {
-    chrome, WebSocket: FakeWebSocket, URL, TextEncoder, Uint8Array, DataView, atob, Set, Number, Array, String, Error, Promise, JSON,
+    chrome: scopedChrome, WebSocket: FakeWebSocket, URL, TextEncoder, Uint8Array, DataView, atob, Set, Number, Array, String, Error, Promise, JSON,
     Date: { now() { return mockNow; } }, crypto: webcrypto,
     fetch: async url => {
       const assetName = extensionBuildAssets.find(name => String(url).endsWith(`/${name}`));
@@ -631,12 +646,12 @@ function runBackground() {
     console: { debug(...args) { commandDiagnostics.push(args); } },
     setTimeout(callback, delay) {
       if (delay === 10) return globalThis.setTimeout(callback, delay);
-      reconnectTimers.push({ callback, delay });
+      reconnectTimers.push({ callback, delay, owner });
       return reconnectTimers.length;
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted };`, backgroundContext);
 }
 runBackground();
 
@@ -795,27 +810,34 @@ async function waitFor(predicate, description) {
     assert.equal((await message({ type: "native-status" })).recovery_journal.status, "clear", "matching acknowledgement clears the durable checkpoint");
     candidate.disconnect("native host unavailable");
     await new Promise(resolve => setTimeout(resolve, 0));
+    const portsBeforeRestart = nativePorts.length;
     runBackground();
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await waitFor(() => nativePorts.length === portsBeforeRestart + 1,
+      "service-worker restart reconnect");
+    await backgroundContext.__testHooks.reconnectStateReady;
+    const currentWorker = nativePorts.at(-1).owner;
+    const currentWorkerTimers = () => reconnectTimers.filter(timer => timer.owner === currentWorker);
     candidate = nativePorts.at(-1);
     candidate.disconnect("native host still unavailable");
     await new Promise(resolve => setTimeout(resolve, 0));
-    assert.equal(reconnectTimers.at(-1).delay, 2000,
+    assert.equal(currentWorkerTimers().at(-1).delay, 2000,
       "service-worker restart preserves the bounded reconnect backoff attempt");
     for (let attempt = 2; attempt <= 12; attempt++) {
-      reconnectTimers.at(-1).callback();
+      const timer = currentWorkerTimers().at(-1);
+      timer.callback();
       candidate = nativePorts.at(-1);
       candidate.disconnect("native host unavailable");
       await new Promise(resolve => setTimeout(resolve, 0));
-      const status = await message({ type: "native-status" });
-      assert.equal(status.retry_exhausted, false, "native reconnect must keep retrying after the delay cap");
+      assert.equal(backgroundContext.__testHooks.reconnectExhausted(), false,
+        "native reconnect must keep retrying after the delay cap");
     }
-    const retrying = await message({ type: "native-status" });
-    assert.equal(retrying.retry_exhausted, false, "a temporary host outage must not require an extension reload");
-    assert.equal(reconnectTimers.at(-1).delay, 60000, "reconnect delay remains capped after repeated failures");
+    assert.equal(backgroundContext.__testHooks.reconnectExhausted(), false,
+      "a temporary host outage must not require an extension reload");
+    assert.equal(currentWorkerTimers().at(-1).delay, 60000, "reconnect delay remains capped after repeated failures");
     const portsBeforeAlarm = nativePorts.length;
     chrome.alarms.onAlarm.fire({ name: "controlla-native-reconnect" });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await waitFor(() => nativePorts.length === portsBeforeAlarm + 1,
+      "alarm retries after worker suspension even after many failures");
     assert.equal(nativePorts.length, portsBeforeAlarm + 1, "alarm retries after worker suspension even after many failures");
     return;
   }

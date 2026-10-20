@@ -978,7 +978,19 @@ async function scheduleNativeReconnect() {
   chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: delay / 60000 });
   reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connectNative(); }, delay);
 }
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name !== RECONNECT_ALARM) return; void reconnectStateReady.then(() => { if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = undefined; connectNative(); }); });
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name !== RECONNECT_ALARM) return;
+  // An alarm can be the only callback delivered after an MV3 worker is
+  // suspended. Reconnect immediately, then reconcile persisted state before
+  // allowing a second attempt. Waiting on reconnectStateReady first could
+  // lose the wake-up when that promise belongs to a discarded worker.
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  connectNative();
+  void reconnectStateReady.then(() => {
+    if (!nativePort && !reconnectExhausted) connectNative();
+  });
+});
 function connectNative() {
   if (nativePort || reconnectExhausted) return;
   try {
