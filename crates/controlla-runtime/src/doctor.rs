@@ -4,8 +4,9 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::process::Command;
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -473,7 +474,42 @@ fn process_probe_with(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_probe(pid: u32) -> (State, Option<String>) {
+    if pid == 0 {
+        return (
+            State::Failed,
+            Some("configured process ID must be positive".to_owned()),
+        );
+    }
+    let filter = format!("PID eq {pid}");
+    match Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let listing = String::from_utf8_lossy(&output.stdout);
+            if listing.contains(&format!("\"{pid}\"")) {
+                (State::Healthy, None)
+            } else {
+                (
+                    State::Failed,
+                    Some("configured local process is not alive or not probeable".to_owned()),
+                )
+            }
+        }
+        Ok(_) => (
+            State::Failed,
+            Some("configured local process is not alive or not probeable".to_owned()),
+        ),
+        Err(error) => (
+            State::Unknown,
+            Some(format!("local process probe unavailable: {error}")),
+        ),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_probe(pid: u32) -> (State, Option<String>) {
     let _ = pid;
     (
