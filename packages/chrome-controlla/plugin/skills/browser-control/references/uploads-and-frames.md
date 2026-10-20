@@ -14,7 +14,7 @@ If an upload result is `unknown`, inspect once and do not replay the upload or a
 
 ## Guarded upload
 
-Guarded uploads use the dedicated private headless task route. Preserve account/document identity checks and refuse ambiguous file inputs.
+Guarded uploads use the dedicated private headless task route or an existing shared session with an explicitly approved local file path. For the latter, call `browser action=artifact_register` with `file_path` and `allow_local_file_path:true`; Controlla reads the bounded regular file without following symlinks, stores it under an opaque artifact handle, and never passes the caller path to the page. Preserve account/document identity checks and refuse ambiguous file inputs. If the caller cannot explicitly approve a local path, use bounded `bytes_base64` instead.
 
 ## Account identity
 
