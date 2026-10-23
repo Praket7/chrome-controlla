@@ -38,6 +38,7 @@ pub struct LeaseCoordinator {
     inner: Arc<Mutex<HashMap<LeaseKey, HeldLease>>>,
     lock_dir: Arc<PathBuf>,
     next_generation: Arc<std::sync::atomic::AtomicU64>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for LeaseCoordinator {
@@ -62,7 +63,14 @@ impl LeaseCoordinator {
             inner: Arc::new(Mutex::new(HashMap::new())),
             lock_dir: Arc::new(lock_dir.into()),
             next_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Register before attempting acquisition, then keep a bounded polling
+    /// fallback for releases in another process (which cannot notify us).
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
     }
 
     /// Try to acquire a target lease. OS file locks exclude other MCP processes;
@@ -154,11 +162,13 @@ impl LeaseCoordinator {
             }
             if readers.is_empty() {
                 map.remove(key);
+                self.changed.notify_waiters();
             }
             return true;
         }
         if held.lease.owner == owner {
             map.remove(key);
+            self.changed.notify_waiters();
             true
         } else {
             false
@@ -175,6 +185,7 @@ impl LeaseCoordinator {
         let mut map = self.inner.lock().unwrap();
         if map.get(key).is_some_and(|held| held.unknown) {
             map.remove(key);
+            self.changed.notify_waiters();
             true
         } else {
             false
@@ -214,6 +225,7 @@ impl LeaseCoordinator {
             held.lease.owner == owner && held.generation == generation && held.unknown
         }) {
             map.remove(key);
+            self.changed.notify_waiters();
             true
         } else {
             false
@@ -252,6 +264,21 @@ fn restrict_lock_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn released_lease_wakes_waiters_before_reconciliation_poll() {
+        let coord = LeaseCoordinator::with_lock_dir(test_dir());
+        coord
+            .try_acquire(key(), "owner", Duration::from_secs(10), false)
+            .unwrap();
+        let changed = coord.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        assert!(coord.release(&key(), "owner"));
+        tokio::time::timeout(Duration::from_millis(100), changed)
+            .await
+            .expect("release did not notify waiters");
+    }
 
     fn key() -> LeaseKey {
         LeaseKey {
@@ -338,13 +365,18 @@ mod tests {
         coord
             .try_acquire(key.clone(), "p1", Duration::from_secs(60), false)
             .unwrap();
+        let released = coord.changed();
+        tokio::pin!(released);
+        released.as_mut().enable();
         coord.retain_on_unknown_for(key.clone(), "p1".into(), Duration::from_millis(20));
         assert!(
             coord
                 .try_acquire(key.clone(), "p2", Duration::from_secs(10), false)
                 .is_err()
         );
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::timeout(Duration::from_secs(2), released)
+            .await
+            .expect("unknown hold did not expire and notify waiters");
         assert!(
             coord
                 .try_acquire(key, "p2", Duration::from_secs(10), false)

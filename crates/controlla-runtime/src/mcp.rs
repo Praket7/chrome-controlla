@@ -4442,15 +4442,13 @@ impl App {
         let prepare = async {
             let connection = shared.connection.as_ref().ok_or("session not accepted")?;
             let registry = shared.registry().map_err(|e| e.to_string())?;
-            let identity =
-                shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
-                    .await?;
-            let interaction = shared_interaction_epoch(
+            let (identity, interaction) = shared_identity_and_epoch(
                 connection,
                 registry,
                 &shared.handle,
                 &args.chrome_tab_id,
                 &snapshot.object_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await?;
             if !unrestricted

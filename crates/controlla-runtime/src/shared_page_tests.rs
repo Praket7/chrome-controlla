@@ -9,7 +9,19 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 #[tokio::test]
 #[ignore = "requires installed Chrome; disposable profile with real CDP behind a test extension transport"]
 async fn shared_snapshot_and_click_real_chrome_regressions() {
-    let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    run_shared_page_fixture(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed Chrome; uses a disposable profile and read-only test bridge"]
+async fn shared_preflight_batches_identity_and_epoch_real_chrome() {
+    run_shared_page_fixture(true).await;
+}
+
+async fn run_shared_page_fixture(preflight_only: bool) {
+    let configured = std::env::var("CONTROLLA_CHROME")
+        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
+    let executable = Path::new(&configured);
     assert!(executable.exists());
     let mut registry = SessionRegistry::new(ProviderGrants {
         dedicated_headless: true,
@@ -159,10 +171,15 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert!(!snapshot["items"].as_array().unwrap().iter().any(|v|v["name"]=="Hidden"));
         assert_eq!(item(&snapshot,"Accounts")["raw_value"],"");
         let before_guard_scroll=eval("scrollY".into()).await["result"]["value"].as_i64().unwrap();
+        let preflight_trace_start=command_trace.lock().unwrap().len();
         let wrong_outcome=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"navigation"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(wrong_outcome["status"],"not_dispatched","{wrong_outcome}");
+        let preflight_commands=command_trace.lock().unwrap()[preflight_trace_start..].to_vec();
+        assert_eq!(preflight_commands[0]["request_type"], "batch", "identity and interaction epoch must share a read-only bridge request");
+        assert_eq!(preflight_commands[0]["methods"], json!(["Runtime.callFunctionOn", "Page.getFrameTree"]));
         assert_eq!(eval("window.trustedClicks||0".into()).await["result"]["value"],0);
         assert_eq!(eval("scrollY".into()).await["result"]["value"].as_i64().unwrap(),before_guard_scroll,"a denied trusted-event action must not move the page");
+        if preflight_only { return; }
         let trusted=client.call_tool(call("shared_click",json!({"session_id":session,"chrome_tab_id":"123","reference":item(&snapshot,"Trusted keys")["reference"],"outcome":{"kind":"focused"}}))).await.unwrap().structured_content.unwrap();
         assert_eq!(trusted["status"],"verified","{trusted}");
         assert_eq!(eval("document.activeElement.id".into()).await["result"]["value"],"trusted");
@@ -174,6 +191,8 @@ async fn shared_snapshot_and_click_real_chrome_regressions() {
         assert_eq!(clicked["status"],"verified","{clicked}");
         let click_round_trips=host_round_trips.load(std::sync::atomic::Ordering::Relaxed)-click_start;
         let click_commands=command_trace.lock().unwrap()[click_trace_start..].to_vec();
+        assert_eq!(click_commands[0]["request_type"], "batch", "identity and interaction epoch must share a read-only bridge request");
+        assert_eq!(click_commands[0]["methods"], json!(["Runtime.callFunctionOn", "Page.getFrameTree"]));
         eprintln!("S3-04 warm click/readback fixture: {click_round_trips} native bridge round trips; command groups {click_commands:?}");
         assert!(click_round_trips<=6,"warm click/readback exceeded the proposed six native bridge round trips: {click_commands:?}");
         snapshot=clicked["snapshot"].clone();

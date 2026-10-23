@@ -1,5 +1,10 @@
 # Build progress
 
+## Performance implementation — 2026-10-23
+
+Concrete changes and retained evidence are recorded in [the implementation ledger](performance-implementation-2026-10-23.md). This pass implements bounded collection, read batching, ordered storage workers, lease notifications, scoped/expiring costs, native WebMCP compatibility, independent basic fixture acceptance, and CI efficiency. Installed-client/site qualification and full prompt-to-outcome performance remain separate gates.
+
+
 ## Comprehensive Chrome audit implementation — 2026-10-18
 
 Implemented document-bound tab grouping, ungrouping, moving/reordering and explicit closure in the V3 `browser action=tabs` path, with live native-lease checks and post-action topology verification. Corrected hidden screenshot liveness evidence and runtime validation, incomplete watcher inventories, direct-action cancellation leases, background DOM readback and secret transitions, human typing budgets, and proxy concurrency/context routing. The route report now gives a concise selected source and rejected candidates, plus the exact-tab pairing fallback when no safe source exists. Benchmark acceptance now refuses forgeable fixture events; no comparative result is qualified. See [the audit](audit-2026-10-18.md) and [verification matrix](verification-matrix.md). The full Rust workspace suite, strict Clippy, extension and DOM fixtures, and benchmark integrity suite pass locally; independent Luna Medium review approved the current diff. The code and local fixtures remain separate from installed-extension and real-application qualification.

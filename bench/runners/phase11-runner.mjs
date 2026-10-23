@@ -1,3 +1,4 @@
+import { randomUUID, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -263,15 +264,24 @@ async function independentlyVerify(verifierCommand, input, actingResult, timeout
   return result;
 }
 
+export function actingAdapterEnvironment(env) {
+  const actingEnv = { ...env };
+  delete actingEnv.PHASE11_ORACLE_TOKEN;
+  delete actingEnv.PHASE11_STATE_FILE;
+  return actingEnv;
+}
+
 async function runOne({ adapter, command, task, mode, executionMode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env }) {
   const fixtureUrl = task.url ? liveTaskUrl(task) : (() => { const url = new URL(task.fixture, fixtureBaseUrl); url.searchParams.set('task', task.id); if (task.scenario) url.searchParams.set('scenario', task.scenario); return url.toString(); })();
-  const input = { task_id: task.id, task_class: task.class, scenario: task.scenario, mode, execution_mode: executionMode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
+  const acceptance=task.id==='form-guarded-fill'?{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'}:task.id==='guarded-upload'?{kind:'upload',filename:'benchmark.txt',size:Buffer.byteLength('Controlla benchmark\n'),sha256:createHash('sha256').update('Controlla benchmark\n').digest('hex')}:undefined;
+  const input = { run_id:randomUUID(), ...(acceptance?{acceptance}:{}), task_id: task.id, task_class: task.class, scenario: task.scenario, mode, execution_mode: executionMode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
   const adapterRequestStartedNs = process.hrtime.bigint();
   const invocationMetrics = {};
   let raw;
   try {
-    raw = await invokeJsonCommand(command, { kind: 'run', ...input, environment }, deadlineMs, env, invocationMetrics);
+    const actingEnv = actingAdapterEnvironment(env);
+    raw = await invokeJsonCommand(command, { kind: 'run', ...input, environment }, deadlineMs, actingEnv, invocationMetrics);
   } catch (error) {
     const elapsedMs = Number(process.hrtime.bigint() - adapterRequestStartedNs) / 1e6;
     raw = {

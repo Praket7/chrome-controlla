@@ -14,6 +14,14 @@ const MAX_RECEIPT_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_TARGETED_RESPONSE_BYTES: usize = 12 * 1024;
 const DEFAULT_BROAD_RESPONSE_BYTES: usize = 100_000;
 
+fn snapshot_collection_budget(response_bytes: usize, text_chars: usize) -> usize {
+    // Keep the collector's text/metadata reserve, but do not collect 100 KB
+    // merely to discard it at the public response boundary.
+    response_bytes
+        .max(text_chars.min(6000) * 6 + 4096)
+        .clamp(4096, 100_000)
+}
+
 fn default_snapshot_response_bytes(targeted_compact: bool) -> usize {
     if targeted_compact {
         DEFAULT_TARGETED_RESPONSE_BYTES
@@ -930,7 +938,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
                 })
                 .as_deref(),
         ),
-        scope_signature: stable_intent_signature(
+        scope_signature: stable_intent_signature(Some(&format!("{}|{}|{}", args.session_id, args.chrome_tab_id, stable_intent_signature(
             args.selector
                 .as_ref()
                 .map(|selector| {
@@ -945,7 +953,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
                 })
                 .or_else(|| args.goal.as_ref().and_then(|goal| goal.href_hint.clone()))
                 .as_deref(),
-        ),
+        )))),
         query_required: args
             .goal
             .as_ref()
@@ -954,7 +962,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
     };
     let decision = app
         .observation_history
-        .lock()
+        .try_lock()
         .map(|history| {
             crate::observation_router::choose_observation_with_history(request, &history)
         })
@@ -1011,6 +1019,13 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         args.max_bytes_reason.as_deref(),
         default_snapshot_response_bytes(targeted_compact),
     );
+    let collection_text_chars = args.max_text_chars.unwrap_or_else(|| {
+        if decision.mode == crate::observation_router::ObservationMode::SemanticRich {
+            6_000
+        } else {
+            snapshot_chars()
+        }
+    }).min(6000);
     let legacy = app
         .legacy
         .shared_snapshot(Parameters(SharedSnapshotArgs {
@@ -1018,20 +1033,8 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
             chrome_tab_id: args.chrome_tab_id.clone(),
             selector: args.selector.clone().unwrap_or_else(snapshot_scope),
             max_items: args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200),
-            max_text_chars: args
-                .max_text_chars
-                .unwrap_or_else(|| {
-                    if decision.mode == crate::observation_router::ObservationMode::SemanticRich {
-                        6_000
-                    } else {
-                        snapshot_chars()
-                    }
-                })
-                .min(6000),
-            // Collect with the legacy endpoint's supported ceiling, then apply
-            // the compact public response budget after identity and deltas are
-            // assembled here.
-            max_bytes: 100_000,
+            max_text_chars: collection_text_chars,
+            max_bytes: snapshot_collection_budget(response_max_bytes, collection_text_chars),
             href_hint: args.href_hint.clone(),
             goal: args.goal.clone(),
             max_scan_nodes: args.max_scan_nodes,
@@ -1300,15 +1303,18 @@ fn record_observation_feedback(
     bytes: u64,
 ) {
     let usable = observation_is_usable(request, value);
-    if let Ok(mut history) = app.observation_history.lock() {
-        history.record(
-            request,
-            decision,
-            started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64,
-            bytes,
-            usable,
-        );
-    }
+    // Telemetry may be dropped under pressure; it cannot stall a page action
+    // or create an unbounded queue of disk writers.
+    static RECORDERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let Ok(permit) = RECORDERS.try_acquire() else { return; };
+    let history = app.observation_history.clone();
+    let elapsed_ms = started.elapsed().as_millis().clamp(1, u64::MAX as u128) as u64;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Ok(mut history) = history.lock() {
+            history.record(request, decision, elapsed_ms, bytes, usable);
+        }
+    });
 }
 
 fn observation_is_usable(
@@ -1932,27 +1938,20 @@ async fn retained_mutation_once(
             .as_ref()
             .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
         let registry = shared.registry()?;
-        let before = tokio::time::timeout_at(
+        tokio::time::timeout_at(
             deadline,
-            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id),
-        )
-        .await
-        .map_err(|_| invalid("action preflight timed out; no mutation dispatched"))?
-        .map_err(invalid)?;
-        let interaction = tokio::time::timeout_at(
-            deadline,
-            super::shared_interaction_epoch(
+            super::shared_identity_and_epoch(
                 connection,
                 registry,
                 &shared.handle,
                 &args.chrome_tab_id,
                 &snapshot.object_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             ),
         )
         .await
-        .map_err(|_| invalid("action epoch check timed out; no mutation dispatched"))?
-        .map_err(invalid)?;
-        (before, interaction)
+        .map_err(|_| invalid("action preflight timed out; no mutation dispatched"))?
+        .map_err(invalid)?
     };
     let epoch_use = if action == "slider" {
         crate::v3::EpochUse::PointerMutation
@@ -3621,6 +3620,9 @@ mod tests {
 
     #[test]
     fn default_semantic_snapshot_budget_is_compact_and_keeps_actionable_identity() {
+        assert_eq!(snapshot_collection_budget(12 * 1024, 0), 12 * 1024);
+        assert_eq!(snapshot_collection_budget(4096, 6000), 40_096);
+        assert_eq!(snapshot_collection_budget(1_048_576, 6000), 100_000);
         assert_eq!(default_snapshot_response_bytes(true), 12 * 1024);
         assert_eq!(default_snapshot_response_bytes(false), 100_000);
         let items = (0..80)

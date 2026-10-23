@@ -5,19 +5,35 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  agent-ux:
+  static-and-node:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      - run: npm ci --ignore-scripts
       - run: npm run check:agent-ux
+      - run: npm run check:docs
+      - run: npm run check:provenance
+      - run: npm run check:apps
+      - run: npm run check:bench
+      - run: npm run check:release
+      - run: npm run check:v3
+      - run: npm run check:topology
+      - run: node extensions/chrome-controlla/test-background.cjs
+      - run: node extensions/chrome-controlla/test-v3-batch.cjs
+      - run: node --check extensions/chrome-controlla/background.js
   headless-background-stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned lane makes comparisons reproducible; stable detects API drift.
+        chrome: ['154.0.8037.98', stable]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,10 +43,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - run: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/google-chrome.deb && sudo apt-get update && sudo apt-get install -y /tmp/google-chrome.deb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: headless
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          chrome-version: ${{ matrix.chrome }}
+          install-dependencies: true
       - run: npm ci --ignore-scripts
       - run: npm run check:background-dom
+        env:
+          CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+      - run: npm run check:snapshot-efficiency
+        env:
+          CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+      - run: npm run check:webmcp-browser
+        env:
+          CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
       - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
+        env:
+          CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
       - run: node extensions/chrome-controlla/test-background.cjs --reconnect-only
       - run: for run in {1..8}; do node extensions/chrome-controlla/test-background.cjs; done
         shell: bash
@@ -45,6 +78,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-rust
       - run: cargo fmt --all -- --check
       - name: Clippy production targets
         if: runner.os == 'Linux'
@@ -65,10 +101,7 @@ jobs:
       - run: npm install --global npm@11.17.0 && test "$(npm --version)" = "11.17.0"
         shell: bash
       - run: npm ci --ignore-scripts
-      - run: npm run check:docs
-      - run: npm run check:provenance
       - run: node --test packages/chrome-controlla/test-client.cjs
-      - run: npm run check:agent-ux
       - run: npm run check:clients
       - name: Verify packaged six-client MCP launch contracts
         if: runner.os != 'Windows'
@@ -80,14 +113,6 @@ jobs:
         run: npm run smoke:client-mcp-contracts
         env:
           CONTROLLA_BINARY_PATH: ${{ github.workspace }}/packages/chrome-controlla/bin/controlla-v2-core.exe
-      - run: npm run check:apps
-      - run: npm run check:bench
-      - run: npm run check:release
-      - run: npm run check:v3
-      - run: node extensions/chrome-controlla/test-background.cjs
-      - run: npm run check:topology
-      - run: node extensions/chrome-controlla/test-v3-batch.cjs
-      - run: node --check extensions/chrome-controlla/background.js
       - run: ./scripts/check-dependencies.sh
         shell: bash
       - run: ./scripts/package-check.sh

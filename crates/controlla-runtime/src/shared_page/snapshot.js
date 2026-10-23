@@ -58,8 +58,10 @@ function(q) {
     const trusted = composedClosest(e, '[data-requires-trusted]');
     return !trusted || trusted === e && trustedText(e);
   };
-  const presentation = e => {
-    const s = e.ownerDocument.defaultView.getComputedStyle(e), b = e.getBoundingClientRect();
+  const presentation = (e, geometry) => {
+    // Geometry is reused only within this synchronous collection pass. Retained
+    // callers omit it, so action guards always read fresh layout.
+    const s = e.ownerDocument.defaultView.getComputedStyle(e), b = geometry || e.getBoundingClientRect();
     const present = e.isConnected;
     const rendered = present && b.width > 0 && b.height > 0 && s.visibility === 'visible' && s.display !== 'none' && Number.parseFloat(s.opacity || '1') > 0 && !composedClosest(e, '[hidden],[inert]');
     const view = e.ownerDocument.defaultView;
@@ -175,12 +177,12 @@ function(q) {
       } catch (_) { cross_origin_frames_unread++; }
     }
     if (e.matches(selector) && (!q.href_hint || e.tagName === 'A' && e.href.includes(q.href_hint)) && readable(e)) {
-      const state = presentation(e);
+      const b = e.getBoundingClientRect();
+      const state = presentation(e, b);
       if (!state.rendered) { e = walker.nextNode(); continue; }
       if (items.length >= q.max_items && !q.goal) { omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_items'; e = walker.nextNode(); continue; }
       const credential = isCredentialInput(e), value = raw(e), label = name(e);
       if (typeof value === 'string' && value.length > 16384 || label.length > 2000) { omitted_oversized++; truncated = true; truncation_reason = truncation_reason || 'oversized_value'; e = walker.nextNode(); continue; }
-      const b = e.getBoundingClientRect();
       const datetime = datetimeOf(e);
       const parsedTime = datetime && /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(datetime) ? Date.parse(datetime) : NaN;
       const dateOnly = typeof datetime === 'string' && /^(\d{4})-(\d{2})-(\d{2})$/.exec(datetime);

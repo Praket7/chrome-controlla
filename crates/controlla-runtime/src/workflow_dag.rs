@@ -12,10 +12,31 @@ pub const DEFAULT_PARALLEL_SETUP_COST_MS: u64 = 300;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DagCostHistory {
-    nodes: BTreeMap<String, Vec<u64>>,
-    setups: BTreeMap<usize, Vec<u64>>,
+    #[serde(default)]
+    build_scope: String,
+    nodes: BTreeMap<String, Vec<TimingSample>>,
+    setups: BTreeMap<usize, Vec<TimingSample>>,
     #[serde(skip)]
     path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TimingSample {
+    elapsed_ms: u64,
+    recorded_at_ms: u64,
+}
+impl TimingSample {
+    fn new(elapsed_ms: u64) -> Self {
+        let recorded_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            elapsed_ms,
+            recorded_at_ms,
+        }
+    }
 }
 
 impl DagCostHistory {
@@ -27,6 +48,10 @@ impl DagCostHistory {
             }
             _ => Self::default(),
         };
+        if history.build_scope != env!("CONTROLLA_COST_BUILD_ID") {
+            history = Self::default();
+        }
+        history.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         history.path = Some(path);
         history
     }
@@ -50,10 +75,34 @@ impl DagCostHistory {
         Some((node_estimates, setup))
     }
 
+    /// Move persistence and its serialization off executor threads. Owned
+    /// guards preserve ordering if the requesting task is cancelled.
+    pub async fn record_node_async(
+        history: std::sync::Arc<tokio::sync::Mutex<Self>>,
+        signature: String,
+        elapsed_ms: u64,
+        verified: bool,
+    ) {
+        let mut guard = history.lock_owned().await;
+        let _ =
+            tokio::task::spawn_blocking(move || guard.record_node(signature, elapsed_ms, verified))
+                .await;
+    }
+
+    pub async fn record_setup_async(
+        history: std::sync::Arc<tokio::sync::Mutex<Self>>,
+        width: usize,
+        elapsed_ms: u64,
+    ) {
+        let mut guard = history.lock_owned().await;
+        let _ = tokio::task::spawn_blocking(move || guard.record_setup(width, elapsed_ms)).await;
+    }
+
     pub fn record_node(&mut self, signature: String, elapsed_ms: u64, verified: bool) {
         if !verified || elapsed_ms == 0 || signature.is_empty() || signature.len() > 256 {
             return;
         }
+        self.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         let key = signature.clone();
         push_sample(&mut self.nodes, signature, elapsed_ms, 512);
         if self
@@ -69,8 +118,9 @@ impl DagCostHistory {
         if !(2..=MAX_DAG_NODES).contains(&width) || elapsed_ms == 0 {
             return;
         }
+        self.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         let samples = self.setups.entry(width).or_default();
-        samples.push(elapsed_ms);
+        samples.push(TimingSample::new(elapsed_ms));
         if samples.len() > 32 {
             samples.remove(0);
         }
@@ -103,7 +153,7 @@ impl DagCostHistory {
 }
 
 fn push_sample<K: Ord + Clone>(
-    map: &mut BTreeMap<K, Vec<u64>>,
+    map: &mut BTreeMap<K, Vec<TimingSample>>,
     key: K,
     value: u64,
     max_profiles: usize,
@@ -115,20 +165,27 @@ fn push_sample<K: Ord + Clone>(
         map.remove(&oldest);
     }
     let samples = map.entry(key).or_default();
-    samples.push(value);
+    samples.push(TimingSample::new(value));
     if samples.len() > 32 {
         samples.remove(0);
     }
 }
 
-fn recent_p95(samples: &[u64]) -> Option<u64> {
-    if samples.len() < 3 {
+fn recent_p95(samples: &[TimingSample]) -> Option<u64> {
+    let mut recent = samples
+        .iter()
+        .rev()
+        .filter(|sample| crate::execution_cost_router::fresh_timing_sample(sample.recorded_at_ms))
+        .take(16)
+        .map(|sample| sample.elapsed_ms)
+        .collect::<Vec<_>>();
+    if recent.len() < 3 {
         return None;
     }
-    let mut recent = samples.iter().rev().take(16).copied().collect::<Vec<_>>();
     recent.sort_unstable();
     Some(recent[recent.len() - 1])
 }
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DagEffect {
@@ -482,5 +539,12 @@ mod tests {
                 .is_none()
         );
         assert!(parallel_wave_is_worthwhile(&[900, 800, 700, 600], 100));
+        for sample in history.nodes.values_mut().flatten() {
+            sample.recorded_at_ms = 0;
+        }
+        assert!(
+            history.estimate_wave(&keys).is_none(),
+            "expired node costs must not qualify a parallel wave"
+        );
     }
 }

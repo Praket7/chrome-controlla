@@ -48,6 +48,10 @@ pub struct TaskCheckpointStore {
     entries: BTreeMap<String, Checkpoint>,
 }
 
+#[path = "checkpoint_worker.rs"]
+mod worker;
+pub use worker::CheckpointWorker;
+
 impl TaskCheckpointStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();

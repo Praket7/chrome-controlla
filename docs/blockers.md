@@ -1,5 +1,10 @@
 # Blockers and external dependencies
 
+## Remaining performance qualification gates — 2026-10-23
+
+[The implementation ledger](performance-implementation-2026-10-23.md) records code improvements and local evidence. Native-host cross-platform event IPC, broad session-lock restructuring, authoritative Chrome-build cost attestation across sessions, actual client timing hooks, production route-weight calibration, representative site/account acceptance and matched end-to-end competitor measurements remain open. Current cost learning conservatively stays within an accepted session. The full legacy simulated-bridge click fixture has an extension-only pointer-command coverage gap; it cannot certify installed-extension mutations.
+
+
 ## Comprehensive Chrome audit qualification boundary — 2026-10-18
 
 Code and local fixture work is recorded in [the audit](audit-2026-10-18.md). The exact installed native host and extension have not been reloaded or qualified through a live user Chrome session. New group/move/close behavior, minimized/frozen-window behavior, secret entry prompt, site acceptance for uploads/downloads, and cross-window workflows require that separate acceptance run. CAPTCHA/Cloudflare/MFA cannot be promised as universal automated bypasses. Purchases require the user's exact final authorization; a runtime approval token is still an open enforcement gate. The Phase 11 fixture has no independent success oracle, and the convenience adapter is intentionally unqualified. There is no matched prompt-to-verified competitor result or Luna multi-tab acceptance evidence, so fastest/best claims remain blocked.

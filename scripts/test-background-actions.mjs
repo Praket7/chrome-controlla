@@ -5,7 +5,7 @@ import { chromium } from 'playwright';
 
 const source = readFileSync(new URL('../crates/controlla-runtime/src/shared_page/background_action.js', import.meta.url), 'utf8');
 let browser;
-before(async () => { browser = await chromium.launch({ channel: 'chrome', headless: true }); });
+before(async () => { browser = await chromium.launch({ headless: true, ...(process.env.CONTROLLA_CHROME ? { executablePath: process.env.CONTROLLA_CHROME } : { channel: 'chrome' }) }); });
 after(async () => { await browser?.close(); });
 async function run(html, action, expected, value, setup = '') {
   const page = await browser.newPage();

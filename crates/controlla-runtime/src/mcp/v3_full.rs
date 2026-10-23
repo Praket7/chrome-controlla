@@ -1586,7 +1586,7 @@ struct AppV3 {
     evidence: Arc<Mutex<std::collections::BTreeMap<String, crate::visual_probe::EvidenceTrail>>>,
     evidence_scopes: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
     evidence_store: Arc<crate::evidence_store::PersistentEvidenceStore>,
-    task_checkpoints: Option<Arc<Mutex<crate::task_checkpoints::TaskCheckpointStore>>>,
+    task_checkpoints: Option<crate::task_checkpoints::CheckpointWorker>,
     action_memory: Option<Arc<Mutex<crate::page_action_memory::ActionMemory>>>,
     skill_traces: Option<Arc<crate::skill_induction::SkillTraceStore>>,
     capabilities: Arc<Mutex<crate::capability_registry::CapabilityRegistry>>,
@@ -1614,7 +1614,7 @@ type ColdOpenFlights = std::collections::BTreeMap<String, std::sync::Weak<Mutex<
 struct TaskResumeContext {
     key: String,
     task_digest: String,
-    checkpoints: Arc<Mutex<crate::task_checkpoints::TaskCheckpointStore>>,
+    checkpoints: crate::task_checkpoints::CheckpointWorker,
 }
 
 fn workflow_operation_key(session_id: &str, operation_id: &str) -> String {
@@ -1736,7 +1736,7 @@ impl AppV3 {
                 super::super::state_directory().join("task-checkpoints-v1.json"),
             )
             .ok()
-            .map(|store| Arc::new(Mutex::new(store))),
+            .map(crate::task_checkpoints::CheckpointWorker::new),
             action_memory: crate::page_action_memory::ActionMemory::open(
                 super::super::state_directory().join("page-action-memory-v1.json"),
             )
@@ -7134,12 +7134,10 @@ fn expand_app_adapter_ops(ops: Vec<V3WorkflowOp>) -> Result<Vec<V3WorkflowOp>, r
     Ok(expanded)
 }
 
-fn dag_node_signature(steps: &[V3WorkflowStep]) -> String {
-    steps
-        .iter()
-        .map(workflow_step_name)
-        .collect::<Vec<_>>()
-        .join(",")
+fn dag_node_signature(session_id: &str, steps: &[V3WorkflowStep]) -> String {
+    let names = steps.iter().map(workflow_step_name).collect::<Vec<_>>().join(",");
+    sha2::Sha256::digest(format!("{session_id}|{names}").as_bytes())
+        .iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn virtual_item_identity(item: &Value, fields: &[String]) -> Option<String> {
@@ -11724,91 +11722,9 @@ fn validate_workflow_steps(steps: &[V3WorkflowStep]) -> Result<(), rmcp::ErrorDa
     Ok(())
 }
 
-fn lease_target_key(_session_id: &str, tab_id: &str) -> crate::v3::TargetKey {
-    crate::v3::TargetKey {
-        // A tab may be paired through more than one MCP session; session IDs do not identify Chrome.
-        browser_id: "shared-extension".into(),
-        tab_id: tab_id.to_owned(),
-    }
-}
-
-const TARGET_LEASE_QUEUE_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn process_lease_key(target: &crate::v3::TargetKey) -> crate::process_lease::LeaseKey {
-    crate::process_lease::LeaseKey {
-        browser_instance: target.browser_id.clone(),
-        target_id: target.tab_id.clone(),
-        // Shared-extension tabs are serialized across document/account changes
-        // too: the mutation route revalidates those identities at dispatch.
-        document_epoch: String::new(),
-        account_epoch: String::new(),
-        effect_class: "shared-target-mutation".into(),
-    }
-}
-
-fn process_lease_coordinator() -> &'static crate::process_lease::LeaseCoordinator {
-    static COORDINATOR: std::sync::OnceLock<crate::process_lease::LeaseCoordinator> =
-        std::sync::OnceLock::new();
-    COORDINATOR.get_or_init(crate::process_lease::LeaseCoordinator::new)
-}
-
-async fn acquire_queued_lease(
-    leases: &Mutex<crate::v3::LeaseTable>,
-    target: &crate::v3::TargetKey,
-    owner: &str,
-    nested: bool,
-) -> Result<crate::v3::TargetLease, crate::v3::TargetLease> {
-    let deadline = tokio::time::Instant::now() + TARGET_LEASE_QUEUE_TIMEOUT;
-    loop {
-        // Do not yield between acquiring the process lock and owning the
-        // in-memory lease: cancellation there would orphan the process lock.
-        let mut table = leases.lock().await;
-        let process_key = process_lease_key(target);
-        if !nested
-            && process_lease_coordinator()
-                .try_acquire(
-                    process_key.clone(),
-                    owner,
-                    Duration::from_millis(120_000),
-                    false,
-                )
-                .is_err()
-        {
-            if tokio::time::Instant::now() >= deadline {
-                let now = now_ms();
-                return Err(crate::v3::TargetLease {
-                    owner: "another MCP process".into(),
-                    acquired_at_ms: now,
-                    expires_at_ms: now.saturating_add(120_000),
-                });
-            }
-            drop(table);
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            continue;
-        }
-        let result = if nested {
-            table.acquire_nested(target.clone(), owner, now_ms(), 120_000)
-        } else {
-            table.acquire(target.clone(), owner, now_ms(), 120_000)
-        };
-        drop(table);
-        match result {
-            Ok(lease) => return Ok(lease),
-            Err(existing) if tokio::time::Instant::now() >= deadline => {
-                if !nested {
-                    process_lease_coordinator().release(&process_key, owner);
-                }
-                return Err(existing);
-            }
-            Err(_) => {
-                if !nested {
-                    process_lease_coordinator().release(&process_key, owner);
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-    }
-}
+#[path = "target_leases.rs"]
+mod target_leases;
+use target_leases::*;
 
 fn schedule_task_trace(
     app: &AppV3,
@@ -14632,6 +14548,7 @@ impl AppV3 {
             && let Some(cohort) = receipt.pointer("/execution_route/cost_cohort")
         {
             let origin = cohort["origin_key"].as_str().unwrap_or_default().to_owned();
+            let environment = cohort["environment"].as_str().unwrap_or_default().to_owned();
             let intent = cohort["intent"].as_str().unwrap_or_default().to_owned();
             let warmth = cohort["warmth"].as_str().unwrap_or("unknown").to_owned();
             let task_size = cohort["task_size"].as_str().unwrap_or_default().to_owned();
@@ -14658,6 +14575,7 @@ impl AppV3 {
                     origin: &origin,
                     intent: &intent,
                     provider: "chrome",
+                    environment: &environment,
                     warmth: &warmth,
                     task_size: &task_size,
                 };
@@ -20336,7 +20254,7 @@ impl AppV3 {
                 .filter_map(|planned| {
                     node_map
                         .get(&planned.id)
-                        .map(|node| dag_node_signature(&node.steps))
+                        .map(|node| dag_node_signature(&args.session_id, &node.steps))
                 })
                 .collect::<Vec<_>>();
             let estimates = self.dag_costs.lock().await.estimate_wave(&signatures);
@@ -20357,7 +20275,7 @@ impl AppV3 {
                     let base_session = args.session_id.clone();
                     let client_id = args.client_id.clone();
                     let operation_id = args.operation_id.clone();
-                    let signature = dag_node_signature(&node.steps);
+                    let signature = dag_node_signature(&args.session_id, &node.steps);
                     async move {
                         let node_started = std::time::Instant::now();
                         let node_args = V3WorkflowArgs {
@@ -20389,10 +20307,7 @@ impl AppV3 {
                         && receipt["receipts"].as_array().is_some_and(|steps| {
                             !steps.is_empty() && steps.iter().all(|step| step["verified"] == true)
                         });
-                    self.dag_costs
-                        .lock()
-                        .await
-                        .record_node(signature, elapsed_ms, verified);
+                    crate::workflow_dag::DagCostHistory::record_node_async(self.dag_costs.clone(), signature, elapsed_ms, verified).await;
                     durations.push(elapsed_ms);
                     receipts.insert(id, receipt);
                 }
@@ -20400,10 +20315,7 @@ impl AppV3 {
                 let overhead_ms = (wave_started.elapsed().as_millis() as u64)
                     .saturating_sub(max_node_ms)
                     .max(1);
-                self.dag_costs
-                    .lock()
-                    .await
-                    .record_setup(durations.len(), overhead_ms);
+                crate::workflow_dag::DagCostHistory::record_setup_async(self.dag_costs.clone(), durations.len(), overhead_ms).await;
             } else {
                 serial_layers += 1;
                 for planned in layer {
@@ -20412,7 +20324,7 @@ impl AppV3 {
                         .get(&planned.id)
                         .expect("compiled DAG node identity")
                         .clone();
-                    let signature = dag_node_signature(&node.steps);
+                    let signature = dag_node_signature(&args.session_id, &node.steps);
                     let node_started = std::time::Instant::now();
                     let node_args = V3WorkflowArgs {
                         session_id: args.session_id.clone(),
@@ -20434,10 +20346,7 @@ impl AppV3 {
                             !steps.is_empty() && steps.iter().all(|step| step["verified"] == true)
                         });
                     if effect == crate::workflow_dag::DagEffect::ReadOnly {
-                        self.dag_costs
-                            .lock()
-                            .await
-                            .record_node(signature, elapsed_ms, verified);
+                        crate::workflow_dag::DagCostHistory::record_node_async(self.dag_costs.clone(), signature, elapsed_ms, verified).await;
                     }
                     receipts.insert(node.id, result.0);
                 }
@@ -21051,10 +20960,7 @@ impl AppV3 {
                 .ok_or_else(|| invalid("durable task checkpoints are unavailable"))?;
             let task_digest = crate::task_checkpoints::task_digest(&args.task).map_err(invalid)?;
             let scoped_key = format!("{}\u{1f}{}", args.session_id, key);
-            checkpoints
-                .lock()
-                .await
-                .bind(&scoped_key, &task_digest)
+            checkpoints.bind(&scoped_key, &task_digest).await
                 .map_err(invalid)?;
             Some(TaskResumeContext {
                 key: scoped_key,
@@ -21091,6 +20997,7 @@ impl AppV3 {
         ) {
             let value = &receipt.0;
             let origin = cohort["origin_key"].as_str().unwrap_or_default().to_owned();
+            let environment = cohort["environment"].as_str().unwrap_or_default().to_owned();
             let intent = cohort["intent"].as_str().unwrap_or_default().to_owned();
             let warmth = cohort["warmth"].as_str().unwrap_or("unknown").to_owned();
             let task_size = cohort["task_size"].as_str().unwrap_or_default().to_owned();
@@ -21138,6 +21045,7 @@ impl AppV3 {
                         origin: &origin,
                         intent: &intent,
                         provider: "chrome",
+                        environment: &environment,
                         warmth: &warmth,
                         task_size: &task_size,
                     };
@@ -21318,6 +21226,7 @@ impl AppV3 {
                 origin,
                 intent,
                 provider: "chrome",
+                environment: &args.session_id,
                 warmth: cost_warmth,
                 task_size: size,
             };
@@ -21340,6 +21249,7 @@ impl AppV3 {
                 origin,
                 intent,
                 provider: "chrome",
+                environment: &args.session_id,
                 warmth: cost_warmth,
                 task_size: size,
             };
@@ -21395,7 +21305,7 @@ impl AppV3 {
         });
         if let Some((origin, intent, size)) = cost_context.as_ref() {
             route_receipt["cost_cohort"] =
-                json!({"origin_key":origin,"intent":intent,"warmth":cost_warmth,"task_size":size});
+                json!({"origin_key":origin,"intent":intent,"warmth":cost_warmth,"task_size":size,"environment":args.session_id});
         }
         if let crate::v3_tasks::TaskPrimitive::Research { urls, tab_ids, .. } = &args.task {
             let tab_ids = tab_ids
@@ -21450,7 +21360,7 @@ impl AppV3 {
             if result["status"] == "completed"
                 && let Some(resume) = resume.as_ref()
             {
-                let _ = resume.checkpoints.lock().await.finish(&resume.key);
+                let _ = resume.checkpoints.finish(&resume.key).await;
             }
             if result
                 .pointer("/receipts")
@@ -21612,11 +21522,11 @@ impl AppV3 {
                         Ok((loader, observed_url, frame)) => {
                             let doc = research_target_identity(&observed_url, &loader, &frame);
                             let target_key = format!("mutation-target:{step_index}:{}", active_tab_id);
-                            let bound = resume.checkpoints.lock().await.bind_target_identity(&resume.key, &resume.task_digest, &target_key, &doc).unwrap_or(false);
+                            let bound = resume.checkpoints.bind_target_identity(&resume.key, &resume.task_digest, &target_key, &doc).await.unwrap_or(false);
                             let state = if bound {
-                                resume.checkpoints.lock().await.mutation_state(&resume.key, &resume.task_digest,
+                                resume.checkpoints.mutation_state(&resume.key, &resume.task_digest,
                                     &format!("step:{step_index}:{reference}"), &active_tab_id, &doc,
-                                    &serde_json::to_string(&predicate).unwrap_or_default())
+                                    &serde_json::to_string(&predicate).unwrap_or_default()).await
                             } else { crate::task_checkpoints::MutationCheckpointState::Drifted };
                             match state {
                                 crate::task_checkpoints::MutationCheckpointState::NotStarted => {
@@ -21646,14 +21556,14 @@ impl AppV3 {
                                                 "next_action":"confirm the intended attachment is absent or use a uniquely identifying acceptance predicate; upload was not dispatched"
                                             }))
                                         } else {
-                                            let marked = resume.checkpoints.lock().await.mark_mutation_dispatch_may_have_occurred(
+                                            let marked = resume.checkpoints.mark_mutation_dispatch_may_have_occurred(
                                                 &resume.key,
                                                 &resume.task_digest,
                                                 &format!("step:{step_index}:{reference}"),
                                                 &active_tab_id,
                                                 &doc,
                                                 &serde_json::to_string(&predicate).unwrap_or_default(),
-                                            ).map_err(invalid)?;
+                                            ).await.map_err(invalid)?;
                                             if marked == crate::task_checkpoints::MutationCheckpointState::NotStarted {
                                                 None
                                             } else {
@@ -21661,9 +21571,9 @@ impl AppV3 {
                                             }
                                         }
                                     } else {
-                                    let marked = resume.checkpoints.lock().await.mark_mutation_dispatch_may_have_occurred(
+                                    let marked = resume.checkpoints.mark_mutation_dispatch_may_have_occurred(
                                         &resume.key, &resume.task_digest, &format!("step:{step_index}:{reference}"), &active_tab_id, &doc,
-                                        &serde_json::to_string(&predicate).unwrap_or_default()).map_err(invalid)?;
+                                        &serde_json::to_string(&predicate).unwrap_or_default()).await.map_err(invalid)?;
                                     if marked == crate::task_checkpoints::MutationCheckpointState::NotStarted { None }
                                     else { Some(json!({"status":"reconciliation_required","verified":false,"reason_code":"mutation_checkpoint_race","dispatch_may_have_occurred":true,"next_action":"reconcile the exact postcondition; do not replay"})) }
                                     }
@@ -21701,9 +21611,9 @@ impl AppV3 {
                                     }
                                     if verification["status"] == "passed" && extra_postconditions_passed {
                                         if state == crate::task_checkpoints::MutationCheckpointState::DispatchMayHaveOccurred {
-                                            resume.checkpoints.lock().await.mark_mutation_verified(&resume.key, &resume.task_digest,
+                                            resume.checkpoints.mark_mutation_verified(&resume.key, &resume.task_digest,
                                                 &format!("step:{step_index}:{reference}"), &active_tab_id, &doc,
-                                                &serde_json::to_string(&predicate).unwrap_or_default()).map_err(invalid)?;
+                                                &serde_json::to_string(&predicate).unwrap_or_default()).await.map_err(invalid)?;
                                         }
                                         if let Some((marker_matches, persisted_passed)) = upload_resume_evidence {
                                             Some(json!({"status":"verified","verified":true,"resumed_from_checkpoint":true,
@@ -22040,9 +21950,9 @@ impl AppV3 {
                         match self.readiness_document(&args.session_id, &active_tab_id).await {
                             Ok((loader_id, observed_url, frame_id)) if observed_url == url => {
                                 let identity = research_target_identity(&observed_url, &loader_id, &frame_id);
-                                resume.checkpoints.lock().await.bind_target_identity(
+                                resume.checkpoints.bind_target_identity(
                                     &resume.key, &resume.task_digest, &url, &identity,
-                                ).unwrap_or(false)
+                                ).await.unwrap_or(false)
                             }
                             _ => false,
                         }
@@ -22391,14 +22301,14 @@ impl AppV3 {
                 match self.readiness_document(&args.session_id, &active_tab_id).await {
                     Ok((loader, observed_url, frame)) => {
                         let document = research_target_identity(&observed_url, &loader, &frame);
-                        if let Err(error) = resume.checkpoints.lock().await.mark_mutation_verified(
+                        if let Err(error) = resume.checkpoints.mark_mutation_verified(
                             &resume.key,
                             &resume.task_digest,
                             &format!("step:{step_index}:{reference}"),
                             &active_tab_id,
                             &document,
                             &serde_json::to_string(predicate).unwrap_or_default(),
-                        ) {
+                        ).await {
                             receipt["checkpoint_error"] = json!(error);
                         }
                     }
@@ -22411,13 +22321,13 @@ impl AppV3 {
                 match self.readiness_document(&args.session_id, &active_tab_id).await {
                     Ok((loader_id, observed_url, frame_id)) if observed_url == url => {
                         let document = research_target_identity(&observed_url, &loader_id, &frame_id);
-                        if let Err(error) = resume.checkpoints.lock().await.mark_postcondition_completed(
+                        if let Err(error) = resume.checkpoints.mark_postcondition_completed(
                             &resume.key,
                             &resume.task_digest,
                             &url,
                             &document,
                             &format!("fill:{reference}"),
-                        ) {
+                        ).await {
                             receipt["checkpoint_error"] = json!(error);
                         }
                     }
@@ -22515,12 +22425,12 @@ impl AppV3 {
                     if let Some(identity) = current_identity.as_deref() {
                         // The checkpoint store hashes and compares the exact
                         // URL, loader and frame identity before allowing reuse.
-                        resume.checkpoints.lock().await.target_completed(
+                        resume.checkpoints.target_completed(
                             &resume.key,
                             &resume.task_digest,
                             &url,
                             identity,
-                        )
+                        ).await
                     } else {
                         false
                     }
@@ -22579,12 +22489,12 @@ impl AppV3 {
                 let complete = extraction_receipt["verified"] == true;
                 if complete
                     && let Some(resume) = resume.as_ref()
-                    && let Err(error) = resume.checkpoints.lock().await.mark_target_completed(
+                    && let Err(error) = resume.checkpoints.mark_target_completed(
                         &resume.key,
                         &resume.task_digest,
                         &url,
                         &research_target_identity(&url, &loader_before, &frame_before),
-                    )
+                    ).await
                 {
                     receipts[0]["checkpoint_error"] = json!(error);
                     return (false, receipts);

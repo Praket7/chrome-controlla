@@ -54,6 +54,8 @@ pub struct ObservationDecision {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationHistory {
+    #[serde(default)]
+    build_scope: String,
     profiles: BTreeMap<String, Vec<ObservationSample>>,
     #[serde(default)]
     profile_recency: BTreeMap<String, u64>,
@@ -66,6 +68,8 @@ pub struct ObservationHistory {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ObservationSample {
+    #[serde(default)]
+    recorded_at_ms: u64,
     mode: ObservationMode,
     elapsed_ms: u64,
     bytes: u64,
@@ -82,6 +86,10 @@ impl ObservationHistory {
             _ => Self::default(),
         };
         history.seed_missing_recency();
+        if history.build_scope != env!("CONTROLLA_COST_BUILD_ID") {
+            history = Self::default();
+        }
+        history.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         history.path = Some(path);
         history
     }
@@ -97,6 +105,7 @@ impl ObservationHistory {
         if elapsed_ms == 0 || bytes > 1_000_000 {
             return;
         }
+        self.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         let key = profile_key(request);
         if !self.profiles.contains_key(&key)
             && self.profiles.len() >= MAX_PROFILES
@@ -108,6 +117,10 @@ impl ObservationHistory {
         self.touch_profile(&key);
         let samples = self.profiles.entry(key).or_default();
         samples.push(ObservationSample {
+            recorded_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             mode: decision.mode,
             elapsed_ms,
             bytes,
@@ -168,7 +181,12 @@ impl ObservationHistory {
             .filter_map(|mode| {
                 let matching = samples
                     .iter()
-                    .filter(|sample| sample.mode == mode)
+                    .filter(|sample| {
+                        sample.mode == mode
+                            && crate::execution_cost_router::fresh_timing_sample(
+                                sample.recorded_at_ms,
+                            )
+                    })
                     .rev()
                     .take(MIN_QUALIFIED_SAMPLES)
                     .collect::<Vec<_>>();

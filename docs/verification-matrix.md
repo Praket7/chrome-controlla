@@ -1,5 +1,10 @@
 # Verification matrix
 
+## Performance implementation evidence — 2026-10-23
+
+See [the implementation ledger](performance-implementation-2026-10-23.md) for commands, review findings, retained failures, final suite outcomes and limits. Real disposable Chromium checks cover DOM actions, snapshot geometry/budget behavior, guarded preflight and native WebMCP schema/input compatibility. The fixture oracle proves basic form/upload server state independent of browser events; unsupported scenarios remain unqualified. These checks do not qualify external clients, arbitrary app persistence, or a speed superiority claim.
+
+
 ## Comprehensive audit local evidence — 2026-10-18
 
 | Gate | Result | Limit |

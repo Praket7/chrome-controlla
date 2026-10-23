@@ -49,6 +49,7 @@ fn expected_cost_vector_can_choose_higher_observed_latency_with_lower_total_cost
         origin: "https://example.test",
         intent: "read-story",
         provider: "chrome",
+        environment: "accepted-browser-session",
         warmth: "warm_qualified_route",
         task_size: "small",
     };

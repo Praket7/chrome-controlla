@@ -12,6 +12,8 @@ const MAX_SAMPLE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionCostRouter {
+    #[serde(default)]
+    build_scope: String,
     profiles: BTreeMap<String, Vec<LatencySample>>,
     #[serde(default)]
     profile_recency: BTreeMap<String, u64>,
@@ -38,6 +40,8 @@ pub struct RouteCostContext<'a> {
     pub origin: &'a str,
     pub intent: &'a str,
     pub provider: &'a str,
+    /// Accepted browser-session identity. Timing evidence never crosses a re-pair.
+    pub environment: &'a str,
     pub warmth: &'a str,
     pub task_size: &'a str,
 }
@@ -66,6 +70,10 @@ impl ExecutionCostRouter {
             _ => Self::default(),
         };
         store.seed_missing_recency();
+        if store.build_scope != env!("CONTROLLA_COST_BUILD_ID") {
+            store = Self::default();
+        }
+        store.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         store.path = Some(path);
         store
     }
@@ -107,6 +115,8 @@ impl ExecutionCostRouter {
             || context.intent.len() > 128
             || context.provider.is_empty()
             || context.provider.len() > 64
+            || context.environment.is_empty()
+            || context.environment.len() > 256
             || !matches!(
                 context.warmth,
                 "warm_browser_first_seen_site"
@@ -120,6 +130,7 @@ impl ExecutionCostRouter {
         {
             return Err("invalid route cost sample");
         }
+        self.build_scope = env!("CONTROLLA_COST_BUILD_ID").to_owned();
         let key = profile_key(context, tier);
         if !self.profiles.contains_key(&key)
             && self.profiles.len() >= MAX_PROFILES
@@ -338,6 +349,11 @@ impl ExecutionCostRouter {
     }
 }
 
+pub(crate) fn fresh_timing_sample(recorded_at_ms: u64) -> bool {
+    let now = unix_time_ms();
+    recorded_at_ms != 0 && recorded_at_ms <= now && now - recorded_at_ms <= MAX_SAMPLE_AGE_MS
+}
+
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -351,8 +367,14 @@ fn profile_key(context: &RouteCostContext<'_>, tier: ExecutionTier) -> String {
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        context.origin, context.intent, context.provider, tier, context.warmth, context.task_size
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        context.origin,
+        context.intent,
+        context.provider,
+        tier,
+        context.warmth,
+        context.task_size,
+        context.environment
     )
 }
 
@@ -360,11 +382,55 @@ fn profile_key(context: &RouteCostContext<'_>, tier: ExecutionTier) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn persisted_unscoped_costs_are_not_qualified() {
+        let mut router = ExecutionCostRouter::default();
+        for _ in 0..16 {
+            router
+                .record(&context(), ExecutionTier::SemanticProgram, 10, true, true)
+                .unwrap();
+        }
+        let mut stored = serde_json::to_value(&router).unwrap();
+        stored.as_object_mut().unwrap().remove("build_scope");
+        let path =
+            std::env::temp_dir().join(format!("controlla-cost-scope-{}.json", std::process::id()));
+        std::fs::write(&path, stored.to_string()).unwrap();
+        let restored = ExecutionCostRouter::open(&path);
+        assert_eq!(
+            restored.select(&context(), &[ExecutionTier::SemanticProgram]),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn learned_costs_do_not_cross_accepted_browser_sessions() {
+        let mut router = ExecutionCostRouter::default();
+        for _ in 0..16 {
+            router
+                .record(&context(), ExecutionTier::SemanticProgram, 10, true, true)
+                .unwrap();
+        }
+        let restarted = RouteCostContext {
+            environment: "new-browser-session",
+            ..context()
+        };
+        assert_eq!(
+            router.select(&context(), &[ExecutionTier::SemanticProgram]),
+            Some(ExecutionTier::SemanticProgram)
+        );
+        assert_eq!(
+            router.select(&restarted, &[ExecutionTier::SemanticProgram]),
+            None
+        );
+    }
+
     fn context() -> RouteCostContext<'static> {
         RouteCostContext {
             origin: "https://example.test",
             intent: "intent-a",
             provider: "chrome",
+            environment: "accepted-browser-session",
             warmth: "warm_qualified_route",
             task_size: "small",
         }

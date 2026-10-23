@@ -79,6 +79,55 @@ fn main() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    // Persisted timing cohorts must not survive changes to the executing
+    // runtime, extension, dependency graph, or target platform unnoticed.
+    let mut source_files = Vec::new();
+    fn sources(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read source directory") {
+            let path = entry.expect("read source entry").path();
+            if path.is_dir() {
+                sources(&path, files);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext == "rs" || ext == "js")
+            {
+                files.push(path);
+            }
+        }
+    }
+    sources(&manifest_dir.join("src"), &mut source_files);
+    sources(
+        &manifest_dir.join("../controlla-browser/src"),
+        &mut source_files,
+    );
+    source_files.extend([
+        manifest_dir.join("build.rs"),
+        manifest_dir.join("../../Cargo.lock"),
+        manifest_dir.join("../../rust-toolchain.toml"),
+    ]);
+    source_files.sort();
+    let mut cost_hasher = Sha256::new();
+    cost_hasher.update(digest.as_bytes());
+    cost_hasher.update(env::var("TARGET").expect("target triple").as_bytes());
+    for key in ["PROFILE", "OPT_LEVEL", "DEBUG", "CARGO_ENCODED_RUSTFLAGS"] {
+        println!("cargo:rerun-if-env-changed={key}");
+        cost_hasher.update(key.as_bytes());
+        cost_hasher.update([0]);
+        cost_hasher.update(env::var(key).unwrap_or_default().as_bytes());
+        cost_hasher.update([0]);
+    }
+    for path in source_files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = fs::read(&path).expect("read cost cohort source");
+        cost_hasher.update((bytes.len() as u64).to_be_bytes());
+        cost_hasher.update(bytes);
+    }
+    let cost_scope = cost_hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    println!("cargo:rustc-env=CONTROLLA_COST_BUILD_ID={cost_scope}");
     println!(
         "cargo:rustc-env=CONTROLLA_EXTENSION_BUILD_ID=controlla-chrome-extension:{runtime_version}:{digest}"
     );

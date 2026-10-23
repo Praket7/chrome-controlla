@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomBytes } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
@@ -59,8 +60,9 @@ async function main() {
   const clientVersions = parseAdapterVersions(process.env.PHASE11_CLIENT_ADAPTER_VERSIONS_JSON, adapters);
   const stateDir = await mkdtemp(join(tmpdir(), 'controlla-phase11-'));
   const stateFile = join(stateDir, 'state.json');
+  const oracleToken=randomBytes(32).toString('hex');
   const fixture = spawn(process.execPath, [resolve(root, 'bench/fixtures/realistic/server.mjs'), '--port=0'], {
-    cwd: root, env: { ...process.env, PHASE11_STATE_FILE: stateFile }, stdio: ['ignore', 'pipe', 'inherit'],
+    cwd: root, env: { ...process.env, PHASE11_ORACLE_TOKEN:oracleToken, PHASE11_STATE_FILE: stateFile }, stdio: ['ignore', 'pipe', 'inherit'],
   });
   try {
     const base = await new Promise((resolveBase, reject) => {
@@ -90,6 +92,7 @@ async function main() {
     const dirtyTreeHash = createHash('sha256').update('').digest('hex');
     const env = {
       ...process.env,
+      PHASE11_ORACLE_TOKEN:oracleToken,
       PHASE11_BASELINE_IDS: process.env.PHASE11_BASELINE_IDS ?? 'playwright-mcp',
       PHASE11_FIXTURE_BASE_URL: base,
       PHASE11_STATE_FILE: stateFile,
@@ -110,7 +113,7 @@ async function main() {
         model_settings: process.env.PHASE11_MODEL_SETTINGS ?? 'unspecified',
         prompt_hash: process.env.PHASE11_PROMPT_HASH ?? 'adapter-generated',
         token_budget: Number(process.env.PHASE11_TOKEN_BUDGET ?? 32000),
-        fixture_revision: 'local-realistic-v1',
+        fixture_revision: 'local-realistic-v2-server-acceptance',
         network_profile: 'loopback-only',
         account_fixture_id: 'phase11-local-disposable',
         client_adapter_versions: clientVersions,

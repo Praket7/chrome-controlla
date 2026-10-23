@@ -160,6 +160,25 @@ async fn page_tool_discovery_cache_is_per_document_and_invalidates_on_toolchange
 }
 
 #[tokio::test]
+async fn page_tool_normalizes_native_json_string_schemas() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
+    let result = context.async_with(async |ctx| {
+        ctx.eval::<(), _>(r#"globalThis.AbortController=class{constructor(){this.signal={}}abort(){}};globalThis.setTimeout=()=>1;globalThis.clearTimeout=()=>{};globalThis.document={modelContext:{getTools:async()=>[{name:'read',inputSchema:'{"type":"object"}'}],executeTool:async()=>({ok:true})}};"#).unwrap();
+        let discovery = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})()))()", PageToolProgram::discovery())).unwrap().into_future::<String>().await.unwrap();
+        let invoked = ctx.eval::<rquickjs::Promise, _>(format!("(async()=>JSON.stringify(await ({})('read',{{}},{{type:'object'}},1000)))()", PageToolProgram::invocation())).unwrap().into_future::<String>().await.unwrap();
+        Ok::<_, rquickjs::Error>((discovery, invoked))
+    }).await.unwrap();
+    let discovery: Value = serde_json::from_str(&result.0).unwrap();
+    let invoked: Value = serde_json::from_str(&result.1).unwrap();
+    assert_eq!(
+        discovery["tools"][0]["input_schema"],
+        json!({"type":"object"})
+    );
+    assert_eq!(invoked["result"]["ok"], true);
+}
+
+#[tokio::test]
 async fn page_tool_invocation_reuses_document_catalog_until_toolchange() {
     let runtime = rquickjs::AsyncRuntime::new().unwrap();
     let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
