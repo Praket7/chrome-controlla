@@ -420,7 +420,8 @@ impl ChromeProcess {
             let _ = std::fs::remove_dir_all(&profile_directory);
             return Err(ProviderError::Io(error));
         }
-        let mut command = chrome_command(executable, &profile_directory, mode);
+        let no_sandbox = std::env::var("CONTROLLA_CHROME_NO_SANDBOX").as_deref() == Ok("1");
+        let mut command = chrome_command(executable, &profile_directory, mode, no_sandbox);
         match command.spawn() {
             Ok(child) => Ok(Self {
                 child: Some(child),
@@ -527,7 +528,12 @@ fn unique_profile_directory() -> Result<PathBuf, std::io::Error> {
     }
 }
 
-fn chrome_command(executable: &Path, profile_directory: &Path, mode: SessionMode) -> Command {
+fn chrome_command(
+    executable: &Path,
+    profile_directory: &Path,
+    mode: SessionMode,
+    no_sandbox: bool,
+) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("--remote-debugging-address=127.0.0.1")
@@ -547,6 +553,10 @@ fn chrome_command(executable: &Path, profile_directory: &Path, mode: SessionMode
         command.arg("--headless=new");
         #[cfg(target_os = "macos")]
         command.arg("--use-mock-keychain");
+    }
+    // Chrome for Testing has no setuid sandbox in disposable CI profiles.
+    if no_sandbox {
+        command.arg("--no-sandbox");
     }
     command
 }
@@ -1534,7 +1544,12 @@ mod tests {
     #[test]
     fn launch_arguments_use_distinct_profile_and_headless_mode() {
         let profile = PathBuf::from("/tmp/chrome profile/with spaces");
-        let headed = chrome_command(Path::new("/opt/chrome"), &profile, SessionMode::Headed);
+        let headed = chrome_command(
+            Path::new("/opt/chrome"),
+            &profile,
+            SessionMode::Headed,
+            false,
+        );
         let headed = headed
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1547,13 +1562,25 @@ mod tests {
         assert!(!headed.iter().any(|arg| arg == "--headless=new"));
         assert!(!headed.iter().any(|arg| arg == "about:blank"));
         assert!(headed.iter().any(|arg| arg == "--no-startup-window"));
-        let headless = chrome_command(Path::new("/opt/chrome"), &profile, SessionMode::Headless);
+        let headless = chrome_command(
+            Path::new("/opt/chrome"),
+            &profile,
+            SessionMode::Headless,
+            false,
+        );
         assert!(headless.get_args().any(|arg| arg == "--headless=new"));
         #[cfg(target_os = "macos")]
         assert!(headless.get_args().any(|arg| arg == "--use-mock-keychain"));
         #[cfg(not(target_os = "macos"))]
         assert!(!headless.get_args().any(|arg| arg == "--use-mock-keychain"));
         assert!(!headed.iter().any(|arg| arg == "--use-mock-keychain"));
+        let ci = chrome_command(
+            Path::new("/opt/chrome"),
+            &profile,
+            SessionMode::Headless,
+            true,
+        );
+        assert!(ci.get_args().any(|arg| arg == "--no-sandbox"));
     }
 
     #[cfg(unix)]

@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         # Pinned lane makes comparisons reproducible; stable detects API drift.
-        chrome: ['154.0.8037.98', stable]
+        chrome: ['156.0.8078.47', stable]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +64,7 @@ jobs:
       - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
         env:
           CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          CONTROLLA_CHROME_NO_SANDBOX: '1'
       - run: node extensions/chrome-controlla/test-background.cjs --reconnect-only
       - run: for run in {1..8}; do node extensions/chrome-controlla/test-background.cjs; done
         shell: bash
