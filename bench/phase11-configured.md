@@ -6,6 +6,8 @@ It starts the disposable loopback fixture service, creates reset and independent
 
 The actor disables shell execution, apps, and plugins, and uses Codex automatic approval review for MCP calls. Its fixture URL is constrained to loopback, but browser and model network access are not restricted by the harness.
 
+The suite writes an exclusive `.partial.jsonl` file next to its output before starting and appends each completed warmup or measured pair. A `completed` record appears only after the final report is written; an interrupted file is partial evidence, not a completed report.
+
 Run a controlled smoke with one task and one baseline:
 
 ```sh

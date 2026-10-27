@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { analyzePaired, evaluateClaimGate } from '../analysis/phase11-analysis.mjs';
-import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config, liveTaskUrl } from './phase11-runner.mjs';
+import { parseCommand, runBenchmark, validateAdapterResult, loadAdapterContract, loadPhase11Config, liveTaskUrl, assertBoundedRow } from './phase11-runner.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mock = resolve(here, 'mock-phase11-command.mjs');
@@ -27,6 +27,13 @@ const environment = {
   client_adapter_versions: Object.fromEntries(['controlla','agent-browser','browser-use','chrome-devtools-mcp','controlla-1','controlla-2-pre-stage2','playwright-mcp','stagehand'].map(id => [id, 'test'])),
   account_fixture_id: 'synthetic-fixture-account'
 };
+
+test('paired evidence has room for two bounded client records', () => {
+  const row = {candidate:'x'.repeat(6500), baseline:'y'.repeat(6500)};
+  assert.throws(() => assertBoundedRow(row), /exceeded 12288/);
+  assert.doesNotThrow(() => assertBoundedRow(row, true));
+  assert.throws(() => assertBoundedRow({data:'x'.repeat(27000)}, true), /exceeded 26624/);
+});
 
 function adapter(id, wall, rounds) {
   return [node, mock, 'adapter', id, String(wall), String(rounds)];
@@ -111,6 +118,7 @@ function completeMetricResult(contract) {
 }
 
 test('runner resets, independently verifies, preserves paired failures, and emits full matrix subset', async () => {
+  const checkpointed = [];
   const report = await runBenchmark({
     baselineId: 'playwright-mcp',
     fixtureBaseUrl: 'https://fixtures.example.test/',
@@ -127,12 +135,14 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     repetitions: 1,
     warmupRepetitions: 0,
     env: {...process.env, PHASE11_MOCK_OUTPUT_UNAVAILABLE:'1'},
+    onRow: async row => checkpointed.push(row),
     deadlineMs: 5000
   });
   assert.equal(report.schema_version, 2);
   assert.deepEqual(report.randomization, { method: 'seeded_paired_order', seed: 20261015 });
   assert.equal(report.candidate_adapter, 'controlla');
   assert.equal(report.baseline_adapter, 'playwright-mcp');
+  assert.deepEqual(checkpointed, report.paired_rows);
   assert.equal(report.paired_rows.length, (await loadPhase11Config()).tasks.length);
   assert.ok(report.paired_rows.every(row => row.execution_mode === 'headless' && row.candidate.execution_mode === 'headless'));
   for (const row of report.paired_rows) {

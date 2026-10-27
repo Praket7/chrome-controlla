@@ -8,6 +8,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const MAX_STDIO_BYTES = 1024 * 1024;
 const MAX_REPORT_ROW_BYTES = 12 * 1024;
+const MAX_PAIRED_ROW_BYTES = 2 * MAX_REPORT_ROW_BYTES + 2048;
 export const MAX_REPORT_BYTES = 256 * 1024 * 1024;
 const OPTIONAL_OUTPUT_FIELDS = [
   'source_ref', 'schema_bytes', 'external_controlla_calls', 'model_turns',
@@ -247,10 +248,11 @@ function compactAdapterOutput(raw, contract) {
   return retained;
 }
 
-function assertBoundedRow(row) {
+export function assertBoundedRow(row, paired = false) {
   const bytes = Buffer.byteLength(JSON.stringify(row));
-  if (bytes > MAX_REPORT_ROW_BYTES) {
-    throw new Error(`benchmark evidence row exceeded ${MAX_REPORT_ROW_BYTES} bytes after normalization (${bytes} bytes)`);
+  const limit = paired ? MAX_PAIRED_ROW_BYTES : MAX_REPORT_ROW_BYTES;
+  if (bytes > limit) {
+    throw new Error(`benchmark evidence row exceeded ${limit} bytes after normalization (${bytes} bytes)`);
   }
   return bytes;
 }
@@ -476,6 +478,7 @@ export async function runBenchmark({
   warmupRepetitions,
   executionModes,
   maxReportBytes = MAX_REPORT_BYTES,
+  onRow,
   deadlineMs = 60_000,
   env = process.env,
   configPath = 'bench/tasks/phase11-realistic.json',
@@ -532,9 +535,10 @@ export async function runBenchmark({
     }
     const row = { warmup: true, replicate, task_id: task.id, mode, execution_mode: executionMode, concurrency,
       candidate_order: candidateFirst ? 'first' : 'second', candidate: candidateResult, baseline: baselineResult };
-    reportBytes += assertBoundedRow(row);
+    reportBytes += assertBoundedRow(row, true);
     if (reportBytes > maxReportBytes) throw new Error(`benchmark report exceeded ${maxReportBytes} bytes`);
     warmupRows.push(row);
+    if (onRow) await onRow(row);
   }
   const cases = [];
   for (let replicate = 0; replicate < selectedRepetitions; replicate++) {
@@ -565,9 +569,10 @@ export async function runBenchmark({
         }
         const row = { replicate, task_id: task.id, mode, execution_mode: executionMode, concurrency,
           candidate_order: candidateFirst ? 'first' : 'second', candidate: candidateResult, baseline: baselineResult };
-        reportBytes += assertBoundedRow(row);
+        reportBytes += assertBoundedRow(row, true);
         if (reportBytes > maxReportBytes) throw new Error(`benchmark report exceeded ${maxReportBytes} bytes`);
         pairedRows.push(row);
+        if (onRow) await onRow(row);
     }
   const report = {
     schema_version: 2,

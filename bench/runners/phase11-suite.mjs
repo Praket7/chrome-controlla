@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadPhase11Config, MAX_REPORT_BYTES, parseCommand, runBenchmark } from './phase11-runner.mjs';
@@ -33,6 +33,7 @@ export async function runFullSuite({
   retainRows = true,
   maxReportBytes = MAX_REPORT_BYTES,
   onComparison,
+  onRow,
   deadlineMs = 60_000,
   env = process.env,
   configPath = process.env.PHASE11_TASK_SET ?? 'bench/tasks/phase11-realistic.json',
@@ -56,6 +57,7 @@ export async function runFullSuite({
       concurrencyLevels,
       repetitions,
       maxReportBytes: retainRows ? maxReportBytes - retainedBytes : maxReportBytes,
+      onRow: onRow ? row => onRow(baselineId, row) : undefined,
       deadlineMs,
       env,
       configPath,
@@ -120,8 +122,12 @@ async function main() {
   const resetCommand = parseCommand(process.env.PHASE11_RESET_COMMAND_JSON, 'PHASE11_RESET_COMMAND_JSON');
   const verifierCommand = parseCommand(process.env.PHASE11_VERIFIER_COMMAND_JSON, 'PHASE11_VERIFIER_COMMAND_JSON');
   const comparisonDir = `${output}.comparisons`;
+  const checkpoint = `${output}.partial.jsonl`;
+  await mkdir(dirname(output), { recursive: true });
+  await writeFile(checkpoint, `${JSON.stringify({status:'running',candidate_adapter:candidateId,baselines,environment,config,modes,executionModes,concurrencyLevels,repetitions})}\n`, {flag:'wx'});
   const report = await runFullSuite({ candidateId, baselineIds: baselines, fixtureBaseUrl, commands, resetCommand, verifierCommand,
     environment, modes, executionModes, concurrencyLevels, repetitions, deadlineMs, configPath, retainRows: false,
+    onRow: async (baseline, row) => appendFile(checkpoint, `${JSON.stringify({baseline,row})}\n`),
     onComparison: async evidence => {
       await mkdir(comparisonDir, { recursive: true });
       const filename = `${evidence.baseline_adapter}.json`;
@@ -134,6 +140,7 @@ async function main() {
     } });
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
+  await appendFile(checkpoint, `${JSON.stringify({status:'completed'})}\n`);
   console.log(`wrote a full Phase 11 evidence manifest for ${report.comparisons.length} structured baselines to ${output}`);
 }
 
