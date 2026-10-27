@@ -632,7 +632,7 @@ async fn private_headless_task_research_draft_and_repeat() {
                 "Fact B"
             };
             let body = format!(
-                "<title>Fixture {fact}</title><main>{fact}</main><input aria-label='Name' value='before'><button type='button' onclick=\"document.querySelector('#saved').textContent='Saved'\">Save</button><span id='saved'></span>"
+                "<title>Fixture {fact}</title><main>{fact}</main><input aria-label='Name' value='before'><button type='button' onclick=\"document.querySelector('#saved').textContent='Saved'\">Save</button><span id='saved'></span><button type='button' onclick=\"document.querySelector('input').style.display='none';document.querySelector('#hiddenstatus').textContent='Hidden'\">Hide name</button><span id='hiddenstatus'></span>"
             );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -746,7 +746,7 @@ async fn private_headless_task_research_draft_and_repeat() {
     let repeat = client
         .call_tool(call(
             "browser",
-            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,"release_after_task":true,
+            serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,"release_after_task":false,
         "task":{"kind":"repeat","references":[name,save],"action":"verify_visible"}}),
         ))
         .await
@@ -754,7 +754,17 @@ async fn private_headless_task_research_draft_and_repeat() {
         .structured_content
         .unwrap();
     assert_eq!(repeat["status"], "completed", "{repeat}");
-    assert_eq!(repeat["private_session_released"], true, "{repeat}");
+    let snapshot = client.call_tool(call("snapshot", serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id}))).await.unwrap().structured_content.unwrap();
+    let hide = snapshot["items"].as_array().unwrap().iter().find(|item| item["name"] == "Hide name").unwrap()["reference"].as_str().unwrap();
+    let hidden = client.call_tool(call("act", serde_json::json!({"session_id":session_id,"chrome_tab_id":tab_id,"action":"click","reference":hide,"outcome":{"kind":"text","selector":"#hiddenstatus","text":"Hidden"}}))).await.unwrap().structured_content.unwrap();
+    assert_eq!(hidden["status"], "verified", "{hidden}");
+    let mutation = client.call_tool(call("browser", serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,"task":{"kind":"mutation","steps":[{"action":"verify_visible","reference":name}]}}))).await.unwrap().structured_content.unwrap();
+    assert_ne!(mutation["status"], "completed", "{mutation}");
+    assert_eq!(mutation["receipts"][0]["verified"], false, "{mutation}");
+    let repeat_hidden = client.call_tool(call("browser", serde_json::json!({"action":"task","session_id":session_id,"chrome_tab_id":tab_id,"release_after_task":true,"task":{"kind":"repeat","references":[name],"action":"verify_visible"}}))).await.unwrap().structured_content.unwrap();
+    assert_ne!(repeat_hidden["status"], "completed", "{repeat_hidden}");
+    assert_eq!(repeat_hidden["receipts"][0]["verified"], false, "{repeat_hidden}");
+    assert_eq!(repeat_hidden["private_session_released"], true, "{repeat_hidden}");
     client.cancel().await.unwrap();
     server.abort();
     std::fs::remove_dir_all(state_dir).unwrap();

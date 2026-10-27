@@ -6,6 +6,20 @@ use controlla_runtime::v3_tasks::{
 use serde_json::json;
 
 #[test]
+fn mutation_can_verify_visibility_without_becoming_resumable() {
+    let task: TaskPrimitive = serde_json::from_value(json!({"kind":"mutation","steps":[
+        {"action":"verify_visible","reference":"@c1"}
+    ]})).unwrap();
+    assert!(matches!(&task.expand().unwrap()[0], ExpandedStep::VerifyVisible { reference } if reference == "@c1"));
+    assert!(!task.is_resumable_fill_only());
+    assert!(!task.is_resumable_with_postconditions());
+    let invalid: TaskPrimitive = serde_json::from_value(json!({"kind":"mutation","steps":[
+        {"action":"verify_visible","reference":"#selector"}
+    ]})).unwrap();
+    assert!(invalid.expand().is_err());
+}
+
+#[test]
 fn research_expands_without_an_autonomous_loop() {
     let task = TaskPrimitive::Research {
         urls: vec![

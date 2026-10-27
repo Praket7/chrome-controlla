@@ -157,11 +157,11 @@ test('not-dispatched browser calls remain unqualified and identify the tool', as
   try {
     const executable=join(dir,'codex');
     const input={task_id:'form-guarded-fill',task_class:'forms',mode:'cold_browser',execution_mode:'headless',concurrency:1,fixture_url:'http://127.0.0.1:1234/registration-form?task=form-guarded-fill',acceptance:{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'},deadline_ms:60000};
-    for (const result of [{structured_content:{status:'not_dispatched'}},{structuredContent:{status:'completed_unverified'}},{content:[{type:'text',text:'{"status":"unknown"}'}]},{isError:true},{status:'incomplete'}]) {
+    for (const result of [{structured_content:{status:'not_dispatched'}},{structuredContent:{status:'completed_unverified'}},{content:[{type:'text',text:'{"status":"unknown"}'}]},{isError:true},{status:'incomplete'},{structured_content:{status:'not_dispatched',reason_code:'unsafe_page'}},{structured_content:{status:'not_dispatched',reason_code:'sensitive text'}}]) {
     await writeFile(executable, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'playwright-mcp',tool:'browser_close',status:'completed',result:${JSON.stringify(result)}}}));\nconsole.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'DONE'}}));\n`,{mode:0o755});
     const output=await new Promise((resolveOutput,reject)=>{const child=spawn(process.execPath,[adapterPath,'playwright-mcp'],{cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome'},stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.once('error',reject);child.once('close',code=>code===0?resolveOutput(JSON.parse(stdout)):reject(new Error(stderr)));child.stdin.end(JSON.stringify(input));});
     assert.equal(output.success,false);
-    assert.equal(output.runner_error,'Codex host MCP call failed: browser_close');
+    assert.equal(output.runner_error,`Codex host MCP call failed: browser_close${result.structured_content?.reason_code === 'unsafe_page' ? ' (unsafe_page)' : ''}`);
     }
   } finally { await rm(dir,{recursive:true,force:true}); }
 });

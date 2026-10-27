@@ -92,9 +92,12 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const selectionArgs = selectionIndex < 0 ? null : calls[selectionIndex].item.arguments;
     const selectionConfirmed = adapter !== 'controlla' || fixtureKind !== 'upload' || Boolean(selectionIndexes.length === 1 && selectionArgs?.session_id && selectionArgs?.chrome_tab_id && calls.slice(selectionIndex + 1).some(event => event.item?.server === configured.server && event.item?.tool === 'act' && event.item?.arguments?.session_id === selectionArgs.session_id && event.item?.arguments?.chrome_tab_id === selectionArgs.chrome_tab_id && event.item?.arguments?.action === 'click' && event.item?.arguments?.outcome?.kind === 'text' && event.item.arguments.outcome.selector === '#status' && event.item.arguments.outcome.text === 'Upload saved' && decoded(event)?.status === 'verified'));
     const success = result === 0 && !oversized && !malformed && intended.length > 0 && intended.length === calls.length && !unrelated && selectionConfirmed && final === 'DONE';
-    const failedCall = calls.find(event => !callSucceeded(event))?.item;
+    const failedEvent = calls.find(event => !callSucceeded(event));
+    const failedCall = failedEvent?.item;
     const failedTool = /^[a-zA-Z0-9_-]{1,80}$/.test(failedCall?.tool ?? '') ? failedCall.tool : 'unknown';
-    const failure = oversized || malformed ? 'Codex host returned invalid or oversized event output' : timedOut ? 'Codex host timed out' : result !== 0 ? `Codex host exited with code ${result ?? 'unknown'}` : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}` : 'Codex host did not report task completion';
+    const reason = failedEvent && decoded(failedEvent)?.reason_code;
+    const safeReason = typeof reason === 'string' && /^[a-z0-9_]{1,80}$/.test(reason) ? ` (${reason})` : '';
+    const failure = oversized || malformed ? 'Codex host returned invalid or oversized event output' : timedOut ? 'Codex host timed out' : result !== 0 ? `Codex host exited with code ${result ?? 'unknown'}` : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}${safeReason}` : 'Codex host did not report task completion';
     output({success, mcp_calls:success ? calls.length : null, runner_error:success ? undefined : failure});
   } finally { await rm(dir,{recursive:true,force:true}); }
   process.exit(0);

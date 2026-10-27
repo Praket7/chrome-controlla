@@ -115,6 +115,9 @@ pub enum MutationStep {
         reference: String,
         outcome: Value,
     },
+    VerifyVisible {
+        reference: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
@@ -247,6 +250,7 @@ impl TaskPrimitive {
                 !steps.is_empty()
                     && steps.iter().all(|step| match step {
                         MutationStep::Fill { reference, .. } => reference.starts_with("@c"),
+                        MutationStep::VerifyVisible { .. } => false,
                         MutationStep::Click { outcome, .. } => {
                             let Some(kind) = outcome.get("kind").and_then(Value::as_str) else {
                                 return false;
@@ -321,6 +325,7 @@ impl TaskPrimitive {
                 "steps":steps.iter().enumerate().map(|(index, step)| match step {
                     MutationStep::Fill { .. } => serde_json::json!({"action":"fill","slot":index}),
                     MutationStep::Click { outcome, .. } => serde_json::json!({"action":"click","slot":index,"outcome":outcome}),
+                    MutationStep::VerifyVisible { .. } => serde_json::json!({"action":"verify_visible","slot":index}),
                 }).collect::<Vec<_>>(),
             });
         }
@@ -599,6 +604,12 @@ impl TaskPrimitive {
                     return Err("mutation requires 1..32 bounded steps");
                 }
                 steps.iter().map(|step| match step {
+                    MutationStep::VerifyVisible { reference } => {
+                        if !reference.starts_with("@c") {
+                            return Err("mutation verification requires a fresh semantic ref");
+                        }
+                        Ok(ExpandedStep::VerifyVisible { reference: reference.clone() })
+                    }
                     MutationStep::Fill { reference, expected_value, value } => {
                         if !reference.starts_with("@c") || expected_value.len() > 16_384 || value.len() > 16_384 {
                             return Err("mutation fill requires a fresh semantic ref and bounded values");

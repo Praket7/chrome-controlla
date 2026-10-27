@@ -95,6 +95,11 @@ impl SemanticTabState {
     }
 }
 
+fn invalidate_semantic_tab(state: &mut SemanticTabState) {
+    let next_ref = state.next_ref.max(1);
+    *state = SemanticTabState { next_ref, ..Default::default() };
+}
+
 fn reset_semantic_document(state: &mut SemanticTabState, doc_key: &str, snapshot: &Value) {
     // Keep public references monotonic for this paired tab even when the
     // document changes. This prevents an old @cN from aliasing a new item.
@@ -3906,6 +3911,11 @@ mod tests {
         assert_eq!(state.document_key, "new-document");
         assert_eq!(state.next_ref, 9);
         assert!(state.key_to_short.is_empty());
+        state.items.insert("@c8".into(), json!({"name":"old"}));
+        invalidate_semantic_tab(&mut state);
+        assert_eq!(state.next_ref, 9);
+        assert!(state.document_key.is_empty());
+        assert!(state.items.is_empty());
     }
 
     #[test]

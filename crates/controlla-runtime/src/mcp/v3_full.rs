@@ -7208,6 +7208,17 @@ fn reject_research_extract(
     extraction
 }
 
+fn fresh_visibility_result(snapshot: &Value, reference: &str) -> Value {
+    let found = snapshot["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| item["reference"] == reference)
+    });
+    let status = if found { "passed" } else { "incomplete" };
+    json!({"status":status,"observer":"fresh_semantic_snapshot",
+        "observed":{"visible":if found { json!(true) } else { Value::Null }},"scope_complete":snapshot["scope_complete"],
+        "reason_code":if found { Value::Null } else { json!("reference_not_reacquired") },
+        "document":snapshot["document"]})
+}
+
 fn task_receipt(kind: &str, url: &str, reference: Option<&str>, value: &Value) -> Value {
     let resumed_from_checkpoint = value["resumed_from_checkpoint"] == true
         // Save/click adapters use this fixed internal reason when returning a
@@ -7499,7 +7510,7 @@ fn mutation_skill_template(task: &crate::v3_tasks::TaskPrimitive) -> Option<(Val
     let crate::v3_tasks::TaskPrimitive::Mutation { steps } = task else {
         return None;
     };
-    if steps.is_empty() || steps.len() > 32 {
+    if steps.is_empty() || steps.len() > 32 || steps.iter().any(|step| matches!(step, crate::v3_tasks::MutationStep::VerifyVisible { .. })) {
         return None;
     }
     let mut value_slot = 0usize;
@@ -7515,6 +7526,7 @@ fn mutation_skill_template(task: &crate::v3_tasks::TaskPrimitive) -> Option<(Val
             crate::v3_tasks::MutationStep::Click { outcome, .. } => {
                 json!({"action":"click","step":step_index,"outcome":outcome})
             }
+            crate::v3_tasks::MutationStep::VerifyVisible { .. } => unreachable!(),
         })
         .collect::<Vec<_>>();
     let parameters = (0..value_slot)
@@ -11915,6 +11927,7 @@ fn task_trace_steps(
                 .map(|step| match step {
                     crate::v3_tasks::MutationStep::Fill { .. } => "fill",
                     crate::v3_tasks::MutationStep::Click { .. } => "click",
+                    crate::v3_tasks::MutationStep::VerifyVisible { .. } => "verify_visible",
                 })
                 .collect();
             (kinds, workflow)
@@ -11984,6 +11997,7 @@ fn task_trace_steps(
                     crate::v3_tasks::MutationStep::Click { .. } => {
                         evidence.push(format!("typed_postcondition:mutation_step:{index}:outcome"))
                     }
+                    crate::v3_tasks::MutationStep::VerifyVisible { .. } => {}
                 }
                 evidence
             })
@@ -15474,6 +15488,7 @@ impl AppV3 {
         let mut actions = Vec::with_capacity(steps.len());
         for (index, step) in steps.iter().enumerate() {
             let result = match step {
+                crate::v3_tasks::MutationStep::VerifyVisible { .. } => return Ok(None),
                 crate::v3_tasks::MutationStep::Fill {
                     reference,
                     expected_value,
@@ -16404,7 +16419,12 @@ impl AppV3 {
             }.await;
             let unknown = result.as_ref().is_ok_and(value_has_unknown);
             for guard in guards { guard.release(unknown).await; }
-            for id in ids { self.core.semantic.lock().await.remove(&super::tab_key(session_id, &id)); }
+            let mut semantic = self.core.semantic.lock().await;
+            for id in ids {
+                if let Some(state) = semantic.get_mut(&super::tab_key(session_id, &id)) {
+                    super::invalidate_semantic_tab(state);
+                }
+            }
             return result.map(Json);
         }
         if args.action == "close_owned" {
@@ -22026,17 +22046,24 @@ impl AppV3 {
                     ("fill", Some(reference), action)
                 }
                 ExpandedStep::VerifyVisible { reference } => {
-                    let value = verify_impl(
+                    let snapshot = snapshot_impl(
                         &self.core,
-                        &BrowserVerifyArgs {
+                        &BrowserSnapshotArgs {
                             session_id: args.session_id.clone(),
                             chrome_tab_id: active_tab_id.clone(),
-                            predicate: BrowserPredicate::Exists {
-                                reference: reference.clone(),
-                            },
+                            selector: None,
+                            max_items: None,
+                            max_text_chars: None,
+                            max_bytes: None,
+                            max_bytes_reason: None,
+                            href_hint: None,
+                            frame_id: None,
+                            include_frames: None,
+                            goal: None,
+                            max_scan_nodes: None,
                         },
-                    )
-                    .await?;
+                    ).await?;
+                    let value = fresh_visibility_result(&snapshot, &reference);
                     ("verify_visible", Some(reference), value)
                 }
                 ExpandedStep::Click { reference, outcome } => {
@@ -23735,6 +23762,17 @@ mod v3_batch_delivery_tests {
             "https://a.test/",
             &failed
         ));
+    }
+
+    #[test]
+    fn fresh_visibility_does_not_claim_absence_from_partial_snapshot() {
+        let partial = json!({"items":[],"scope_complete":false});
+        assert_eq!(super::fresh_visibility_result(&partial, "@c1")["status"], "incomplete");
+        assert!(super::fresh_visibility_result(&partial, "@c1")["observed"]["visible"].is_null());
+        let complete = json!({"items":[],"scope_complete":true});
+        assert_eq!(super::fresh_visibility_result(&complete, "@c1")["status"], "incomplete");
+        let present = json!({"items":[{"reference":"@c1"}],"scope_complete":false});
+        assert_eq!(super::fresh_visibility_result(&present, "@c1")["status"], "passed");
     }
 
     #[test]
