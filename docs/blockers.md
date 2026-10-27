@@ -293,3 +293,12 @@ The latest independent-review findings are closed locally: checkpoint disk refre
 The early role/href filter reduces candidate work but still walks the reachable DOM and does not close the shared chat's broader goals: paired cold/warm end-to-end tasks with independent acceptance, identity coalescing beyond the current preflight, expanded programs, and live application/client qualification remain open. See `bench/reports/collector-role-2026-10-26.md` for the limited measurement.
 
 The download path now coalesces two identity/epoch checks, but its qualification used a simulated extension. After increasing MCP startup time and enabling automatic approval review, one Codex-host form smoke passed with the pinned Playwright package invoked through a temporary shim. The paired baseline and Controlla actor remain unqualified. The local launcher and native host manifest point to a missing older checkout; the new release build and an observed unpacked extension ID are needed before installation and reload.
+
+
+### 2026-10-27 performance continuation blockers
+
+- Codex host processes exited during both clients in the extraction smoke and many upload pairs. Current benchmark adapter retains only the exit code and a bounded stderr digest, not diagnostic text; root cause is unresolved.
+- The 30-pair upload run includes failures and some logged local build/package/test overlap. No latency or comparative reliability claim is supported.
+- Browser-open programs currently allow bounded read-only steps only. Safe write-program replay requires durable progress/unknown-delivery handling.
+- Structured extraction is an experimental loopback task; its first paired smoke failed at host exit, and server acceptance does not by itself prove browser use by arbitrary adapters.
+- Latest merged release still needs package build/install verification, extension reload, dedicated example.com pairing, Codex refresh for direct-client qualification, and live account-bound qualification for Classroom/Slides, Canva, and CapCut.

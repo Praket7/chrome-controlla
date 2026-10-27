@@ -1056,3 +1056,11 @@ The isolated real-Chrome private headless suite passed all three ignored `v2_std
 A 30-pair warm synthetic collector comparison and five collector regressions cover early role and href filtering, including duplicate shadow-root matches; the nine background action fixtures also passed. Details and raw rows are in `bench/reports/collector-role-2026-10-26.md` and its adjacent JSON. This does not establish end-to-end latency, live extension behavior, application persistence, or a competitor result.
 
 The isolated simulated-extension shared-download fixture passed with identity/epoch batching at both guard points and exact downloaded bytes. The adapter, configured-suite and pilot checks passed 33 Node tests. Earlier real form smokes failed; a later Codex-host form smoke with a temporary shim to the installed pinned Playwright package passed actor completion and independent persisted-state readback. This does not qualify the installed Controlla extension or a paired baseline. Browser and model network access are unrestricted during these probes.
+
+
+### 2026-10-27 performance continuation
+
+- Paired cold headless upload: 30 attempts retained; Controlla 19/30 and Playwright 18/30 independently accepted. Numerous Codex host exits/tool-call failures and logged local-work overlap prevent a comparative speed/reliability claim.
+- One-call read-only browser open program: nested branches and conditions are bounded/preflighted; 12 focused Rust tests pass. Programmed writes, scrolling, and artifact operations fail closed before pairing.
+- Structured extraction task: run-specific nonce and privileged fixture acceptance implemented. First Controlla/Playwright smoke failed at Codex host exit on both clients; live mixed-task qualification not established.
+- Installed extension bridge, direct client on latest build, and Classroom, Slides, Canva, CapCut qualification: pending observed reload/pairing and live postconditions.
