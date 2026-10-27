@@ -51,10 +51,27 @@ function invoke(input) {
 }
 
 test('generic extraction is unqualified without independent fixture acceptance', async () => {
-  const output = await invoke({ task_id:'structured-extraction', task_class:'extraction', mode:'cold_browser', execution_mode:'headless', concurrency:1 });
+  const output = await invoke({ task_id:'50k-node-targeted-control', task_class:'extraction', mode:'cold_browser', execution_mode:'headless', concurrency:1 });
   assert.equal(output.success,false);
   assert.equal(output.independently_verified_success,false);
   assert.match(output.runner_error,/not an independent task acceptance oracle/);
+});
+
+test('extraction actor requires an exact bound observed row', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'phase11-extraction-'));
+  try {
+    const executable=join(dir,'codex');
+    const input={task_id:'structured-extraction',task_class:'extraction',mode:'cold_browser',execution_mode:'headless',concurrency:1,fixture_url:'http://127.0.0.1:1234/records-table?task=structured-extraction',acceptance:{kind:'extraction',row:'record-42',status:'older'},deadline_ms:60000};
+    const nonce='a'.repeat(32), answer=`record-42|older|${nonce}`;
+    for (const scenario of ['valid','wrong_url','no_observation','wrong_final']) {
+      const url=scenario==='wrong_url'?'http://127.0.0.1:1234/other':input.fixture_url;
+      const events=[...(scenario==='no_observation'?[]:[{type:'item.completed',item:{type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',status:'completed',arguments:{action:'task',task:{kind:'research',selector:'#records tbody tr:nth-child(42)',urls:[input.fixture_url]}},result:{structured_content:{status:'completed',receipts:[{kind:'extract',url,snippet:`record-42 older ${nonce}`}]}}}}]),{type:'item.completed',item:{type:'agent_message',text:scenario==='wrong_final'?'record-42|older':answer}}];
+      await writeFile(executable, `#!/usr/bin/env node\nfor(const e of ${JSON.stringify(events)}) console.log(JSON.stringify(e));\n`,{mode:0o755});
+      const output=await new Promise((resolveOutput,reject)=>{const child=spawn(process.execPath,[adapterPath,'controlla'],{cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome',PHASE11_CONTROLLA_BINARY:'/controlla'},stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.once('error',reject);child.once('close',code=>code===0?resolveOutput(JSON.parse(stdout)):reject(new Error(stderr)));child.stdin.end(JSON.stringify(input));});
+      assert.equal(output.success,scenario==='valid');
+      assert.equal(output.independently_verified_success,false);
+    }
+  } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
 test('cold adapter distinguishes host exit from deadline', async () => {

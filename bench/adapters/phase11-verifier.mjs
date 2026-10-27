@@ -8,4 +8,4 @@ if(process.env.PHASE11_ORACLE_TOKEN){
  const response=await fetch(`${base}/__state?task_id=${encodeURIComponent(input.task_id)}&run_id=${encodeURIComponent(input.run_id??'')}`,{headers:{authorization:`Bearer ${process.env.PHASE11_ORACLE_TOKEN}`},signal:AbortSignal.timeout(Math.min(input.deadline_ms??60000,60000))});
  if(response.ok)state=await response.json();
 }
-console.log(JSON.stringify(evaluateAcceptance(input,state)));
+console.log(JSON.stringify(evaluateAcceptance(input,state,request.acting_result)));

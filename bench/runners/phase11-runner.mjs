@@ -161,6 +161,7 @@ export function validateAdapterResult(result, contract, expected) {
     throw new Error('adapter result identity does not match requested run');
   }
   if (expected.source_ref && result.source_ref !== expected.source_ref) throw new Error(`adapter ${expected.adapter} did not execute pinned source_ref ${expected.source_ref}`);
+  if (result.extraction_value !== undefined && (typeof result.extraction_value !== 'string' || result.extraction_value.length > 256)) throw new Error('invalid extraction evidence');
   if (typeof result.success !== 'boolean' || typeof result.independently_verified_success !== 'boolean') {
     throw new Error('success fields must be booleans');
   }
@@ -279,7 +280,7 @@ export function actingAdapterEnvironment(env) {
 
 async function runOne({ adapter, command, task, mode, executionMode, concurrency, fixtureBaseUrl, deadlineMs, resetCommand, verifierCommand, contract, environment, env }) {
   const fixtureUrl = task.url ? liveTaskUrl(task) : (() => { const url = new URL(task.fixture, fixtureBaseUrl); url.searchParams.set('task', task.id); if (task.scenario) url.searchParams.set('scenario', task.scenario); return url.toString(); })();
-  const acceptance=task.id==='form-guarded-fill'?{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'}:task.id==='guarded-upload'?{kind:'upload',filename:'benchmark.txt',size:Buffer.byteLength('Controlla benchmark\n'),sha256:createHash('sha256').update('Controlla benchmark\n').digest('hex')}:undefined;
+  const acceptance=task.id==='form-guarded-fill'?{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'}:task.id==='guarded-upload'?{kind:'upload',filename:'benchmark.txt',size:Buffer.byteLength('Controlla benchmark\n'),sha256:createHash('sha256').update('Controlla benchmark\n').digest('hex')}:task.id==='structured-extraction'?{kind:'extraction',row:'record-42',status:'older'}:undefined;
   const input = { run_id:randomUUID(), ...(acceptance?{acceptance}:{}), task_id: task.id, task_class: task.class, scenario: task.scenario, mode, execution_mode: executionMode, concurrency, fixture_url: fixtureUrl, site_urls: task.site_urls ?? [fixtureUrl], deadline_ms: deadlineMs, source_ref: adapter.source_ref ?? null };
   await resetFixture(resetCommand, input, deadlineMs, env);
   const adapterRequestStartedNs = process.hrtime.bigint();

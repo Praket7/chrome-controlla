@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { validAcceptance } from '../../adapters/phase11-verifier-state.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -37,9 +37,9 @@ function taskState(id) { return tasks.get(id) ?? { task_id: id, events: [], comp
 async function persist() { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath+'.tmp', JSON.stringify(Object.fromEntries(tasks), null, 2), {mode:0o600}); await rename(statePath+'.tmp',statePath); }
 async function load() { try { const raw = JSON.parse(await readFile(statePath, 'utf8')); for (const [k,v] of Object.entries(raw)) tasks.set(k,v); } catch {} }
 function json(res, status, value) { const body = JSON.stringify(value); res.writeHead(status, {'content-type':'application/json','content-length':Buffer.byteLength(body)}); res.end(body); }
-function page(taskId, fixture, scenario) {
+function page(taskId, fixture, scenario, extractionNonce) {
   const title = `Controlla Phase 11 · ${taskId}`;
-  const rows = Array.from({length: fixture === 'records-table' && scenario?.includes('50k') ? 50000 : 50}, (_, i) => `<tr><td>record-${i + 1}</td><td>${i % 2 ? 'older' : 'current'}</td></tr>`).join('');
+  const rows = Array.from({length: fixture === 'records-table' && scenario?.includes('50k') ? 50000 : 50}, (_, i) => `<tr><td>record-${i + 1}</td><td>${i % 2 ? 'older' : 'current'}</td>${taskId === 'structured-extraction' && i === 41 ? `<td>${extractionNonce}</td>` : ''}</tr>`).join('');
   const action = `Complete ${taskId}`;
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>body{font:16px system-ui;margin:32px}#scroll{height:220px;overflow:auto;border:1px solid #888}canvas{border:1px solid #888;width:500px;height:140px}label,button,input{margin:8px;padding:8px}iframe{width:400px;height:100px}</style></head><body>
 <h1>${title}</h1><p data-testid="fixture-description">Controlled benchmark fixture for ${fixture}.</p>
@@ -77,7 +77,7 @@ const server = createServer(async (req,res) => {
     if (req.method==='POST' && url.pathname==='/__reset') {
       const input=JSON.parse((await body(req)).toString());
       if(!identifier(input.task_id)||!identifier(input.run_id)||(input.acceptance!==undefined&&!validAcceptance(input.acceptance))) return json(res,400,{ok:false});
-      await serialized(async()=>{if(!tasks.has(input.task_id)&&tasks.size>=256)tasks.delete(tasks.keys().next().value);const state={task_id:input.task_id,run_id:input.run_id,acceptance:input.acceptance,events:[],persisted:true};tasks.set(input.task_id,state);try{await persist();}catch(error){tasks.delete(input.task_id);throw error;}});
+      await serialized(async()=>{if(!tasks.has(input.task_id)&&tasks.size>=256)tasks.delete(tasks.keys().next().value);const state={task_id:input.task_id,run_id:input.run_id,acceptance:input.acceptance,events:[],persisted:true,...(input.task_id==='structured-extraction'?{extraction_nonce:randomBytes(16).toString('hex')}:{})};tasks.set(input.task_id,state);try{await persist();}catch(error){tasks.delete(input.task_id);throw error;}});
       return json(res,200,{ok:true,task_id:input.task_id,run_id:input.run_id});
     }
     if(req.method==='GET' && url.pathname==='/__state') {
@@ -100,7 +100,7 @@ const server = createServer(async (req,res) => {
     });
   }
   if (req.method === 'GET' && url.pathname === '/frame') { const id=url.searchParams.get('task');if(!identifier(id))return json(res,400,{ok:false});return res.end(`<html><body><p>Independent child frame for ${id}</p></body></html>`); }
-  if (req.method === 'GET' && (url.pathname.startsWith('/fixture/') || ['registration-form','records-table','paired-tabs','spa-router','canvas-widget','virtual-list','file-input','workflow-suite','slide-deck'].includes(url.pathname.replace(/^\//,'')))) { const fixture=url.pathname.replace(/^\/|\/\$/g,'').replace(/^fixture\//,''); const taskId=url.searchParams.get('task') ?? fixture; if(!identifier(taskId)||!identifier(fixture))return json(res,400,{ok:false}); const current=taskState(taskId); return res.end(page(taskId, fixture, url.searchParams.get('scenario') ?? '').replace(JSON.stringify('RUN_PLACEHOLDER'),JSON.stringify(current.run_id??''))); }
+  if (req.method === 'GET' && (url.pathname.startsWith('/fixture/') || ['registration-form','records-table','paired-tabs','spa-router','canvas-widget','virtual-list','file-input','workflow-suite','slide-deck'].includes(url.pathname.replace(/^\//,'')))) { const fixture=url.pathname.replace(/^\/|\/\$/g,'').replace(/^fixture\//,''); const taskId=url.searchParams.get('task') ?? fixture; if(!identifier(taskId)||!identifier(fixture))return json(res,400,{ok:false}); const current=taskState(taskId); return res.end(page(taskId, fixture, url.searchParams.get('scenario') ?? '', current.extraction_nonce ?? '').replace(JSON.stringify('RUN_PLACEHOLDER'),JSON.stringify(current.run_id??''))); }
   res.writeHead(404); res.end('not found');
  } catch { if(!res.headersSent)json(res,400,{ok:false,error:'invalid or oversized request'});else res.end(); }
 });

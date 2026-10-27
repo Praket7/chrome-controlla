@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { evaluateAcceptance } from './phase11-verifier-state.mjs';
 const input = { task_id:'form-one', run_id:'run-one', task_class:'forms', acceptance:{kind:'form',name:'Alice',notes:'Saved'} };
 const state = { task_id:input.task_id,run_id:input.run_id,persisted:true,form:{name:'Alice',notes:'Saved'} };
+test('extraction requires the oracle nonce from the exact reset run',()=>{
+ const request={task_id:'structured-extraction',run_id:'run-one',task_class:'extraction',acceptance:{kind:'extraction',row:'record-42',status:'older'}};
+ const nonce='a'.repeat(32), state={task_id:request.task_id,run_id:request.run_id,extraction_nonce:nonce};
+ assert.equal(evaluateAcceptance(request,state,{extraction_value:`record-42|older|${nonce}`}).passed,true);
+ for(const [s,result] of [[state,{}],[state,{extraction_value:'record-42|older'}],[{...state,run_id:'other'},{extraction_value:`record-42|older|${nonce}`}],[{...state,extraction_nonce:'b'.repeat(32)},{extraction_value:`record-42|older|${nonce}`}]]) assert.equal(evaluateAcceptance(request,s,result).passed,false);
+});
 test('server persisted form qualifies exact bound run only',()=>{
  assert.equal(evaluateAcceptance(input,state).passed,true);
  for(const bad of [{...state,persisted:false},{...state,run_id:'old'},{...state,form:null},{...state,form:{name:'Other',notes:'Saved'}},{...state,events:[{kind:'form_saved',completed:true}],form:null}]) assert.equal(evaluateAcceptance(input,bad).passed,false);

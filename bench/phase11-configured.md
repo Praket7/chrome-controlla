@@ -28,3 +28,7 @@ npm run bench:phase11:configured
 ```
 
 The convenience adapters reject `foreground` and `background` explicitly, and headless tasks other than the bounded form and upload cases remain unqualified. A real Codex/Playwright form smoke has passed independent server readback; the Controlla actor and paired benchmark still require live qualification. A full release benchmark remains ineligible until the remaining adapters and a headed/background Chrome display harness are supplied. Explicit refusals are not browser measurements.
+
+### Experimental structured extraction
+
+The cold headless extraction actor is scoped to the built-in Controlla and Playwright adapters. A reset creates a fresh nonce in one fixture row, and the independent server oracle checks the reported row and nonce for that run. The adapter checks the exact browser tool receipt and page URL; the oracle alone does not prove browser use, because the fixture is publicly readable. Custom adapters that bypass the trusted trace checks are not qualified by this oracle. This task remains experimental until real client smokes and negative tests pass.
