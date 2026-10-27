@@ -2502,16 +2502,23 @@ impl AppV3 {
         let accepted = self
             .core
             .browser_session(Parameters(BrowserSessionArgs {
-                action: "accept_shared".into(),
+                action: "accept_shared_wait".into(),
                 provider: Some("shared_extension".into()),
                 session_id: Some(session_id.clone()),
                 target_ids: None,
                 host_id: None,
             }))
-            .await?;
-        if accepted.0["accepted"] != true {
-            self.release_cold_session(&session_id).await;
-            return Err(invalid("existing-tab pairing was not accepted"));
+            .await;
+        match accepted {
+            Ok(Json(value)) if value["accepted"] == true => {}
+            Ok(_) => {
+                self.release_cold_session(&session_id).await;
+                return Err(invalid("existing-tab pairing was not accepted"));
+            }
+            Err(error) => {
+                self.release_cold_session(&session_id).await;
+                return Err(error);
+            }
         }
         Ok(Some((session_id, candidate, anchor)))
     }
