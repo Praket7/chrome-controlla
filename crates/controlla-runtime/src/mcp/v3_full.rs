@@ -2739,6 +2739,8 @@ struct V3BrowserArgs {
     idempotency_key: Option<String>,
     #[schemars(description = "one call")]
     steps: Option<Vec<V3WorkflowStep>>,
+    #[schemars(description = "bounded workflow program for one-call open")]
+    program: Option<Vec<V3WorkflowOp>>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
@@ -6952,6 +6954,19 @@ fn compile_workflow_ops(
         Ok(result)
     }
     compile_sequence(ops)
+}
+
+fn open_program_is_read_only(ops: &[V3WorkflowOp]) -> bool {
+    ops.iter().all(|op| match op {
+        V3WorkflowOp::Step { step } => matches!(step,
+            V3WorkflowStep::WaitStable { .. } | V3WorkflowStep::Snapshot { .. }
+            | V3WorkflowStep::Find { .. } | V3WorkflowStep::FindAll { .. }
+            | V3WorkflowStep::Choose { .. } | V3WorkflowStep::Extract { .. }
+            | V3WorkflowStep::Verify { .. }),
+        V3WorkflowOp::If { then_branch, else_branch, .. } => open_program_is_read_only(then_branch) && open_program_is_read_only(else_branch),
+        V3WorkflowOp::Foreach { body, .. } => open_program_is_read_only(body),
+        V3WorkflowOp::TryFallback { primary, fallback } => open_program_is_read_only(primary) && open_program_is_read_only(fallback),
+    })
 }
 
 fn validate_workflow_ops(ops: &[V3WorkflowOp], depth: usize) -> Result<(), rmcp::ErrorData> {
@@ -16011,8 +16026,11 @@ impl AppV3 {
 
     async fn browser_inner(&self, mut args: V3BrowserArgs) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.tab_operation.is_some() && args.action != "tabs" { return Err(invalid("tab_operation requires action=tabs")); }
-        if args.steps.is_some() && args.action != "open" {
-            return Err(invalid("steps are supported only by browser action=open"));
+        if (args.steps.is_some() || args.program.is_some()) && args.action != "open" {
+            return Err(invalid("steps and program are supported only by browser action=open"));
+        }
+        if args.steps.is_some() && args.program.is_some() {
+            return Err(invalid("provide only one of steps or program"));
         }
         if args.ready_when.is_some() && args.action != "open" {
             return Err(invalid(
@@ -16668,6 +16686,17 @@ impl AppV3 {
                 }
                 validate_workflow_steps(steps)?;
             }
+            if let Some(program) = args.program.as_ref() {
+                let expanded = expand_app_adapter_ops(program.clone())?;
+                if expanded.is_empty() || expanded.len() > 40 {
+                    return Err(invalid("workflow program requires 1..40 top-level operations"));
+                }
+                validate_workflow_ops(&expanded, 0)?;
+                if !open_program_is_read_only(&expanded) {
+                    return Err(invalid("one-call open programs currently support read-only operations only"));
+                }
+                let _ = compile_workflow_ops(expanded)?;
+            }
             if args.idempotency_key.as_deref().is_none_or(str::is_empty) {
                 return Err(invalid(
                     "browser action=open requires idempotency_key so retries reuse the same tab",
@@ -16904,8 +16933,9 @@ impl AppV3 {
                 result["next_action"] = json!("Let the user complete the challenge in Chrome; observe the same tab again before resuming. Do not attempt to bypass or replay the challenge.");
                 return Ok(Json(result));
             }
-            if let Some(steps) = args.steps {
-                let step_count = steps.len();
+            if args.steps.is_some() || args.program.is_some() {
+                let step_count = args.steps.as_ref().map_or_else(|| args.program.as_ref().map_or(0, Vec::len), Vec::len);
+                let steps = args.steps.unwrap_or_default();
                 let tab_id = result["tab_id"]
                     .as_str()
                     .ok_or_else(|| invalid("open omitted tab_id"))?
@@ -16917,7 +16947,7 @@ impl AppV3 {
                         operation_id: None,
                         cancel: false,
                         steps,
-                        program: None,
+                        program: args.program,
                         client_id: args.client_id,
                         dag: None,
                         max_bytes: None,
@@ -24353,6 +24383,54 @@ mod v3_batch_delivery_tests {
             compiled[2],
             crate::workflow_vm::VmOp::TryFallback { .. }
         ));
+    }
+
+    #[test]
+    fn open_program_checks_every_branch_for_read_only_steps() {
+        let read: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"if","condition":"true","then_branch":[{"op":"step","step":{"kind":"snapshot"}}],"else_branch":[]},
+            {"op":"foreach","items":["a"],"var":"item","body":[{"op":"step","step":{"kind":"snapshot"}}]}
+        ])).unwrap();
+        assert!(super::open_program_is_read_only(&read));
+        let write: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"if","condition":"false","then_branch":[{"op":"step","step":{"kind":"click","reference":"@c1","outcome":null}}],"else_branch":[]}
+        ])).unwrap();
+        assert!(!super::open_program_is_read_only(&write));
+        let scrolling: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"step","step":{"kind":"collect_virtual","container":null,"query":null,"role":null,"identity_fields":[],"max_scrolls":1,"max_items":1,"save_as":"items"}}
+        ])).unwrap();
+        assert!(!super::open_program_is_read_only(&scrolling));
+        let fallback: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"try_fallback","primary":[{"op":"step","step":{"kind":"snapshot"}}],"fallback":[{"op":"step","step":{"kind":"click","reference":"@c1","outcome":null}}]}
+        ])).unwrap();
+        assert!(!super::open_program_is_read_only(&fallback));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_nested_mutation_before_pairing() {
+        let app = AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        let args: V3BrowserArgs = serde_json::from_value(json!({
+            "action":"open", "mode":"background", "url":"https://example.test/",
+            "idempotency_key":"preflight", "program":[{"op":"if","condition":"true",
+            "then_branch":[{"op":"step","step":{"kind":"snapshot"}}],
+            "else_branch":[{"op":"step","step":{"kind":"click","reference":"@c1","outcome":null}}]}]
+        })).unwrap();
+        let error = match app.browser_inner(args).await { Err(error) => error, Ok(_) => panic!("mutation program was accepted") };
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(app.core.legacy.shared_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_program_condition_before_pairing() {
+        let app = AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        let args: V3BrowserArgs = serde_json::from_value(json!({
+            "action":"open", "mode":"background", "url":"https://example.test/",
+            "idempotency_key":"preflight", "program":[{"op":"if","condition":"unsupported",
+            "then_branch":[{"op":"step","step":{"kind":"snapshot"}}],"else_branch":[]}]
+        })).unwrap();
+        let error = match app.browser_inner(args).await { Err(error) => error, Ok(_) => panic!("invalid condition was accepted") };
+        assert!(error.to_string().contains("condition"), "{error}");
+        assert!(app.core.legacy.shared_sessions.lock().await.is_empty());
     }
 
     #[test]
