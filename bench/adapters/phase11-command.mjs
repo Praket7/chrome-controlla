@@ -49,12 +49,12 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const prompt = `Use only ${configured.server} browser tools. ${route} Navigate to ${url.href}, ${goal}, then close or release the browser session. Do not use shell commands, web search, direct HTTP requests, or other tools. Return exactly DONE if every step succeeded, otherwise return exactly FAILED.`;
     const args = ['exec','--ephemeral','--json','--ignore-user-config','--disable','shell_tool','--disable','unified_exec','--disable','apps','--disable','plugins','--disable','remote_plugin','--approve-for-me','-c','web_search="disabled"','--skip-git-repo-check','-m',process.env.PHASE11_MODEL ?? 'gpt-6-luna','-C',dir,...configured.config,'-c',`mcp_servers.${configured.server}.startup_timeout_sec=120`,prompt];
     const env = Object.fromEntries(['PATH','HOME','USER','SHELL','TMPDIR','TEMP','TMP','LANG','LC_ALL','CODEX_HOME','SSL_CERT_FILE','SYSTEMROOT','USERPROFILE','APPDATA','LOCALAPPDATA'].filter(key=>process.env[key] !== undefined).map(key=>[key,process.env[key]]));
-    const events = []; let text = '', oversized = false;
+    const events = []; let text = '', oversized = false, timedOut = false;
     const result = await new Promise((resolveRun, reject) => {
       const child = spawn(process.env.PHASE11_CODEX_PATH ?? 'codex', args, {cwd:dir,env,detached:process.platform !== 'win32',stdio:['ignore','pipe','ignore']});
       const stop = () => { try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch {} };
       process.once('SIGTERM', stop);
-      const timer = setTimeout(stop, Math.max(1, Math.min(Number(input.deadline_ms) || 60000, 600000) - 1000));
+      const timer = setTimeout(() => { timedOut = true; stop(); }, Math.max(1, Math.min(Number(input.deadline_ms) || 60000, 600000) - 1000));
       child.stdout.on('data', chunk => { text += chunk; if (Buffer.byteLength(text) > 4_000_000) { oversized = true; stop(); } });
       child.once('error', error => { clearTimeout(timer); process.removeListener('SIGTERM', stop); reject(error); });
       child.once('close', code => { clearTimeout(timer); process.removeListener('SIGTERM', stop); stop(); resolveRun(code); });
@@ -94,7 +94,7 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const success = result === 0 && !oversized && !malformed && intended.length > 0 && intended.length === calls.length && !unrelated && selectionConfirmed && final === 'DONE';
     const failedCall = calls.find(event => !callSucceeded(event))?.item;
     const failedTool = /^[a-zA-Z0-9_-]{1,80}$/.test(failedCall?.tool ?? '') ? failedCall.tool : 'unknown';
-    const failure = result !== 0 ? 'Codex host exited or timed out' : oversized || malformed ? 'Codex host returned invalid or oversized event output' : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}` : 'Codex host did not report task completion';
+    const failure = oversized || malformed ? 'Codex host returned invalid or oversized event output' : timedOut ? 'Codex host timed out' : result !== 0 ? `Codex host exited with code ${result ?? 'unknown'}` : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}` : 'Codex host did not report task completion';
     output({success, mcp_calls:success ? calls.length : null, runner_error:success ? undefined : failure});
   } finally { await rm(dir,{recursive:true,force:true}); }
   process.exit(0);
