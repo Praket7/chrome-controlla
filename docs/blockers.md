@@ -301,4 +301,4 @@ The download path now coalesces two identity/epoch checks, but its qualification
 - The 30-pair upload run includes failures and some logged local build/package/test overlap. No latency or comparative reliability claim is supported.
 - Browser-open programs currently allow bounded read-only steps only. Safe write-program replay requires durable progress/unknown-delivery handling.
 - Structured extraction is an experimental loopback task; its first paired smoke failed at host exit, and server acceptance does not by itself prove browser use by arbitrary adapters.
-- Latest merged release still needs package build/install verification, extension reload, dedicated example.com pairing, Codex refresh for direct-client qualification, and live account-bound qualification for Classroom/Slides, Canva, and CapCut.
+- Latest release package build/check/lifecycle passed on darwin/arm64; the exact extension ID is registered and Hotload is refreshed. Extension reload and dedicated example.com pairing, Codex refresh for direct-client qualification, and live account-bound qualification for Classroom/Slides, Canva, and CapCut remain pending.
