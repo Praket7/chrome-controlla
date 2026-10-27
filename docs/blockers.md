@@ -297,9 +297,9 @@ The download path now coalesces two identity/epoch checks, but its qualification
 
 ### 2026-10-27 performance continuation blockers
 
-- Codex host processes exited during both clients in the extraction smoke and many upload pairs. The adapter now retains bounded JSONL event names plus an allowlisted error class, without raw stderr/provider text. The retained 30-pair evidence predates this diagnostic and does not identify its shared host-exit cause; a fresh run is needed.
+- Codex host processes exited during both clients in the extraction smoke and many upload pairs. The adapter now retains bounded JSONL event names plus allowlisted error classes and failed-tool metadata, without raw stderr/provider text. The retained 30-pair report also conflates actor completion with verifier acceptance, so its pure application acceptance counts are not recoverable.
 - The 30-pair upload run includes failures and some logged local build/package/test overlap. No latency or comparative reliability claim is supported.
 - Browser-open programs currently allow bounded read-only steps only. Safe write-program replay requires durable progress/unknown-delivery handling.
 - Structured extraction is an experimental loopback task; its first paired smoke failed at host exit, and server acceptance does not by itself prove browser use by arbitrary adapters.
 - Latest release package build/check/lifecycle passed on darwin/arm64; the exact extension ID is registered and Hotload is refreshed. Extension reload and dedicated example.com pairing, Codex refresh for direct-client qualification, and live account-bound qualification for Classroom/Slides, Canva, and CapCut remain pending.
-- The verifier and actor outcomes are now stored separately, as required by their distinct provenance. Rechecking the old upload report found no persisted acceptance behind a failed actor row, so the reported 19/30 acceptance is unchanged; significantly higher acceptance remains unproven until a fresh paired run completes.
+- The verifier and actor outcomes are now stored separately, as required by their distinct provenance. A corrected three-pair diagnostic produced 2/3 Controlla app acceptances and 1/3 client completions, versus Playwright 3/3 and 2/3; this is too small to establish a higher rate. Run the corrected 30-pair cohort before reporting the application acceptance rate.

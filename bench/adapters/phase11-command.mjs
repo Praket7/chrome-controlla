@@ -69,7 +69,8 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const calls = events.filter(event => event.type === 'item.completed' && event.item?.type === 'mcp_tool_call');
     const codexEvents = [...new Set(events.flatMap(event => [event.type, event.item?.type].filter(type => typeof type === 'string' && /^[a-zA-Z0-9_.-]{1,48}$/.test(type))))].sort().slice(0, 5);
     const errorText = [...events.filter(event => ['turn.failed','error'].includes(event.type)).map(event => [event.error?.message, event.message].filter(value => typeof value === 'string').join(' ')), stderr].join(' ');
-    const codexErrorClass = /rate.?limit|too many requests/i.test(errorText) ? 'rate_limit'
+    const hostFailure = result !== 0 || events.some(event => ['turn.failed','error'].includes(event.type));
+    const codexErrorClass = !hostFailure ? null : /rate.?limit|too many requests/i.test(errorText) ? 'rate_limit'
       : /quota|insufficient.?quota|billing/i.test(errorText) ? 'quota'
       : /auth|unauthorized|forbidden|credential/i.test(errorText) ? 'authentication'
       : /context.?length|token.?limit/i.test(errorText) ? 'context_limit'
@@ -77,7 +78,7 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
       : /timeout|timed out|deadline/i.test(errorText) ? 'timeout'
       : /overload|unavailable|5\d\d/i.test(errorText) ? 'provider_unavailable'
       : /network|connection|transport|reset by peer|dns/i.test(errorText) ? 'transport'
-      : events.some(event => ['turn.failed','error'].includes(event.type)) || result !== 0 ? 'unclassified_host_failure' : null;
+      : 'unclassified_host_failure';
     const decoded = event => {
       const result = event.item?.result;
       let value = result?.structured_content ?? result?.structuredContent;
@@ -124,10 +125,13 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const failedEvent = calls.find(event => !callSucceeded(event));
     const failedCall = failedEvent?.item;
     const failedTool = /^[a-zA-Z0-9_-]{1,80}$/.test(failedCall?.tool ?? '') ? failedCall.tool : 'unknown';
-    const reason = failedEvent && decoded(failedEvent)?.reason_code;
+    const failedResult = failedEvent && decoded(failedEvent);
+    const failureStatus = typeof failedResult?.status === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(failedResult.status) ? failedResult.status : null;
+    const failureReason = typeof failedResult?.reason_code === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(failedResult.reason_code) ? failedResult.reason_code : null;
+    const reason = failedResult?.reason_code;
     const safeReason = typeof reason === 'string' && /^[a-z0-9_]{1,80}$/.test(reason) ? ` (${reason})` : '';
     const failure = oversized || malformed ? 'Codex host returned invalid or oversized event output' : timedOut ? 'Codex host timed out' : result !== 0 ? `Codex host exited with code ${result ?? 'unknown'}` : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}${safeReason}` : 'Codex host did not report task completion';
-    output({success, mcp_calls:success ? calls.length : null, codex_event_types:codexEvents.join(','), codex_error_class:codexErrorClass, codex_turn_failed:events.some(event => event.type === 'turn.failed'), ...(fixtureKind === 'extraction' && extracted ? {extraction_value:extracted} : {}), runner_error:success ? undefined : failure});
+    output({success, mcp_calls:success ? calls.length : null, codex_event_types:codexEvents.join(','), codex_error_class:success ? null : failedEvent ? 'mcp_tool_failure' : codexErrorClass ?? 'actor_incomplete', codex_failed_tool:failedEvent ? failedTool : null, codex_tool_failure_status:failureStatus, codex_tool_failure_reason:failureReason, codex_turn_failed:events.some(event => event.type === 'turn.failed'), ...(fixtureKind === 'extraction' && extracted ? {extraction_value:extracted} : {}), runner_error:success ? undefined : failure});
   } finally { await rm(dir,{recursive:true,force:true}); }
   process.exit(0);
 }
