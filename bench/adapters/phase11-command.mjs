@@ -53,19 +53,31 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const prompt = `Use only ${configured.server} browser tools. ${route} Navigate to ${url.href}, ${goal}, then ${cleanup}. Do not use shell commands, web search, direct HTTP requests, or other tools. ${finalInstruction}`;
     const args = ['exec','--ephemeral','--json','--ignore-user-config','--disable','shell_tool','--disable','unified_exec','--disable','apps','--disable','plugins','--disable','remote_plugin','--approve-for-me','-c','web_search="disabled"','--skip-git-repo-check','-m',process.env.PHASE11_MODEL ?? 'gpt-6-luna','-C',dir,...configured.config,'-c',`mcp_servers.${configured.server}.startup_timeout_sec=120`,prompt];
     const env = Object.fromEntries(['PATH','HOME','USER','SHELL','TMPDIR','TEMP','TMP','LANG','LC_ALL','CODEX_HOME','SSL_CERT_FILE','SYSTEMROOT','USERPROFILE','APPDATA','LOCALAPPDATA'].filter(key=>process.env[key] !== undefined).map(key=>[key,process.env[key]]));
-    const events = []; let text = '', oversized = false, timedOut = false;
+    const events = []; let text = '', stderr = '', oversized = false, timedOut = false;
     const result = await new Promise((resolveRun, reject) => {
-      const child = spawn(process.env.PHASE11_CODEX_PATH ?? 'codex', args, {cwd:dir,env,detached:process.platform !== 'win32',stdio:['ignore','pipe','ignore']});
+      const child = spawn(process.env.PHASE11_CODEX_PATH ?? 'codex', args, {cwd:dir,env,detached:process.platform !== 'win32',stdio:['ignore','pipe','pipe']});
       const stop = () => { try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch {} };
       process.once('SIGTERM', stop);
       const timer = setTimeout(() => { timedOut = true; stop(); }, Math.max(1, Math.min(Number(input.deadline_ms) || 60000, 600000) - 1000));
       child.stdout.on('data', chunk => { text += chunk; if (Buffer.byteLength(text) > 4_000_000) { oversized = true; stop(); } });
+      child.stderr.on('data', chunk => { if (Buffer.byteLength(stderr) < 16_384) stderr += chunk.toString().slice(0, 16_384 - stderr.length); });
       child.once('error', error => { clearTimeout(timer); process.removeListener('SIGTERM', stop); reject(error); });
       child.once('close', code => { clearTimeout(timer); process.removeListener('SIGTERM', stop); stop(); resolveRun(code); });
     });
     let malformed = false;
     for (const line of text.split('\n')) { if (!line.trim()) continue; try { events.push(JSON.parse(line)); } catch { malformed = true; } }
     const calls = events.filter(event => event.type === 'item.completed' && event.item?.type === 'mcp_tool_call');
+    const codexEvents = [...new Set(events.flatMap(event => [event.type, event.item?.type].filter(type => typeof type === 'string' && /^[a-zA-Z0-9_.-]{1,48}$/.test(type))))].sort().slice(0, 5);
+    const errorText = [...events.filter(event => ['turn.failed','error'].includes(event.type)).map(event => [event.error?.message, event.message].filter(value => typeof value === 'string').join(' ')), stderr].join(' ');
+    const codexErrorClass = /rate.?limit|too many requests/i.test(errorText) ? 'rate_limit'
+      : /quota|insufficient.?quota|billing/i.test(errorText) ? 'quota'
+      : /auth|unauthorized|forbidden|credential/i.test(errorText) ? 'authentication'
+      : /context.?length|token.?limit/i.test(errorText) ? 'context_limit'
+      : /mcp.{0,40}(start|connect|initializ)|initializ.{0,40}mcp/i.test(errorText) ? 'mcp_startup'
+      : /timeout|timed out|deadline/i.test(errorText) ? 'timeout'
+      : /overload|unavailable|5\d\d/i.test(errorText) ? 'provider_unavailable'
+      : /network|connection|transport|reset by peer|dns/i.test(errorText) ? 'transport'
+      : events.some(event => ['turn.failed','error'].includes(event.type)) || result !== 0 ? 'unclassified_host_failure' : null;
     const decoded = event => {
       const result = event.item?.result;
       let value = result?.structured_content ?? result?.structuredContent;
@@ -115,7 +127,7 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const reason = failedEvent && decoded(failedEvent)?.reason_code;
     const safeReason = typeof reason === 'string' && /^[a-z0-9_]{1,80}$/.test(reason) ? ` (${reason})` : '';
     const failure = oversized || malformed ? 'Codex host returned invalid or oversized event output' : timedOut ? 'Codex host timed out' : result !== 0 ? `Codex host exited with code ${result ?? 'unknown'}` : unrelated ? 'Codex host used an unrelated tool' : calls.length === 0 ? 'Codex host made no MCP calls' : intended.length !== calls.length ? `Codex host MCP call failed: ${failedTool}${safeReason}` : 'Codex host did not report task completion';
-    output({success, mcp_calls:success ? calls.length : null, ...(fixtureKind === 'extraction' && extracted ? {extraction_value:extracted} : {}), runner_error:success ? undefined : failure});
+    output({success, mcp_calls:success ? calls.length : null, codex_event_types:codexEvents.join(','), codex_error_class:codexErrorClass, codex_turn_failed:events.some(event => event.type === 'turn.failed'), ...(fixtureKind === 'extraction' && extracted ? {extraction_value:extracted} : {}), runner_error:success ? undefined : failure});
   } finally { await rm(dir,{recursive:true,force:true}); }
   process.exit(0);
 }

@@ -317,7 +317,7 @@ test('failed independent verification reports decision latency without a verifie
   assert.equal(typeof result.prompt_to_verifier_decision_ms, 'number');
 });
 
-test('failed adapter run cannot receive verified-success timing even if the verifier predicate passes', async () => {
+test('independent acceptance is reported when the client exits after the verifier observed success', async () => {
   const report = await runBenchmark({
     baselineId: 'playwright-mcp',
     fixtureBaseUrl: 'https://fixtures.example.test/',
@@ -335,9 +335,9 @@ test('failed adapter run cannot receive verified-success timing even if the veri
   });
   const result = report.paired_rows[0].candidate;
   assert.equal(result.success, false);
-  assert.equal(result.independently_verified_success, false);
-  assert.equal(result.prompt_to_verified_ms, null);
-  assert.equal(result.prompt_to_verified_ms, null);
+  assert.equal(result.independently_verified_success, true);
+  assert.equal(typeof result.prompt_to_verified_ms, 'number');
+  assert.equal(typeof result.adapter_request_to_verified_ms, 'number');
   assert.equal(typeof result.prompt_to_verifier_decision_ms, 'number');
 });
 

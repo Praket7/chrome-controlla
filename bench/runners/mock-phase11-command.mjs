@@ -21,7 +21,7 @@ const modelRounds = Number(rounds);
 const promptSentNs = process.env.PHASE11_MOCK_TRACE ? process.hrtime.bigint().toString() : null;
 const tracePromptBoundary = process.env.PHASE11_MOCK_NO_PROMPT_BOUNDARY !== '1';
 const successful = process.env.PHASE11_MOCK_RAW_FAILURE !== '1';
-const verifiedPromptOutcome = Boolean(promptSentNs && tracePromptBoundary && successful
+const verifiedPromptOutcome = Boolean(promptSentNs && tracePromptBoundary && (successful || process.env.PHASE11_MOCK_VERIFY_PASS_ON_FAILURE === '1')
   && process.env.PHASE11_MOCK_VERIFY_FAIL !== '1');
 const metricProvenance = JSON.parse(readFileSync('bench/runners/adapter-contract.json', 'utf8')).measurement_metric_provenance;
 const metricEvidence = Object.fromEntries(Object.entries(metricProvenance).map(([field, provenance]) => [field, {

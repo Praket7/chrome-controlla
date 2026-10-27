@@ -91,6 +91,24 @@ test('cold adapter distinguishes host exit from deadline', async () => {
   } finally { await rm(dir, {recursive:true, force:true}); }
 });
 
+test('cold adapter retains bounded Codex failure diagnostics without raw error text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'phase11-host-diagnostic-'));
+  try {
+    const executable = join(dir, 'codex');
+    await writeFile(executable, `#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'turn.failed',error:{message:'429 rate limit: private provider detail'}}));\nconsole.error('rate limit: private provider detail');\nprocess.exit(1);\n`, {mode:0o755});
+    const input = {task_id:'form-guarded-fill',task_class:'forms',mode:'cold_browser',execution_mode:'headless',concurrency:1,fixture_url:'http://127.0.0.1:1234/registration-form?task=form-guarded-fill',acceptance:{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'},deadline_ms:3000};
+    const output = await new Promise((resolveOutput, reject) => {
+      const child = spawn(process.execPath, [adapterPath, 'playwright-mcp'], {cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome'},stdio:['pipe','pipe','pipe']});
+      let stdout='', stderr=''; child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk);
+      child.once('error',reject); child.once('close',code=>code===0?resolveOutput(JSON.parse(stdout)):reject(new Error(stderr))); child.stdin.end(JSON.stringify(input));
+    });
+    assert.equal(output.codex_error_class, 'rate_limit');
+    assert.equal(output.codex_turn_failed, true);
+    assert.ok(output.codex_event_types.includes('turn.failed'));
+    assert.doesNotMatch(JSON.stringify(output), /private provider detail/);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
 test('cold form adapter runs the configured Codex host without oracle secrets', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'phase11-host-test-'));
   try {

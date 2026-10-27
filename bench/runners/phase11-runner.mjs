@@ -16,6 +16,7 @@ const OPTIONAL_OUTPUT_FIELDS = [
   'native_host_messages_sent', 'native_host_messages_received', 'tool_input_bytes',
   'unknown_delivery_count', 'timeout_count', 'cleanup_completed', 'cleanup_outcome',
   'metric_evidence', 'execution_tier', 'fallback_count', 'runner_error', 'prompt_to_final_ms',
+  'codex_event_types', 'codex_error_class', 'codex_turn_failed',
 ];
 
 export async function loadPhase11Config(configPath = 'bench/tasks/phase11-realistic.json') {
@@ -165,6 +166,9 @@ export function validateAdapterResult(result, contract, expected) {
   if (typeof result.success !== 'boolean' || typeof result.independently_verified_success !== 'boolean') {
     throw new Error('success fields must be booleans');
   }
+  if (result.codex_turn_failed !== undefined && typeof result.codex_turn_failed !== 'boolean') throw new Error('codex_turn_failed must be a boolean');
+  if (result.codex_event_types !== undefined && (typeof result.codex_event_types !== 'string' || result.codex_event_types.length > 256)) throw new Error('codex_event_types must be a bounded string');
+  if (result.codex_error_class !== undefined && !['rate_limit','quota','authentication','context_limit','mcp_startup','timeout','provider_unavailable','transport','unclassified_host_failure',null].includes(result.codex_error_class)) throw new Error('codex_error_class is invalid');
   for (const field of [
     'wall_ms','model_round_trips','model_tokens','mcp_calls','browser_ops','observation_bytes','screenshot_bytes',
     'retries','recovery_events','verification_ms','cpu_ms','peak_rss_bytes','focus_disruptions','clipboard_disruptions',
@@ -341,8 +345,9 @@ async function runOne({ adapter, command, task, mode, executionMode, concurrency
     ? Number(verifierDecisionNs - processStartNs) / 1_000_000 : null;
   const traceCounters = promptTrace.counters && typeof promptTrace.counters === 'object' ? promptTrace.counters : {};
   const promptToVerifierDecisionMs = exactPromptTrace ? Number(verifierDecisionNs - promptSentNs) / 1_000_000 : null;
-  const independentlyVerifiedSuccess = Boolean(raw.success && verification.passed);
-  const promptToVerifiedMs = independentlyVerifiedSuccess ? promptToVerifierDecisionMs : null;
+  const independentlyVerifiedSuccess = Boolean(verification.passed);
+  const success = Boolean(raw.success && independentlyVerifiedSuccess);
+  const promptToVerifiedMs = independentlyVerifiedSuccess && exactPromptTrace ? promptToVerifierDecisionMs : null;
   const adapterRequestToVerifierDecisionMs = Number(verifierDecisionNs - adapterRequestStartedNs) / 1_000_000;
   const adapterRequestToVerifiedMs = independentlyVerifiedSuccess ? adapterRequestToVerifierDecisionMs : null;
   const fallbackCount = Number.isSafeInteger(raw.fallback_count) ? raw.fallback_count
@@ -352,6 +357,7 @@ async function runOne({ adapter, command, task, mode, executionMode, concurrency
   if (fallbackCount === null) missingCounterNames.push('fallback_count');
   const result = {
     ...compactAdapterOutput(raw, contract),
+    success,
     prompt_to_verified_ms: promptToVerifiedMs,
     prompt_to_verifier_decision_ms: promptToVerifierDecisionMs,
     prompt_to_final_ms: Number.isFinite(reportedFinalMs) && reportedFinalMs >= 0 ? reportedFinalMs : null,
