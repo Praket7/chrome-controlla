@@ -100,9 +100,12 @@ async function main() {
       sha(binary), hashDirectory(resolve(root, 'extensions/chrome-controlla')),
     ]);
     verifyAdapterVersions(clientVersions, runtimeHash);
+    let playwrightCliHash = null;
     if (adapters.includes('playwright-mcp')) {
-      const version = execFileSync('npx', ['-y','@playwright/mcp@0.0.83','--version'], {encoding:'utf8',timeout:60000}).trim();
+      const cli = process.env.PHASE11_PLAYWRIGHT_MCP_CLI;
+      const version = cli ? execFileSync(process.execPath, [cli,'--version'], {encoding:'utf8',timeout:60000}).trim() : execFileSync('npx', ['-y','@playwright/mcp@0.0.83','--version'], {encoding:'utf8',timeout:60000}).trim();
       if (version !== 'Version 0.0.83') throw new Error(`Playwright MCP version check failed: ${version}`);
+      if (cli) playwrightCliHash = await sha(cli);
     }
     const chromeVersion = execFileSync(chrome, ['--version'], { encoding: 'utf8' }).trim();
     if (!chromeVersion) throw new Error('Chrome did not report its version');
@@ -136,6 +139,7 @@ async function main() {
         network_profile: 'loopback fixture; client and model network unrestricted',
         account_fixture_id: 'phase11-local-disposable',
         client_adapter_versions: clientVersions,
+        ...(playwrightCliHash ? {playwright_mcp_cli_sha256:playwrightCliHash} : {}),
       }),
       PHASE11_RESET_COMMAND_JSON: JSON.stringify([process.execPath, resolve(root, 'bench/adapters/phase11-reset.mjs')]),
       PHASE11_VERIFIER_COMMAND_JSON: JSON.stringify([process.execPath, resolve(root, 'bench/adapters/phase11-verifier.mjs')]),

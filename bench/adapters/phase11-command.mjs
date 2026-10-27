@@ -3,8 +3,7 @@ import { readFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setup } from '../runners/phase11-public-readonly-pilot.mjs';
 
@@ -36,6 +35,13 @@ if (['controlla','playwright-mcp'].includes(adapter) && fixtureKind && !input.sc
     const state = join(dir, 'state');
     await mkdir(state);
     const configured = setup(adapter, chrome, binary, state);
+    const directCli = adapter === 'playwright-mcp' ? process.env.PHASE11_PLAYWRIGHT_MCP_CLI : undefined;
+    if (directCli) {
+      if (!isAbsolute(directCli) || basename(directCli) !== 'cli.js') throw new Error('Playwright MCP CLI must be an absolute cli.js path');
+      const pkg = JSON.parse(await readFile(join(dirname(directCli), 'package.json'), 'utf8'));
+      if (pkg.name !== '@playwright/mcp' || pkg.version !== '0.0.83') throw new Error('Playwright MCP CLI package is not the pinned version');
+      configured.config.push('-c',`mcp_servers.playwright-mcp.command=${JSON.stringify(process.execPath)}`,'-c',`mcp_servers.playwright-mcp.args=${JSON.stringify([directCli,'--browser','chrome','--headless','--isolated','--executable-path',chrome])}`);
+    }
     const file = join(dir,'benchmark.txt');
     if (fixtureKind === 'upload') await writeFile(file,bytes,{flag:'wx'});
     const goal = fixtureKind === 'form' ? 'fill Name with "Benchmark User" and Notes with "Persisted benchmark form", click Save form, and verify the visible Saved status' : adapter === 'controlla' ? `Register the synthetic bytes with browser action=artifact_register, filename benchmark.txt, and bytes_base64 ${bytes.toString('base64')}. Use the returned artifact_handle in browser action=task with task {"kind":"upload","artifact_handle":"<returned handle>","selector":"#upload","trigger_reference":null,"acceptance":null,"persisted":null,"account_marker":["h1","Controlla Phase 11 · guarded-upload"]}. Selection alone is not application acceptance. After selection, take a fresh snapshot and use the act tool with action="click", reference for Register upload, and outcome {"kind":"text","selector":"#status","text":"Upload saved"}; require a verified result.` : `select and upload the synthetic file benchmark.txt, click Register upload, and verify the visible Upload saved status. The synthetic file path for the browser upload tool is ${file}.`;

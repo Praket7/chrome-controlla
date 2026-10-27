@@ -8,6 +8,8 @@ The actor disables shell execution, apps, and plugins, and uses Codex automatic 
 
 The suite writes an exclusive `.partial.jsonl` file next to its output before starting and appends each completed warmup or measured pair. A `completed` record appears only after the final report is written; an interrupted file is partial evidence, not a completed report.
 
+Set `PHASE11_PLAYWRIGHT_MCP_CLI` to an absolute path to the installed pinned `@playwright/mcp` 0.0.83 `cli.js` to avoid `npx` startup variability. The actor checks the adjacent package identity and version, and the suite records the CLI's SHA-256 and verifies its reported version.
+
 Run a controlled smoke with one task and one baseline:
 
 ```sh

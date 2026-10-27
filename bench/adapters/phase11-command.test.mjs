@@ -95,6 +95,22 @@ test('cold upload adapter launches a client without claiming server acceptance',
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
+test('Playwright actor can launch the verified pinned local CLI directly', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'phase11-playwright-cli-test-'));
+  try {
+    const cli=join(dir,'cli.js'), executable=join(dir,'codex');
+    await writeFile(join(dir,'package.json'),JSON.stringify({name:'@playwright/mcp',version:'0.0.83'}));
+    await writeFile(cli,'');
+    await writeFile(executable, `#!/usr/bin/env node\nif (!process.argv.some(x=>x.includes(${JSON.stringify(cli)}))) process.exit(9);\nconsole.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'playwright-mcp',tool:'browser_navigate',status:'completed',result:{content:[{type:'text',text:'ok'}]}}}));\nconsole.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'DONE'}}));\n`,{mode:0o755});
+    const input={task_id:'form-guarded-fill',task_class:'forms',mode:'cold_browser',execution_mode:'headless',concurrency:1,fixture_url:'http://127.0.0.1:1234/registration-form?task=form-guarded-fill',acceptance:{kind:'form',name:'Benchmark User',notes:'Persisted benchmark form'},deadline_ms:60000};
+    const output=await new Promise((resolveOutput,reject)=>{const child=spawn(process.execPath,[adapterPath,'playwright-mcp'],{cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome',PHASE11_PLAYWRIGHT_MCP_CLI:cli},stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.once('error',reject);child.once('close',code=>code===0?resolveOutput(JSON.parse(stdout)):reject(new Error(stderr)));child.stdin.end(JSON.stringify(input));});
+    assert.equal(output.success,true);
+    await writeFile(join(dir,'package.json'),JSON.stringify({name:'@playwright/mcp',version:'0.0.84'}));
+    const code=await new Promise((resolveCode,reject)=>{const child=spawn(process.execPath,[adapterPath,'playwright-mcp'],{cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome',PHASE11_PLAYWRIGHT_MCP_CLI:cli},stdio:['pipe','ignore','ignore']});child.once('error',reject);child.once('close',resolveCode);child.stdin.end(JSON.stringify(input));});
+    assert.notEqual(code,0);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
 test('an incomplete browser call cannot claim actor success', async () => {
   const dir=await mkdtemp(join(tmpdir(),'phase11-incomplete-test-'));
   try {
