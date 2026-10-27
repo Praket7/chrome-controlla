@@ -28,6 +28,7 @@ const metricEvidence = Object.fromEntries(Object.entries(metricProvenance).map((
   provenance,
   ...((field === 'prompt_to_verified_ms' && !verifiedPromptOutcome)
     || (field === 'fallback_count' && process.env.PHASE11_MOCK_PARTIAL_COUNTERS === '1')
+    || (field === 'output_bytes' && process.env.PHASE11_MOCK_OUTPUT_UNAVAILABLE === '1')
     || field === 'prompt_to_final_ms'
     ? { missing_reason: field === 'fallback_count' ? 'mock counter unavailable' : 'mock did not emit a qualifying verified-outcome or final-answer boundary' } : {})
 }]));
@@ -70,7 +71,7 @@ process.stdout.write(JSON.stringify({
   schema_bytes: 512,
   prompt_input_bytes: 128,
   tool_input_bytes: 64,
-  output_bytes: 1024,
+  output_bytes: process.env.PHASE11_MOCK_OUTPUT_UNAVAILABLE === '1' ? null : 1024,
   unknown_delivery_count: 0,
   fallback_count: process.env.PHASE11_MOCK_PARTIAL_COUNTERS === '1' ? null : 0,
   timeout_count: 0,

@@ -209,11 +209,15 @@ export function validateAdapterResult(result, contract, expected) {
   return result;
 }
 
-function normalizedMetricEvidence(raw, normalized, contract) {
+function normalizedMetricEvidence(raw, normalized, contract, invocationMetrics) {
   const evidence = {};
   for (const field of contract.measurement_metric_fields ?? []) {
     const metadata = raw.metric_evidence[field];
     const value = normalized[field];
+    if (field === 'output_bytes' && Number.isSafeInteger(invocationMetrics.output_bytes)) {
+      evidence[field] = { s: 'observed', p: contract.measurement_metric_provenance[field] };
+      continue;
+    }
     if (value === null || value === undefined) {
       if (typeof metadata.missing_reason !== 'string' || !metadata.missing_reason.trim()) {
         throw new Error(`normalized unavailable ${field} needs a non-empty missing_reason`);
@@ -397,7 +401,7 @@ async function runOne({ adapter, command, task, mode, executionMode, concurrency
     independently_verified_success: independentlyVerifiedSuccess,
     verifier_evidence_hash: verification.evidence_hash,
   };
-  result.metric_evidence = normalizedMetricEvidence(raw, result, contract);
+  result.metric_evidence = normalizedMetricEvidence(raw, result, contract, invocationMetrics);
   assertBoundedRow(result);
   return result;
 }

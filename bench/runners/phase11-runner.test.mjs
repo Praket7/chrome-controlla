@@ -126,6 +126,7 @@ test('runner resets, independently verifies, preserves paired failures, and emit
     concurrencyLevels: [1],
     repetitions: 1,
     warmupRepetitions: 0,
+    env: {...process.env, PHASE11_MOCK_OUTPUT_UNAVAILABLE:'1'},
     deadlineMs: 5000
   });
   assert.equal(report.schema_version, 2);
@@ -137,6 +138,8 @@ test('runner resets, independently verifies, preserves paired failures, and emit
   for (const row of report.paired_rows) {
     assert.equal(row.candidate.success, true);
     assert.equal(row.candidate.independently_verified_success, true);
+    assert.equal(row.candidate.metric_evidence.output_bytes.s, 'observed');
+    assert.equal(row.candidate.metric_evidence.output_bytes.p, 'runner_output_counter');
     assert.equal(row.baseline.independently_verified_success, true);
     assert.equal(row.candidate.wall_ms, 80);
     assert.equal(row.candidate.prompt_to_verified_ms, null);
