@@ -1050,3 +1050,9 @@ and installed-Chrome qualification remain open.
 ### Comprehensive Chrome audit follow-up — 2026-10-18
 
 The isolated real-Chrome private headless suite passed all three ignored `v2_stdio` fixtures: downloaded artifact bytes, research/draft/repeat, and widget drag/drop. The research fixture requests a reasoned 16 KiB response budget so all page receipts and exact short URLs remain available; compact responses mark longer URL identity with a prefix, digest, and `url_truncated`. Its debug server uses an 8 MiB worker stack, consistent with earlier long async fixture qualification. These tests do not exercise the installed extension or signed-in Chrome profile. Full workspace Rust tests, strict Clippy, JavaScript checks, and package checks are recorded separately for this branch.
+
+### 2026-10-26 targeted collector continuation
+
+A 30-pair warm synthetic collector comparison and five collector regressions cover early role and href filtering, including duplicate shadow-root matches; the nine background action fixtures also passed. Details and raw rows are in `bench/reports/collector-role-2026-10-26.md` and its adjacent JSON. This does not establish end-to-end latency, live extension behavior, application persistence, or a competitor result.
+
+The isolated simulated-extension shared-download fixture passed with identity/epoch batching at both guard points and exact downloaded bytes. The adapter, configured-suite and pilot checks passed 33 Node tests. Earlier real form smokes failed; a later Codex-host form smoke with a temporary shim to the installed pinned Playwright package passed actor completion and independent persisted-state readback. This does not qualify the installed Controlla extension or a paired baseline. Browser and model network access are unrestricted during these probes.

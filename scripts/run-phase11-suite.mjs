@@ -8,6 +8,20 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+export function configuredAdapterIds(candidate, baselines) {
+  const allowed = new Set(['controlla','controlla-1','controlla-2-pre-stage2','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use']);
+  const selected = baselines.split(',').map(value => value.trim()).filter(Boolean);
+  if (!allowed.has(candidate) || !selected.length || selected.some(value => !allowed.has(value) || value === candidate) || new Set(selected).size !== selected.length) throw new Error('invalid candidate or baseline adapters');
+  return [candidate, ...selected];
+}
+
+export function verifyAdapterVersions(versions, runtimeHash) {
+  for (const [id, version] of Object.entries(versions)) {
+    const expected = id === 'controlla' ? `sha256:${runtimeHash}` : id === 'playwright-mcp' ? '0.0.83' : null;
+    if (!expected || version !== expected) throw new Error(`unverified adapter identity for ${id}`);
+  }
+}
+
 export async function hashDirectory(directory) {
   const entries = [];
   async function walk(current) {
@@ -50,12 +64,12 @@ export function parseAdapterVersions(raw, adapters) {
       throw new Error(`exact observed client adapter version required for ${id}`);
     }
   }
-  return versions;
+  return Object.fromEntries(adapters.map(id => [id, versions[id]]));
 }
 
 async function main() {
   const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
-  const adapters = ['controlla','controlla-1','controlla-2-pre-stage2','playwright-mcp','chrome-devtools-mcp','agent-browser','stagehand','browser-use'];
+  const adapters = configuredAdapterIds(process.env.PHASE11_CANDIDATE_ID ?? 'controlla', process.env.PHASE11_BASELINE_IDS ?? 'playwright-mcp');
   const candidateSourceSha = requireCleanTree(root);
   const clientVersions = parseAdapterVersions(process.env.PHASE11_CLIENT_ADAPTER_VERSIONS_JSON, adapters);
   const stateDir = await mkdtemp(join(tmpdir(), 'controlla-phase11-'));
@@ -85,6 +99,11 @@ async function main() {
     const [runtimeHash, extensionHash] = await Promise.all([
       sha(binary), hashDirectory(resolve(root, 'extensions/chrome-controlla')),
     ]);
+    verifyAdapterVersions(clientVersions, runtimeHash);
+    if (adapters.includes('playwright-mcp')) {
+      const version = execFileSync('npx', ['-y','@playwright/mcp@0.0.83','--version'], {encoding:'utf8',timeout:60000}).trim();
+      if (version !== 'Version 0.0.83') throw new Error(`Playwright MCP version check failed: ${version}`);
+    }
     const chromeVersion = execFileSync(chrome, ['--version'], { encoding: 'utf8' }).trim();
     if (!chromeVersion) throw new Error('Chrome did not report its version');
     const codexVersion = execFileSync(codex, ['--version'], { encoding: 'utf8' }).trim();
@@ -114,7 +133,7 @@ async function main() {
         prompt_hash: process.env.PHASE11_PROMPT_HASH ?? 'adapter-generated',
         token_budget: Number(process.env.PHASE11_TOKEN_BUDGET ?? 32000),
         fixture_revision: 'local-realistic-v2-server-acceptance',
-        network_profile: 'loopback-only',
+        network_profile: 'loopback fixture; client and model network unrestricted',
         account_fixture_id: 'phase11-local-disposable',
         client_adapter_versions: clientVersions,
       }),
@@ -128,7 +147,7 @@ async function main() {
       `--execution-modes=${process.env.PHASE11_EXECUTION_MODES ?? 'headless'}`,
       `--concurrency=${process.env.PHASE11_CONCURRENCY ?? '1'}`,
       `--repetitions=${process.env.PHASE11_REPETITIONS ?? '1'}`,
-      `--deadline-ms=${process.env.PHASE11_DEADLINE_MS ?? '15000'}`,
+      `--deadline-ms=${process.env.PHASE11_DEADLINE_MS ?? '180000'}`,
       `--baseline-ids=${process.env.PHASE11_BASELINE_IDS ?? 'playwright-mcp'}`,
       `--output=${process.env.PHASE11_OUTPUT ?? 'bench/reports/phase11-suite-local.json'}`,
     ];

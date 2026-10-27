@@ -287,3 +287,9 @@ The latest independent-review findings are closed locally: checkpoint disk refre
 
 - The new capsule, target graph, network-candidate, compact-catalog, and protocol-contract modules are implemented and locally tested. They do not by themselves prove installed-Chrome behavior, compositor correctness, or competitor superiority.
 - The extension and native runtime still retain the six-tool compatibility surface for existing clients; the three-concept catalog is an explicit mapping layer and is not yet a breaking public API migration.
+
+### 2026-10-26 targeted collector continuation
+
+The early role/href filter reduces candidate work but still walks the reachable DOM and does not close the shared chat's broader goals: paired cold/warm end-to-end tasks with independent acceptance, identity coalescing beyond the current preflight, expanded programs, and live application/client qualification remain open. See `bench/reports/collector-role-2026-10-26.md` for the limited measurement.
+
+The download path now coalesces two identity/epoch checks, but its qualification used a simulated extension. After increasing MCP startup time and enabling automatic approval review, one Codex-host form smoke passed with the pinned Playwright package invoked through a temporary shim. The paired baseline and Controlla actor remain unqualified. The local launcher and native host manifest point to a missing older checkout; the new release build and an observed unpacked extension ID are needed before installation and reload.

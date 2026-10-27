@@ -1,7 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve } from 'node:path';
-import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles, newStagehandProfiles, processLineContainsPath } from './phase11-public-readonly-pilot.mjs';
+import { resolve, join } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { browserOutcomeElapsed, htmlReference, parseFinal, setup, summarizeToolEvents, toolOutcomeMatchesReference, verifiedCleanup, verifiedRead, verifyBrowserUseIdentity, stagehandProcessCleanup, stagehandSingleCall, parseWindowsProcessInventory, noNewStagehandProfiles, newStagehandProfiles, processLineContainsPath, parseRepetitions, writePilotReport } from './phase11-public-readonly-pilot.mjs';
+
+test('pilot checkpoints measured pairs without replacing an existing report', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pilot-checkpoint-'));
+  try {
+    const path = join(dir, 'report.json');
+    await writePilotReport(path, { pairs: [] }, true);
+    await writePilotReport(path, { pairs: [{ replicate: 1 }] }, false);
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).pairs, [{ replicate: 1 }]);
+    await assert.rejects(writePilotReport(path, { pairs: [] }, true), { code: 'EEXIST' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('pilot accepts 30 paired repetitions with a bounded count', () => {
+  assert.equal(parseRepetitions('30'), 30);
+  for (const value of ['0', '31', '1.5', 'NaN']) assert.throws(() => parseRepetitions(value));
+});
 
 test('Controlla pilot uses one private task call without a launch round trip', () => {
   const prompt = setup('controlla', '/chrome', '/controlla', '/state').prompt;

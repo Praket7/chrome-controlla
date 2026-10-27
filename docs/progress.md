@@ -595,3 +595,9 @@ The ignored isolated shared-bridge Chrome fixture exercises the complete public 
 ### Comprehensive Chrome audit follow-up — 2026-10-18
 
 The three isolated private-Chrome headless `v2_stdio` fixtures pass for download bytes, research/draft/repeat, and widget drag/drop. The multi-page research fixture exposed receipt compaction that silently dropped URL identity; compact task receipts now retain exact short URLs or explicitly mark a long URL prefix and digest, with byte-cap regressions. The long debug task fixture launches its test server with an 8 MiB worker stack. Installed-extension, signed-in Chrome, minimized-window, and real-app persistence qualification remain open.
+
+### 2026-10-26 targeted collector continuation
+
+On base `0ef14468ee2b2597b7a486d95fda758904f429de`, semantic goal role and href filters now exclude nonmatching controls before layout and metadata collection. Traversal and mutation guards remain unchanged. A real-Chrome regression checks the target and scope and reduces fixture layout reads from 31 to one. This is a local improvement, not completion of the broader performance and application-qualification plan. See `bench/reports/collector-role-2026-10-26.md`.
+
+The shared-download path batches its identity and epoch reads at both guard points. Its isolated simulated-extension Chrome fixture passed with the exact downloaded byte hash. Cold form and upload benchmark actors were added; one later Codex/Playwright form smoke passed with independent persisted-state readback, using a temporary shim to the pinned installed package. No paired end-to-end result is established. See `docs/performance-continuation-2026-10-26.md`.

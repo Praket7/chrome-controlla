@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,22 @@ const maxOutputBytes = 4_000_000;
 function option(name, fallback) {
   const value = process.argv.find(arg => arg.startsWith(`--${name}=`));
   return value ? value.slice(name.length + 3) : fallback;
+}
+
+export function parseRepetitions(value) {
+  const repetitions = Number(value);
+  if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 30) throw new Error('repetitions must be 1 to 30');
+  return repetitions;
+}
+
+export async function writePilotReport(path, report, initial) {
+  const data = `${JSON.stringify(report, null, 2)}\n`;
+  if (initial) return writeFile(path, data, { flag: 'wx' });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, data, { flag: 'wx' });
+    await rename(temporary, path);
+  } finally { await rm(temporary, { force: true }); }
 }
 
 export function htmlReference(html) {
@@ -473,8 +489,7 @@ async function runAdapter(adapter, { codexPath, model, browserPath, binaryPath, 
 }
 
 async function main() {
-  const repetitions = Number(option('repetitions', '1'));
-  if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 10) throw new Error('repetitions must be 1 to 10');
+  const repetitions = parseRepetitions(option('repetitions', '1'));
   const selectedAdapters = option('adapters', adapters.join(',')).split(',').map(value => value.trim()).filter(Boolean);
   if (!selectedAdapters.length || new Set(selectedAdapters).size !== selectedAdapters.length
       || selectedAdapters.some(adapter => !adapters.includes(adapter))) throw new Error('adapters must be a unique comma-separated subset of configured adapters');
@@ -496,6 +511,7 @@ async function main() {
   });
   const parentDir = await mkdtemp(join(tmpdir(), `controlla-phase11-pilot-${randomUUID()}-`));
   const report = { schema_version: 1, track: 'phase11-public-readonly-pilot', release_claim_eligible: false,
+    status: 'running', planned_repetitions: repetitions,
     scope: 'one public read-only fact task in isolated Chrome profiles; no signed-in state; no full Phase 11 matrix',
     task: { id: 'example-domain-title-paragraph', url: targetUrl, verifier: 'independent HTTPS fetch and exact title/paragraph match plus observed browser tool calls' },
     environment: { chrome_version: chromeVersion, model, selected_adapters: selectedAdapters,
@@ -512,15 +528,18 @@ async function main() {
       timing_origin: 'immediately_before_codex_cli_spawn; Codex JSON events do not expose prompt-send dispatch' },
     pairs: [] };
   try {
+    await mkdir(dirname(output), { recursive: true });
+    await writePilotReport(output, report, true);
     for (let i = 0; i < repetitions; i++) {
       const order = i % 2 === 0 ? selectedAdapters : [...selectedAdapters].reverse();
       const results = {};
       for (const adapter of order) results[adapter] = await runAdapter(adapter, { codexPath, model, browserPath, binaryPath,
         browserUseExecutable: browserUsePath, stagehandServerPath: stagehandIdentity?.server_path ?? stagehandServerPath, timeoutMs, parentDir });
       report.pairs.push({ replicate: i + 1, execution_order: order, ...results });
+      await writePilotReport(output, report, false);
     }
-    await mkdir(dirname(output), { recursive: true });
-    await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
+    report.status = 'completed';
+    await writePilotReport(output, report, false);
     console.log(output);
   } finally {
     await rm(parentDir, { recursive: true, force: true });

@@ -4,7 +4,19 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { hashDirectory, parseAdapterVersions, requireCleanTree } from './run-phase11-suite.mjs';
+import { configuredAdapterIds, hashDirectory, parseAdapterVersions, requireCleanTree, verifyAdapterVersions } from './run-phase11-suite.mjs';
+
+test('recorded adapter identities must match the pinned client and runtime bytes', () => {
+  const hash='a'.repeat(64);
+  assert.doesNotThrow(()=>verifyAdapterVersions({'controlla':`sha256:${hash}`,'playwright-mcp':'0.0.83'},hash));
+  assert.throws(()=>verifyAdapterVersions({'controlla':`sha256:${hash}`,'playwright-mcp':'1.0.0'},hash));
+  assert.throws(()=>verifyAdapterVersions({'controlla':'0.1.0','playwright-mcp':'0.0.83'},hash));
+});
+
+test('configured run requires versions only for the selected candidate and baselines', () => {
+  assert.deepEqual(configuredAdapterIds('controlla', 'playwright-mcp'), ['controlla','playwright-mcp']);
+  assert.throws(() => configuredAdapterIds('controlla', 'controlla'), /baseline/);
+});
 
 test('adapter provenance requires explicit exact versions for every configured client', () => {
   assert.throws(() => parseAdapterVersions('', ['one']), /must provide exact observed versions/);

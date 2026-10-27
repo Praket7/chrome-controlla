@@ -10401,15 +10401,13 @@ async fn shared_download(
     if token != snapshot.token || index >= snapshot.count || snapshot.consumed {
         return Err(invalid("download reference was stale or consumed"));
     }
-    let before = super::super::shared_frame_identity(transport, registry, &live.handle, tab_id)
-        .await
-        .map_err(invalid)?;
-    let interaction = super::super::shared_interaction_epoch(
+    let (before, interaction) = super::super::shared_identity_and_epoch(
         transport,
         registry,
         &live.handle,
         tab_id,
         &snapshot.object_id,
+        Duration::from_secs(30),
     )
     .await
     .map_err(invalid)?;
@@ -10437,18 +10435,16 @@ async fn shared_download(
     if checked["ok"] != true {
         return Ok(crate::guard_reason::refusal(&checked));
     }
-    let preflight_identity =
-        super::super::shared_frame_identity(transport, registry, &live.handle, tab_id).await;
-    let preflight_interaction = super::super::shared_interaction_epoch(
+    let preflight = super::super::shared_identity_and_epoch(
         transport,
         registry,
         &live.handle,
         tab_id,
         &snapshot.object_id,
+        Duration::from_secs(30),
     )
     .await;
-    if !matches!(preflight_identity, Ok(ref identity) if identity == &before)
-        || !matches!(preflight_interaction, Ok(ref epoch) if super::super::shared_epoch_matches(&snapshot,tab_id,&before,epoch,crate::v3::EpochUse::PointerMutation))
+    if !matches!(preflight, Ok((ref identity, ref epoch)) if identity == &before && super::super::shared_epoch_matches(&snapshot,tab_id,&before,epoch,crate::v3::EpochUse::PointerMutation))
     {
         return Ok(
             json!({"status":"not_dispatched","reason":"download target or presentation changed immediately before retrieval"}),
@@ -27167,7 +27163,8 @@ mod v3_batch_delivery_tests {
                     let request_actions=if request["type"]=="batch" {request["actions"].as_array().cloned().unwrap_or_default()} else {vec![request.clone()]};
                     proxy_command_trace.lock().unwrap().push(json!({
                         "request_type":request["type"],
-                        "methods":request_actions.iter().map(|action|action["method"].clone()).collect::<Vec<_>>()
+                        "methods":request_actions.iter().map(|action|action["method"].clone()).collect::<Vec<_>>(),
+                        "identity_epoch_batch":request["type"]=="batch" && request_actions.first().and_then(|action|action["params"]["functionDeclaration"].as_str()).is_some_and(|script|script.contains("controlla.interactionEpoch.v1"))
                     }));
                     if request["type"]=="batch" {
                         let actions=request["actions"].as_array().unwrap();
@@ -27402,6 +27399,8 @@ mod v3_batch_delivery_tests {
             });
             let accepted=client.call_tool(call("browser",json!({"action":"accept_shared","session_id":session}))).await.unwrap().structured_content.unwrap();
             assert_eq!(accepted["accepted"],true);
+            let download_only=std::env::var_os("CONTROLLA_SHARED_DOWNLOAD_ONLY").is_some();
+            if !download_only {
             let snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
             let target_ref=snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Trusted keys").unwrap()["reference"].clone();
             let clicked=client.call_tool(call("act",json!({"session_id":session,"chrome_tab_id":"123","action":"click","reference":target_ref,"outcome":{"kind":"focused"}}))).await.unwrap().structured_content.unwrap();
@@ -27530,17 +27529,23 @@ mod v3_batch_delivery_tests {
             assert_eq!(recovered_value,format!("{current}r"),"fresh trusted readback verifies recovery without echoing the value in the MCP receipt");
             }
             }
+            }
             {
             let download_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
             let download_ref=download_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Download fixture").unwrap()["reference"].clone();
+            let download_trace_start=command_trace.lock().unwrap().len();
             let downloaded=client.call_tool(call("browser",json!({"action":"task","session_id":session,"chrome_tab_id":"123","task":{"kind":"download","reference":download_ref,"source":"page_fetch"}}))).await.unwrap().structured_content.unwrap();
             assert_eq!(downloaded["status"],"completed","shared public download route: {downloaded}");
+            let download_commands=command_trace.lock().unwrap()[download_trace_start..].to_vec();
+            let identity_batches=download_commands.iter().filter(|entry| entry["identity_epoch_batch"]==true && entry["methods"]==json!(["Runtime.callFunctionOn","Page.getFrameTree"])).count();
+            assert!(identity_batches >= 2,"download must batch both identity/epoch checks: {download_commands:?}");
             let downloaded=downloaded["receipts"][0].clone();
             let expected_hash=crate::artifacts::ArtifactExpectation::sha256(UPLOAD_FIXTURE);
             assert_eq!(downloaded["sha256"],expected_hash,"shared downloaded-byte digest: {downloaded}");
             assert_eq!(downloaded["source_identity"]["kind"],"browser_download","shared artifact carries source identity");
             assert_eq!(downloaded["mime"],"application/octet-stream");
             assert!(downloaded["expires_at_ms"].as_u64().is_some(),"shared download exposes artifact expiry: {downloaded}");
+            if !download_only {
             let upload_snapshot=client.call_tool(call("snapshot",json!({"session_id":session,"chrome_tab_id":"123"}))).await.unwrap().structured_content.unwrap();
             let upload_ref=upload_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Upload file").unwrap()["reference"].clone();
             let status_ref=upload_snapshot["items"].as_array().unwrap().iter().find(|item|item["name"]=="Upload status").unwrap()["reference"].clone();
@@ -27578,6 +27583,7 @@ mod v3_batch_delivery_tests {
             assert_eq!(hash, expected_hash);
             assert!(accepted, "local receipt server rejected the public shared upload");
             assert!(uploaded["step_ms"][0].as_u64().is_some(),"{uploaded}");
+            }
             }
             proxy.abort(); let _=proxy.await;
             receipt_server.abort(); let _=receipt_server.await;
