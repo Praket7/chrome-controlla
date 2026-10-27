@@ -426,7 +426,7 @@ function validateLiveTaskUrls(task) {
   }
 }
 
-function assertEnvironment(environment, config) {
+function assertEnvironment(environment, config, selectedAdapters) {
   if (!environment || typeof environment !== 'object' || Array.isArray(environment)) throw new Error('environment manifest is required');
   const required = config.required_environment ?? [];
   for (const field of required) {
@@ -450,10 +450,10 @@ function assertEnvironment(environment, config) {
   for (const adapterId of Object.keys(environment.client_adapter_versions)) {
     if (!configuredAdapters.has(adapterId)) throw new Error(`environment contains unknown client adapter version ${adapterId}`);
   }
-  for (const adapter of config.adapters.filter(item => item.track === 'structured')) {
-    if (typeof environment.client_adapter_versions[adapter.id] !== 'string'
-        || !environment.client_adapter_versions[adapter.id].trim()) {
-      throw new Error(`environment client_adapter_versions missing configured adapter ${adapter.id}`);
+  for (const adapterId of selectedAdapters) {
+    if (typeof environment.client_adapter_versions[adapterId] !== 'string'
+        || !environment.client_adapter_versions[adapterId].trim()) {
+      throw new Error(`environment client_adapter_versions missing selected adapter ${adapterId}`);
     }
   }
 }
@@ -484,7 +484,7 @@ export async function runBenchmark({
   if (baseline.track !== 'structured') throw new Error('release comparison requires a structured baseline; computer-use stays on the separate vision track');
   if (!fixtureBaseUrl && config.tasks.some(task => !task.url)) throw new Error('fixtureBaseUrl is required for fixture tasks');
   for (const task of config.tasks) if (task.url) validateLiveTaskUrls(task);
-  assertEnvironment(environment, config);
+  assertEnvironment(environment, config, [candidateId, baselineId]);
   const selectedModes = modes ?? config.modes;
   const selectedExecutionModes = executionModes ?? config.execution_modes;
   const selectedConcurrency = concurrencyLevels ?? config.concurrency;

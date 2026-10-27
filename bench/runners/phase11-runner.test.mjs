@@ -193,6 +193,12 @@ test('runner stops before retaining more than the configured aggregate report bu
   }), /benchmark report exceeded 1 bytes/);
 });
 
+test('environment requires versions for the measured pair, not every configured adapter', async () => {
+  const options={baselineId:'playwright-mcp',fixtureBaseUrl:'https://fixtures.example.test/',commands:{controlla:adapter('controlla',80,1),'playwright-mcp':adapter('playwright-mcp',120,3)},resetCommand:reset,verifierCommand:verifier,modes:['warm_qualified_route'],executionModes:['headless'],concurrencyLevels:[1],repetitions:1,warmupRepetitions:0,deadlineMs:5000,maxReportBytes:1};
+  await assert.rejects(() => runBenchmark({...options,environment:{...environment,client_adapter_versions:{controlla:'test','playwright-mcp':'test'}}}), /benchmark report exceeded 1 bytes/);
+  await assert.rejects(() => runBenchmark({...options,environment:{...environment,client_adapter_versions:{controlla:'test'}}}), /missing selected adapter playwright-mcp/);
+});
+
 test('paired trial ordering is reproducible and randomized from the matrix order', async () => {
   const options = {
     baselineId: 'playwright-mcp', fixtureBaseUrl: 'https://fixtures.example.test/',
