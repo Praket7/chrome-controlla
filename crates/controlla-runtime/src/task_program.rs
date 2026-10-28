@@ -27,10 +27,13 @@ impl Default for TaskProgramLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStepKind {
     Navigate,
+    #[default]
     Observe,
     Find,
     Click,
@@ -67,11 +70,14 @@ impl TaskStepKind {
     }
 
     pub fn is_control_flow(self) -> bool {
-        matches!(self, Self::If | Self::Foreach | Self::TryFallback | Self::ParallelRead)
+        matches!(
+            self,
+            Self::If | Self::Foreach | Self::TryFallback | Self::ParallelRead
+        )
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskStep {
     pub kind: TaskStepKind,
@@ -109,15 +115,15 @@ pub struct TaskStep {
     pub predicate: Option<serde_json::Value>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub delta_x: Option<i32>,
+    #[serde(default)]
+    pub delta_y: Option<i32>,
+    #[serde(default)]
+    pub typing_mode: Option<String>,
 }
 
-impl Default for TaskStepKind {
-    fn default() -> Self {
-        Self::Observe
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskProgram {
     #[serde(default)]
@@ -324,7 +330,20 @@ fn validate_steps(
             | TaskStepKind::Hover
             | TaskStepKind::Drag => {
                 if step.reference.is_none() && step.target.is_none() && step.query.is_none() {
-                    return Err(format!("{:?} requires a target, reference, or query", step.kind));
+                    return Err(format!(
+                        "{:?} requires a target, reference, or query",
+                        step.kind
+                    ));
+                }
+                if step.kind == TaskStepKind::Scroll {
+                    let horizontal = step.delta_x.unwrap_or(0).unsigned_abs();
+                    let vertical = step.delta_y.unwrap_or(0).unsigned_abs();
+                    if (horizontal == 0) == (vertical == 0) || horizontal > 1200 || vertical > 1200
+                    {
+                        return Err(
+                            "scroll requires exactly one nonzero delta within +/-1200".into()
+                        );
+                    }
                 }
             }
             TaskStepKind::WaitFor => {
@@ -389,12 +408,15 @@ pub fn lower_to_vm_ops(program: &CompiledTaskProgram) -> Vec<serde_json::Value> 
         .map(|step| {
             let mut value = serde_json::to_value(step).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {
-                object.insert("kind".into(), serde_json::Value::String(
-                    serde_json::to_string(&step.kind)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_owned(),
-                ));
+                object.insert(
+                    "kind".into(),
+                    serde_json::Value::String(
+                        serde_json::to_string(&step.kind)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                            .to_owned(),
+                    ),
+                );
             }
             value
         })
@@ -414,7 +436,9 @@ mod tests {
 
     #[test]
     fn empty_and_oversized_programs_fail_closed() {
-        assert!(compile_task_program(&TaskProgram::default(), TaskProgramLimits::default()).is_err());
+        assert!(
+            compile_task_program(&TaskProgram::default(), TaskProgramLimits::default()).is_err()
+        );
         let program = TaskProgram {
             steps: vec![step(TaskStepKind::Observe); 200],
         };

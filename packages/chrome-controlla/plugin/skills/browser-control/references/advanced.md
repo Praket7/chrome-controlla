@@ -4,7 +4,11 @@ Load this only when the task actually needs one of these features.
 
 ## Workflow VM
 
-`workflow` supports bounded `step`, `if`, `foreach`, and `try_fallback`. Fallback is permitted only after read failure or known `not_dispatched`, and never after a successful or unknown mutation. A mutation with `unknown`/`dispatched` may continue only to immediate read-only verification.
+`workflow` supports bounded `step`, `if`, `foreach`, `try_fallback`, and `parallel_read`. Fallback is permitted only after read failure or known `not_dispatched`, and never after a successful or unknown mutation. A mutation with `unknown`/`dispatched` may continue only to immediate read-only verification. `parallel_read` accepts only read-only steps and is rejected before dispatch when any child could mutate state.
+
+Steps include navigate, snapshot, find, click, double_click, context_click, hover, touch, swipe, multi_touch, scroll, scroll_to, fill, select, type, press, extract, verify, and widget data transfer. Prefer these over separate `act` calls when the sequence is already known.
+
+`browser(action="task", task_program=...)` compiles the same typed steps (plus bounded control flow) into that VM, so one call can navigate, observe, fill, click, and verify without returning intermediate model turns. Programs are bounded to 128 expanded steps and 16 nesting levels; `drag` and selector `wait_for` are rejected rather than approximated.
 
 ## Virtualized lists
 
@@ -12,7 +16,7 @@ Use `collect_virtual` when the page recycles rows or reveals items only through 
 
 ## Typing
 
-Omit `typing_mode` normally. Controlla chooses block insertion, fast trusted key events, or IME based on the target. For a fresh `@f:<frame>:<loader>:<backend-node>` reference, omitted mode defaults to guarded `human_keys` because child-frame editors must receive ordered input events; composition mode remains unsupported there. Use `human_keys` on other targets only when the user explicitly asks for human-paced input. A verified editor readback confirms the live field value, not server-side save or persistence.
+Omit `typing_mode` normally. Controlla chooses block insertion, fast trusted key events, IME, or a qualified editor adapter from the resolved target. Root and child-frame text entry use one `Controlla.typeTextTransaction` per operation; chunking and readback stay inside the extension, and no path sends one native message per character. Use `human_keys` only when the user explicitly asks for human-paced input. A verified editor readback confirms the live field value, not server-side save or persistence.
 
 ## Page tools
 
@@ -30,5 +34,9 @@ Snapshots expose password controls only as redacted credential inputs. Password 
 # Visual settling and desktop fallback
 
 Use `ready_when: {"kind":"visual_stable","quiet_ms":300,"timeout_ms":3000}` on `browser action=open`, or `{"kind":"wait_stable","quiet_ms":300,"timeout_ms":3000}` inside a workflow. Add a bounded integer-pixel `region` when only part of the viewport matters. The step is read-only: if it times out, inspect the current page and do not dispatch the planned visual mutation from that receipt.
+
+## Deprecated compatibility paths
+
+`Controlla.frameHumanTypeCharacter` remains registered for one compatibility cycle so already-packaged clients do not break. No V3 task, workflow, or `act` typing path calls it: they use `Controlla.typeTextTransaction`, and the extension tests assert a 1,000-character frame type sends exactly one such request and no per-character frame typing. Remove the shim only after two green package-compatibility cycles; do not route new work through it.
 
 Use native fallback only when the live capability report advertises it and the task needs foreground pointer movement/scrolling or a non-submitting key. It refuses coordinate clicks, drags, all text entry, and navigation because native visual evidence cannot establish safe intent. Use fresh semantic extension actions for page controls and navigation; keep order confirmation, credential entry, challenge hand-off, and background actions on their guarded extension routes. See `docs/desktop-fallback.md` for exact platform status.

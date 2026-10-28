@@ -16,10 +16,79 @@ pub enum ReplayStatus {
     Disabled,
 }
 
+/// Bounded structural identity for a validated operation target. Raw user
+/// input never belongs here; callers re-resolve a live `@cN` before dispatch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+pub struct TargetTemplate {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub href: Option<String>,
+    #[serde(default)]
+    pub ancestor: Option<String>,
+    #[serde(default)]
+    pub test_id: Option<String>,
+}
+
+/// Postcondition stored with a learned operation. Predicates carry identity
+/// patterns, never the user's typed values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerifyPredicate {
+    UrlMatches { pattern: String },
+    TextPresent { text: String },
+    Visible { target: TargetTemplate },
+    Hidden { target: TargetTemplate },
+    AppState { adapter: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReplayPlan {
-    Extract { selector: String },
+    Navigate {
+        url_template: String,
+    },
+    Click {
+        target: TargetTemplate,
+        outcome: VerifyPredicate,
+    },
+    Fill {
+        target: TargetTemplate,
+        value_slot: String,
+        outcome: VerifyPredicate,
+    },
+    Type {
+        target: TargetTemplate,
+        value_slot: String,
+        #[serde(default)]
+        strategy_hint: Option<String>,
+    },
+    Select {
+        target: TargetTemplate,
+        value_slot: String,
+        outcome: VerifyPredicate,
+    },
+    Extract {
+        selector: String,
+    },
+    Tool {
+        capability_id: String,
+        schema_hash: String,
+    },
+}
+
+/// Proof that a cached operation was repaired after a successful reactive
+/// fallback instead of being replayed blindly.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairMetadata {
+    pub repaired_at_ms: u64,
+    pub reason: String,
+    #[serde(default)]
+    pub previous_target: Option<TargetTemplate>,
 }
 
 #[cfg(test)]
@@ -44,6 +113,8 @@ mod tests {
             replay: Some(ReplayPlan::Extract {
                 selector: selector.into(),
             }),
+            preconditions: None,
+            repair: None,
             last_verified_ms: 100,
         }
     }
@@ -73,6 +144,8 @@ mod tests {
                 action: "fill".into(),
                 expected_postcondition: json!({"kind":"filled","value":"super-secret"}),
                 replay: None,
+                preconditions: None,
+                repair: None,
                 last_verified_ms: 100,
             },
             Verification::Passed,
@@ -89,6 +162,144 @@ mod tests {
             memory.replay_status(&key, 100 + super::MAX_AGE_MS + 1),
             super::ReplayStatus::Stale
         );
+    }
+
+    #[test]
+    fn validated_operation_plans_store_slots_not_raw_values() {
+        let mut memory = ActionMemory::default();
+        let key = key();
+        let target = super::TargetTemplate {
+            role: Some("textbox".into()),
+            name: Some("Email".into()),
+            href: None,
+            ancestor: Some("form#signup".into()),
+            test_id: Some("signup-email".into()),
+        };
+        let plan = ReplayPlan::Fill {
+            target: target.clone(),
+            value_slot: "email_address".into(),
+            outcome: super::VerifyPredicate::TextPresent {
+                text: "Check your inbox".into(),
+            },
+        };
+        let entry = ActionMemoryEntry {
+            semantic_target: json!({"role":"textbox","name":"Email"}),
+            action: "fill".into(),
+            expected_postcondition: json!({"kind":"text_present"}),
+            replay: Some(plan.clone()),
+            preconditions: Some(json!({"form":"signup","step":1})),
+            repair: None,
+            last_verified_ms: 100,
+        };
+        assert!(memory.record(key.clone(), entry, Verification::Passed));
+        let stored = memory.lookup(&key, 101).unwrap();
+        assert_eq!(stored.replay.as_ref(), Some(&plan));
+        let encoded = serde_json::to_string(stored).unwrap();
+        assert!(!encoded.contains("person@example.test"));
+        assert_eq!(memory.replay_status(&key, 101), super::ReplayStatus::Hit);
+
+        // A raw user value in the slot position is rejected by the slot grammar.
+        let raw_value = ActionMemoryEntry {
+            semantic_target: json!({"role":"textbox"}),
+            action: "fill".into(),
+            expected_postcondition: json!({"kind":"filled"}),
+            replay: Some(ReplayPlan::Fill {
+                target: target.clone(),
+                value_slot: "person@example.test".into(),
+                outcome: super::VerifyPredicate::UrlMatches {
+                    pattern: "https://example.test/".into(),
+                },
+            }),
+            preconditions: None,
+            repair: None,
+            last_verified_ms: 100,
+        };
+        let raw_key = ActionMemoryKey {
+            intent: "fill-raw".into(),
+            ..key.clone()
+        };
+        assert!(!memory.record(raw_key, raw_value, Verification::Passed));
+    }
+
+    #[test]
+    fn repaired_targets_keep_bounded_provenance() {
+        let mut memory = ActionMemory::default();
+        let key = key();
+        assert!(memory.record(
+            key.clone(),
+            ActionMemoryEntry {
+                semantic_target: json!({"role":"button","name":"Save"}),
+                action: "click".into(),
+                expected_postcondition: json!({"kind":"text_present","text":"Saved"}),
+                replay: Some(ReplayPlan::Click {
+                    target: super::TargetTemplate {
+                        role: Some("button".into()),
+                        name: Some("Save".into()),
+                        href: None,
+                        ancestor: None,
+                        test_id: None,
+                    },
+                    outcome: super::VerifyPredicate::TextPresent {
+                        text: "Saved".into(),
+                    },
+                }),
+                preconditions: None,
+                repair: None,
+                last_verified_ms: 100,
+            },
+            Verification::Passed
+        ));
+        assert!(memory.repair_target(
+            &key,
+            json!({"role":"button","name":"Save","ancestor":"dialog"}),
+            Some(super::TargetTemplate {
+                role: Some("button".into()),
+                name: Some("Save".into()),
+                href: None,
+                ancestor: None,
+                test_id: None,
+            }),
+            "reactive fallback verified Saved after dialog rerender",
+            200,
+        ));
+        let repaired = memory.lookup(&key, 201).unwrap();
+        assert_eq!(repaired.last_verified_ms, 200);
+        assert_eq!(
+            repaired.repair.as_ref().unwrap().previous_target,
+            Some(super::TargetTemplate {
+                role: Some("button".into()),
+                name: Some("Save".into()),
+                href: None,
+                ancestor: None,
+                test_id: None,
+            })
+        );
+        assert!(!memory.repair_target(
+            &key,
+            json!({"role":"button"}),
+            None,
+            "password=secret",
+            300,
+        ));
+    }
+
+    #[test]
+    fn secret_bearing_preconditions_are_rejected() {
+        let mut memory = ActionMemory::default();
+        let key = key();
+        assert!(!memory.record(
+            key,
+            ActionMemoryEntry {
+                semantic_target: json!({"role":"textbox"}),
+                action: "fill".into(),
+                expected_postcondition: json!({"kind":"filled"}),
+                replay: None,
+                preconditions: Some(json!({"password":"hunter2"})),
+                repair: None,
+                last_verified_ms: 100,
+            },
+            Verification::Passed
+        ));
     }
 }
 
@@ -109,6 +320,12 @@ pub struct ActionMemoryEntry {
     /// A bounded, non-secret replay description. Older persisted entries omit it.
     #[serde(default)]
     pub replay: Option<ReplayPlan>,
+    /// Required state observed immediately before the validated operation.
+    #[serde(default)]
+    pub preconditions: Option<Value>,
+    /// Bounded proof that a drifted target was repaired after successful fallback.
+    #[serde(default)]
+    pub repair: Option<RepairMetadata>,
     pub last_verified_ms: u64,
 }
 
@@ -215,6 +432,36 @@ impl ActionMemory {
         ReplayStatus::Hit
     }
 
+    /// Repair a cached operation target after a reactive fallback succeeded and
+    /// the postcondition was freshly verified. The previous target is retained
+    /// only as bounded structural identity so later repairs stay explainable.
+    pub fn repair_target(
+        &mut self,
+        key: &ActionMemoryKey,
+        target: Value,
+        previous_target: Option<TargetTemplate>,
+        reason: &str,
+        now_ms: u64,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return false;
+        };
+        if target.is_null() || contains_secret_marker(&target) || !valid_plan_string(reason, 512) {
+            return false;
+        }
+        entry.semantic_target = target;
+        entry.repair = Some(RepairMetadata {
+            repaired_at_ms: now_ms,
+            reason: reason.to_owned(),
+            previous_target,
+        });
+        entry.last_verified_ms = now_ms;
+        if !valid_entry(entry) {
+            return false;
+        }
+        self.persist().is_ok()
+    }
+
     /// Removes one exact hint after structural drift or an unverified result.
     pub fn invalidate(&mut self, key: &ActionMemoryKey) -> bool {
         let removed = self.entries.remove(key).is_some();
@@ -302,23 +549,110 @@ impl ActionMemory {
 }
 
 fn valid_entry(entry: &ActionMemoryEntry) -> bool {
+    let preconditions_valid = entry.preconditions.as_ref().is_none_or(|value| {
+        !value.is_null()
+            && !contains_secret_marker(value)
+            && serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 1024)
+    });
+    let repair_valid = entry.repair.as_ref().is_none_or(|repair| {
+        !repair.reason.is_empty()
+            && repair.reason.len() <= 512
+            && !contains_secret_marker(&Value::String(repair.reason.clone()))
+            && repair
+                .previous_target
+                .as_ref()
+                .is_none_or(valid_target_template)
+    });
     !entry.action.is_empty()
         && entry.action.len() <= 64
         && !entry.semantic_target.is_null()
         && !entry.expected_postcondition.is_null()
         && !contains_secret_marker(&entry.semantic_target)
         && !contains_secret_marker(&entry.expected_postcondition)
+        && preconditions_valid
+        && repair_valid
         && entry.replay.as_ref().is_none_or(valid_replay_plan)
         && serde_json::to_vec(entry).is_ok_and(|bytes| bytes.len() <= 4096)
 }
 
+fn valid_plan_string(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && !value.contains('\0')
+        && !contains_secret_marker(&Value::String(value.to_owned()))
+}
+
+fn valid_value_slot(slot: &str) -> bool {
+    !slot.is_empty()
+        && slot.len() <= 64
+        && slot
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn valid_target_template(target: &TargetTemplate) -> bool {
+    let bounded = |value: &Option<String>, max: usize| {
+        value
+            .as_ref()
+            .is_none_or(|value| valid_plan_string(value, max))
+    };
+    bounded(&target.role, 64)
+        && bounded(&target.name, 512)
+        && bounded(&target.href, 2048)
+        && bounded(&target.ancestor, 512)
+        && bounded(&target.test_id, 128)
+}
+
+fn valid_predicate(predicate: &VerifyPredicate) -> bool {
+    match predicate {
+        VerifyPredicate::UrlMatches { pattern } => valid_plan_string(pattern, 2048),
+        VerifyPredicate::TextPresent { text } => valid_plan_string(text, 1024),
+        VerifyPredicate::Visible { target } | VerifyPredicate::Hidden { target } => {
+            valid_target_template(target)
+        }
+        VerifyPredicate::AppState { adapter } => valid_plan_string(adapter, 128),
+    }
+}
+
 fn valid_replay_plan(plan: &ReplayPlan) -> bool {
     match plan {
-        ReplayPlan::Extract { selector } => {
-            !selector.is_empty()
-                && selector.len() <= 512
-                && !contains_secret_marker(&Value::String(selector.clone()))
+        ReplayPlan::Extract { selector } => valid_plan_string(selector, 512),
+        ReplayPlan::Navigate { url_template } => valid_plan_string(url_template, 4096),
+        ReplayPlan::Click { target, outcome } => {
+            valid_target_template(target) && valid_predicate(outcome)
         }
+        ReplayPlan::Fill {
+            target,
+            value_slot,
+            outcome,
+        }
+        | ReplayPlan::Select {
+            target,
+            value_slot,
+            outcome,
+        } => {
+            valid_target_template(target)
+                && valid_value_slot(value_slot)
+                && valid_predicate(outcome)
+        }
+        ReplayPlan::Type {
+            target,
+            value_slot,
+            strategy_hint,
+        } => {
+            valid_target_template(target)
+                && valid_value_slot(value_slot)
+                && strategy_hint.as_ref().is_none_or(|hint| {
+                    matches!(
+                        hint.as_str(),
+                        "block" | "fast_keys" | "human_keys" | "ime" | "auto"
+                    )
+                })
+        }
+        ReplayPlan::Tool {
+            capability_id,
+            schema_hash,
+        } => valid_plan_string(capability_id, 128) && valid_plan_string(schema_hash, 128),
     }
 }
 

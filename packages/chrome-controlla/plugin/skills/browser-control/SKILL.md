@@ -40,7 +40,7 @@ On `not_dispatched`, follow the returned `next_action`. A `stale_watcher_revisio
 Choose the route from the user's intent, not from trial and error:
 
 1. **New URL or new target:** `browser(action="open")` with an idempotency key.
-2. **Existing session or tab:** `browser(action="task")` for a bounded goal, or `act` for one known mutation.
+2. **Existing session or tab:** `browser(action="task")` for a bounded goal, or `act` for one known mutation. When the sequence is already known, pass `task_program` so navigate, find, fill, click, press, select, scroll, hover, verification, and bounded `if`/`foreach`/`try_fallback`/`parallel_read` run locally in one call instead of returning intermediate state.
 3. **Need fresh page evidence:** one `snapshot`; use its exact references and observed `href` values.
 4. **Several known steps:** one `workflow` so reads and writes share a bounded operation budget.
 5. **Effect not proven:** one read-only `verify`; never replay the mutation.
@@ -48,6 +48,8 @@ Choose the route from the user's intent, not from trial and error:
 7. **Finished:** `browser(action="release")` and keep the user's tab open.
 
 Action modes are predictable: background handles semantic DOM work and wheel scroll even when the tab is inactive, the window is unfocused, Chrome is minimized, or the tab is otherwise out of the computer view; foreground handles trusted pointer, touch, swipe, pinch, hover, IME, and native dialogs. Background DOM mutations require the exact retained node, document identity and value precondition; report `verified` only when the readback and requested outcome both pass. A detached, masked or newly sensitive control is refused, and uncertain dispatch returns `unknown`. If a receipt says `not_dispatched`, follow its `reason_code` and `next_action`. If it says `unknown`, reconcile once and do not retry the write.
+
+A completed task returns a compact receipt: `status`, `context`, the requested result, and `verified`. Detailed step receipts, budgets, and recovery diagnostics are available on demand; do not ask for them after an ordinary success.
 
 Do not visit a homepage when a specific destination is user-provided, observed, or available through qualified Controlla route memory. Do not take duplicate broad snapshots. Do not send deterministic intermediate state back to the model merely so it can issue the obvious next action.
 

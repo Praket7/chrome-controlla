@@ -2685,11 +2685,10 @@ async fn renew_workflow_lease(app: &AppV3, session_id: &str, tab_id: &str, owner
         return true;
     }
     let target = lease_target_key(session_id, tab_id);
-    app.leases
-        .lock()
-        .await
-        .renew(&target, owner, now_ms(), 120_000)
-        .is_some()
+    let mut leases = app.leases.lock().await;
+    // Read-only workflows hold shared reader leases, not the exclusive lease.
+    leases.renew(&target, owner, now_ms(), 120_000).is_some()
+        || leases.renew_read(&target, owner, now_ms(), 120_000).is_some()
 }
 
 impl Drop for WorkflowLeaseGuard {
@@ -2757,6 +2756,11 @@ struct V3BrowserArgs {
         description = "{\"kind\":\"research\"}; read-only research tasks without tab_ids."
     )]
     task: Option<crate::v3_tasks::TaskPrimitive>,
+    #[serde(default)]
+    #[schemars(
+        description = "Bounded task program run through the workflow VM; exclusive with task."
+    )]
+    task_program: Option<crate::task_program::TaskProgram>,
     #[serde(default)]
     resume_key: Option<String>,
     max_bytes: Option<usize>,
@@ -2960,6 +2964,49 @@ struct V3ActArgs {
     center_y: Option<f64>,
     start_distance: Option<f64>,
     end_distance: Option<f64>,
+}
+
+impl V3ActArgs {
+    /// Build the single-act argument envelope for a workflow step. Workflow
+    /// steps delegate to the same guarded action route as `act`, so pointer and
+    /// input semantics never fork by entry point.
+    fn from_workflow(args: &V3WorkflowArgs, action: &str, reference: String) -> Self {
+        Self {
+            session_id: args.session_id.clone(),
+            chrome_tab_id: args.chrome_tab_id.clone(),
+            action: action.to_owned(),
+            reference: Some(reference),
+            desktop_action: None,
+            desktop_mode: None,
+            expected_visual_revision: None,
+            expected_value: None,
+            value: None,
+            allow_password: None,
+            expected_origin: None,
+            account_marker: None,
+            order_confirmation: None,
+            key: None,
+            outcome: None,
+            timeout_ms: None,
+            typing_mode: None,
+            delay_ms: None,
+            client_id: args.client_id.clone(),
+            page_tool_name: None,
+            page_tool_input: None,
+            max_bytes: None,
+            max_bytes_reason: None,
+            delta_x: None,
+            delta_y: None,
+            start_x: None,
+            start_y: None,
+            end_x: None,
+            end_y: None,
+            center_x: None,
+            center_y: None,
+            start_distance: None,
+            end_distance: None,
+        }
+    }
 }
 
 #[derive(Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -3244,6 +3291,9 @@ enum V3WorkflowStep {
     NavigateSelected {
         from: String,
     },
+    Navigate {
+        url: String,
+    },
     Click {
         reference: String,
         outcome: Option<BrowserClickOutcome>,
@@ -3255,6 +3305,34 @@ enum V3WorkflowStep {
     },
     ScrollTo {
         reference: String,
+    },
+    Hover {
+        reference: String,
+    },
+    DoubleClick {
+        reference: String,
+        outcome: Option<BrowserClickOutcome>,
+    },
+    ContextClick {
+        reference: String,
+        outcome: Option<BrowserClickOutcome>,
+    },
+    Touch {
+        reference: String,
+    },
+    Swipe {
+        reference: String,
+        start_x: f64,
+        start_y: f64,
+        end_x: f64,
+        end_y: f64,
+    },
+    MultiTouch {
+        reference: String,
+        center_x: f64,
+        center_y: f64,
+        start_distance: f64,
+        end_distance: f64,
     },
     Upload {
         #[serde(default)]
@@ -3390,6 +3468,9 @@ enum V3WorkflowOp {
         primary: Vec<V3WorkflowOp>,
         fallback: Vec<V3WorkflowOp>,
     },
+    ParallelRead {
+        ops: Vec<V3WorkflowOp>,
+    },
 }
 
 impl crate::workflow_vm::VmOperation for V3WorkflowStep {
@@ -3411,6 +3492,13 @@ impl crate::workflow_vm::VmOperation for V3WorkflowStep {
             | Self::DesktopFallback { .. }
             | Self::Scroll { .. }
             | Self::ScrollTo { .. }
+            | Self::Hover { .. }
+            | Self::DoubleClick { .. }
+            | Self::ContextClick { .. }
+            | Self::Touch { .. }
+            | Self::Swipe { .. }
+            | Self::MultiTouch { .. }
+            | Self::Navigate { .. }
             | Self::NavigateSelected { .. }
             | Self::Upload { .. }
             | Self::UploadDrop { .. }
@@ -7147,12 +7235,223 @@ fn compile_workflow_ops(
                         fallback: compile_sequence(fallback)?,
                     });
                 }
+                V3WorkflowOp::ParallelRead { ops } => {
+                    flush(&mut pending_steps, &mut result);
+                    result.push(crate::workflow_vm::VmOp::ParallelRead(compile_sequence(
+                        ops,
+                    )?));
+                }
             }
         }
         flush(&mut pending_steps, &mut result);
         Ok(result)
     }
     compile_sequence(ops)
+}
+
+fn task_step_reference(
+    step: &crate::task_program::TaskStep,
+) -> Result<String, rmcp::ErrorData> {
+    step.reference
+        .clone()
+        .or_else(|| step.target.clone())
+        .ok_or_else(|| invalid(format!("{:?} requires a reference or target", step.kind)))
+}
+
+fn task_step_predicate(
+    step: &crate::task_program::TaskStep,
+) -> Result<BrowserPredicate, rmcp::ErrorData> {
+    let predicate = step
+        .predicate
+        .clone()
+        .ok_or_else(|| invalid("verify requires a typed predicate"))?;
+    serde_json::from_value(predicate)
+        .map_err(|error| invalid(format!("invalid task predicate: {error}")))
+}
+
+/// Lower a shared `TaskProgram` into the existing workflow VM operations.
+/// The VM owns execution; this compiler only maps typed task steps onto the
+/// same guarded browser steps the public workflow compiler emits.
+fn task_program_ops(
+    program: &crate::task_program::TaskProgram,
+) -> Result<Vec<V3WorkflowOp>, rmcp::ErrorData> {
+    use crate::task_program::TaskStepKind;
+    fn step(step: V3WorkflowStep) -> V3WorkflowOp {
+        V3WorkflowOp::Step { step }
+    }
+    fn translate(
+        steps: &[crate::task_program::TaskStep],
+    ) -> Result<Vec<V3WorkflowOp>, rmcp::ErrorData> {
+        let mut ops = Vec::new();
+        for task_step in steps {
+            match task_step.kind {
+                TaskStepKind::Navigate => {
+                    let url = task_step
+                        .url
+                        .clone()
+                        .ok_or_else(|| invalid("navigate requires url"))?;
+                    ops.push(step(V3WorkflowStep::Navigate { url }));
+                }
+                TaskStepKind::Observe => ops.push(step(V3WorkflowStep::Snapshot {
+                    href_hint: None,
+                    max_items: None,
+                    max_text_chars: None,
+                    goal: None,
+                    max_scan_nodes: None,
+                })),
+                TaskStepKind::Find => {
+                    let query = task_step
+                        .query
+                        .clone()
+                        .ok_or_else(|| invalid("find requires a query"))?;
+                    let save_as = task_step
+                        .save_as
+                        .clone()
+                        .ok_or_else(|| invalid("find requires save_as"))?;
+                    ops.push(step(V3WorkflowStep::Find {
+                        query,
+                        role: task_step.role.clone(),
+                        match_mode: None,
+                        max_matches: None,
+                        within_reference: None,
+                        href_hint: None,
+                        save_as,
+                    }));
+                }
+                TaskStepKind::Click => {
+                    let reference = task_step_reference(task_step)?;
+                    ops.push(step(V3WorkflowStep::Click {
+                        reference,
+                        outcome: None,
+                    }));
+                    if task_step.predicate.is_some() {
+                        ops.push(step(V3WorkflowStep::Verify {
+                            predicate: task_step_predicate(task_step)?,
+                        }));
+                    }
+                }
+                TaskStepKind::Fill => {
+                    let reference = task_step_reference(task_step)?;
+                    let value = task_step
+                        .value
+                        .clone()
+                        .ok_or_else(|| invalid("fill requires a value"))?;
+                    ops.push(step(V3WorkflowStep::Fill {
+                        reference,
+                        expected_value: task_step.expected_value.clone().unwrap_or_default(),
+                        value,
+                    }));
+                }
+                TaskStepKind::Type => {
+                    let reference = task_step_reference(task_step)?;
+                    let value = task_step
+                        .value
+                        .clone()
+                        .ok_or_else(|| invalid("type requires a value"))?;
+                    ops.push(step(V3WorkflowStep::Type {
+                        reference,
+                        expected_value: task_step.expected_value.clone().unwrap_or_default(),
+                        value,
+                        typing_mode: task_step.typing_mode.clone(),
+                        delay_ms: None,
+                    }));
+                }
+                TaskStepKind::Press => {
+                    let reference = task_step_reference(task_step)?;
+                    let key = task_step
+                        .key
+                        .clone()
+                        .ok_or_else(|| invalid("press requires a key"))?;
+                    ops.push(step(V3WorkflowStep::Press { reference, key }));
+                }
+                TaskStepKind::Select => {
+                    let reference = task_step_reference(task_step)?;
+                    let value = task_step
+                        .value
+                        .clone()
+                        .ok_or_else(|| invalid("select requires a value"))?;
+                    ops.push(step(V3WorkflowStep::Select {
+                        reference,
+                        expected_value: task_step.expected_value.clone().unwrap_or_default(),
+                        value,
+                    }));
+                }
+                TaskStepKind::Scroll => {
+                    let reference = task_step_reference(task_step)?;
+                    ops.push(step(V3WorkflowStep::Scroll {
+                        reference,
+                        delta_x: task_step.delta_x.unwrap_or(0),
+                        delta_y: task_step.delta_y.unwrap_or(0),
+                    }));
+                }
+                TaskStepKind::ScrollTo => {
+                    let reference = task_step_reference(task_step)?;
+                    ops.push(step(V3WorkflowStep::ScrollTo { reference }));
+                }
+                TaskStepKind::Hover => {
+                    let reference = task_step_reference(task_step)?;
+                    ops.push(step(V3WorkflowStep::Hover { reference }));
+                }
+                TaskStepKind::Extract => {
+                    let selector = task_step
+                        .selector
+                        .clone()
+                        .ok_or_else(|| invalid("extract requires a selector"))?;
+                    ops.push(step(V3WorkflowStep::Extract {
+                        selector,
+                        fields: None,
+                        goal: None,
+                    }));
+                }
+                TaskStepKind::Assert | TaskStepKind::Verify => {
+                    ops.push(step(V3WorkflowStep::Verify {
+                        predicate: task_step_predicate(task_step)?,
+                    }));
+                }
+                TaskStepKind::If => {
+                    let condition = task_step
+                        .condition
+                        .clone()
+                        .ok_or_else(|| invalid("if requires a bounded condition"))?;
+                    ops.push(V3WorkflowOp::If {
+                        condition,
+                        then_branch: translate(&task_step.steps)?,
+                        else_branch: translate(&task_step.fallback)?,
+                    });
+                }
+                TaskStepKind::Foreach => {
+                    let var = task_step
+                        .var
+                        .clone()
+                        .ok_or_else(|| invalid("foreach requires a variable name"))?;
+                    ops.push(V3WorkflowOp::Foreach {
+                        items: task_step.items.clone(),
+                        var,
+                        body: translate(&task_step.steps)?,
+                    });
+                }
+                TaskStepKind::TryFallback => ops.push(V3WorkflowOp::TryFallback {
+                    primary: translate(&task_step.steps)?,
+                    fallback: translate(&task_step.fallback)?,
+                }),
+                TaskStepKind::ParallelRead => ops.push(V3WorkflowOp::ParallelRead {
+                    ops: translate(&task_step.steps)?,
+                }),
+                TaskStepKind::Drag => {
+                    return Err(invalid(
+                        "drag requires a trusted pointer workflow step (widget data transfer or swipe); the task compiler does not approximate it",
+                    ));
+                }
+                TaskStepKind::WaitFor => {
+                    return Err(invalid(
+                        "wait_for selector waits are not part of the workflow VM; use observe plus verify",
+                    ));
+                }
+            }
+        }
+        Ok(ops)
+    }
+    translate(&program.steps)
 }
 
 fn open_program_is_read_only(ops: &[V3WorkflowOp]) -> bool {
@@ -7165,6 +7464,7 @@ fn open_program_is_read_only(ops: &[V3WorkflowOp]) -> bool {
         V3WorkflowOp::If { then_branch, else_branch, .. } => open_program_is_read_only(then_branch) && open_program_is_read_only(else_branch),
         V3WorkflowOp::Foreach { body, .. } => open_program_is_read_only(body),
         V3WorkflowOp::TryFallback { primary, fallback } => open_program_is_read_only(primary) && open_program_is_read_only(fallback),
+        V3WorkflowOp::ParallelRead { ops } => open_program_is_read_only(ops),
     })
 }
 
@@ -7216,6 +7516,21 @@ fn validate_workflow_ops(ops: &[V3WorkflowOp], depth: usize) -> Result<(), rmcp:
                 validate_workflow_ops(primary, depth + 1)?;
                 validate_workflow_ops(fallback, depth + 1)?;
             }
+            V3WorkflowOp::ParallelRead { ops } => {
+                if !consecutive_steps.is_empty() {
+                    validate_workflow_steps(&consecutive_steps)?;
+                    consecutive_steps.clear();
+                }
+                if ops.is_empty() {
+                    return Err(invalid("parallel_read requires at least one read operation"));
+                }
+                if !open_program_is_read_only(ops) {
+                    return Err(invalid(
+                        "parallel_read may contain only read-only observation operations",
+                    ));
+                }
+                validate_workflow_ops(ops, depth + 1)?;
+            }
         }
     }
     if !consecutive_steps.is_empty() {
@@ -7238,9 +7553,16 @@ fn workflow_step_name(step: &V3WorkflowStep) -> &'static str {
         V3WorkflowStep::CollectVirtual { .. } => "collect_virtual",
         V3WorkflowStep::Choose { .. } => "choose",
         V3WorkflowStep::NavigateSelected { .. } => "navigate_selected",
+        V3WorkflowStep::Navigate { .. } => "navigate",
         V3WorkflowStep::Click { .. } => "click",
         V3WorkflowStep::Scroll { .. } => "scroll",
         V3WorkflowStep::ScrollTo { .. } => "scroll_to",
+        V3WorkflowStep::Hover { .. } => "hover",
+        V3WorkflowStep::DoubleClick { .. } => "double_click",
+        V3WorkflowStep::ContextClick { .. } => "context_click",
+        V3WorkflowStep::Touch { .. } => "touch",
+        V3WorkflowStep::Swipe { .. } => "swipe",
+        V3WorkflowStep::MultiTouch { .. } => "multi_touch",
         V3WorkflowStep::Upload { .. } => "upload",
         V3WorkflowStep::UploadDrop { .. } => "upload_drop",
         V3WorkflowStep::Fill { .. } => "fill",
@@ -7343,6 +7665,11 @@ fn expand_app_adapter_ops(ops: Vec<V3WorkflowOp>) -> Result<Vec<V3WorkflowOp>, r
                 expanded.push(V3WorkflowOp::TryFallback {
                     primary: expand_app_adapter_ops(primary)?,
                     fallback: expand_app_adapter_ops(fallback)?,
+                })
+            }
+            V3WorkflowOp::ParallelRead { ops } => {
+                expanded.push(V3WorkflowOp::ParallelRead {
+                    ops: expand_app_adapter_ops(ops)?,
                 })
             }
         }
@@ -11797,6 +12124,65 @@ fn validate_workflow_steps(steps: &[V3WorkflowStep]) -> Result<(), rmcp::ErrorDa
             return Err(invalid(
                 "scroll_to requires a bounded fresh semantic reference",
             ));
+        }
+        if let V3WorkflowStep::Navigate { url } = step
+            && !url.starts_with('$')
+        {
+            super::super::validate_shared_url(url).map_err(|error| invalid(error.to_string()))?;
+        }
+        if let V3WorkflowStep::Hover { reference }
+        | V3WorkflowStep::Touch { reference }
+        | V3WorkflowStep::DoubleClick { reference, .. }
+        | V3WorkflowStep::ContextClick { reference, .. } = step
+            && (reference.is_empty() || reference.len() > 1024)
+        {
+            return Err(invalid(
+                "hover, touch, double_click and context_click require a bounded fresh semantic reference",
+            ));
+        }
+        if let V3WorkflowStep::Swipe {
+            reference,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } = step
+        {
+            let bounded = |value: f64| value.is_finite() && (20.0..=1200.0).contains(&value);
+            if reference.is_empty()
+                || reference.len() > 1024
+                || ![start_x, start_y, end_x, end_y]
+                    .iter()
+                    .all(|value| bounded(**value))
+                || (*start_x - *end_x).abs() + (*start_y - *end_y).abs() < 20.0
+            {
+                return Err(invalid(
+                    "swipe requires a bounded reference and a 20..=1200 px path within the frame viewport",
+                ));
+            }
+        }
+        if let V3WorkflowStep::MultiTouch {
+            reference,
+            center_x,
+            center_y,
+            start_distance,
+            end_distance,
+        } = step
+        {
+            let bounded = |value: f64| value.is_finite() && (0.0..=4000.0).contains(&value);
+            let ratio = end_distance / start_distance;
+            if reference.is_empty()
+                || reference.len() > 1024
+                || ![center_x, center_y, start_distance, end_distance]
+                    .iter()
+                    .all(|value| bounded(**value))
+                || *start_distance < 20.0
+                || !(0.5..=2.0).contains(&ratio)
+            {
+                return Err(invalid(
+                    "multi_touch requires a bounded reference, finite geometry, and a 0.5..=2 distance ratio",
+                ));
+            }
         }
         if let V3WorkflowStep::Widget {
             reference, value, ..
@@ -16390,6 +16776,12 @@ impl AppV3 {
             return self.transition_presentation(session_id, tab_id, mode).await;
         }
         if args.action == "task" {
+            if let Some(program) = args.task_program.take() {
+                if args.task.is_some() {
+                    return Err(invalid("provide only one of task or task_program"));
+                }
+                return self.run_task_program(&args, program).await;
+            }
             let task = args.task.ok_or_else(|| invalid("task is required"))?;
             let auto_headless = args.session_id.is_none();
             let task_mode = if auto_headless {
@@ -18302,6 +18694,8 @@ impl AppV3 {
                 expected_postcondition: json!({"kind":"fresh_live_postcondition","action":args.action,
                     "verification":"passed","outcome_kind":result.as_ref().ok().and_then(|receipt| receipt["outcome"]["kind"].as_str())}),
                 replay: None,
+                preconditions: None,
+                repair: None,
                 last_verified_ms: now_ms(),
             };
             let recorded = memory.lock().await.record(key, entry, verification);
@@ -19661,6 +20055,11 @@ impl AppV3 {
                     }
                 }
             }
+            V3WorkflowStep::Navigate { url } => {
+                let url = resolve(url, vars)?;
+                super::super::validate_shared_url(&url).map_err(|error| invalid(error.to_string()))?;
+                task_navigate(self, &args.session_id, &args.chrome_tab_id, &url).await
+            }
             V3WorkflowStep::NavigateSelected { from } => {
                 let chosen = selected
                     .get(&from)
@@ -19882,6 +20281,60 @@ impl AppV3 {
                 }))
                 .await?
                 .0
+            }
+            V3WorkflowStep::Hover { reference } => {
+                let reference = resolve(reference, vars)?;
+                self.act(Parameters(V3ActArgs::from_workflow(args, "hover", reference)))
+                    .await?
+                    .0
+            }
+            V3WorkflowStep::DoubleClick { reference, outcome } => {
+                let reference = resolve(reference, vars)?;
+                let mut act_args = V3ActArgs::from_workflow(args, "double_click", reference);
+                act_args.outcome = outcome;
+                self.act(Parameters(act_args)).await?.0
+            }
+            V3WorkflowStep::ContextClick { reference, outcome } => {
+                let reference = resolve(reference, vars)?;
+                let mut act_args = V3ActArgs::from_workflow(args, "context_click", reference);
+                act_args.outcome = outcome;
+                self.act(Parameters(act_args)).await?.0
+            }
+            V3WorkflowStep::Touch { reference } => {
+                let reference = resolve(reference, vars)?;
+                self.act(Parameters(V3ActArgs::from_workflow(args, "touch", reference)))
+                    .await?
+                    .0
+            }
+            V3WorkflowStep::Swipe {
+                reference,
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+            } => {
+                let reference = resolve(reference, vars)?;
+                let mut act_args = V3ActArgs::from_workflow(args, "swipe", reference);
+                act_args.start_x = Some(start_x);
+                act_args.start_y = Some(start_y);
+                act_args.end_x = Some(end_x);
+                act_args.end_y = Some(end_y);
+                self.act(Parameters(act_args)).await?.0
+            }
+            V3WorkflowStep::MultiTouch {
+                reference,
+                center_x,
+                center_y,
+                start_distance,
+                end_distance,
+            } => {
+                let reference = resolve(reference, vars)?;
+                let mut act_args = V3ActArgs::from_workflow(args, "multi_touch", reference);
+                act_args.center_x = Some(center_x);
+                act_args.center_y = Some(center_y);
+                act_args.start_distance = Some(start_distance);
+                act_args.end_distance = Some(end_distance);
+                self.act(Parameters(act_args)).await?.0
             }
             V3WorkflowStep::UploadDrop {
                 artifact_handles,
@@ -20834,6 +21287,13 @@ impl AppV3 {
                 | V3WorkflowStep::DesktopFallback { .. }
                     | V3WorkflowStep::Scroll { .. }
                     | V3WorkflowStep::ScrollTo { .. }
+                    | V3WorkflowStep::Hover { .. }
+                    | V3WorkflowStep::DoubleClick { .. }
+                    | V3WorkflowStep::ContextClick { .. }
+                    | V3WorkflowStep::Touch { .. }
+                    | V3WorkflowStep::Swipe { .. }
+                    | V3WorkflowStep::MultiTouch { .. }
+                    | V3WorkflowStep::Navigate { .. }
                     | V3WorkflowStep::NavigateSelected { .. }
                     | V3WorkflowStep::Fill { .. }
                     | V3WorkflowStep::Select { .. }
@@ -20993,6 +21453,58 @@ impl AppV3 {
         Ok(Json(
             json!({"status":if workflow_host.state.lock().await.unverified_effect {"completed_unverified"} else {"completed"},"steps":receipts.len(),"receipts":receipts,"step_ms":step_ms,"elapsed_ms":started.elapsed().as_millis() as u64,"route_budget":workflow_vm_route_budget_receipt(&workflow_vm)}),
         ))
+    }
+
+    /// Execute `browser(action="task", task_program=...)` by compiling the
+    /// shared task program into the existing workflow VM and running it through
+    /// the same leased, budgeted workflow route.
+    async fn run_task_program(
+        &self,
+        args: &V3BrowserArgs,
+        program: crate::task_program::TaskProgram,
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
+        let compiled = crate::task_program::compile_task_program(
+            &program,
+            crate::task_program::TaskProgramLimits::default(),
+        )
+        .map_err(invalid)?;
+        let session_id = args
+            .session_id
+            .clone()
+            .ok_or_else(|| invalid("task_program requires session_id"))?;
+        let chrome_tab_id = args
+            .chrome_tab_id
+            .clone()
+            .ok_or_else(|| invalid("task_program requires chrome_tab_id"))?;
+        let ops = expand_app_adapter_ops(task_program_ops(&program)?)?;
+        validate_workflow_ops(&ops, 0)?;
+        let result = self
+            .workflow(Parameters(V3WorkflowArgs {
+                session_id,
+                chrome_tab_id,
+                operation_id: None,
+                cancel: false,
+                steps: Vec::new(),
+                program: Some(ops),
+                client_id: args.client_id.clone(),
+                dag: None,
+                max_bytes: args.max_bytes,
+                max_bytes_reason: args.max_bytes_reason.clone(),
+                retain_text_evidence: false,
+            }))
+            .await?;
+        let mut value = result.structured_content.ok_or_else(|| {
+            invalid("task program execution returned no structured receipt")
+        })?;
+        if value["status"] == "completed" || value["status"] == "completed_unverified" {
+            value["task_program"] = json!({
+                "steps": compiled.expanded_steps,
+                "control_flow": compiled.has_control_flow,
+                "has_mutation": compiled.has_mutation,
+                "one_observation_policy": true,
+            });
+        }
+        Ok(Json(value))
     }
 
     async fn execute_workflow_program(
@@ -22198,6 +22710,8 @@ impl AppV3 {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
                             expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
                             replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            preconditions: None,
+                            repair: None,
                             last_verified_ms: now_ms(),
                         };
                         if let Some(memory) = self.action_memory.as_ref()
@@ -22220,6 +22734,8 @@ impl AppV3 {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
                             expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
                             replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            preconditions: None,
+                            repair: None,
                             last_verified_ms:now_ms(),
                         };
                         tokio::spawn(async move {
@@ -24651,6 +25167,150 @@ mod v3_batch_delivery_tests {
             compiled[2],
             crate::workflow_vm::VmOp::TryFallback { .. }
         ));
+    }
+
+    #[test]
+    fn task_program_lowers_into_the_workflow_vm_and_stays_bounded() {
+        let program: crate::task_program::TaskProgram = serde_json::from_value(json!({
+            "steps":[
+                {"kind":"navigate","url":"https://example.test/"},
+                {"kind":"observe"},
+                {"kind":"find","query":"Email","save_as":"email"},
+                {"kind":"fill","reference":"$email","value":"a@b.test"},
+                {"kind":"click","reference":"@c1","predicate":{"kind":"url","equals":"https://example.test/done"}},
+                {"kind":"if","condition":"true","steps":[{"kind":"hover","reference":"@c2"}],"fallback":[]},
+                {"kind":"foreach","items":["a","b"],"var":"item","steps":[{"kind":"scroll_to","reference":"@c3"}]},
+                {"kind":"parallel_read","steps":[{"kind":"observe"}]}
+            ]
+        }))
+        .unwrap();
+        let compiled = crate::task_program::compile_task_program(
+            &program,
+            crate::task_program::TaskProgramLimits::default(),
+        )
+        .unwrap();
+        assert!(compiled.has_control_flow);
+        assert!(compiled.has_mutation);
+        let ops = super::task_program_ops(&program).unwrap();
+        super::validate_workflow_ops(&ops, 0).unwrap();
+        assert_eq!(ops.len(), 9);
+        assert!(matches!(
+            ops[0],
+            V3WorkflowOp::Step {
+                step: V3WorkflowStep::Navigate { .. }
+            }
+        ));
+        assert!(matches!(
+            ops[5],
+            V3WorkflowOp::Step {
+                step: V3WorkflowStep::Verify { .. }
+            }
+        ));
+        assert!(matches!(ops[6], V3WorkflowOp::If { .. }));
+        assert!(matches!(ops[7], V3WorkflowOp::Foreach { .. }));
+        assert!(matches!(ops[8], V3WorkflowOp::ParallelRead { .. }));
+        let V3WorkflowOp::If { then_branch, .. } = &ops[6] else {
+            panic!("control flow must stay an If operation");
+        };
+        assert!(matches!(
+            then_branch[0],
+            V3WorkflowOp::Step {
+                step: V3WorkflowStep::Hover { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn task_program_refuses_uncompiled_pointer_and_wait_steps() {
+        for step in [
+            json!({"kind":"drag","reference":"@c1","target":"@c2"}),
+            json!({"kind":"wait_for","selector":"main","timeout_ms":100}),
+        ] {
+            let program: crate::task_program::TaskProgram =
+                serde_json::from_value(json!({"steps":[step]})).unwrap();
+            assert!(super::task_program_ops(&program).is_err());
+        }
+        let unbounded: crate::task_program::TaskProgram = serde_json::from_value(json!({
+            "steps":[{"kind":"scroll","reference":"@c1","delta_x":0,"delta_y":0}]
+        }))
+        .unwrap();
+        assert!(
+            crate::task_program::compile_task_program(
+                &unbounded,
+                crate::task_program::TaskProgramLimits::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_workflow_program_accepts_pointer_steps_and_parallel_reads() {
+        let program: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"step","step":{"kind":"hover","reference":"@c1"}},
+            {"op":"step","step":{"kind":"double_click","reference":"@c2","outcome":null}},
+            {"op":"step","step":{"kind":"context_click","reference":"@c3","outcome":null}},
+            {"op":"step","step":{"kind":"swipe","reference":"@c4","start_x":100.0,"start_y":400.0,"end_x":100.0,"end_y":200.0}},
+            {"op":"step","step":{"kind":"multi_touch","reference":"@c5","center_x":200.0,"center_y":300.0,"start_distance":80.0,"end_distance":160.0}},
+            {"op":"step","step":{"kind":"touch","reference":"@c6"}},
+            {"op":"parallel_read","ops":[
+                {"op":"step","step":{"kind":"snapshot"}},
+                {"op":"step","step":{"kind":"find","query":"Status","save_as":"status"}}
+            ]}
+        ]))
+        .unwrap();
+        validate_workflow_ops(&program, 0).unwrap();
+        let compiled = compile_workflow_ops(program).unwrap();
+        assert_eq!(compiled.len(), 7);
+        assert!(matches!(
+            compiled[6],
+            crate::workflow_vm::VmOp::ParallelRead(ref ops) if ops.len() == 2
+        ));
+        let names = compiled
+            .iter()
+            .filter_map(|op| match op {
+                crate::workflow_vm::VmOp::Step(step) => Some(super::workflow_step_name(step)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "hover",
+                "double_click",
+                "context_click",
+                "swipe",
+                "multi_touch",
+                "touch"
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_reads_reject_mutations_and_malformed_geometry() {
+        let mutation: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"parallel_read","ops":[
+                {"op":"step","step":{"kind":"click","reference":"@c1","outcome":null}}
+            ]}
+        ]))
+        .unwrap();
+        assert!(validate_workflow_ops(&mutation, 0).is_err());
+        assert!(!super::open_program_is_read_only(&mutation));
+
+        let empty: Vec<V3WorkflowOp> =
+            serde_json::from_value(json!([{"op":"parallel_read","ops":[]}])).unwrap();
+        assert!(validate_workflow_ops(&empty, 0).is_err());
+
+        let short_swipe: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"step","step":{"kind":"swipe","reference":"@c4","start_x":100.0,"start_y":100.0,"end_x":105.0,"end_y":100.0}}
+        ]))
+        .unwrap();
+        assert!(validate_workflow_ops(&short_swipe, 0).is_err());
+
+        let extreme_pinch: Vec<V3WorkflowOp> = serde_json::from_value(json!([
+            {"op":"step","step":{"kind":"multi_touch","reference":"@c5","center_x":200.0,"center_y":300.0,"start_distance":80.0,"end_distance":400.0}}
+        ]))
+        .unwrap();
+        assert!(validate_workflow_ops(&extreme_pinch, 0).is_err());
     }
 
     #[test]

@@ -8,9 +8,8 @@ pub use controlla_runtime::{
     http_server, jobs, metrics, native_host, native_setup, observation_router, page_action_memory,
     process_lease, reference_reacquire, relevance, runtime_observer, semantic_state, site_profiles,
     skill_induction, skill_runtime, skill_store, skills, slides_deck, target_registry,
-    task_checkpoints, v3,
-    v3_runtime, v3_tasks, verifier, visual_probe, visual_stability, widget_adapters, workflow,
-    workflow_dag, workflow_vm,
+    task_checkpoints, task_program, v3, v3_runtime, v3_tasks, verifier, visual_probe,
+    visual_stability, widget_adapters, workflow, workflow_dag, workflow_vm,
 };
 
 #[allow(dead_code, clippy::unnecessary_sort_by)]

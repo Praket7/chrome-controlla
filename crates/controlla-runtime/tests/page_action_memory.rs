@@ -14,6 +14,8 @@ fn only_verified_actions_are_recalled_for_an_exact_origin_structure_and_intent()
         action: "click".into(),
         expected_postcondition: json!({"kind":"text_present","text":"Results"}),
         replay: None,
+        preconditions: None,
+        repair: None,
         last_verified_ms: 100,
     };
     let mut memory = ActionMemory::default();
@@ -84,6 +86,8 @@ fn stale_memory_is_a_hint_that_expires_and_never_executes_by_itself() {
         action: "click".into(),
         expected_postcondition: json!({}),
         replay: None,
+        preconditions: None,
+        repair: None,
         last_verified_ms: 10,
     };
     let mut memory = ActionMemory::default();
@@ -110,6 +114,8 @@ fn origin_intent_prefilter_avoids_live_snapshot_when_no_fresh_hint_can_match() {
         action: "extract".into(),
         expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
         replay: None,
+        preconditions: None,
+        repair: None,
         last_verified_ms: 100,
     };
     let mut memory = ActionMemory::default();
@@ -141,6 +147,8 @@ fn verified_affordance_memory_survives_restart_but_unverified_changes_do_not() {
         action: "fill".into(),
         expected_postcondition: json!({"kind":"text_present","text":"results"}),
         replay: None,
+        preconditions: None,
+        repair: None,
         last_verified_ms: 100,
     };
     let mut first = ActionMemory::open(&path).unwrap();

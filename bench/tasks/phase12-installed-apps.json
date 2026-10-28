@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "kind": "phase12_installed_apps",
+  "notes": "Rows are qualifications, not claims. A row is only passable with current evidence produced on installed Chrome by the operator's own account. Fixtures remain the deterministic gate; these rows prove live application acceptance.",
+  "rows": [
+    {
+      "id": "google-docs-type-1000",
+      "application": "Google Docs",
+      "capability": "rich_editor_type",
+      "task": "Type a 1000-character paragraph into a blank document without a manual pre-click.",
+      "assertions": {
+        "exact_text": true,
+        "one_model_call": true,
+        "one_native_text_transaction": true,
+        "per_character_native_requests": 0,
+        "auto_attach_toggles_warm": 0
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "google-docs-replace-append-undo",
+      "application": "Google Docs",
+      "capability": "rich_editor_edit",
+      "task": "Replace, append, and undo text in an existing paragraph.",
+      "assertions": {
+        "exact_text_after_each_step": true,
+        "selection_anchor_preserved": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "word-web-type-1000",
+      "application": "Word for Web",
+      "capability": "rich_editor_type",
+      "task": "Type a 1000-character paragraph into a blank document.",
+      "assertions": {
+        "exact_text": true,
+        "one_native_text_transaction": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "gmail-compose",
+      "application": "Gmail",
+      "capability": "compose",
+      "task": "Address, subject, and body a draft without sending.",
+      "assertions": {
+        "recipient_resolved": true,
+        "subject_exact": true,
+        "body_exact": true,
+        "no_send_dispatched": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "react-form",
+      "application": "Generic React form fixture and live clone",
+      "capability": "controlled_input",
+      "task": "Fill controlled inputs and submit only after the app accepts the values.",
+      "assertions": {
+        "react_state_accepts_value": true,
+        "postcondition_verified": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "codemirror",
+      "application": "CodeMirror",
+      "capability": "code_editor_input",
+      "task": "Insert multiline code at the caret and verify the buffer.",
+      "assertions": {
+        "exact_buffer": true,
+        "caret_anchor_preserved": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "monaco",
+      "application": "Monaco",
+      "capability": "code_editor_input",
+      "task": "Replace a selection with multiline text and verify the model.",
+      "assertions": {
+        "exact_model_text": true
+      },
+      "evidence": "qualification"
+    },
+    {
+      "id": "contenteditable-ime",
+      "application": "Contenteditable fixture",
+      "capability": "ime",
+      "task": "Compose CJK, combining marks, emoji, and multiline text through IME.",
+      "assertions": {
+        "exact_unicode_round_trip": true,
+        "no_replacement_characters": true
+      },
+      "evidence": "fixture"
+    },
+    {
+      "id": "cross-origin-iframe-form",
+      "application": "Cross-origin iframe fixture",
+      "capability": "frame_input",
+      "task": "Fill and submit a form inside a child frame without root-document refusal.",
+      "assertions": {
+        "frame_local_route_used": true,
+        "exact_value": true
+      },
+      "evidence": "fixture"
+    },
+    {
+      "id": "virtualized-table",
+      "application": "Virtualized table fixture",
+      "capability": "observation",
+      "task": "Collect complete rows across scrolling and report coverage honestly.",
+      "assertions": {
+        "coverage_complete_or_declared": true,
+        "no_duplicate_rows": true
+      },
+      "evidence": "fixture"
+    },
+    {
+      "id": "canvas-drag-zoom",
+      "application": "Canvas fixture",
+      "capability": "pointer_gesture",
+      "task": "Drag and pinch a canvas element through trusted pointer input.",
+      "assertions": {
+        "geometry_changed_as_requested": true,
+        "uncertainty_never_replayed": true
+      },
+      "evidence": "fixture"
+    },
+    {
+      "id": "human-interference",
+      "application": "Human interference fixture and one live app",
+      "capability": "interference_rebase",
+      "task": "Move focus, scroll, and type elsewhere during an append; finish safely or return one ambiguity.",
+      "assertions": {
+        "no_duplicate_write": true,
+        "one_terminal_ambiguity_max": true
+      },
+      "evidence": "fixture"
+    }
+  ],
+  "competitors": [
+    "playwright-mcp",
+    "stagehand",
+    "agent-browser",
+    "plain-cdp-reference"
+  ]
+}

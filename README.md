@@ -10,6 +10,23 @@ The current V3 server exposes six tools:
 
 ![Controlla architecture](docs/assets/controlla-architecture.png)
 
+## Execution model
+
+A normal task is one call, not a discovery ceremony:
+
+```text
+browser(action="task", session_id=..., chrome_tab_id=..., task_program={...})
+  -> resolve the bound tab and document
+  -> observe once only if the program needs fresh references
+  -> run the typed program locally through the bounded workflow VM
+  -> rebind recoverable targets, route frame-local input, then verify
+  -> return the requested result with compact evidence
+```
+
+`task_program` accepts navigate, observe, find, click, double-click, context-click, hover, touch, swipe, multi-touch, scroll, scroll-to, fill, type, press, select, extract, assert, verify, and bounded `if`/`foreach`/`try_fallback`/`parallel_read`. Root and child-frame text entry is one native transaction per operation, and shared reads no longer serialize behind the mutation lease.
+
+Recovery stays internal: a stale reference is rebound once, an out-of-viewport target is scrolled and revalidated, and benign focus or layout drift is rebased before typing. An uncertain mutation is never replayed. Claims about live applications are limited to what the [qualification matrix](docs/qualification/execution-core-matrix.md) records for the current build.
+
 ## Install in five minutes
 
 The supported local setup has two pieces that must come from the **same checkout**:
