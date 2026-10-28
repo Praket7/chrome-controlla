@@ -5,6 +5,7 @@ pub mod cancellation;
 pub mod coordination;
 mod input;
 pub mod input_planner;
+pub mod input_strategy;
 mod manager;
 pub mod native;
 mod observe;

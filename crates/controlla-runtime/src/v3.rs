@@ -98,18 +98,24 @@ impl TypingPolicy {
     }
 
     pub fn choose(text: &str, requires_key_events: bool, composition_sensitive: bool) -> Self {
-        let mode = match controlla_browser::input_planner::plan(
-            text,
-            requires_key_events,
-            composition_sensitive,
-        )
-        .mode
-        {
-            controlla_browser::input_planner::InputMode::Ime => TypingMode::Ime,
-            controlla_browser::input_planner::InputMode::FastKeys => TypingMode::FastKeys,
-            controlla_browser::input_planner::InputMode::Block
-            | controlla_browser::input_planner::InputMode::AppAdapter => TypingMode::Block,
-            controlla_browser::input_planner::InputMode::HumanKeys => TypingMode::HumanKeys,
+        use controlla_browser::input_strategy::{
+            InputBackend, InputCharacteristics, InputMode, select_input_strategy,
+        };
+        let decision = select_input_strategy(
+            InputMode::Auto,
+            InputCharacteristics {
+                ordinary_text_control: !requires_key_events,
+                requires_trusted_events: requires_key_events,
+                ime_required: composition_sensitive || !text.is_ascii(),
+                value_length: text.len(),
+                ..InputCharacteristics::default()
+            },
+        );
+        let mode = match decision.backend {
+            Some(InputBackend::ImeComposition) => TypingMode::Ime,
+            Some(InputBackend::KeyEvents) => TypingMode::FastKeys,
+            Some(InputBackend::AppAdapter(_)) | None => TypingMode::Block,
+            Some(_) => TypingMode::Block,
         };
         Self::new(mode, None).expect("built-in typing policies are valid")
     }

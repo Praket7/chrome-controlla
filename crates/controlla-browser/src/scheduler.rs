@@ -7,8 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 
-#[path = "input_strategy.rs"]
-pub mod input_strategy;
+pub use crate::input_strategy;
 #[path = "probe.rs"]
 pub mod probe;
 #[path = "semantic.rs"]

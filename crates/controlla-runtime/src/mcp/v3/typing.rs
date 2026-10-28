@@ -1,60 +1,20 @@
-//! Canonical V3 typing policy and transaction representation.
+//! Canonical V3 typing policy facade.
 //!
-//! This module is the single place that maps public typing modes to an input
-//! backend, normalizes text, and builds the one-shot extension transaction.
+//! The transaction representation and backend vocabulary live in
+//! `controlla_browser::input_strategy`; this module only maps the public V3
+//! typing modes onto that single engine.
 
-use serde::{Deserialize, Serialize};
+pub use controlla_browser::input_strategy::{
+    InputBackend, InputExpectation, InputOperation, InputPace, InputTransaction,
+};
+use controlla_browser::input_strategy::{
+    InputCharacteristics, PublicTypingMode as CanonicalTypingMode,
+    compile_transaction as compile_canonical,
+};
 
 pub const MAX_TRANSACTION_TEXT: usize = 16_384;
 pub const DEFAULT_CHUNK_CHARS: usize = 256;
 pub const DEFAULT_KEY_CHUNK_CHARS: usize = 32;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputBackend {
-    NativeSetter,
-    InsertText,
-    KeyEvents,
-    ImeComposition,
-    ClipboardPaste,
-    AppAdapter,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputPace {
-    Immediate,
-    Adaptive { min_ms: u16, max_ms: u16 },
-    Human { delay_ms: u16 },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputOperation {
-    Replace,
-    Append,
-    InsertAtCaret,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InputExpectation {
-    ExactValue { value: String },
-    Suffix { value: String },
-    CaretAnchor { offset: u32 },
-    Unchecked,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct InputTransaction {
-    pub operation: InputOperation,
-    pub expected: InputExpectation,
-    pub text: String,
-    pub backend: InputBackend,
-    pub pace: InputPace,
-    pub chunk_chars: usize,
-    pub verify_every_chunks: u16,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicTypingMode {
@@ -92,7 +52,9 @@ pub fn pace_for_mode(mode: PublicTypingMode, delay_ms: u16) -> InputPace {
             min_ms: 0,
             max_ms: 4,
         },
-        PublicTypingMode::Block | PublicTypingMode::Ime | PublicTypingMode::Auto => InputPace::Immediate,
+        PublicTypingMode::Block | PublicTypingMode::Ime | PublicTypingMode::Auto => {
+            InputPace::Immediate
+        }
     }
 }
 
@@ -119,30 +81,39 @@ pub fn compile_transaction(
     delay_ms: u16,
 ) -> Result<InputTransaction, &'static str> {
     let text = normalize_key_text(text);
-    if text.is_empty() || text.len() > MAX_TRANSACTION_TEXT {
-        return Err("typing text must contain 1..=16384 bytes");
-    }
-    if mode == PublicTypingMode::HumanKeys && human_keys_control_character(&text).is_some() {
-        return Err("HumanKeys does not support control characters other than normalized newline");
-    }
-    let backend = backend_for_mode(mode);
-    Ok(InputTransaction {
+    let public_mode = match mode {
+        PublicTypingMode::Block => CanonicalTypingMode::Block,
+        PublicTypingMode::FastKeys => CanonicalTypingMode::FastKeys,
+        PublicTypingMode::HumanKeys => CanonicalTypingMode::HumanKeys,
+        PublicTypingMode::Ime => CanonicalTypingMode::Ime,
+        PublicTypingMode::Auto => CanonicalTypingMode::Block,
+    };
+    compile_canonical(
+        public_mode,
         operation,
         expected,
-        text,
-        backend,
-        pace: pace_for_mode(mode, delay_ms),
-        chunk_chars: chunk_chars_for(backend),
-        verify_every_chunks: verify_every_for(mode),
-    })
+        &text,
+        InputCharacteristics {
+            ordinary_text_control: true,
+            contenteditable: false,
+            ..InputCharacteristics::default()
+        },
+        delay_ms,
+    )
 }
+
 
 pub fn transaction_payload(transaction: &InputTransaction) -> serde_json::Value {
     serde_json::json!({
         "operation": transaction.operation,
-        "expected": transaction.expected,
+        "expected": match &transaction.expected {
+            InputExpectation::ExactValue(value) => serde_json::json!({"kind":"exact_value","value":value}),
+            InputExpectation::Suffix(value) => serde_json::json!({"kind":"suffix","value":value}),
+            InputExpectation::CaretAnchor { offset } => serde_json::json!({"kind":"caret_anchor","offset":offset}),
+            InputExpectation::Unchecked => serde_json::json!({"kind":"unchecked"}),
+        },
         "text": transaction.text,
-        "strategy": transaction.backend,
+        "strategy": transaction.backend.label(),
         "chunk_chars": transaction.chunk_chars,
         "verify_every_chunks": transaction.verify_every_chunks,
         "pacing_ms": match transaction.pace {
@@ -173,7 +144,10 @@ mod tests {
         assert_eq!(backend_for_mode(PublicTypingMode::FastKeys), InputBackend::KeyEvents);
         assert_eq!(backend_for_mode(PublicTypingMode::HumanKeys), InputBackend::KeyEvents);
         assert_eq!(backend_for_mode(PublicTypingMode::Ime), InputBackend::ImeComposition);
-        assert_eq!(pace_for_mode(PublicTypingMode::HumanKeys, 999), InputPace::Human { delay_ms: 250 });
+        assert_eq!(
+            pace_for_mode(PublicTypingMode::HumanKeys, 999),
+            InputPace::Human { delay_ms: 250 }
+        );
     }
 
     #[test]
@@ -204,5 +178,20 @@ mod tests {
             0,
         )
         .is_err());
+    }
+
+    #[test]
+    fn payload_exposes_canonical_expectation_shape() {
+        let transaction = compile_transaction(
+            PublicTypingMode::Ime,
+            InputOperation::Append,
+            InputExpectation::Suffix("old".into()),
+            "こんにちは",
+            0,
+        )
+        .unwrap();
+        let payload = transaction_payload(&transaction);
+        assert_eq!(payload["strategy"], "ime_composition");
+        assert_eq!(payload["expected"]["kind"], "suffix");
     }
 }
