@@ -20,7 +20,7 @@ const ADAPTERS = Object.freeze({
 // intentional update of this value and the client qualification fixtures.
 export const EXPECTED_V3_TOOL_SCHEMA_SHA256 = '32e0c4e9c35b4e3931766d28317d1b633ffceac051b31fff01d18e2e402e4a65';
 export const EXPECTED_CLIENT_TOOL_SCHEMA_SHA256 = Object.freeze({
-  'chatgpt-desktop': '870e72c7d4c9c502c255ea05a2d4d8da3b3f007d4bb72d9001c6ca6f556fda65',
+  'chatgpt-desktop': 'dc5666fb5673810f91b11f7db5630600cc4b461041a1b71746e61cb0ffd9108c',
 });
 
 function waitForResponse(child, id, timeoutMs, pending) {
