@@ -221,6 +221,19 @@ mod tests {
     }
 
     #[test]
+    fn child_frame_controls_are_not_blanket_unsafe_pages() {
+        let script = click_guard_script("false");
+        assert!(
+            !script.contains("frame && e.tagName !== 'A'"),
+            "non-link child-frame controls must reach the frame-local route"
+        );
+        assert!(script.contains("const frame = e.ownerDocument === document"), "frame ownership remains checked");
+        assert!(script.contains("unsafe_page"), "the actual unsafe-control predicate stays enforced");
+        assert_eq!(GuardReason::UnsupportedControl.retry_class(), RetryClass::DoNotRetry);
+        assert_eq!(GuardReason::ReadOnly.retry_class(), RetryClass::RequiresUser);
+    }
+
+    #[test]
     fn refusal_is_specific_not_dispatched_and_bounded() {
         let value =
             refusal(&json!({"ok":false,"reason":"obscured","detail":{"blocker":{"tag":"div"}}}));

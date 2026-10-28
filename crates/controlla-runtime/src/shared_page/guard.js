@@ -1,7 +1,7 @@
 function(index, outcome, opts) {
   // Ordered, named predicates. Each failure names exactly one cause; never a generic "blocked".
   // `detail` is bounded safe metadata only: no text, values, passwords, or file paths.
-  const RETRY = {outside_viewport:'safe_internal',obscured:'safe_internal',stale_reference:'refresh_snapshot',changed_target:'refresh_snapshot',detached:'refresh_snapshot',document_changed:'refresh_snapshot',hidden:'refresh_snapshot',no_hit_target:'refresh_snapshot',pointer_events_none:'refresh_snapshot',disabled:'refresh_snapshot',aria_disabled:'refresh_snapshot',masked_boundary:'requires_user',trusted_boundary:'requires_user',unsafe_page:'do_not_retry'};
+  const RETRY = {outside_viewport:'safe_internal',obscured:'safe_internal',stale_reference:'refresh_snapshot',changed_target:'refresh_snapshot',detached:'refresh_snapshot',document_changed:'refresh_snapshot',hidden:'refresh_snapshot',no_hit_target:'refresh_snapshot',pointer_events_none:'refresh_snapshot',disabled:'refresh_snapshot',aria_disabled:'refresh_snapshot',stale_value:'refresh_snapshot',masked_boundary:'requires_user',trusted_boundary:'requires_user',read_only:'requires_user',unsupported_control:'do_not_retry',unsafe_page:'do_not_retry'};
   const fail = (reason, detail) => ({ok:false, reason, retry_class:RETRY[reason] || 'do_not_retry', detail:detail || {}});
   const round = n => Math.round(n);
   const rectOf = b => ({l:round(b.left), t:round(b.top), r:round(b.right), b:round(b.bottom)});
@@ -29,7 +29,9 @@ function(index, outcome, opts) {
   }
   const frame = e.ownerDocument === document ? null : e.ownerDocument.defaultView?.frameElement;
   if (e.ownerDocument !== document && (!frame || !frame.isConnected || frame.ownerDocument !== document)) return fail('document_changed');
-  if (frame && e.tagName !== 'A') return fail('unsafe_page', {tag:e.tagName.toLowerCase()});
+  // A child-document control is not inherently unsafe. The runtime chooses a
+  // frame-local backend when one is available; only the actual unsafe-control
+  // predicate below can produce `unsafe_page`.
   if (this.raw(e) !== saved.raw_value || this.name(e) !== saved.name || (e.tagName === 'A' && e.href !== saved.href)) {
     return fail('changed_target', {field: this.raw(e) !== saved.raw_value ? 'value' : (this.name(e) !== saved.name ? 'name' : 'href')});
   }
