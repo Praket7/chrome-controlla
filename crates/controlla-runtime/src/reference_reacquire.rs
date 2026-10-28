@@ -123,7 +123,17 @@ pub fn reacquire_reference(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let current_backend_node_id = item.get("backend_node_id").and_then(Value::as_i64);
-        // Score deterministically
+        let current_rect = item.get("rect_bucket").map(Value::to_string);
+        let current_ancestor = item
+            .pointer("/semantic_ancestor/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let rect_matched = expected.rect_bucket.is_some() && current_rect == expected.rect_bucket;
+        let ancestor_matched = expected.ancestor_id.is_some()
+            && current_ancestor == expected.ancestor_id;
+        // Score deterministically. Textual identity is necessary for a
+        // context rebind; geometry and ancestor context break ties between
+        // otherwise identical repeated controls.
         let mut score = 0;
         if role == expected.role {
             score += 10;
@@ -137,22 +147,32 @@ pub fn reacquire_reference(
         if fp == expected.dom_path_fingerprint {
             score += 25;
         }
+        if rect_matched {
+            score += 8;
+        }
+        if ancestor_matched {
+            score += 12;
+        }
         let backend_id_matched = expected.backend_node_id.is_some()
             && current_backend_node_id == expected.backend_node_id;
         if backend_id_matched {
             score += 50;
         }
-        let same_semantic_node = role == expected.role
+        let same_core = role == expected.role
             && name == expected.name
-            && href == expected.href
-            && !fp.is_empty()
-            && fp == expected.dom_path_fingerprint;
-        let is_high = (backend_id_matched && score >= 50)
-            || same_semantic_node
-            || (expected.backend_node_id.is_none()
-                && score >= 40
-                && !fp.is_empty()
-                && fp == expected.dom_path_fingerprint);
+            && href == expected.href;
+        let fingerprint_matched = !fp.is_empty() && fp == expected.dom_path_fingerprint;
+        let context_required = expected.rect_bucket.is_some() || expected.ancestor_id.is_some();
+        let is_high = if backend_id_matched {
+            score >= 50
+        } else if same_core && fingerprint_matched {
+            // When the stale reference carried context, an otherwise identical
+            // repeated control must also match that context. Without context,
+            // duplicate fingerprint matches remain ambiguous.
+            !context_required || rect_matched || ancestor_matched
+        } else {
+            false
+        };
         if is_high {
             high_matches.push(ReacquiredReference {
                 reference: ref_str.to_owned(),
@@ -227,6 +247,48 @@ mod tests {
         // Only one high match (the one with fingerprint a:0) -> still ambiguous if ordering changed? stub treats one match as ok; ensure not silently switching.
         // Here we expect ok because exactly one high-confidence still exists; reordered test should ensure caller validates not swapping.
         assert!(reacquire_reference(&id, &doc, &items).is_ok());
+    }
+
+    #[test]
+    fn geometry_and_ancestor_break_ties_between_repeated_controls() {
+        let doc = SemanticDocumentKey {
+            frame_id: "f".into(),
+            loader_id: "l".into(),
+            url: "https://example.test".into(),
+            frame_revision: None,
+            document_revision: None,
+        };
+        let expected = SemanticIdentity {
+            document: doc.clone(),
+            frame_id: "f".into(),
+            frame_revision: String::new(),
+            backend_node_id: None,
+            role: "button".into(),
+            name: "Save".into(),
+            href: None,
+            dom_path_fingerprint: "button:0".into(),
+            rect_bucket: Some("\"10,20,30,40\"".into()),
+            ancestor_id: Some("toolbar-main".into()),
+        };
+        let items = vec![
+            json!({"reference":"@c1","source_frame":"f","role":"button","name":"Save",
+                "dom_path_fingerprint":"button:0","rect_bucket":"10,20,30,40",
+                "semantic_ancestor":{"id":"toolbar-main"}}),
+            json!({"reference":"@c2","source_frame":"f","role":"button","name":"Save",
+                "dom_path_fingerprint":"button:0","rect_bucket":"500,20,30,40",
+                "semantic_ancestor":{"id":"toolbar-secondary"}}),
+        ];
+        let reacquired = reacquire_reference(&expected, &doc, &items).unwrap();
+        assert_eq!(reacquired.reference, "@c1");
+        let contextless = SemanticIdentity {
+            rect_bucket: None,
+            ancestor_id: None,
+            ..expected
+        };
+        assert!(matches!(
+            reacquire_reference(&contextless, &doc, &items),
+            Err(ReacquireError::Ambiguous)
+        ));
     }
 
     #[test]
