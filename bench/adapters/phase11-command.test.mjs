@@ -230,3 +230,19 @@ test('Controlla upload selection requires a later verified application click', a
     }
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
+
+test('Controlla upload prompt omits null optionals and continues after an incomplete selection receipt', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'phase11-upload-prompt-test-'));
+  try {
+    const executable=join(dir,'codex');
+    const input={task_id:'guarded-upload',task_class:'upload',mode:'cold_browser',execution_mode:'headless',concurrency:1,fixture_url:'http://127.0.0.1:1234/file-input?task=guarded-upload',acceptance:{kind:'upload',filename:'benchmark.txt',size:20,sha256:'e6cd2f3dd6fbc01ec2f9b8f1578535ab325cd7a884a14d1170cb50dc744a0231'},deadline_ms:60000};
+    const events=[
+      {type:'item.completed',item:{type:'mcp_tool_call',server:'chrome-controlla',tool:'browser',status:'completed',arguments:{session_id:'s',chrome_tab_id:'t',task:{kind:'upload'}},result:{structured_content:{status:'incomplete',receipts:[{status:'selected',chrome_selected_file:true,files:{files:[input.acceptance]}}]}}}},
+      {type:'item.completed',item:{type:'mcp_tool_call',server:'chrome-controlla',tool:'act',status:'completed',arguments:{session_id:'s',chrome_tab_id:'t',action:'click',outcome:{kind:'text',selector:'#status',text:'Upload saved'}},result:{structured_content:{status:'verified'}}}},
+      {type:'item.completed',item:{type:'agent_message',text:'DONE'}},
+    ];
+    await writeFile(executable, `#!/usr/bin/env node\nconst prompt=process.argv.at(-1); if (['"trigger_reference":null','"acceptance":null','"persisted":null'].some(x=>prompt.includes(x)) || !prompt.includes('status=incomplete') || !prompt.includes('continue')) process.exit(9);\nfor(const event of ${JSON.stringify(events)}) console.log(JSON.stringify(event));\n`,{mode:0o755});
+    const output=await new Promise((resolveOutput,reject)=>{const child=spawn(process.execPath,[adapterPath,'controlla'],{cwd:root,env:{...process.env,PHASE11_FIXTURE_BASE_URL:'http://127.0.0.1:1234',PHASE11_CODEX_PATH:executable,PHASE11_CHROME_PATH:'/chrome',PHASE11_CONTROLLA_BINARY:'/controlla'},stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);child.once('error',reject);child.once('close',code=>code===0?resolveOutput(JSON.parse(stdout)):reject(new Error(stderr)));child.stdin.end(JSON.stringify(input));});
+    assert.equal(output.success,true);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
