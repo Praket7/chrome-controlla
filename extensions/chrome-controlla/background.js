@@ -1,3 +1,9 @@
+import { createBoundedTransport } from "./lib/transport.js";
+import { FrameTreeRegistry } from "./lib/frame-tree.js";
+import { DebuggerSessionManager } from "./lib/debugger-sessions.js";
+import { typeTextTransaction } from "./lib/input.js";
+import { semanticDelta, pruneSemanticItems } from "./lib/observation.js";
+
 let socket;
 const NATIVE_HOST = "chrome_controlla_bridge";
 const RECONNECT_BASE_MS = 1000;
@@ -35,7 +41,7 @@ const MAX_DOWNLOAD_OBSERVERS_PER_TAB = 4;
 const MAX_DOWNLOAD_OBSERVERS = 64;
 function uploadInputPolicyFunction() { return "function(names){const e=this;if(!e||e.nodeName!=='INPUT'||e.type!=='file')return {ok:false,reason:'target_not_file_input'};const accept=(e.getAttribute('accept')||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);const mime=n=>({txt:'text/plain',csv:'text/csv',json:'application/json',pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',svg:'image/svg+xml',mp3:'audio/mpeg',mp4:'video/mp4',html:'text/html',xml:'application/xml'})[String(n).split('.').pop().toLowerCase()];if(names.length>1&&!e.multiple)return {ok:false,reason:'multiple_files_not_allowed'};for(const name of names){const lower=String(name).toLowerCase(),ext='.'+lower.split('.').pop(),type=mime(name);if(accept.length&&!accept.some(a=>a.startsWith('.')?lower.endsWith(a):a.endsWith('/*')?!!type&&type.startsWith(a.slice(0,-1)):a.includes('/')?a===type:false))return {ok:false,reason:'accept_filter_mismatch',filename:name};}return {ok:true,accept,multiple:!!e.multiple}}"; }
 const DOWNLOAD_OBSERVER_TTL_MS = 60000;
-const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
+const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js", "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/input.js", "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/tab-control.js"];
 const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
   const runtimeFallback = `controlla-chrome-extension:${chrome.runtime.getManifest().version}:runtime`;
   const compute = (async () => {
@@ -97,22 +103,26 @@ function noteCdpCommand(method) {
 function executionCounterReceipt() {
   return { ...executionCounters, by_method: { ...executionCounters.by_method } };
 }
+const cdpTransport = createBoundedTransport({
+  sendCommand: (target, method, params) => chrome.debugger.sendCommand(target, method, params),
+  onCommand: noteCdpCommand,
+});
+const frameTreeRegistry = new FrameTreeRegistry();
+const debuggerSessions = new DebuggerSessionManager({
+  send: sendCdpCommand,
+  frames: frameTreeRegistry,
+  attach: attachDebugger,
+  detach: performDebuggerDetach,
+});
 async function sendCdpCommand(target, method, params, timeoutMs = 30000) {
-  noteCdpCommand(method);
-  const boundedTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(1, Math.min(60000, timeoutMs)) : 30000;
-  let timer;
-  try {
-    return await Promise.race([
-      chrome.debugger.sendCommand(target, method, params),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(Object.assign(new Error(`CDP command ${method} exceeded its ${boundedTimeoutMs}ms deadline.`), {
-          reason_code: "cdp_command_timeout", dispatch_may_have_occurred: true,
-        })), boundedTimeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+  const result = await cdpTransport.send(target, method, params, timeoutMs);
+  if (method === "Page.getFrameTree" && Number.isSafeInteger(target?.tabId) && result?.frameTree) {
+    frameTreeRegistry.hydrate(target.tabId, result.frameTree, target.sessionId ?? null);
+    if (!target.sessionId) debuggerSessions.ensureState(target.tabId).attached = true;
+  } else if (method === "Target.setAutoAttach" && Number.isSafeInteger(target?.tabId) && params?.autoAttach === true) {
+    if (!target.sessionId) frameTreeRegistry.markAutoAttach(target.tabId, true);
   }
+  return result;
 }
 let nativePort;
 let nativeReady = false;
@@ -430,6 +440,7 @@ function recordFrameSession(tabId, frameId, sessionId) {
   let frames = frameSessions.get(tabId);
   if (!frames) { frames = new Map(); frameSessions.set(tabId, frames); }
   frames.set(frameId, sessionId);
+  frameTreeRegistry.bindSession(tabId, frameId, sessionId);
   const waiter = frameSessionWaiters.get(`${tabId}:${frameId}`);
   if (waiter) { clearTimeout(waiter.timer); frameSessionWaiters.delete(`${tabId}:${frameId}`); waiter.resolve(sessionId); }
 }
@@ -761,9 +772,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (Number.isSafeInteger(source?.tabId)) {
     const tabId = source.tabId;
     captureUploadNetworkEvent(tabId, source, method, params || {});
+    debuggerSessions.handleDebuggerEvent(source, method, params || {});
     if (method === "Target.attachedToTarget" && params?.targetInfo?.type === "iframe" && typeof params.sessionId === "string") {
       recordFrameSession(tabId, params.targetInfo.targetId, params.sessionId);
-      void sendCdpCommand({ tabId, sessionId: params.sessionId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] }).catch(() => {});
     } else if (method === "Page.frameNavigated" && typeof source.sessionId === "string" && typeof params?.frame?.id === "string") {
       recordFrameSession(tabId, params.frame.id, source.sessionId);
     } else if (method === "Target.detachedFromTarget") {
@@ -884,7 +895,7 @@ function resolveNativeLease(leaseId, tabId) { if (leaseId) return nativeLeases.g
 function safeNativeError(value) { if (typeof value !== "string" || !value) return undefined; return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 256); }
 function safeErrorClass(error) { try { const name = error?.name; return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : "Error"; } catch { return "Error"; } }
 function traceSharedCommand(phase, request, tabId, startedAt, details = {}) {
-  if ((!SHARED_COMMAND_METHODS.has(request.method) && request.method !== "Controlla.fastType" && request.method !== "Controlla.humanTypeCharacter") || !Number.isSafeInteger(tabId)) return;
+  if ((!SHARED_COMMAND_METHODS.has(request.method) && request.method !== "Controlla.fastType" && request.method !== "Controlla.humanTypeCharacter" && request.method !== "Controlla.typeTextTransaction") || !Number.isSafeInteger(tabId)) return;
   const commandId = typeof request.id === "string" || Number.isSafeInteger(request.id) ? String(request.id).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128) : "";
   try { console.debug("[Chrome Controlla] shared command", { phase, commandId, targetId: tabId, method: request.method, elapsedMs: Math.max(0, Date.now() - startedAt), ...details }); } catch {}
 }
@@ -2591,6 +2602,25 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       } finally {
         await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
+      return;
+    }
+    if (request.method === "Controlla.typeTextTransaction") {
+      const result = await typeTextTransaction(tabId, request.params, {
+        send: sendCdpCommand,
+        isAuthorized,
+        now: () => performance.now(),
+        commandCount: () => executionCounters.cdp_commands,
+        sessionForFrame: (tab, frame) => frameSessions.get(tab)?.get(frame) ?? frameTreeRegistry.sessionForFrame(tab, frame),
+        loaderForFrame: (tab, frame) => frameTreeRegistry.loaderForFrame(tab, frame) ?? null,
+        syncFrameTree: async tab => {
+          const response = await sendCdpCommand({ tabId: tab }, "Page.getFrameTree", {});
+          return response?.frameTree ?? null;
+        },
+        ensureAutoAttach: async tab => { await debuggerSessions.ensureAutoAttach(tab); },
+        waitForFrameSession,
+      });
+      traceSharedCommand("settled", request, tabId, startedAt, { outcome: result.status, completedChars: result.completed_chars, inputCommands: result.input_commands });
+      respond({ type: "result", id: request.id, result });
       return;
     }
     if (request.method === "Controlla.frameHumanTypeCharacter") {

@@ -43,6 +43,7 @@ pub mod slides_deck;
 pub mod target_graph;
 pub mod task_capsule;
 pub mod task_checkpoints;
+pub mod task_program;
 pub mod v3;
 pub mod v3_runtime;
 pub mod v3_tasks;

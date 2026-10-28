@@ -1,3 +1,6 @@
+#[path = "../mcp/v3/mod.rs"]
+pub mod v3_execution;
+
 pub use controlla_runtime::{
     apps, artifacts, browser_contract, browser_workflow, cache, canva, capability,
     capability_registry, capability_router, capcut_recipe, compact_catalog, desktop_fallback,

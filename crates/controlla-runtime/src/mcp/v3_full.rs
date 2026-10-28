@@ -4085,22 +4085,7 @@ async fn visual_click_impl(
 }
 
 fn semantic_item_center(item: &Value) -> Option<(f64, f64)> {
-    let bounds = item.get("bounds")?;
-    let x = bounds.get("x")?.as_f64()?;
-    let y = bounds.get("y")?.as_f64()?;
-    let width = bounds.get("width")?.as_f64()?;
-    let height = bounds.get("height")?.as_f64()?;
-    (x.is_finite()
-        && y.is_finite()
-        && width.is_finite()
-        && height.is_finite()
-        && x.abs() <= 10_000_000.0
-        && y.abs() <= 10_000_000.0
-        && width > 0.0
-        && height > 0.0
-        && width <= 1_000_000.0
-        && height <= 1_000_000.0)
-        .then_some((x + width / 2.0, y + height / 2.0))
+    crate::v3_execution::pointer::semantic_item_center(item)
 }
 
 fn semantic_drag_destination(item: &Value) -> Option<(f64, f64, String, String, f64, f64)> {
@@ -13235,12 +13220,11 @@ fn cdp_character_events(character: char) -> Vec<(Value, bool)> {
 }
 
 fn normalize_key_text(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    crate::v3_execution::typing::normalize_key_text(text)
 }
 
 fn human_keys_control_character(text: &str) -> Option<char> {
-    text.chars()
-        .find(|character| character.is_control() && *character != '\n')
+    crate::v3_execution::typing::human_keys_control_character(text)
 }
 
 async fn key_type(

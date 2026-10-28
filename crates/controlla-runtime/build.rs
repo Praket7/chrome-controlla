@@ -10,6 +10,14 @@ const EXTENSION_RUNTIME_ASSETS: &[&str] = &[
     "secure-input.css",
     "secure-input.html",
     "secure-input.js",
+    "lib/transport.js",
+    "lib/frame-tree.js",
+    "lib/debugger-sessions.js",
+    "lib/input.js",
+    "lib/editor-adapters.js",
+    "lib/observation.js",
+    "lib/pointer.js",
+    "lib/tab-control.js",
 ];
 
 fn main() {
@@ -19,7 +27,7 @@ fn main() {
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let allowed_non_runtime_files = ["README.md", "test-background.cjs", "test-v3-batch.cjs"]
+    let allowed_non_runtime_files = ["README.md", "test-background.cjs", "test-v3-batch.cjs", "lib"]
         .into_iter()
         .collect::<BTreeSet<_>>();
     let actual_files = fs::read_dir(&extension_dir)
@@ -34,7 +42,7 @@ fn main() {
         .collect::<BTreeSet<_>>();
     let expected_files = runtime_asset_names
         .iter()
-        .map(|name| (*name).to_owned())
+        .map(|name| name.split('/').next().unwrap_or(name).to_owned())
         .chain(
             allowed_non_runtime_files
                 .iter()

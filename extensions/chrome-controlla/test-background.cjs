@@ -134,6 +134,8 @@ let frameActionable = true;
 let frameShadowRootFixture = false;
 let frameFillMockEvidence;
 let frameHumanTypeGuardResults = [];
+let transactionFixtureValue = "old";
+let transactionFixtureReplacePending = false;
 let childFrameLoaderId = "fixture-loader";
 let navigateFrameDuringFileReadback = false;
 let fileReadbackEmpty = false;
@@ -474,6 +476,15 @@ const chrome = {
         if (changeRootOriginOnPasswordCheck) { changeRootOriginOnPasswordCheck = false; rootFrameSecurityOrigin = "https://attacker.example"; }
         return { result: { value: { ok: true } } };
       }
+      if (method === "Input.insertText" && target.sessionId === "fixture-oopif-session") {
+        transactionFixtureValue = transactionFixtureReplacePending ? String(params?.text ?? "") : transactionFixtureValue + String(params?.text ?? "");
+        transactionFixtureReplacePending = false;
+        return { accepted: true };
+      }
+      if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session") {
+        if (params?.type === "char") { transactionFixtureValue += String(params?.text ?? ""); return {}; }
+        if (params?.type === "keyDown" && params?.key === "Enter") { transactionFixtureValue += "\n"; return {}; }
+      }
       if (method === "Input.dispatchKeyEvent") {
         if (params.type === "keyDown" && blockNextHumanKeydown) {
           const blocked = blockNextHumanKeydown;
@@ -581,6 +592,30 @@ const chrome = {
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 92 ? "fixture-frame-textbox" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")) return { result: { value: frameHumanTypeGuardResults.shift() || { ok: true } } };
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expectedKind")) {
+        const kind = params.arguments?.[0]?.value;
+        const expected = params.arguments?.[1]?.value;
+        const operation = params.arguments?.[3]?.value;
+        const prepare = params.arguments?.[4]?.value === true;
+        if (kind === "exact_value" && expected !== transactionFixtureValue) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
+        if (kind === "suffix" && !transactionFixtureValue.endsWith(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
+        if (kind === "contains" && !transactionFixtureValue.includes(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
+        if (prepare && operation === "replace") transactionFixtureReplacePending = true;
+        return { result: { value: { ok: true, value: transactionFixtureValue, length: transactionFixtureValue.length, rich: true, focused: true, selectionStart: transactionFixtureValue.length, selectionEnd: transactionFixtureValue.length } } };
+      }
+      if (method === "Input.insertText" && target.sessionId === "fixture-oopif-session") {
+        transactionFixtureValue = transactionFixtureReplacePending ? String(params?.text ?? "") : transactionFixtureValue + String(params?.text ?? "");
+        transactionFixtureReplacePending = false;
+        return { accepted: true };
+      }
+      if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session" && params?.type === "char") {
+        transactionFixtureValue += String(params?.text ?? "");
+        return { accepted: true };
+      }
+      if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session" && params?.type === "keyDown" && params?.key === "Enter") {
+        transactionFixtureValue += "\n";
+        return { accepted: true };
+      }
       if (method === "DOM.setFileInputFiles" && target.sessionId === "fixture-oopif-session") {
         fileReadbackFiles = (params?.files || []).map(path => ({ name: String(path).split("/").at(-1), size: 12 }));
         return {};
@@ -612,13 +647,24 @@ const chrome = {
   },
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
+const extensionLibraryAssets = [
+  "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/input.js",
+  "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/tab-control.js",
+];
+function stripModuleSyntax(source) {
+  return source.replace(/^import[^;]*;[ \t]*$/gm, "").replace(/^export default /gm, "").replace(/^export /gm, "");
+}
+const extensionLibrarySource = extensionLibraryAssets
+  .map(name => stripModuleSyntax(fs.readFileSync(new URL(`./${name}`, `file://${__filename}`), "utf8")))
+  .join("\n");
+const backgroundExecutable = `${extensionLibrarySource}\n${backgroundSource.replace(/^import[^;]*;[ \t]*$/gm, "")}`;
 assert.match(backgroundSource, /const documents = await Promise\.all\(/,
   "independent frame document inventory remains parallelized");
 assert.match(backgroundSource, /clearFrameSessions\(tabId\)/,
   "frame inventory is fenced when a target detaches");
 assert.match(backgroundSource, /Frame inventory target topology changed during parallel document reads/,
   "parallel frame inventory discards reads after topology drift");
-const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js"];
+const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js", ...extensionLibraryAssets];
 const extensionAssetBytes = new Map(extensionBuildAssets.map(name => [name, fs.readFileSync(new URL(`./${name}`, `file://${__filename}`))]));
 const expectedExtensionDigest = createHash("sha256");
 for (const name of extensionBuildAssets) expectedExtensionDigest.update(name).update(Buffer.from([0])).update(extensionAssetBytes.get(name)).update(Buffer.from([0]));
@@ -653,7 +699,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted, executionCounters: executionCounterReceipt, resetExecutionCounters };`, backgroundContext);
+  vm.runInNewContext(`${backgroundExecutable}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted, executionCounters: executionCounterReceipt, resetExecutionCounters };`, backgroundContext);
 }
 runBackground();
 
@@ -1570,6 +1616,8 @@ async function waitFor(predicate, description) {
   backgroundContext.__testHooks.resetExecutionCounters();
   const transactionStart = debuggerCalls.length;
   const perCharacterNativeBefore = native.sent.filter(message => message.method === "Controlla.frameHumanTypeCharacter").length;
+  transactionFixtureValue = "old";
+  transactionFixtureReplacePending = false;
   const transactionText = "T".repeat(1000);
   identityAxNodes = [{ nodeId: "field", role: { value: "textbox" }, name: { value: "Document editor" }, backendDOMNodeId: 92 }];
   native.hostMessage({ type: "command", id: "oopif-type-transaction", target_id: "41", method: "Controlla.typeTextTransaction", params: {
