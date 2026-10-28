@@ -17,7 +17,7 @@ const OPTIONAL_OUTPUT_FIELDS = [
   'unknown_delivery_count', 'timeout_count', 'cleanup_completed', 'cleanup_outcome',
   'metric_evidence', 'execution_tier', 'fallback_count', 'runner_error', 'prompt_to_final_ms',
   'codex_event_types', 'codex_error_class', 'codex_turn_failed', 'codex_failed_tool',
-  'codex_tool_failure_status', 'codex_tool_failure_reason',
+  'codex_tool_failure_status', 'codex_tool_failure_reason', 'codex_failed_action',
 ];
 
 export async function loadPhase11Config(configPath = 'bench/tasks/phase11-realistic.json') {
@@ -170,7 +170,7 @@ export function validateAdapterResult(result, contract, expected) {
   if (result.codex_turn_failed !== undefined && typeof result.codex_turn_failed !== 'boolean') throw new Error('codex_turn_failed must be a boolean');
   if (result.codex_event_types !== undefined && (typeof result.codex_event_types !== 'string' || result.codex_event_types.length > 256)) throw new Error('codex_event_types must be a bounded string');
   if (result.codex_error_class !== undefined && !['rate_limit','quota','authentication','context_limit','mcp_startup','timeout','provider_unavailable','transport','unclassified_host_failure','mcp_tool_failure','actor_incomplete',null].includes(result.codex_error_class)) throw new Error('codex_error_class is invalid');
-  for (const field of ['codex_failed_tool','codex_tool_failure_status','codex_tool_failure_reason']) {
+  for (const field of ['codex_failed_tool','codex_tool_failure_status','codex_tool_failure_reason','codex_failed_action']) {
     if (result[field] !== undefined && result[field] !== null && (typeof result[field] !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(result[field]))) throw new Error(`${field} must be a bounded identifier or null`);
   }
   for (const field of [
