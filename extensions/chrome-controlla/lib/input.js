@@ -115,7 +115,7 @@ export function validateTypeTextTransaction(params = {}) {
   const chunkChars = boundedInteger(params.chunk_chars, 256, 1, 1024);
   const verifyEvery = boundedInteger(params.verify_every_chunks, 1, 0, 64);
   const pacingMs = boundedInteger(params.pacing_ms, 0, 0, 250);
-  const deadlineMs = boundedInteger(params.deadline_ms, 30000, 1000, 60000);
+  const deadlineMs = boundedInteger(params.deadline_ms, 30000, 1000, 600000);
   return {
     tabId: Number.isSafeInteger(params.tabId) ? params.tabId : null,
     objectId: params.object_id ?? null,

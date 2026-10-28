@@ -103,9 +103,17 @@ pub fn compile_transaction(
 }
 
 
+pub fn operation_label(operation: InputOperation) -> &'static str {
+    match operation {
+        InputOperation::Replace => "replace",
+        InputOperation::Append => "append",
+        InputOperation::InsertAtCaret => "insert_at_caret",
+    }
+}
+
 pub fn transaction_payload(transaction: &InputTransaction) -> serde_json::Value {
     serde_json::json!({
-        "operation": transaction.operation,
+        "operation": operation_label(transaction.operation),
         "expected": match &transaction.expected {
             InputExpectation::ExactValue(value) => serde_json::json!({"kind":"exact_value","value":value}),
             InputExpectation::Suffix(value) => serde_json::json!({"kind":"suffix","value":value}),
@@ -125,6 +133,95 @@ pub fn transaction_payload(transaction: &InputTransaction) -> serde_json::Value 
 
 pub fn receipt_is_verified(receipt: &serde_json::Value) -> bool {
     receipt["status"] == "verified" && receipt["dispatch_may_have_occurred"] == true
+}
+
+#[derive(Clone, Debug)]
+pub enum TransactionTarget {
+    Object { object_id: String, index: usize },
+    Frame {
+        frame_id: String,
+        loader_id: String,
+        backend_node_id: i64,
+    },
+}
+
+pub fn strategy_for(mode: PublicTypingMode) -> &'static str {
+    match mode {
+        PublicTypingMode::Block | PublicTypingMode::Auto => "insert_text",
+        PublicTypingMode::FastKeys | PublicTypingMode::HumanKeys => "key_events",
+        PublicTypingMode::Ime => "ime",
+    }
+}
+
+pub fn extension_transaction_payload(
+    target: &TransactionTarget,
+    expected: &str,
+    text: &str,
+    mode: PublicTypingMode,
+    delay_ms: u16,
+    deadline_ms: u64,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "expected": {"kind": "exact_value", "value": expected},
+        "operation": "append",
+        "text": text,
+        "strategy": strategy_for(mode),
+        "chunk_chars": if mode == PublicTypingMode::HumanKeys { 8 } else { 64 },
+        "verify_every_chunks": if mode == PublicTypingMode::HumanKeys { 1 } else { 4 },
+        "pacing_ms": if mode == PublicTypingMode::HumanKeys { delay_ms } else { 0 },
+        "normalize_paragraphs": true,
+        "deadline_ms": deadline_ms.clamp(1, 600_000),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        match target {
+            TransactionTarget::Object { object_id, index } => {
+                object.insert("object_id".into(), serde_json::json!(object_id));
+                object.insert("index".into(), serde_json::json!(index));
+            }
+            TransactionTarget::Frame {
+                frame_id,
+                loader_id,
+                backend_node_id,
+            } => {
+                object.insert("frame_id".into(), serde_json::json!(frame_id));
+                object.insert("loader_id".into(), serde_json::json!(loader_id));
+                object.insert("backend_node_id".into(), serde_json::json!(backend_node_id));
+            }
+        }
+    }
+    payload
+}
+
+pub fn compact_transaction_receipt(receipt: &serde_json::Value, mode: PublicTypingMode) -> serde_json::Value {
+    let status = receipt["status"].as_str().unwrap_or("unknown");
+    serde_json::json!({
+        "status": status,
+        "action": "type",
+        "typing_mode": match mode {
+            PublicTypingMode::Block | PublicTypingMode::Auto => "block",
+            PublicTypingMode::FastKeys => "fast_keys",
+            PublicTypingMode::HumanKeys => "human_keys",
+            PublicTypingMode::Ime => "ime",
+        },
+        "input_method": receipt["backend"],
+        "completed_chars": receipt["completed_chars"],
+        "key_events": receipt["key_events"],
+        "cdp_commands": receipt["cdp_commands"],
+        "dispatch_acknowledged": receipt["dispatch_may_have_occurred"],
+        "dispatch_may_have_occurred": receipt["dispatch_may_have_occurred"],
+        "readback_length": receipt["readback_length"],
+        "readback_hash": receipt["readback_hash"],
+        "adapter": receipt["adapter"],
+        "reason_code": receipt["reason"],
+        "interruption": receipt["interruption"],
+        "next_action": if status == "unknown" {
+            serde_json::Value::from("Inspect the field read-only; do not replay the whole text transaction.")
+        } else if status == "not_dispatched" {
+            serde_json::Value::from("Refresh the target and retry once.")
+        } else {
+            serde_json::Value::Null
+        },
+    })
 }
 
 #[cfg(test)]
@@ -155,7 +252,7 @@ mod tests {
         let transaction = compile_transaction(
             PublicTypingMode::Auto,
             InputOperation::Append,
-            InputExpectation::ExactValue { value: "old".into() },
+            InputExpectation::ExactValue("old".into()),
             "new",
             0,
         )

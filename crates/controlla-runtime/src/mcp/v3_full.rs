@@ -3803,6 +3803,10 @@ async fn type_frame_reference(
     args: &V3ActArgs,
     policy: crate::v3::TypingPolicy,
 ) -> Result<Value, rmcp::ErrorData> {
+    use crate::v3_execution::typing::{
+        PublicTypingMode, TransactionTarget, compact_transaction_receipt,
+        extension_transaction_payload,
+    };
     let reference = args
         .reference
         .as_deref()
@@ -3820,10 +3824,12 @@ async fn type_frame_reference(
             "frame typing does not support control characters other than normalized newline",
         ));
     }
-    if policy.mode == crate::v3::TypingMode::Ime {
-        return Ok(json!({"status":"not_dispatched","action":"type","typing_mode":"ime","dispatch_may_have_occurred":false,
-            "reason_code":"frame_ime_unsupported","reason":"Composition input is not implemented for child-frame editors; use human_keys or fast_keys."}));
-    }
+    let mode = match policy.mode {
+        crate::v3::TypingMode::Block => PublicTypingMode::Block,
+        crate::v3::TypingMode::FastKeys => PublicTypingMode::FastKeys,
+        crate::v3::TypingMode::HumanKeys => PublicTypingMode::HumanKeys,
+        crate::v3::TypingMode::Ime => PublicTypingMode::Ime,
+    };
     let shared = app
         .core
         .legacy
@@ -3841,12 +3847,6 @@ async fn type_frame_reference(
         .connection
         .as_ref()
         .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
-    let mode = match policy.mode {
-        crate::v3::TypingMode::Block => "block",
-        crate::v3::TypingMode::FastKeys => "fast_keys",
-        crate::v3::TypingMode::HumanKeys => "human_keys",
-        crate::v3::TypingMode::Ime => unreachable!(),
-    };
     let character_count = text.chars().count();
     let timeout = Duration::from_millis(
         args.timeout_ms
@@ -3860,53 +3860,71 @@ async fn type_frame_reference(
             .clamp(1_000, 600_000),
     );
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut progress = expected.to_owned();
-    let mut key_events = 0_u64;
-    for (index, character) in text.chars().enumerate() {
-        let result = tokio::time::timeout_at(
-            deadline,
-            connection.command(
-                shared.registry()?,
-                &shared.handle,
-                &args.chrome_tab_id,
-                "Controlla.frameHumanTypeCharacter",
-                json!({"frame_id":parts.0,"loader_id":parts.1,"backend_node_id":parts.2,
-                    "expected":progress,"character":character.to_string(),"normalize_paragraphs":true,"prepare":index==0,
-                    "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1,60_000) as u64}),
-            ),
-        )
-        .await;
-        let receipt = match result {
-            Ok(Ok(response)) => super::super::shared_value(&response).map_err(invalid)?,
-            Ok(Err(error)) => return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,
-                "dispatch_may_have_occurred":true,"completed_chars":index,"reason_code":"frame_key_delivery_uncertain",
-                "reason":format!("frame character delivery is uncertain; inspect before retrying: {error}")})),
-            Err(_) => return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,
-                "dispatch_may_have_occurred":true,"completed_chars":index,"reason_code":"frame_key_deadline",
-                "reason":"frame character transaction exceeded its deadline; inspect before retrying"})),
-        };
-        key_events = key_events.saturating_add(receipt["key_events"].as_u64().unwrap_or_default());
-        if receipt["status"] != "verified" {
-            return Ok(json!({"status":receipt["status"],"action":"type","typing_mode":mode,"completed_chars":index,"key_events":key_events,
-                "dispatch_acknowledged":receipt["dispatch_may_have_occurred"]==true,"dispatch_may_have_occurred":receipt["dispatch_may_have_occurred"],
-                "reason_code":receipt["reason"],"frame_receipt":receipt}));
+    let transaction_deadline = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis()
+        .clamp(1, 60_000) as u64;
+    let payload = extension_transaction_payload(
+        &TransactionTarget::Frame {
+            frame_id: parts.0.to_owned(),
+            loader_id: parts.1.to_owned(),
+            backend_node_id: parts.2,
+        },
+        expected,
+        &text,
+        mode,
+        policy.delay_ms.min(250) as u16,
+        transaction_deadline,
+    );
+    let result = tokio::time::timeout_at(
+        deadline,
+        connection.command(
+            shared.registry()?,
+            &shared.handle,
+            &args.chrome_tab_id,
+            "Controlla.typeTextTransaction",
+            payload,
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(response)) => {
+            let receipt = super::super::shared_value(&response).map_err(invalid)?;
+            let mut compact = compact_transaction_receipt(&receipt, mode);
+            if let Some(object) = compact.as_object_mut() {
+                object.insert(
+                    "source_frame_id".into(),
+                    serde_json::Value::String(parts.0.to_owned()),
+                );
+                object.insert("completed_chars".into(), receipt["completed_chars"].clone());
+                object.insert(
+                    "dispatch_acknowledged".into(),
+                    receipt["dispatch_may_have_occurred"].clone(),
+                );
+            }
+            Ok(compact)
         }
-        progress.push(character);
-        if policy.delay_ms > 0
-            && index + 1 < character_count
-            && tokio::time::timeout_at(
-                deadline,
-                tokio::time::sleep(Duration::from_millis(policy.delay_ms)),
-            )
-            .await
-            .is_err()
-        {
-            return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,
-                "completed_chars":index+1,"key_events":key_events,"reason_code":"frame_typing_deadline","reason":"typing deadline expired between frame characters; inspect before retrying"}));
-        }
+        Ok(Err(error)) => Ok(json!({
+            "status":"unknown",
+            "action":"type",
+            "source_frame_id":parts.0,
+            "dispatch_acknowledged":true,
+            "dispatch_may_have_occurred":true,
+            "reason_code":"frame_text_transaction_uncertain",
+            "reason":format!("frame text transaction delivery or readback is uncertain; inspect before retrying: {error}"),
+            "next_action":"Inspect the frame editor read-only; do not replay the text transaction."
+        })),
+        Err(_) => Ok(json!({
+            "status":"unknown",
+            "action":"type",
+            "source_frame_id":parts.0,
+            "dispatch_acknowledged":true,
+            "dispatch_may_have_occurred":true,
+            "reason_code":"frame_text_transaction_deadline",
+            "reason":"frame text transaction exceeded its deadline; inspect before retrying",
+            "next_action":"Inspect the frame editor read-only; do not replay the text transaction."
+        })),
     }
-    Ok(json!({"status":"verified","action":"type","typing_mode":mode,"input_method":"frame_key_events","completed_chars":character_count,
-        "key_events":key_events,"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"readback":progress}))
 }
 
 async fn swipe_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
@@ -13395,7 +13413,6 @@ async fn key_type(
             .consumed = true;
     }
     let mut dispatch_count = 0_u64;
-    let mut mutation_dispatched = false;
     let bridge_fast_type = matches!(
         shared.connection.as_ref(),
         Some(super::super::PageSessionTransport::Shared(_))
@@ -13441,65 +13458,70 @@ async fn key_type(
                 "reason_code":result["reason"],"fast_type_receipt":result}),
             );
         }
-    } else if policy.mode == crate::v3::TypingMode::HumanKeys && bridge_fast_type {
-        for character in text.chars() {
-            let connection = shared.connection.as_ref().unwrap();
-            let result = tokio::time::timeout_at(deadline, connection.command(
-                shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.humanTypeCharacter",
-                json!({"object_id":snapshot.object_id,"index":index,"expected":progress,
-                    "character":character.to_string(),"normalize_paragraphs":rich_editor,
-                    "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1, 60_000) as u64}),
-            )).await;
-            let result = match result {
-                Ok(Ok(value)) => match shared_extension_value(&value) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        return Ok(
-                            json!({"status":"unknown","action":"type","dispatch_acknowledged":true,
-                        "reason":"human-key character transaction returned an invalid receipt; inspect before retrying","detail":error.to_string()}),
-                        );
-                    }
-                },
-                Ok(Err(error)) => {
-                    return Ok(
-                        json!({"status":"unknown","action":"type","dispatch_acknowledged":true,
-                    "dispatch_may_have_occurred":true,"reason":format!("human-key character transaction is uncertain; inspect before retrying: {error}")}),
-                    );
-                }
-                Err(_) => {
-                    return Ok(
-                        json!({"status":"unknown","action":"type","dispatch_acknowledged":true,
-                    "dispatch_may_have_occurred":true,"reason":"human-key character transaction exceeded its deadline; inspect before retrying"}),
-                    );
-                }
-            };
-            dispatch_count =
-                dispatch_count.saturating_add(result["key_events"].as_u64().unwrap_or_default());
-            mutation_dispatched |= result["dispatches"].as_u64().unwrap_or_default() > 0
-                || result["key_events"].as_u64().unwrap_or_default() > 0;
-            if result["status"] != "verified" {
-                return Ok(
-                    json!({"status":result["status"],"action":"type","dispatch_acknowledged":mutation_dispatched,
-                    "dispatch_may_have_occurred":mutation_dispatched,"completed_chars":result["completed_chars"],
-                    "cleanup_status":result["reason"],"human_key_receipt":result}),
-                );
+    } else if matches!(
+        policy.mode,
+        crate::v3::TypingMode::HumanKeys | crate::v3::TypingMode::Ime
+    ) && bridge_fast_type
+    {
+        use crate::v3_execution::typing::{
+            PublicTypingMode, TransactionTarget, compact_transaction_receipt,
+            extension_transaction_payload,
+        };
+        let mode = if policy.mode == crate::v3::TypingMode::HumanKeys {
+            PublicTypingMode::HumanKeys
+        } else {
+            PublicTypingMode::Ime
+        };
+        let connection = shared.connection.as_ref().unwrap();
+        let payload = extension_transaction_payload(
+            &TransactionTarget::Object {
+                object_id: snapshot.object_id.clone(),
+                index,
+            },
+            &progress,
+            &text,
+            mode,
+            policy.delay_ms.min(250) as u16,
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .clamp(1, 600_000) as u64,
+        );
+        let result = tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                shared.registry()?,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Controlla.typeTextTransaction",
+                payload,
+            ),
+        )
+        .await;
+        let receipt = match result {
+            Ok(Ok(value)) => shared_extension_value(&value).map_err(invalid)?,
+            Ok(Err(error)) => {
+                return Ok(json!({
+                    "status":"unknown","action":"type","dispatch_acknowledged":true,
+                    "dispatch_may_have_occurred":true,
+                    "reason_code":"text_transaction_uncertain",
+                    "reason":format!("text transaction delivery or readback is uncertain; inspect before retrying: {error}"),
+                    "next_action":"Inspect the field read-only; do not replay the whole text transaction."
+                }));
             }
-            progress = result["readback"].as_str().unwrap_or(&progress).to_owned();
-            if policy.delay_ms > 0
-                && tokio::time::timeout_at(
-                    deadline,
-                    tokio::time::sleep(Duration::from_millis(policy.delay_ms)),
-                )
-                .await
-                .is_err()
-            {
-                return Ok(
-                    json!({"status":"unknown","action":"type","dispatch_acknowledged":true,
-                    "dispatch_may_have_occurred":true,"completed_chars":dispatch_count,
-                    "reason":"typing deadline expired between human-key character transactions; inspect before retrying"}),
-                );
+            Err(_) => {
+                return Ok(json!({
+                    "status":"unknown","action":"type","dispatch_acknowledged":true,
+                    "dispatch_may_have_occurred":true,
+                    "reason_code":"text_transaction_deadline",
+                    "reason":"text transaction exceeded its deadline; inspect before retrying",
+                    "next_action":"Inspect the field read-only; do not replay the whole text transaction."
+                }));
             }
-        }
+        };
+        dispatch_count = receipt["input_commands"].as_u64().unwrap_or_default();
+        let _ = dispatch_count;
+        return Ok(compact_transaction_receipt(&receipt, mode));
     } else {
         for character in text.chars() {
             let mut attempts = 0;
