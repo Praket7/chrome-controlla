@@ -214,6 +214,7 @@ pub fn compact_transaction_receipt(receipt: &serde_json::Value, mode: PublicTypi
         "adapter": receipt["adapter"],
         "reason_code": receipt["reason"],
         "interruption": receipt["interruption"],
+        "interference_rebased": receipt["interference_rebased"],
         "next_action": if status == "unknown" {
             serde_json::Value::from("Inspect the field read-only; do not replay the whole text transaction.")
         } else if status == "not_dispatched" {

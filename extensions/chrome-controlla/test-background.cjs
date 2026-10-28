@@ -136,6 +136,7 @@ let frameFillMockEvidence;
 let frameHumanTypeGuardResults = [];
 let transactionFixtureValue = "old";
 let transactionFixtureReplacePending = false;
+let transactionFocusStealOnce = false;
 let childFrameLoaderId = "fixture-loader";
 let navigateFrameDuringFileReadback = false;
 let fileReadbackEmpty = false;
@@ -593,6 +594,10 @@ const chrome = {
       if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 92 ? "fixture-frame-textbox" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")) return { result: { value: frameHumanTypeGuardResults.shift() || { ok: true } } };
       if (method === "Runtime.callFunctionOn" && ["fixture-frame-textbox", "fixture-root-textbox"].includes(params?.objectId) && params?.functionDeclaration?.startsWith("function(expectedKind")) {
+        if (transactionFocusStealOnce) {
+          transactionFocusStealOnce = false;
+          return { result: { value: { ok: false, reason: "focus_or_selection_changed", value: transactionFixtureValue, length: transactionFixtureValue.length, rich: true, focused: false } } };
+        }
         const kind = params.arguments?.[0]?.value;
         const expected = params.arguments?.[1]?.value;
         const operation = params.arguments?.[3]?.value;
@@ -1683,6 +1688,20 @@ async function waitFor(predicate, description) {
   assert.ok(debuggerCalls.slice(oopifImeStart).some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.imeSetComposition"),
     "OOPIF IME composes in the owning child target");
   assert.equal(transactionFixtureValue, "oldこんにちは");
+  // A single benign focus drift before dispatch is rebased once; no input is
+  // replayed and the final receipt states that recovery happened.
+  transactionFixtureValue = "old";
+  transactionFocusStealOnce = true;
+  native.hostMessage({ type: "command", id: "root-focus-rebased", target_id: "41", method: "Controlla.typeTextTransaction", params: {
+    object_id: "fixture-root-textbox",
+    expected: { kind: "exact_value", value: "old" }, operation: "append", text: "ok",
+    strategy: "insert_text", chunk_chars: 8, verify_every_chunks: 1, pacing_ms: 0, deadline_ms: 30000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const rebased = native.sent.findLast(message => message.id === "root-focus-rebased")?.result;
+  assert.equal(rebased?.status, "verified", JSON.stringify(rebased));
+  assert.equal(rebased?.interference_rebased, true, "one benign focus drift is rebased before dispatch");
+  assert.equal(transactionFixtureValue, "oldok");
   const transactionCounters = backgroundContext.__testHooks.executionCounters();
   assert.equal(transactionCounters.auto_attach_calls, 0, "auto-attach stays warm across transactions");
   assert.equal(transactionCounters.frame_tree_reads, 0, "frame tree reads are recovery-only when warm");

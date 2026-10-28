@@ -220,6 +220,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
       readback_hash: typeof lastReadback === "string" ? hashText(lastReadback) : null,
       dispatch_may_have_occurred: dispatchMayHaveOccurred,
       interruption: extra.interruption ?? null,
+      interference_rebased: extra.interference_rebased === true,
       frame_id: transaction.frameId,
       loader_id: transaction.loaderId,
       session_id: resolved?.sessionId ?? null,
@@ -238,10 +239,21 @@ export async function typeTextTransaction(tabId, params, ctx) {
     const firstValue = transaction.expected.kind === "unchecked"
       ? { kind: "unchecked", value: "" }
       : { kind: transaction.expected.kind, value: transaction.expected.value ?? "", anchor: transaction.expected.anchor ?? null };
-    const before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true);
+    let before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true);
+    let interferenceRebased = false;
+    if (before.ok !== true && before.reason === "focus_or_selection_changed" && !dispatchMayHaveOccurred) {
+      // Benign focus drift before any input: re-prepare the same target once.
+      // A changed value or replaced target is never overwritten.
+      before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true);
+      interferenceRebased = before.ok === true;
+    }
     cdpCommands = ctx.commandCount() - commandStart;
     if (before.ok !== true) {
-      return finish({ status: "not_dispatched", reason: before.reason ?? "editor_guard_rejected" });
+      return finish({
+        status: "not_dispatched",
+        reason: before.reason ?? "editor_guard_rejected",
+        interference: { reason: before.reason ?? "editor_guard_rejected", phase: "preflight", attempts: interferenceRebased ? 2 : 1 },
+      });
     }
     prepared = true;
     lastReadback = before.value;
@@ -380,7 +392,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
     }
     lastReadback = final.value;
     return {
-      ...finish({ status: "verified", backend, chunks: chunks.length }),
+      ...finish({ status: "verified", backend, chunks: chunks.length, interference_rebased: interferenceRebased }),
       adapter: adapter.id,
       adapter_qualified: adapter.qualified === true,
       completed_chars: codePointLength(transaction.text),
