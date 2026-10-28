@@ -18,7 +18,11 @@ impl Default for ControlFlowLimits {
     }
 }
 
-pub fn validate_loop(items: usize, nesting: usize, limits: ControlFlowLimits) -> Result<(), &'static str> {
+pub fn validate_loop(
+    items: usize,
+    nesting: usize,
+    limits: ControlFlowLimits,
+) -> Result<(), &'static str> {
     if items == 0 || items > limits.max_foreach_items {
         return Err("foreach requires 1..=32 concrete items");
     }

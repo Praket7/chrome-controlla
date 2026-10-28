@@ -1266,6 +1266,38 @@ mod tests {
                 "secure-input.js",
                 include_bytes!("../../../extensions/chrome-controlla/secure-input.js"),
             ),
+            (
+                "lib/transport.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/transport.js"),
+            ),
+            (
+                "lib/frame-tree.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/frame-tree.js"),
+            ),
+            (
+                "lib/debugger-sessions.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/debugger-sessions.js"),
+            ),
+            (
+                "lib/input.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/input.js"),
+            ),
+            (
+                "lib/editor-adapters.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/editor-adapters.js"),
+            ),
+            (
+                "lib/observation.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/observation.js"),
+            ),
+            (
+                "lib/pointer.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/pointer.js"),
+            ),
+            (
+                "lib/tab-control.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/tab-control.js"),
+            ),
         ];
         let extension_source = include_str!("../../../extensions/chrome-controlla/background.js");
         let asset_declaration = extension_source

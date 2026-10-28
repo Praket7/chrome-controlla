@@ -102,7 +102,6 @@ pub fn compile_transaction(
     )
 }
 
-
 pub fn operation_label(operation: InputOperation) -> &'static str {
     match operation {
         InputOperation::Replace => "replace",
@@ -137,7 +136,10 @@ pub fn receipt_is_verified(receipt: &serde_json::Value) -> bool {
 
 #[derive(Clone, Debug)]
 pub enum TransactionTarget {
-    Object { object_id: String, index: usize },
+    Object {
+        object_id: String,
+        index: usize,
+    },
     Frame {
         frame_id: String,
         loader_id: String,
@@ -192,7 +194,10 @@ pub fn extension_transaction_payload(
     payload
 }
 
-pub fn compact_transaction_receipt(receipt: &serde_json::Value, mode: PublicTypingMode) -> serde_json::Value {
+pub fn compact_transaction_receipt(
+    receipt: &serde_json::Value,
+    mode: PublicTypingMode,
+) -> serde_json::Value {
     let status = receipt["status"].as_str().unwrap_or("unknown");
     serde_json::json!({
         "status": status,
@@ -238,10 +243,22 @@ mod tests {
 
     #[test]
     fn public_modes_map_to_one_backend_and_pace() {
-        assert_eq!(backend_for_mode(PublicTypingMode::Block), InputBackend::InsertText);
-        assert_eq!(backend_for_mode(PublicTypingMode::FastKeys), InputBackend::KeyEvents);
-        assert_eq!(backend_for_mode(PublicTypingMode::HumanKeys), InputBackend::KeyEvents);
-        assert_eq!(backend_for_mode(PublicTypingMode::Ime), InputBackend::ImeComposition);
+        assert_eq!(
+            backend_for_mode(PublicTypingMode::Block),
+            InputBackend::InsertText
+        );
+        assert_eq!(
+            backend_for_mode(PublicTypingMode::FastKeys),
+            InputBackend::KeyEvents
+        );
+        assert_eq!(
+            backend_for_mode(PublicTypingMode::HumanKeys),
+            InputBackend::KeyEvents
+        );
+        assert_eq!(
+            backend_for_mode(PublicTypingMode::Ime),
+            InputBackend::ImeComposition
+        );
         assert_eq!(
             pace_for_mode(PublicTypingMode::HumanKeys, 999),
             InputPace::Human { delay_ms: 250 }
@@ -260,22 +277,26 @@ mod tests {
         .unwrap();
         assert_eq!(transaction.backend, InputBackend::InsertText);
         assert_eq!(transaction.chunk_chars, DEFAULT_CHUNK_CHARS);
-        assert!(compile_transaction(
-            PublicTypingMode::Auto,
-            InputOperation::Append,
-            InputExpectation::Unchecked,
-            "",
-            0,
-        )
-        .is_err());
-        assert!(compile_transaction(
-            PublicTypingMode::HumanKeys,
-            InputOperation::Append,
-            InputExpectation::Unchecked,
-            "bad\u{0001}",
-            0,
-        )
-        .is_err());
+        assert!(
+            compile_transaction(
+                PublicTypingMode::Auto,
+                InputOperation::Append,
+                InputExpectation::Unchecked,
+                "",
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            compile_transaction(
+                PublicTypingMode::HumanKeys,
+                InputOperation::Append,
+                InputExpectation::Unchecked,
+                "bad\u{0001}",
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

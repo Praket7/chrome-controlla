@@ -1,3 +1,4 @@
+pub mod action_recovery;
 pub mod apps;
 pub mod artifacts;
 pub mod browser_contract;
@@ -25,7 +26,6 @@ pub mod metrics;
 pub mod native_host;
 pub mod native_setup;
 pub mod network_acceleration;
-pub mod action_recovery;
 pub mod observation_router;
 pub mod page_action_memory;
 pub mod page_tool_schema;

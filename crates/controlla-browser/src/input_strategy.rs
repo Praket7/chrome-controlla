@@ -178,15 +178,17 @@ pub fn select_backend(
             } else {
                 InputBackend::InsertText
             }),
-            chunk_chars: if input.requires_trusted_events { 32 } else { 256 },
+            chunk_chars: if input.requires_trusted_events {
+                32
+            } else {
+                256
+            },
             verify_every_chunks: 1,
             requires_app_adapter: false,
         };
     }
     match mode {
-        InputMode::Fast | InputMode::Auto
-            if input.ordinary_text_control && !input.insertion =>
-        {
+        InputMode::Fast | InputMode::Auto if input.ordinary_text_control && !input.insertion => {
             StrategyDecision {
                 backend: Some(InputBackend::NativeSetter),
                 chunk_chars: input.value_length.max(1),
@@ -194,9 +196,7 @@ pub fn select_backend(
                 requires_app_adapter: false,
             }
         }
-        InputMode::Fast | InputMode::Auto
-            if input.ordinary_text_control && input.insertion =>
-        {
+        InputMode::Fast | InputMode::Auto if input.ordinary_text_control && input.insertion => {
             StrategyDecision {
                 backend: Some(if input.value_length > 4096 {
                     InputBackend::ChunkedInsert
@@ -238,28 +238,55 @@ pub fn compile_transaction(
     operation: InputOperation,
     expected: InputExpectation,
     text: &str,
-    _input: InputCharacteristics,
+    input: InputCharacteristics,
     delay_ms: u16,
 ) -> Result<InputTransaction, &'static str> {
     if text.is_empty() || text.len() > 16_384 {
         return Err("typing text must contain 1..=16384 bytes");
     }
     if mode == PublicTypingMode::HumanKeys
-        && text.chars().any(|character| character.is_control() && character != '\n')
+        && text
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
     {
         return Err("HumanKeys does not support control characters other than normalized newline");
     }
     let decision = match mode {
-        PublicTypingMode::Block => StrategyDecision {
-            backend: Some(InputBackend::InsertText),
-            chunk_chars: 256,
-            verify_every_chunks: 1,
-            requires_app_adapter: false,
-        },
+        PublicTypingMode::Block => {
+            // NativeSetter replaces the whole value, so it is only valid for
+            // Replace. Append and caret insertion must preserve existing text.
+            let ordinary_plain_control = operation == InputOperation::Replace
+                && input.ordinary_text_control
+                && !input.contenteditable
+                && !input.requires_trusted_events;
+            if ordinary_plain_control {
+                StrategyDecision {
+                    backend: Some(InputBackend::NativeSetter),
+                    chunk_chars: text.chars().count().max(1),
+                    verify_every_chunks: 1,
+                    requires_app_adapter: false,
+                }
+            } else {
+                StrategyDecision {
+                    backend: Some(InputBackend::InsertText),
+                    chunk_chars: 256,
+                    verify_every_chunks: 1,
+                    requires_app_adapter: false,
+                }
+            }
+        }
         PublicTypingMode::FastKeys | PublicTypingMode::HumanKeys => StrategyDecision {
             backend: Some(InputBackend::KeyEvents),
-            chunk_chars: if mode == PublicTypingMode::HumanKeys { 8 } else { 32 },
-            verify_every_chunks: if mode == PublicTypingMode::HumanKeys { 1 } else { 4 },
+            chunk_chars: if mode == PublicTypingMode::HumanKeys {
+                8
+            } else {
+                32
+            },
+            verify_every_chunks: if mode == PublicTypingMode::HumanKeys {
+                1
+            } else {
+                4
+            },
             requires_app_adapter: false,
         },
         PublicTypingMode::Ime => StrategyDecision {
@@ -414,7 +441,7 @@ mod tests {
         for (mode, backend) in cases {
             let transaction = compile_transaction(
                 mode,
-                InputOperation::Append,
+                InputOperation::Replace,
                 InputExpectation::ExactValue("old".into()),
                 "café\n🙂",
                 characteristics(),
@@ -425,15 +452,29 @@ mod tests {
             assert!(transaction.chunk_chars >= 1);
             assert!(transaction.verify_every_chunks >= 1);
         }
-        assert!(compile_transaction(
+        // NativeSetter replaces the whole value, so an append through Block must
+        // use InsertText to preserve existing text.
+        let append = compile_transaction(
             PublicTypingMode::Block,
             InputOperation::Append,
-            InputExpectation::Unchecked,
-            "",
+            InputExpectation::ExactValue("old".into()),
+            "café\n🙂",
             characteristics(),
             0,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(append.backend, InputBackend::InsertText);
+        assert!(
+            compile_transaction(
+                PublicTypingMode::Block,
+                InputOperation::Append,
+                InputExpectation::Unchecked,
+                "",
+                characteristics(),
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

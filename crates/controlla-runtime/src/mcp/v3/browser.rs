@@ -59,10 +59,19 @@ mod tests {
     #[test]
     fn six_tools_and_compatibility_actions_classify() {
         assert_eq!(classify_action("task"), Some(BrowserRequestKind::Task));
-        assert_eq!(classify_action("snapshot"), Some(BrowserRequestKind::Snapshot));
+        assert_eq!(
+            classify_action("snapshot"),
+            Some(BrowserRequestKind::Snapshot)
+        );
         assert_eq!(classify_action("act"), Some(BrowserRequestKind::Act));
-        assert_eq!(classify_action("workflow"), Some(BrowserRequestKind::Workflow));
-        assert_eq!(classify_action("extract"), Some(BrowserRequestKind::Extract));
+        assert_eq!(
+            classify_action("workflow"),
+            Some(BrowserRequestKind::Workflow)
+        );
+        assert_eq!(
+            classify_action("extract"),
+            Some(BrowserRequestKind::Extract)
+        );
         assert_eq!(classify_action("verify"), Some(BrowserRequestKind::Verify));
         assert_eq!(classify_action("unknown"), None);
         assert!(action_is_read_only(BrowserRequestKind::Snapshot));

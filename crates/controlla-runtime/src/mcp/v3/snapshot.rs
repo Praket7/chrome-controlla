@@ -28,8 +28,15 @@ impl Default for ObservationRequest {
 impl ObservationRequest {
     pub fn bounded(mut self) -> Self {
         self.byte_budget = self.byte_budget.clamp(4_096, 256_000);
-        if self.query.as_ref().is_some_and(|query| query.chars().count() > 512) {
-            self.query = self.query.take().map(|query| query.chars().take(512).collect());
+        if self
+            .query
+            .as_ref()
+            .is_some_and(|query| query.chars().count() > 512)
+        {
+            self.query = self
+                .query
+                .take()
+                .map(|query| query.chars().take(512).collect());
         }
         if self.required_roles.len() > 32 {
             self.required_roles.truncate(32);
@@ -63,10 +70,12 @@ mod tests {
     #[test]
     fn delta_requires_a_prior_snapshot() {
         assert!(!ObservationRequest::default().wants_delta());
-        assert!(ObservationRequest {
-            since_snapshot_id: Some("snap-1".into()),
-            ..ObservationRequest::default()
-        }
-        .wants_delta());
+        assert!(
+            ObservationRequest {
+                since_snapshot_id: Some("snap-1".into()),
+                ..ObservationRequest::default()
+            }
+            .wants_delta()
+        );
     }
 }

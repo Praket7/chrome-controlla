@@ -43,7 +43,12 @@ mod tests {
     fn uncertain_mutations_never_suggest_replay() {
         let receipt = act_receipt("click", "unknown", false, true, Some("focus_changed"));
         assert_eq!(receipt["status"], "unknown");
-        assert!(receipt["next_action"].as_str().unwrap().contains("do not replay"));
+        assert!(
+            receipt["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("do not replay")
+        );
     }
 
     #[test]

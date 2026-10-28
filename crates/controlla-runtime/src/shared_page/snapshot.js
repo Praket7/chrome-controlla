@@ -272,7 +272,22 @@ function(q) {
     if (early_stopped || truncation_reason === 'scanned_nodes_exceeded' || truncation_reason === 'max_bytes' && !q.goal) break;
   }
   if (q.goal && items.length > 1) {
-    const ranked = items.map((item,index)=>({item,node:nodes[index],index})).sort((a,b)=>(b.item.goal_score||0)-(a.item.goal_score||0)||a.index-b.index);
+    // Equal relevance is common for sibling story links. Prefer the fresher
+    // bounded <time> signal before falling back to DOM order so a "latest"
+    // goal does not rank an older article first merely because it appears first.
+    const recencyMinutes = node => {
+      const scope = node?.closest?.('article,li,[data-card]');
+      const time = scope?.querySelector?.('time');
+      const raw = (time?.getAttribute?.('datetime') || time?.textContent || '').trim();
+      const relative = /^(\d+)\s*(m|h|d|w)\b/i.exec(raw);
+      if (relative) {
+        const unit = {m:1,h:60,d:1440,w:10080}[relative[2].toLowerCase()];
+        return Number(relative[1]) * unit;
+      }
+      const instant = Date.parse(raw);
+      return Number.isFinite(instant) ? Date.now() - instant : null;
+    };
+    const ranked = items.map((item,index)=>({item,node:nodes[index],index})).sort((a,b)=>(b.item.goal_score||0)-(a.item.goal_score||0)||((recencyMinutes(a.node) ?? Number.MAX_SAFE_INTEGER)-(recencyMinutes(b.node) ?? Number.MAX_SAFE_INTEGER))||a.index-b.index);
     items.splice(0,items.length,...ranked.map(entry=>entry.item));
     nodes.splice(0,nodes.length,...ranked.map(entry=>entry.node));
     for (let i=0;i<items.length;i++) items[i].reference=q.token+':'+i;

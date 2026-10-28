@@ -266,13 +266,22 @@ mod tests {
             !script.contains("frame && e.tagName !== 'A'"),
             "non-link child-frame controls must reach the frame-local route"
         );
-        assert!(script.contains("const frame = e.ownerDocument === document"), "frame ownership remains checked");
+        assert!(
+            script.contains("const frame = e.ownerDocument === document"),
+            "frame ownership remains checked"
+        );
         assert!(
             script.contains("unsupported_renderer_surface"),
             "the actual unsafe-control predicate stays enforced with a precise reason"
         );
-        assert_eq!(GuardReason::UnsupportedControl.retry_class(), RetryClass::DoNotRetry);
-        assert_eq!(GuardReason::ReadOnly.retry_class(), RetryClass::RequiresUser);
+        assert_eq!(
+            GuardReason::UnsupportedControl.retry_class(),
+            RetryClass::DoNotRetry
+        );
+        assert_eq!(
+            GuardReason::ReadOnly.retry_class(),
+            RetryClass::RequiresUser
+        );
     }
 
     #[test]

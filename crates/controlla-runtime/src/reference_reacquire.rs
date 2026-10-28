@@ -149,23 +149,19 @@ pub fn reacquire_reference(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
         let rect_matched = expected.rect_bucket.is_some() && current_rect == expected.rect_bucket;
-        let ancestor_matched = expected.ancestor_id.is_some()
-            && current_ancestor == expected.ancestor_id;
-        let test_id_matched = expected.test_id.is_some()
-            && current_test_id == expected.test_id.as_deref();
-        let section_matched = expected.section.is_some()
-            && current_section == expected.section.as_deref();
+        let ancestor_matched =
+            expected.ancestor_id.is_some() && current_ancestor == expected.ancestor_id;
+        let test_id_matched =
+            expected.test_id.is_some() && current_test_id == expected.test_id.as_deref();
+        let section_matched =
+            expected.section.is_some() && current_section == expected.section.as_deref();
         // A control that moved to a different semantic ancestor is a different
         // target unless a stable test attribute proves that it is the same one.
-        let ancestor_conflict = expected
-            .ancestor_id
-            .as_deref()
-            .is_some_and(|expected| {
-                current_ancestor
-                    .as_deref()
-                    .is_some_and(|current| current != expected)
-            })
-            && !test_id_matched;
+        let ancestor_conflict = expected.ancestor_id.as_deref().is_some_and(|expected| {
+            current_ancestor
+                .as_deref()
+                .is_some_and(|current| current != expected)
+        }) && !test_id_matched;
         // Score deterministically. Textual identity is necessary for a
         // context rebind; geometry and ancestor context break ties between
         // otherwise identical repeated controls.

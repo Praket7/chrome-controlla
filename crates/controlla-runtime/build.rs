@@ -27,9 +27,14 @@ fn main() {
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let allowed_non_runtime_files = ["README.md", "test-background.cjs", "test-v3-batch.cjs", "lib"]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let allowed_non_runtime_files = [
+        "README.md",
+        "test-background.cjs",
+        "test-v3-batch.cjs",
+        "lib",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let actual_files = fs::read_dir(&extension_dir)
         .expect("read extension directory")
         .map(|entry| {

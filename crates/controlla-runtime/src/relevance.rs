@@ -94,7 +94,11 @@ pub fn filter_items_for_task(
         })
         .map(|(index, _)| index)
         .collect::<BTreeSet<_>>();
-    let mut selected = mandatory.iter().copied().take(limit).collect::<BTreeSet<_>>();
+    let mut selected = mandatory
+        .iter()
+        .copied()
+        .take(limit)
+        .collect::<BTreeSet<_>>();
     let mut output = mandatory.iter().copied().take(limit).collect::<Vec<_>>();
     let mut ranked = items
         .iter()

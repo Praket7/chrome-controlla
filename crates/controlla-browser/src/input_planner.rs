@@ -5,9 +5,8 @@
 //! callers that still need the old shape.
 
 pub use crate::input_strategy::{
-    InputBackend, InputExpectation, InputOperation, InputPace, InputTransaction,
-    PublicTypingMode, adapt_chunk_size, compile_transaction, select_backend,
-    select_input_strategy,
+    InputBackend, InputExpectation, InputOperation, InputPace, InputTransaction, PublicTypingMode,
+    adapt_chunk_size, compile_transaction, select_backend, select_input_strategy,
 };
 use crate::input_strategy::{InputCharacteristics, InputMode as CanonicalMode};
 
@@ -47,7 +46,9 @@ pub fn plan(text: &str, requires_trusted: bool, prefers_composition: bool) -> In
     };
     InputPlan {
         mode,
-        backend: decision.backend.unwrap_or(InputBackend::AppAdapter("unqualified".into())),
+        backend: decision
+            .backend
+            .unwrap_or(InputBackend::AppAdapter("unqualified".into())),
         chunk_size: decision.chunk_chars.max(1),
         delay_ms,
         verify_every_chunks: decision.verify_every_chunks.max(1),
@@ -116,7 +117,9 @@ pub fn transaction_action(transaction: &InputTransaction) -> super::input::Input
         (InputBackend::NativeSetter, InputOperation::Replace) => {
             super::input::InputAction::Fill(transaction.text.clone())
         }
-        (InputBackend::NativeSetter, _) => super::input::InputAction::Insert(transaction.text.clone()),
+        (InputBackend::NativeSetter, _) => {
+            super::input::InputAction::Insert(transaction.text.clone())
+        }
         (InputBackend::InsertText | InputBackend::ChunkedInsert, _) => {
             super::input::InputAction::Insert(transaction.text.clone())
         }
@@ -127,7 +130,9 @@ pub fn transaction_action(transaction: &InputTransaction) -> super::input::Input
             super::input::InputAction::ImeText(transaction.text.clone())
         }
         (InputBackend::ClipboardPaste, _) => super::input::InputAction::PasteInternalClipboard,
-        (InputBackend::AppAdapter(_), _) => super::input::InputAction::Insert(transaction.text.clone()),
+        (InputBackend::AppAdapter(_), _) => {
+            super::input::InputAction::Insert(transaction.text.clone())
+        }
     }
 }
 

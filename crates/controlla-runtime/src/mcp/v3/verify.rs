@@ -5,13 +5,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerifyPredicate {
-    TextPresent { text: String, scope: Option<String> },
-    ValueEquals { target: String, value: String },
-    UrlMatches { pattern: String },
-    Visible { target: String },
-    Hidden { target: String },
-    Selected { target: String },
-    AppState { adapter: String, state: serde_json::Value },
+    TextPresent {
+        text: String,
+        scope: Option<String>,
+    },
+    ValueEquals {
+        target: String,
+        value: String,
+    },
+    UrlMatches {
+        pattern: String,
+    },
+    Visible {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    Selected {
+        target: String,
+    },
+    AppState {
+        adapter: String,
+        state: serde_json::Value,
+    },
 }
 
 impl VerifyPredicate {
@@ -33,7 +50,9 @@ impl VerifyPredicate {
                 }
             }
             Self::UrlMatches { pattern } => {
-                if too_long(pattern) || !(pattern.starts_with("http://") || pattern.starts_with("https://")) {
+                if too_long(pattern)
+                    || !(pattern.starts_with("http://") || pattern.starts_with("https://"))
+                {
                     return Err("URL predicate must be a bounded http(s) pattern");
                 }
             }
@@ -58,31 +77,39 @@ mod tests {
 
     #[test]
     fn url_predicates_are_http_only() {
-        assert!(VerifyPredicate::UrlMatches {
-            pattern: "https://example.test/".into()
-        }
-        .bounded()
-        .is_ok());
-        assert!(VerifyPredicate::UrlMatches {
-            pattern: "javascript:alert(1)".into()
-        }
-        .bounded()
-        .is_err());
+        assert!(
+            VerifyPredicate::UrlMatches {
+                pattern: "https://example.test/".into()
+            }
+            .bounded()
+            .is_ok()
+        );
+        assert!(
+            VerifyPredicate::UrlMatches {
+                pattern: "javascript:alert(1)".into()
+            }
+            .bounded()
+            .is_err()
+        );
     }
 
     #[test]
     fn app_state_predicates_are_bounded() {
-        assert!(VerifyPredicate::AppState {
-            adapter: "generic".into(),
-            state: serde_json::json!({"saved": true}),
-        }
-        .bounded()
-        .is_ok());
-        assert!(VerifyPredicate::AppState {
-            adapter: "generic".into(),
-            state: serde_json::json!("x".repeat(70_000)),
-        }
-        .bounded()
-        .is_err());
+        assert!(
+            VerifyPredicate::AppState {
+                adapter: "generic".into(),
+                state: serde_json::json!({"saved": true}),
+            }
+            .bounded()
+            .is_ok()
+        );
+        assert!(
+            VerifyPredicate::AppState {
+                adapter: "generic".into(),
+                state: serde_json::json!("x".repeat(70_000)),
+            }
+            .bounded()
+            .is_err()
+        );
     }
 }

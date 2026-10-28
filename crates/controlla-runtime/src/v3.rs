@@ -318,6 +318,26 @@ impl LeaseTable {
         Some(lease.clone())
     }
 
+    /// Renew a live shared read lease for its owner. Returns `None` once the
+    /// reader has expired or was released, so callers stop instead of resurrecting it.
+    pub fn renew_read(
+        &mut self,
+        target: &TargetKey,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Option<TargetReadLease> {
+        self.expire(now_ms);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(250, 120_000));
+        let expiry = self.readers.get_mut(target)?.get_mut(owner)?;
+        *expiry = expires_at_ms;
+        Some(TargetReadLease {
+            owner: owner.to_owned(),
+            acquired_at_ms: now_ms,
+            expires_at_ms,
+        })
+    }
+
     pub fn release(&mut self, target: &TargetKey, owner: &str) -> bool {
         if !self
             .leases
@@ -555,12 +575,16 @@ mod lease_recovery_tests {
             .acquire_read(target.clone(), "reader-b", 101, 5_000)
             .unwrap();
         assert!(
-            leases.acquire(target.clone(), "writer", 102, 5_000).is_err(),
+            leases
+                .acquire(target.clone(), "writer", 102, 5_000)
+                .is_err(),
             "a writer must wait for active readers"
         );
         assert!(leases.release_read(&target, "reader-a"));
         assert!(
-            leases.acquire(target.clone(), "writer", 103, 5_000).is_err(),
+            leases
+                .acquire(target.clone(), "writer", 103, 5_000)
+                .is_err(),
             "one remaining reader still fences the writer"
         );
         assert!(leases.release_read(&target, "reader-b"));
@@ -585,11 +609,17 @@ mod lease_recovery_tests {
             .unwrap();
         leases.expire(351);
         assert!(
-            leases.acquire(target.clone(), "writer", 352, 5_000).is_err(),
+            leases
+                .acquire(target.clone(), "writer", 352, 5_000)
+                .is_err(),
             "the still-live reader keeps the writer fenced"
         );
         leases.expire(5_101);
-        assert!(leases.acquire(target.clone(), "writer", 5_102, 5_000).is_ok());
+        assert!(
+            leases
+                .acquire(target.clone(), "writer", 5_102, 5_000)
+                .is_ok()
+        );
     }
 
     #[test]

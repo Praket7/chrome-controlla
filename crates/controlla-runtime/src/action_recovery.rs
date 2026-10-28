@@ -187,16 +187,14 @@ mod tests {
             let directive = directive_for(reason);
             assert!(!directive.class.is_internal(), "{reason:?}");
             assert_eq!(directive.max_attempts, 0);
-            assert_eq!(
-                decide(reason, 0),
-                RecoveryDecision::Stop(directive.class)
-            );
+            assert_eq!(decide(reason, 0), RecoveryDecision::Stop(directive.class));
         }
     }
 
     #[test]
     fn refusal_receipt_reports_recovery_without_mutating() {
-        let mut refusal = serde_json::json!({"status":"not_dispatched","dispatch_may_have_occurred":false});
+        let mut refusal =
+            serde_json::json!({"status":"not_dispatched","dispatch_may_have_occurred":false});
         attach_to_refusal(&mut refusal, GuardReason::OutsideViewport);
         assert_eq!(refusal["recovery"]["class"], "scroll_into_view");
         assert_eq!(refusal["recovery"]["max_attempts"], 2);

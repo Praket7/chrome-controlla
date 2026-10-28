@@ -9,13 +9,17 @@ use serde_json::json;
 fn mutation_can_verify_visibility_without_becoming_resumable() {
     let task: TaskPrimitive = serde_json::from_value(json!({"kind":"mutation","steps":[
         {"action":"verify_visible","reference":"@c1"}
-    ]})).unwrap();
-    assert!(matches!(&task.expand().unwrap()[0], ExpandedStep::VerifyVisible { reference } if reference == "@c1"));
+    ]}))
+    .unwrap();
+    assert!(
+        matches!(&task.expand().unwrap()[0], ExpandedStep::VerifyVisible { reference } if reference == "@c1")
+    );
     assert!(!task.is_resumable_fill_only());
     assert!(!task.is_resumable_with_postconditions());
     let invalid: TaskPrimitive = serde_json::from_value(json!({"kind":"mutation","steps":[
         {"action":"verify_visible","reference":"#selector"}
-    ]})).unwrap();
+    ]}))
+    .unwrap();
     assert!(invalid.expand().is_err());
 }
 
