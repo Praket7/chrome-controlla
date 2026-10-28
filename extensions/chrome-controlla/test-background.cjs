@@ -653,7 +653,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted };`, backgroundContext);
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted, executionCounters: executionCounterReceipt, resetExecutionCounters };`, backgroundContext);
 }
 runBackground();
 
@@ -1565,6 +1565,36 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.findLast(message => message.id === "oopif-human-type-stale-loader")?.result?.status, "not_dispatched");
   assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length, frameKeysBeforeStaleLoader, "stale child-frame identity refuses before key dispatch");
+  // Execution-core regression: one whole-text transaction for a child editor.
+  // This must not fall back to the per-character native bridge command.
+  backgroundContext.__testHooks.resetExecutionCounters();
+  const transactionStart = debuggerCalls.length;
+  const perCharacterNativeBefore = native.sent.filter(message => message.method === "Controlla.frameHumanTypeCharacter").length;
+  const transactionText = "T".repeat(1000);
+  identityAxNodes = [{ nodeId: "field", role: { value: "textbox" }, name: { value: "Document editor" }, backendDOMNodeId: 92 }];
+  native.hostMessage({ type: "command", id: "oopif-type-transaction", target_id: "41", method: "Controlla.typeTextTransaction", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92,
+    expected: { kind: "exact_value", value: "old" }, operation: "append", text: transactionText,
+    strategy: "auto", chunk_chars: 64, verify_every_chunks: 1, pacing_ms: 0, deadline_ms: 30000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const transactionReceipt = native.sent.findLast(message => message.id === "oopif-type-transaction")?.result;
+  assert.equal(transactionReceipt?.status, "verified", JSON.stringify(transactionReceipt));
+  assert.equal(transactionReceipt.completed_chars, 1000);
+  assert.ok(transactionReceipt.cdp_commands > 0 && transactionReceipt.cdp_commands <= 64,
+    "whole-text frame transaction keeps CDP work bounded, not O(text length)");
+  const transactionCalls = debuggerCalls.slice(transactionStart);
+  assert.equal(transactionCalls.filter(call => call.method === "Accessibility.getFullAXTree").length, 0,
+    "warm whole-text transaction does not re-read the full AX tree");
+  assert.equal(transactionCalls.filter(call => call.method === "Page.getFrameTree").length, 0,
+    "warm whole-text transaction uses the persistent frame registry");
+  assert.equal(transactionCalls.filter(call => call.method === "Target.setAutoAttach").length, 0,
+    "warm whole-text transaction never toggles auto-attach");
+  assert.equal(native.sent.filter(message => message.method === "Controlla.frameHumanTypeCharacter").length, perCharacterNativeBefore,
+    "no per-character native bridge call is issued");
+  const transactionCounters = backgroundContext.__testHooks.executionCounters();
+  assert.equal(transactionCounters.auto_attach_calls, 0, "auto-attach stays warm across transactions");
+  assert.equal(transactionCounters.frame_tree_reads, 0, "frame tree reads are recovery-only when warm");
   identityAxNodes = [];
   const frameInputCountBeforeInvalidUrl = debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length;
   for (const [index, url] of ["/relative-story", "javascript:alert(1)", "https://user:secret@example.test/", "https://example.test:bad", "https://[:::]/", "https://[gggg::1]/", " https://example.test/", `https://example.test/${"x".repeat(2048)}`].entries()) {

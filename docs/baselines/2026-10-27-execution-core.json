@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "label": "Pre-execution-core red baseline",
+  "captured_at": "2026-10-27",
+  "base_commit": "6f5f9728292965e93749a245cb73bae8e9460ace",
+  "source": "Benchmark contracts and the extension regression harness before the execution-core changes.",
+  "measurement_kind": "code-path-derived-and-red-test-observed",
+  "notes": [
+    "The child-frame HumanKeys path issues one Controlla.frameHumanTypeCharacter native command per character and re-reads Page.getFrameTree plus full AX state for every character.",
+    "The 1000-character transaction test is intentionally red at this commit; it asserts one native transaction, zero warm frame-tree reads, zero AX reads, and zero auto-attach toggles.",
+    "These are deterministic local baselines, not installed-Chrome or application qualification."
+  ],
+  "scenarios": {
+    "root_1000_char": {
+      "model_visible_calls": 1,
+      "native_host_commands": 1,
+      "cdp_commands_upper_bound": 4600,
+      "full_ax_reads": 0,
+      "frame_tree_reads": 0,
+      "auto_attach_calls": 0,
+      "input_commands_upper_bound": 3500,
+      "verification_reads_upper_bound": 1100,
+      "framework": "Controlla.fastType/humanTypeCharacter previously dispatched per character with an in-page guard before and after each key."
+    },
+    "child_frame_1000_char": {
+      "model_visible_calls": 1,
+      "native_host_commands": 1000,
+      "cdp_commands_upper_bound": 8000,
+      "full_ax_reads": 1000,
+      "frame_tree_reads": 2000,
+      "auto_attach_calls": 2000,
+      "input_commands_upper_bound": 3000,
+      "verification_reads_upper_bound": 3000,
+      "framework": "One native command per character, each revalidating frame tree, AX node, DOM node, focus, and toggling auto-attach."
+    },
+    "contenteditable_ime": {
+      "status": "unsupported-in-child-frames",
+      "model_visible_calls": 1,
+      "native_host_commands": 0,
+      "reason_code": "frame_ime_unsupported"
+    },
+    "same_tab_reads": {
+      "status": "exclusive-target-lease",
+      "model_visible_calls": 2,
+      "serialized": true
+    }
+  },
+  "red_tests": [
+    "extensions/chrome-controlla/test-background.cjs: oopif-type-transaction",
+    "crates/controlla-runtime/src/mcp/v3_full.rs: frame transaction route (added with Phase 4)"
+  ],
+  "recorded_metrics": [
+    "model_visible_calls",
+    "browser_commands",
+    "native_host_commands",
+    "cdp_commands",
+    "full_ax_reads",
+    "frame_tree_reads",
+    "target_rebinds",
+    "automatic_recoveries",
+    "user_visible_recoveries",
+    "application_accepted"
+  ]
+}

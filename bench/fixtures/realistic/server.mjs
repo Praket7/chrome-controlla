@@ -18,18 +18,18 @@ let queue=Promise.resolve();
 function serialized(fn){ const next=queue.then(fn);queue=next.catch(()=>{});return next; }
 
 const classes = new Map([
-  ['forms', ['registration-form','rich-editor-1000-char-fastkeys','slow-media-early-form']],
+  ['forms', ['registration-form','rich-editor-1000-char-fastkeys','slow-media-early-form','root-1000-char-transaction','contenteditable-ime-unicode']],
   ['extraction', ['structured-extraction','50k-node-targeted-control','newest-ranking-50-candidates','on-demand-frame-escalation']],
   ['multitab', ['two-tab-compare','eight-tab-pressure']],
-  ['spa', ['spa-document-change','stale-after-navigation']],
+  ['spa', ['spa-document-change','stale-after-navigation','service-worker-restart-between-observation-action']],
   ['visual_canvas', ['canvas-targeted-probe','seven-slide-capture-manifest']],
   ['virtual_list', ['virtual-list-find','virtual-list-1000-rows']],
   ['upload', ['guarded-upload','artifact-register-4mb','artifact-register-10mb']],
   ['repeated_workflow', ['repeat-qualified-flow','five-field-single-workflow']],
-  ['interference', ['human-edit-race','react-rerender-target']],
+  ['interference', ['human-edit-race','react-rerender-target','human-interference-rebase','same-tab-read-plus-mutation']],
   ['long_workflow', ['bounded-long-flow']],
-  ['concurrent_tabs', ['eight-tab-pressure']],
-  ['cross_origin_oopif', ['cross-site-oopif-target']],
+  ['concurrent_tabs', ['eight-tab-pressure','same-tab-concurrent-reads']],
+  ['cross_origin_oopif', ['cross-site-oopif-target','child-frame-1000-char-transaction']],
   ['download_upload', ['download-register-upload']],
 ]);
 
@@ -39,6 +39,8 @@ async function load() { try { const raw = JSON.parse(await readFile(statePath, '
 function json(res, status, value) { const body = JSON.stringify(value); res.writeHead(status, {'content-type':'application/json','content-length':Buffer.byteLength(body)}); res.end(body); }
 function page(taskId, fixture, scenario, extractionNonce) {
   const title = `Controlla Phase 11 · ${taskId}`;
+  const richScenario = /1000_char|ime_unicode/.test(scenario);
+  const interferenceScenario = /focus_scroll_rerender|human_interference/.test(scenario);
   const rows = Array.from({length: fixture === 'records-table' && scenario?.includes('50k') ? 50000 : 50}, (_, i) => `<tr><td>record-${i + 1}</td><td>${i % 2 ? 'older' : 'current'}</td>${taskId === 'structured-extraction' && i === 41 ? `<td>${extractionNonce}</td>` : ''}</tr>`).join('');
   const action = `Complete ${taskId}`;
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>body{font:16px system-ui;margin:32px}#scroll{height:220px;overflow:auto;border:1px solid #888}canvas{border:1px solid #888;width:500px;height:140px}label,button,input{margin:8px;padding:8px}iframe{width:400px;height:100px}</style></head><body>
@@ -50,12 +52,17 @@ function page(taskId, fixture, scenario, extractionNonce) {
 <canvas id="canvas" width="500" height="140"></canvas><button id="canvas-action">Probe canvas target</button>
 <div id="scroll">${Array.from({length:1000},(_,i)=>`<div class="row">virtual-row-${i+1}</div>`).join('')}</div>
 <input id="upload" type="file"><button id="upload-action">Register upload</button>
-<div id="editor" contenteditable="true">Editable benchmark content</div>
+<div id="editor" contenteditable="true" role="textbox" aria-label="Editable benchmark content">Editable benchmark content</div>
+<div id="ime-editor" contenteditable="true" role="textbox" aria-label="IME benchmark editor"></div>
+<label>Root text field <textarea id="root-editor-textarea" aria-label="Root editor textarea"></textarea></label>
+<iframe id="rich-child" title="child editor frame" src="/rich-editor-frame?task=${encodeURIComponent(taskId)}&scenario=${encodeURIComponent(scenario)}"></iframe>
 <iframe title="child frame" src="/frame?task=${encodeURIComponent(taskId)}"></iframe>
+<button id="focus-elsewhere" type="button">Focus elsewhere</button>
+<button id="rerender-target" type="button">Rerender target</button>
 <button id="complete" data-task="${taskId}">${action}</button><output id="status" aria-live="polite"></output>
 <script>
-const task=${JSON.stringify(taskId)}; const run=${JSON.stringify('RUN_PLACEHOLDER')}; const fixture=${JSON.stringify(fixture)};
-async function save(path,data){const r=await fetch(path+'?task='+encodeURIComponent(task)+'&run='+encodeURIComponent(run),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});document.querySelector('#status').textContent=r.ok?'Saved':'Save failed';}
+const task=${JSON.stringify(taskId)}; const run=${JSON.stringify('RUN_PLACEHOLDER')}; const fixture=${JSON.stringify(fixture)}; const scenario=${JSON.stringify(scenario)}; const richScenario=${JSON.stringify(richScenario || interferenceScenario)};
+async function save(path,data){const r=await fetch(path+'?task='+encodeURIComponent(task)+'&run='+encodeURIComponent(run),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});document.querySelector('#status').textContent=r.ok?'Saved':'Save failed';return r.ok;}
 async function event(kind, extra={}){document.querySelector('#status').textContent=kind; await fetch('/__event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({task_id:task,kind,fixture,...extra})});}
 document.querySelector('#registration-form').addEventListener('submit',e=>{e.preventDefault(); save('/accept/form',{name:document.querySelector('#name').value,notes:document.querySelector('#notes').value});});
 document.querySelector('#extract').onclick=()=>event('extracted',{count:1});
@@ -63,6 +70,10 @@ document.querySelector('#route').onclick=()=>{history.pushState({},'',location.p
 document.querySelector('#canvas-action').onclick=()=>event('canvas_probed');
 document.querySelector('#upload-action').onclick=async()=>{const f=document.querySelector('#upload').files[0];if(!f)return;const r=await fetch('/accept/upload?task='+encodeURIComponent(task)+'&run='+encodeURIComponent(run)+'&filename='+encodeURIComponent(f.name),{method:'POST',body:f});document.querySelector('#status').textContent=r.ok?'Upload saved':'Upload failed';};
 document.querySelector('#complete').onclick=()=>event('completed',{completed:true});
+document.querySelector('#focus-elsewhere').onclick=()=>document.querySelector('#name').focus();
+document.querySelector('#rerender-target').onclick=()=>{const field=document.querySelector('#name');const next=field.cloneNode(true);next.value=field.value;field.replaceWith(next);};
+for(const type of ['compositionstart','compositionupdate','compositionend','beforeinput','input'])document.querySelector('#ime-editor').addEventListener(type,e=>event('ime_'+type,{data:e.data??null}));
+if(richScenario){window.__controllaFixture={readRoot:()=>document.querySelector('#editor').innerText,readIme:()=>document.querySelector('#ime-editor').innerText,readChild:()=>document.querySelector('#rich-child').contentDocument?.querySelector('#child-editor')?.innerText??null,persistRoot:()=>save('/accept/editor',{kind:'editor',text:document.querySelector('#editor').innerText,length:document.querySelector('#editor').innerText.length})};}
 window.addEventListener('scroll',()=>event('scrolled',{scrollY:scrollY}));
 </script></body></html>`;
 }
@@ -86,13 +97,12 @@ const server = createServer(async (req,res) => {
     }
     return json(res,405,{ok:false});
   }
-  if(req.method==='POST' && url.pathname==='/__event') { await body(req);return json(res,202,{ok:true,diagnostic_only:true}); }
-  if(req.method==='POST' && ['/accept/form','/accept/upload'].includes(url.pathname)) {
+  if(req.method==='POST' && url.pathname==='/__event') { await body(req);return json(res,202,{ok:true,diagnostic_only:true}); }  if (req.method === 'POST' && ['/accept/form','/accept/upload','/accept/editor'].includes(url.pathname)) {
     const bytes=await body(req,url.pathname.endsWith('/form')?32768:12*1024*1024); const id=url.searchParams.get('task'); const run=url.searchParams.get('run');
     return await serialized(async()=>{
       const current=tasks.get(id);if(!current || current.run_id!==run)return json(res,409,{ok:false});
-      const kind=url.pathname.endsWith('/form')?'form':'upload';
-      const value=kind==='form'?{kind,...JSON.parse(bytes.toString())}:{kind,filename:url.searchParams.get('filename'),size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
+      const kind=url.pathname.endsWith('/form')?'form':url.pathname.endsWith('/editor')?'editor':'upload';
+      const value=kind==='form'?{kind,...JSON.parse(bytes.toString())}:kind==='editor'?{kind,...JSON.parse(bytes.toString())}:{kind,filename:url.searchParams.get('filename'),size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
       if(value.kind!==kind || !validAcceptance(value))return json(res,400,{ok:false});
       const next={...current,[kind]:value,persisted:true};tasks.set(id,next);
       try{await persist();}catch(error){tasks.set(id,{...current,persisted:false});return json(res,500,{ok:false});}
@@ -100,6 +110,7 @@ const server = createServer(async (req,res) => {
     });
   }
   if (req.method === 'GET' && url.pathname === '/frame') { const id=url.searchParams.get('task');if(!identifier(id))return json(res,400,{ok:false});return res.end(`<html><body><p>Independent child frame for ${id}</p></body></html>`); }
+  if (req.method === 'GET' && url.pathname === '/rich-editor-frame') { const id=url.searchParams.get('task');if(!identifier(id))return json(res,400,{ok:false});return res.end(`<html><body><div id="child-editor" contenteditable="true" role="textbox" aria-label="Child editor">${url.searchParams.get('scenario')?.includes('1000_char')?'':'Child editor ready'}</div><textarea id="child-textarea" aria-label="Child textarea"></textarea><script>window.__controllaFrameFixture={read:()=>document.querySelector('#child-editor').innerText};</script></body></html>`); }
   if (req.method === 'GET' && (url.pathname.startsWith('/fixture/') || ['registration-form','records-table','paired-tabs','spa-router','canvas-widget','virtual-list','file-input','workflow-suite','slide-deck'].includes(url.pathname.replace(/^\//,'')))) { const fixture=url.pathname.replace(/^\/|\/\$/g,'').replace(/^fixture\//,''); const taskId=url.searchParams.get('task') ?? fixture; if(!identifier(taskId)||!identifier(fixture))return json(res,400,{ok:false}); const current=taskState(taskId); return res.end(page(taskId, fixture, url.searchParams.get('scenario') ?? '', current.extraction_nonce ?? '').replace(JSON.stringify('RUN_PLACEHOLDER'),JSON.stringify(current.run_id??''))); }
   res.writeHead(404); res.end('not found');
  } catch { if(!res.headersSent)json(res,400,{ok:false,error:'invalid or oversized request'});else res.end(); }

@@ -7,7 +7,10 @@ export const REQUIRED_METRIC_EVIDENCE_FIELDS = [
   'tool_input_bytes','output_bytes','observation_bytes','screenshot_bytes','unknown_delivery_count',
   'fallback_count','retries','timeout_count','cleanup_completed','cleanup_outcome','recovery_events',
   'cache_status','verification_ms','cpu_ms','peak_rss_bytes','focus_disruptions',
-  'clipboard_disruptions','human_interventions'
+  'clipboard_disruptions','human_interventions','model_visible_calls','browser_commands',
+  'native_host_commands','cdp_commands','full_ax_reads','frame_tree_reads','target_rebinds',
+  'automatic_recoveries','user_visible_recoveries','application_accepted','input_commands',
+  'verification_reads','auto_attach_calls'
 ];
 
 export function median(values) {

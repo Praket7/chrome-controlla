@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlla IME fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    [contenteditable] { min-height: 100px; border: 1px solid #888; padding: 8px; }
+    output { display: block; margin-top: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>IME / contenteditable fixture</h1>
+  <div id="editor" contenteditable="true" role="textbox" aria-label="IME editor"></div>
+  <output id="receipt" aria-live="polite">idle</output>
+  <script>
+    const editor = document.getElementById('editor');
+    const receipt = document.getElementById('receipt');
+    const events = [];
+    for (const type of ['compositionstart', 'compositionupdate', 'compositionend', 'beforeinput', 'input']) {
+      editor.addEventListener(type, event => {
+        events.push({ type, data: event.data ?? null });
+        receipt.textContent = JSON.stringify(events);
+      });
+    }
+    window.__fixture = {
+      read() { return editor.innerText; },
+      events() { return events.slice(); }
+    };
+  </script>
+</body>
+</html>

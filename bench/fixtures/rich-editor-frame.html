@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlla child editor</title>
+  <style>
+    body { font: 14px system-ui; margin: 8px; }
+    [contenteditable] { min-height: 70px; border: 1px solid #666; padding: 6px; }
+    textarea { width: 100%; min-height: 56px; }
+  </style>
+</head>
+<body>
+  <div id="child-editor" contenteditable="true" role="textbox" aria-label="Child editor"></div>
+  <textarea id="child-textarea" aria-label="Child textarea"></textarea>
+  <script>
+    window.__fixture = {
+      read(id) {
+        const node = document.getElementById(id);
+        return node ? (node.innerText ?? node.value) : null;
+      }
+    };
+  </script>
+</body>
+</html>

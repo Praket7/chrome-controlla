@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlla rich editor / child frame fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    [contenteditable] { min-height: 80px; border: 1px solid #888; padding: 8px; margin: 8px 0; }
+    iframe { width: 520px; height: 220px; border: 1px solid #888; }
+    output { display: block; margin-top: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Rich editor transaction fixture</h1>
+  <label>Root editor
+    <div id="root-editor" contenteditable="true" role="textbox" aria-label="Root editor"></div>
+  </label>
+  <label>Root textarea
+    <textarea id="root-textarea" aria-label="Root textarea"></textarea>
+  </label>
+  <iframe id="child" title="Child editor frame" src="/rich-editor-frame.html"></iframe>
+  <output id="receipt" aria-live="polite">idle</output>
+  <script>
+    const receipt = document.querySelector('#receipt');
+    for (const id of ['root-editor', 'root-textarea']) {
+      const node = document.getElementById(id);
+      node.addEventListener('input', () => { receipt.textContent = `${id}:${node.innerText ?? node.value}`; });
+    }
+    window.__fixture = {
+      read(id) {
+        const node = document.getElementById(id);
+        return node ? (node.innerText ?? node.value) : null;
+      },
+      childDocument() {
+        return document.getElementById('child').contentDocument;
+      },
+      receipt() { return receipt.textContent; }
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlla human interference fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    label { display: block; margin: 8px 0; }
+    input, button { padding: 8px; }
+    #unrelated { margin-top: 16px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Human interference fixture</h1>
+  <label>Target <input id="target" aria-label="Target field" value=""></label>
+  <label>Elsewhere <input id="elsewhere" aria-label="Elsewhere field" value=""></label>
+  <button id="rerender" type="button">Rerender target</button>
+  <div id="unrelated">unrelated content</div>
+  <script>
+    const target = document.getElementById('target');
+    const unrelated = document.getElementById('unrelated');
+    document.getElementById('rerender').addEventListener('click', () => {
+      const replacement = target.cloneNode(true);
+      replacement.value = target.value;
+      target.replaceWith(replacement);
+      replacement.id = 'target';
+    });
+    setInterval(() => { unrelated.textContent = `unrelated content ${Date.now() % 1000}`; }, 25);
+    window.__fixture = {
+      target() { return document.getElementById('target'); },
+      value() { return document.getElementById('target')?.value ?? null; },
+      changeFocus() { document.getElementById('elsewhere').focus(); },
+      appendElsewhere(text) {
+        const field = document.getElementById('elsewhere');
+        field.value += text;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    };
+  </script>
+</body>
+</html>
