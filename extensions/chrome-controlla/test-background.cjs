@@ -665,6 +665,8 @@ assert.match(backgroundSource, /clearFrameSessions\(tabId\)/,
   "frame inventory is fenced when a target detaches");
 assert.match(backgroundSource, /Frame inventory target topology changed during parallel document reads/,
   "parallel frame inventory discards reads after topology drift");
+assert.doesNotMatch(backgroundSource, /sendCdpCommand\([^\n]*"Input\.dispatch(?:Mouse|Touch|Drag)Event"/,
+  "root and frame pointer input share the single PointerEngine");
 const extensionBuildAssets = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js", ...extensionLibraryAssets];
 const extensionAssetBytes = new Map(extensionBuildAssets.map(name => [name, fs.readFileSync(new URL(`./${name}`, `file://${__filename}`))]));
 const expectedExtensionDigest = createHash("sha256");

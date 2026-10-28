@@ -2,6 +2,7 @@ import { createBoundedTransport } from "./lib/transport.js";
 import { FrameTreeRegistry } from "./lib/frame-tree.js";
 import { DebuggerSessionManager } from "./lib/debugger-sessions.js";
 import { typeTextTransaction } from "./lib/input.js";
+import { PointerEngine } from "./lib/pointer.js";
 import { semanticDelta, pruneSemanticItems } from "./lib/observation.js";
 
 let socket;
@@ -114,6 +115,7 @@ const debuggerSessions = new DebuggerSessionManager({
   attach: attachDebugger,
   detach: performDebuggerDetach,
 });
+const pointerEngine = new PointerEngine({ send: (target, method, params) => sendCdpCommand(target, method, params) });
 async function sendCdpCommand(target, method, params, timeoutMs = 30000) {
   const result = await cdpTransport.send(target, method, params, timeoutMs);
   if (method === "Page.getFrameTree" && Number.isSafeInteger(target?.tabId) && result?.frameTree) {
@@ -1726,7 +1728,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({ type:"result", id:request.id, result:{status:"not_dispatched",dispatch_acknowledged:false,reason_code:"final_target_revalidation_failed",reason:finalChecked?.reason || "Target or viewport changed before pointer input."} }); return;
         }
         const point = {x:finalChecked.x,y:finalChecked.y};
-        await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseMoved",...point});
+        await pointerEngine.move({tabId}, point);
         const button = clickKind === "context_click" ? "right" : "left";
         const clicks = clickKind === "double_click" ? 2 : 1;
         for (let clickCount = 1; clickCount <= clicks; clickCount++) {
@@ -1748,13 +1750,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           }
           activePress = {button, clickCount, ...point};
           pressAttempted = true;
-          await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mousePressed",...activePress});
-          await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress});
+          await pointerEngine.press({tabId}, activePress);
+          await pointerEngine.release({tabId}, activePress);
           activePress = undefined;
         }
         acknowledged = true;
       } catch (error) {
-        if (activePress) await sendCdpCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...activePress}).catch(() => {});
+        if (activePress) await pointerEngine.release({tabId}, activePress).catch(() => {});
         respond({ type:"result", id:request.id, result:{status:pressAttempted?"unknown":"not_dispatched",dispatch_acknowledged:false,reason_code:pressAttempted?"pointer_delivery_unknown":"pointer_dispatch_failed",reason:safeNativeError(String(error))} });
         return;
       } finally {
@@ -1809,14 +1811,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"swipe_target_changed_before_dispatch",dispatch_may_have_occurred:false}});return;
         }
         touchStartAttempted=true;
-        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:sx,y:sy,radiusX:1,radiusY:1,force:1}]});
-        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:ex,y:ey,radiusX:1,radiusY:1,force:1}]});
+        await pointerEngine.touchStart({tabId},{x:sx,y:sy});
+        await pointerEngine.touchMove({tabId},{x:ex,y:ey});
         dispatchAcknowledged=true;
       }catch(error){
         respond({type:"result",id:request.id,result:{status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"touch_delivery_unknown":"swipe_preflight_failed",dispatch_acknowledged:false,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))}});return;
       }finally{
         if(touchStartAttempted){
-          touchReleaseAcknowledged=await Promise.race([sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+          touchReleaseAcknowledged=await Promise.race([pointerEngine.touchEnd({tabId}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
         }
       }
       try{
@@ -1874,13 +1876,13 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"pinch_target_changed_before_dispatch",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
         touchStartAttempted=true;
-        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:points(startDistance)});
-        await sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:points(endDistance)});
+        await pointerEngine.touch({tabId},"touchStart",points(startDistance));
+        await pointerEngine.touch({tabId},"touchMove",points(endDistance));
         dispatchAcknowledged=true;
       } catch(error) {
         respond({type:"result",id:request.id,result:{status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"touch_delivery_unknown":"pinch_preflight_failed",dispatch_acknowledged:false,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))}});return;
       } finally {
-        if(touchStartAttempted) releaseAcknowledged=await Promise.race([sendCdpCommand({tabId},"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+        if(touchStartAttempted) releaseAcknowledged=await Promise.race([pointerEngine.touchEnd({tabId}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
       }
       if(!releaseAcknowledged){respond({type:"result",id:request.id,result:{status:"unknown",reason_code:"touch_release_unconfirmed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true}});return;}
       if(performance.now()>=deadline||!isAuthorized(tabId)||pairedTabDocumentIds.get(tabId)!==documentId||
@@ -1948,8 +1950,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"guard_deadline_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
         dispatchAttempted=true;
-        await sendCdpCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",x,y});
-        await sendCdpCommand({tabId},"Input.dispatchMouseEvent",{type:"mouseWheel",x,y,deltaX:dx,deltaY:dy});
+        await pointerEngine.wheel({tabId},{x,y},{deltaX:dx,deltaY:dy});
         dispatchAcknowledged=true;
         const afterRead=await sendCdpCommand({tabId},"Runtime.callFunctionOn",{objectId:containerId,
           functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
@@ -2081,9 +2082,8 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           const finalPoint=await rootPointForFrame(tabId,frameId,objectId,final.scalar("x"),final.scalar("y"),{width:final.scalar("width"),height:final.scalar("height")});
           const dispatchInfo=await currentFrame();
           if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||frameTreeRegistry.sessionForFrame(tabId, frameId)!==(frameSessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
-          await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",...finalPoint});
           wheelAttempted=true;
-          await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseWheel",...finalPoint,deltaX:dx,deltaY:dy});
+          await pointerEngine.wheel(root, finalPoint, {deltaX:dx,deltaY:dy});
           wheelAcknowledged=true;
           const afterRead=await sendCdpCommand(frameRoute,"Runtime.callFunctionOn",{objectId:containerId,functionDeclaration:"function(){return {connected:this.isConnected,left:this.scrollLeft,top:this.scrollTop}}",returnByValue:true});
           const after=afterRead.result?.value;
@@ -2360,10 +2360,8 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         // shortcut: CDP does not identify a chooser's initiating click; add causal page instrumentation if same-frame human interaction must be distinguished during dispatch.
         operation.eventCursor = fileChooserEventSequence;
         operation.pressing = true;
-        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
         pressAttempted = true;
-        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-        await sendCdpCommand(root, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+        await pointerEngine.click(root, { x, y });
         dispatched = true;
         const chooser = await waitForFileChooser(tabId, expectedDocumentId, 4000, operation.eventCursor);
         if (operation.conflicted || chooser.frame_id !== frameId || chooser.frame_loader_id !== loaderId || (await readFrame())?.loaderId !== loaderId || pairedTabDocumentIds.get(tabId) !== expectedDocumentId) throw new Error("File chooser belongs to another frame, document, or overlapping operation.");
@@ -2440,18 +2438,18 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (Math.abs(dispatchPoint.x - x) > 0.5 || Math.abs(dispatchPoint.y - y) > 0.5 || JSON.stringify(dispatchPoint.owner_signature) !== JSON.stringify(initialMapping.owner_signature) || await frameLoader() !== loaderId) throw new Error("Frame owner geometry changed before dispatch.");
         let pressAttempted = false;
         try {
-          if (inputMode === "mouse") await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", x, y });
+          if (inputMode === "mouse") await pointerEngine.move(route, { x, y }, { button: "none" });
           pressAttempted = true;
           if (inputMode === "touch") {
-            await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ id: 1, x, y, radiusX: 1, radiusY: 1, force: 1 }] });
-            await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+            await pointerEngine.touchStart(route, { x, y });
+            await pointerEngine.touchEnd(route);
           } else {
-            await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
-            await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+            await pointerEngine.press(route, { x, y });
+            await pointerEngine.release(route, { x, y });
           }
         } catch (error) {
-          if (pressAttempted && inputMode === "touch") await sendCdpCommand(route, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }).catch(() => {});
-          if (pressAttempted && inputMode === "mouse") await sendCdpCommand(route, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y }).catch(() => {});
+          if (pressAttempted && inputMode === "touch") await pointerEngine.touchEnd(route).catch(() => {});
+          if (pressAttempted && inputMode === "mouse") await pointerEngine.release(route, { x, y }).catch(() => {});
           respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, dispatch_acknowledged: false, dispatch_may_have_occurred: pressAttempted, verified: false, reason: String(error) } });
           return;
         }
@@ -2536,8 +2534,8 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const chainChanged=!sameChain(initialInfo,dispatchInfo),originChanged=!safeOrigins(dispatchInfo),identityChanged=!(await identityStillOwned());
         if(startChanged||endChanged||ownerChanged||chainChanged||originChanged||identityChanged)throw new Error(`Frame transform or document identity changed before trusted touch input (start=${startChanged}, end=${endChanged}, owner=${ownerChanged}, chain=${chainChanged}, origin=${originChanged}, identity=${identityChanged}).`);
         touchStartAttempted=true;
-        await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:finalStart.x,y:finalStart.y,radiusX:1,radiusY:1,force:1}]});
-        await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:finalEnd.x,y:finalEnd.y,radiusX:1,radiusY:1,force:1}]});
+        await pointerEngine.touchStart(root, {x:finalStart.x,y:finalStart.y});
+        await pointerEngine.touchMove(root, {x:finalEnd.x,y:finalEnd.y});
         dispatchAcknowledged=true;
         if(!sameChain(initialInfo,await currentInfo())||frameTreeRegistry.sessionForFrame(tabId, frameId)!==(sessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame identity changed after swipe dispatch.");
         const after=await guardCall("after",before.viewport);
@@ -2547,7 +2545,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       } catch(error) {
         receipt={status:touchStartAttempted?"unknown":"not_dispatched",reason_code:touchStartAttempted?"frame_swipe_delivery_unknown":"frame_swipe_preflight_refused",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:touchStartAttempted,reason:safeNativeError(String(error))};
       } finally {
-        if(touchStartAttempted)releaseAcknowledged=await Promise.race([sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
+        if(touchStartAttempted)releaseAcknowledged=await Promise.race([pointerEngine.touchEnd(root).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
         if(objectId&&child)await sendCdpCommand(child,"Runtime.releaseObject",{objectId}).catch(()=>{});
         /* auto-attach stays warm for the bound tab */
       }

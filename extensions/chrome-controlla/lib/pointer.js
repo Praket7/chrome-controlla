@@ -56,3 +56,73 @@ export function clickBackendLadder({ semanticEquivalent, trustedRequired, frameL
 export function touchPath(from, to, { steps = 6, maxSteps = 16 } = {}) {
   return interpolateDragPath(from, to, { steps, maxSteps });
 }
+
+// One trusted-input engine for root and child-frame routes. Callers own target
+// identity validation and receipts; this module owns event vocabulary,
+// ordering, interpolation, and release cleanup.
+export class PointerEngine {
+  constructor({ send } = {}) {
+    if (typeof send !== "function") throw new Error("send is required");
+    this.send = send;
+  }
+
+  async move(target, { x, y }, { button } = {}) {
+    const event = { type: "mouseMoved", x, y };
+    if (button) event.button = button;
+    return this.send(target, "Input.dispatchMouseEvent", event);
+  }
+
+  async press(target, { x, y, button = "left", clickCount = 1 }) {
+    return this.send(target, "Input.dispatchMouseEvent", { type: "mousePressed", button, clickCount, x, y });
+  }
+
+  async release(target, { x, y, button = "left", clickCount = 1 }) {
+    return this.send(target, "Input.dispatchMouseEvent", { type: "mouseReleased", button, clickCount, x, y });
+  }
+
+  async click(target, point, { button = "left", clickCount = 1, move = true } = {}) {
+    if (move) await this.move(target, point);
+    await this.press(target, { ...point, button, clickCount });
+    await this.release(target, { ...point, button, clickCount });
+  }
+
+  async wheel(target, point, { deltaX = 0, deltaY = 0 } = {}) {
+    await this.move(target, point, { button: "none" });
+    return this.send(target, "Input.dispatchMouseEvent", { type: "mouseWheel", x: point.x, y: point.y, deltaX, deltaY });
+  }
+
+  async touchStart(target, point) {
+    return this.send(target, "Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ id: 1, x: point.x, y: point.y, radiusX: 1, radiusY: 1, force: 1 }],
+    });
+  }
+
+  async touchMove(target, point) {
+    return this.send(target, "Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ id: 1, x: point.x, y: point.y, radiusX: 1, radiusY: 1, force: 1 }],
+    });
+  }
+
+  async touchEnd(target) {
+    return this.send(target, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  }
+
+  async touch(target, type, touchPoints) {
+    return this.send(target, "Input.dispatchTouchEvent", { type, touchPoints });
+  }
+
+  async swipe(target, from, to, { steps = 6 } = {}) {
+    await this.touchStart(target, from);
+    for (const point of touchPath(from, to, { steps })) await this.touchMove(target, point);
+    await this.touchEnd(target);
+  }
+
+  async drag(target, from, to, { steps = 8, button = "left" } = {}) {
+    await this.move(target, from);
+    await this.press(target, { ...from, button, clickCount: 1 });
+    for (const point of interpolateDragPath(from, to, { steps })) await this.move(target, point);
+    await this.release(target, { ...to, button, clickCount: 1 });
+  }
+}
