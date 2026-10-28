@@ -3681,6 +3681,37 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn parse_frame_reference<'a>(
+    reference: &'a str,
+    action: &str,
+) -> Result<(&'a str, &'a str, i64), rmcp::ErrorData> {
+    let parts = reference
+        .strip_prefix("@f:")
+        .unwrap_or_default()
+        .splitn(3, ':')
+        .collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts[0].is_empty()
+        || parts[0].len() > 256
+        || parts[1].is_empty()
+        || parts[1].len() > 256
+    {
+        return Err(invalid(format!(
+            "frame {action} requires a fresh @f:<frame>:<loader>:<backend-node> reference"
+        )));
+    }
+    let node = parts[2]
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            invalid(format!(
+                "frame {action} reference has an invalid backend node identity"
+            ))
+        })?;
+    Ok((parts[0], parts[1], node))
+}
+
 async fn fill_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
     let reference = args
         .reference
@@ -3765,6 +3796,117 @@ async fn fill_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, rm
             "reason":format!("frame fill delivery or readback became uncertain; inspect the field before retrying: {error}")}),
         ),
     }
+}
+
+async fn type_frame_reference(
+    app: &AppV3,
+    args: &V3ActArgs,
+    policy: crate::v3::TypingPolicy,
+) -> Result<Value, rmcp::ErrorData> {
+    let reference = args
+        .reference
+        .as_deref()
+        .ok_or_else(|| invalid("frame type requires a fresh frame reference"))?;
+    let parts = parse_frame_reference(reference, "type")?;
+    let expected = args.expected_value.as_deref().unwrap_or_default();
+    let text = normalize_key_text(args.value.as_deref().unwrap_or_default());
+    if text.is_empty() || expected.len().saturating_add(text.len()) > 16_384 {
+        return Err(invalid(
+            "frame typing requires nonempty text and final value <= 16384 bytes",
+        ));
+    }
+    if human_keys_control_character(&text).is_some() {
+        return Err(invalid(
+            "frame typing does not support control characters other than normalized newline",
+        ));
+    }
+    if policy.mode == crate::v3::TypingMode::Ime {
+        return Ok(json!({"status":"not_dispatched","action":"type","typing_mode":"ime","dispatch_may_have_occurred":false,
+            "reason_code":"frame_ime_unsupported","reason":"Composition input is not implemented for child-frame editors; use human_keys or fast_keys."}));
+    }
+    let shared = app
+        .core
+        .legacy
+        .shared_sessions
+        .lock()
+        .await
+        .get(&args.session_id)
+        .cloned()
+        .ok_or_else(|| invalid("unknown shared session"))?;
+    let shared = shared.lock().await;
+    if shared.handle.principal != app.core.legacy.principal.as_ref() {
+        return Err(invalid("session is not owned by this server principal"));
+    }
+    let connection = shared
+        .connection
+        .as_ref()
+        .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+    let mode = match policy.mode {
+        crate::v3::TypingMode::Block => "block",
+        crate::v3::TypingMode::FastKeys => "fast_keys",
+        crate::v3::TypingMode::HumanKeys => "human_keys",
+        crate::v3::TypingMode::Ime => unreachable!(),
+    };
+    let character_count = text.chars().count();
+    let timeout = Duration::from_millis(
+        args.timeout_ms
+            .unwrap_or_else(|| {
+                if policy.mode == crate::v3::TypingMode::HumanKeys {
+                    crate::v3::human_typing_timeout_ms(character_count, policy.delay_ms)
+                } else {
+                    30_000
+                }
+            })
+            .clamp(1_000, 600_000),
+    );
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut progress = expected.to_owned();
+    let mut key_events = 0_u64;
+    for (index, character) in text.chars().enumerate() {
+        let result = tokio::time::timeout_at(
+            deadline,
+            connection.command(
+                shared.registry()?,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Controlla.frameHumanTypeCharacter",
+                json!({"frame_id":parts.0,"loader_id":parts.1,"backend_node_id":parts.2,
+                    "expected":progress,"character":character.to_string(),"normalize_paragraphs":true,"prepare":index==0,
+                    "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1,60_000) as u64}),
+            ),
+        )
+        .await;
+        let receipt = match result {
+            Ok(Ok(response)) => super::super::shared_value(&response).map_err(invalid)?,
+            Ok(Err(error)) => return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,
+                "dispatch_may_have_occurred":true,"completed_chars":index,"reason_code":"frame_key_delivery_uncertain",
+                "reason":format!("frame character delivery is uncertain; inspect before retrying: {error}")})),
+            Err(_) => return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,
+                "dispatch_may_have_occurred":true,"completed_chars":index,"reason_code":"frame_key_deadline",
+                "reason":"frame character transaction exceeded its deadline; inspect before retrying"})),
+        };
+        key_events = key_events.saturating_add(receipt["key_events"].as_u64().unwrap_or_default());
+        if receipt["status"] != "verified" {
+            return Ok(json!({"status":receipt["status"],"action":"type","typing_mode":mode,"completed_chars":index,"key_events":key_events,
+                "dispatch_acknowledged":receipt["dispatch_may_have_occurred"]==true,"dispatch_may_have_occurred":receipt["dispatch_may_have_occurred"],
+                "reason_code":receipt["reason"],"frame_receipt":receipt}));
+        }
+        progress.push(character);
+        if policy.delay_ms > 0
+            && index + 1 < character_count
+            && tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(Duration::from_millis(policy.delay_ms)),
+            )
+            .await
+            .is_err()
+        {
+            return Ok(json!({"status":"unknown","action":"type","typing_mode":mode,"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,
+                "completed_chars":index+1,"key_events":key_events,"reason_code":"frame_typing_deadline","reason":"typing deadline expired between frame characters; inspect before retrying"}));
+        }
+    }
+    Ok(json!({"status":"verified","action":"type","typing_mode":mode,"input_method":"frame_key_events","completed_chars":character_count,
+        "key_events":key_events,"dispatch_acknowledged":true,"dispatch_may_have_occurred":true,"readback":progress}))
 }
 
 async fn swipe_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
@@ -12618,12 +12760,29 @@ async fn rich_editor_reference(app: &AppV3, args: &V3ActArgs, reference: &str) -
 
 fn direct_action_budget(args: &V3ActArgs) -> crate::v3::CommandBudget {
     let mut budget = crate::v3::CommandBudget::interactive_default();
-    if args.action == "type" && args.typing_mode.as_deref() == Some("human_keys") {
+    let frame_target = args.action == "type"
+        && args
+            .reference
+            .as_deref()
+            .is_some_and(|reference| reference.starts_with("@f:"));
+    let human_paced = args.typing_mode.as_deref() == Some("human_keys") || frame_target && args.typing_mode.is_none();
+    if args.action == "type" && (frame_target || human_paced) {
         let count = args.value.as_deref().unwrap_or_default().chars().count().min(16_384);
-        let pacing = crate::v3::human_typing_timeout_ms(count, args.delay_ms.unwrap_or(180).min(250));
+        let pacing = crate::v3::human_typing_timeout_ms(
+            count,
+            if human_paced {
+                args.delay_ms.unwrap_or(180).min(250)
+            } else {
+                0
+            },
+        );
         budget.max_wall_ms = args.timeout_ms.unwrap_or(pacing).clamp(1_000, 600_000);
-        budget.max_browser_commands = budget.max_browser_commands.max((count * 4 + 32) as u32);
-        budget.max_cdp_commands = budget.max_cdp_commands.max((count * 12 + 64) as u32);
+        budget.max_browser_commands = budget
+            .max_browser_commands
+            .max((count * (if frame_target { 6 } else { 4 }) + 32) as u32);
+        budget.max_cdp_commands = budget
+            .max_cdp_commands
+            .max((count * (if frame_target { 24 } else { 12 }) + 64) as u32);
     }
     budget
 }
@@ -17885,10 +18044,15 @@ impl AppV3 {
                 }
                 "type" => {
                     if args.reference.as_deref().is_some_and(|reference| reference.starts_with("@f:")) {
-                        return Ok(json!({"status":"not_dispatched","action":"type",
-                            "reason_code":"frame_key_typing_unsupported",
-                            "reason":"Key-event typing into child-frame references is not implemented; no input was dispatched.",
-                            "dispatch_may_have_occurred":false,"verified":false}));
+                        let text = args.value.as_deref().unwrap_or_default();
+                        let policy = typing_policy(
+                            Some(args.typing_mode.as_deref().unwrap_or("human_keys")),
+                            args.delay_ms,
+                            text,
+                            true,
+                        )
+                        .map_err(invalid)?;
+                        return type_frame_reference(self, &args, policy).await;
                     }
                     let required = requires_key_events(self, &args).await;
                     if background_mutation && !required && args.typing_mode.as_deref().unwrap_or("block") == "block" {
@@ -22732,7 +22896,8 @@ mod v3_batch_delivery_tests {
         lease_target_key, linked_date_frontier, mutation_skill_template,
         native_download_anchor_is_safe, native_download_lifecycle_receipt, next_visual_probe_limit,
         normalize_key_text, normalize_presentation_state, page_navigate_error,
-        page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable, parse_map_pan,
+        page_tool_completion, page_tool_snapshot_fresh, page_tool_unavailable,
+        parse_frame_reference, parse_map_pan,
         presentation_transition_matches, presentation_transition_stable,
         private_headless_task_is_supported, public_native_download_lifecycle,
         read_only_research_skill_steps, record_task_evidence, reject_research_extract,
@@ -22760,6 +22925,23 @@ mod v3_batch_delivery_tests {
         assert_eq!(human_keys_control_character("café🙂\n"), None);
         assert_eq!(human_keys_control_character("a\u{0001}b"), Some('\u{0001}'));
         assert_eq!(normalize_key_text("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn frame_editor_reference_binds_frame_loader_and_backend_node() {
+        assert_eq!(
+            parse_frame_reference("@f:frame:loader:92", "type").unwrap(),
+            ("frame", "loader", 92)
+        );
+        for malformed in [
+            "@c1:92",
+            "@f::loader:92",
+            "@f:frame::92",
+            "@f:frame:loader:0",
+            "@f:frame:loader:-1",
+        ] {
+            assert!(parse_frame_reference(malformed, "type").is_err(), "accepted malformed reference {malformed}");
+        }
     }
 
     #[test]

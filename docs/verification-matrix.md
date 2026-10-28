@@ -1057,6 +1057,19 @@ A 30-pair warm synthetic collector comparison and five collector regressions cov
 
 The isolated simulated-extension shared-download fixture passed with identity/epoch batching at both guard points and exact downloaded bytes. The adapter, configured-suite and pilot checks passed 33 Node tests. Earlier real form smokes failed; a later Codex-host form smoke with a temporary shim to the installed pinned Playwright package passed actor completion and independent persisted-state readback. This does not qualify the installed Controlla extension or a paired baseline. Browser and model network access are unrestricted during these probes.
 
+### 2026-10-27 web writing route
+
+| Check | Result | Evidence and boundary |
+|---|---|---|
+| Child-frame HumanKeys fixture | pass | `node --check extensions/chrome-controlla/background.js` and `node --test extensions/chrome-controlla/test-background.cjs`; covers child-session keydown/char/keyup, stale loader/value refusal, and focus-theft suppression. Simulated extension evidence only. |
+| Rust frame-reference route | pass | `cargo test -p controlla-runtime frame_editor_reference_binds_frame_loader_and_backend_node`; binds fresh frame, loader, and positive backend-node identities. |
+| Full local runtime suite | pass | `cargo test --workspace --locked --offline --quiet`; all non-ignored tests passed. |
+| Warnings-denied static checks | pass | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`. |
+| Release/package lifecycle | pass | `./scripts/package-build.sh` and `./scripts/package-check.sh`; release binaries and clean-prefix darwin/arm64 package install, startup, rollback, and uninstall verified. |
+| Documentation links and diff whitespace | pass | `npm run check:docs`; `git diff --check`. |
+| Workspace formatting | blocked by existing files | `cargo fmt --all -- --check` reports formatting differences in untouched `crates/controlla-runtime/tests/v2_stdio.rs` and `tests/v3_tasks.rs`; no unrelated formatting was applied. |
+| Google Docs, Gmail, Word for web, other live writing apps, saved persistence | unqualified | Requires refreshed installed extension/runtime and observed live postconditions. Native desktop Word is outside Chrome/web scope. |
+
 
 ### 2026-10-27 performance continuation
 

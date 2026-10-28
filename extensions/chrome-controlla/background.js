@@ -966,6 +966,74 @@ async function humanTypeCharacter(tabId, params, isAuthorized) {
   }
   return result || { status: "unknown", completed_chars: 0, key_events: keyEvents, cdp_commands: cdpCommands, readback: progress, reason: "character_transaction_incomplete" };
 }
+async function frameHumanTypeCharacter(tabId, params, isAuthorized) {
+  const { frame_id: frameId, loader_id: loaderId, backend_node_id: backendNodeId, expected, character, normalize_paragraphs: normalizeParagraphs, prepare = false } = params || {};
+  const scalar = typeof character === "string" && [...character].length === 1 ? character.codePointAt(0) : -1;
+  if (typeof frameId !== "string" || !frameId || frameId.length > 256 || typeof loaderId !== "string" || !loaderId || loaderId.length > 256 ||
+      !Number.isSafeInteger(backendNodeId) || backendNodeId <= 0 || typeof expected !== "string" || expected.length > 16384 ||
+      scalar < 0 || scalar >= 0xd800 && scalar <= 0xdfff || typeof normalizeParagraphs !== "boolean" || typeof prepare !== "boolean" ||
+      character === "\r" || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(character)) throw new Error("frame_human_type_character requires a fresh frame/editor identity and one bounded Unicode scalar.");
+  const route = { tabId }, deadline = performance.now() + Math.min(60000, Math.max(1000, Number.isSafeInteger(params.deadline_ms) ? params.deadline_ms : 30000));
+  const frameLoader = async () => {
+    const tree = await sendCdpCommand(route, "Page.getFrameTree", {});
+    const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
+    return visit(tree.frameTree);
+  };
+  await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+  let dispatchAttempted = false, keyDownAttempted = false, child = route, cleanupKey, cleanupExpected = expected, guard, objectId;
+  try {
+    if (!isAuthorized(tabId) || performance.now() >= deadline || await frameLoader() !== loaderId) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_identity_stale" };
+    let sessionId = frameSessions.get(tabId)?.get(frameId);
+    if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
+    child = sessionId ? { tabId, sessionId } : route;
+    const ax = await sendCdpCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
+    if (!ax.nodes?.some(item => item.backendDOMNodeId === backendNodeId && ["textbox", "searchbox", "combobox"].includes(item.role?.value))) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_editor_not_accessible_textbox" };
+    const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
+    objectId = resolved.object?.objectId;
+    if (!objectId || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_identity_stale" };
+    guard = "function(expected,prepare,normalize){const e=this;if(!e||!e.isConnected)return {ok:false,reason:'target_stale'};const rich=e instanceof HTMLElement&&!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)&&(e.isContentEditable||e.getAttribute('role')==='textbox'),plain=e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type),trusted=e.closest('[data-requires-trusted]');if(!rich&&!plain||e.matches(':disabled,[aria-disabled=\\\"true\\\"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||trusted&&trusted!==e)return {ok:false,reason:'blocked'};const value=()=>{const raw=rich?(e.innerText??e.textContent??'').replace(/\\r\\n/g,'\\n').replace(/\\u00a0/g,' '):e.value;return rich?(raw==='\\n'?'':normalize?raw.replace(/\\n{2,}/g,b=> '\\n'.repeat(Math.ceil(b.length/2))):raw):raw};if(value()!==(rich&&expected==='\\n'?'':expected))return {ok:false,reason:'stale_value'};if(prepare){e.focus();if(rich){const s=e.ownerDocument.getSelection(),r=e.ownerDocument.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r)}else e.setSelectionRange(e.value.length,e.value.length)}const s=e.ownerDocument.getSelection(),focused=e.ownerDocument.activeElement===e,atEnd=rich?s?.isCollapsed&&s.anchorNode&&e.contains(s.anchorNode)&&(()=>{const r=e.ownerDocument.createRange();r.selectNodeContents(e);r.setStart(s.anchorNode,s.anchorOffset);return r.toString()===''})():e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;return focused&&atEnd?{ok:true,value:value()}:{ok:false,reason:'focus_or_selection_changed'}}";
+    const check = async value => {
+      if (!isAuthorized(tabId) || performance.now() >= deadline || await frameLoader() !== loaderId || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId)) return { ok: false, reason: "frame_identity_stale" };
+      const response = await sendCdpCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration: guard, arguments: [{ value }, { value: false }, { value: normalizeParagraphs }], returnByValue: true });
+      return response.result?.value || { ok: false, reason: "guard_response_missing" };
+    };
+    const before = await sendCdpCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration: guard, arguments: [{ value: expected }, { value: prepare }, { value: normalizeParagraphs }], returnByValue: true });
+    if (before.result?.value?.ok !== true) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: before.result?.value?.reason || "editor_guard_rejected" };
+    const enter = character === "\n", key = enter ? "Enter" : character;
+    cleanupKey = enter ? { type: "keyUp", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 } : { type: "keyUp", key };
+    if (scalar > 0x7f) {
+      dispatchAttempted = true;
+      await sendCdpCommand(child, "Input.insertText", { text: character });
+      const after = await check(expected + character);
+      return after.ok ? { status: "verified", dispatch_may_have_occurred: true, completed_chars: 1, key_events: 0, readback_length: (expected + character).length, input_method: "insertText" } : { status: "unknown", dispatch_may_have_occurred: true, completed_chars: 0, key_events: 0, reason: after.reason || "post_insert_readback_failed" };
+    }
+    const down = enter ? { type: "keyDown", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36, text: "\r", unmodifiedText: "\r" } : { type: "keyDown", key };
+    dispatchAttempted = keyDownAttempted = true;
+    await sendCdpCommand(child, "Input.dispatchKeyEvent", down);
+    cleanupExpected = enter ? expected + "\n" : expected;
+    const afterDown = await check(cleanupExpected);
+    if (!afterDown.ok) return { status: "unknown", dispatch_may_have_occurred: true, completed_chars: 0, key_events: 1, reason: afterDown.reason || "focus_changed_after_keydown" };
+    if (!enter) await sendCdpCommand(child, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character });
+    const progress = expected + character;
+    cleanupExpected = progress;
+    const after = await check(progress);
+    if (!after.ok) return { status: "unknown", dispatch_may_have_occurred: true, completed_chars: 0, key_events: enter ? 1 : 2, reason: after.reason || "post_character_readback_failed" };
+    await sendCdpCommand(child, "Input.dispatchKeyEvent", enter ? { type: "keyUp", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 } : { type: "keyUp", key });
+    keyDownAttempted = false;
+    return { status: "verified", dispatch_may_have_occurred: true, completed_chars: 1, key_events: enter ? 2 : 3, readback_length: progress.length };
+  } catch (error) {
+    return { status: dispatchAttempted ? "unknown" : "not_dispatched", dispatch_may_have_occurred: dispatchAttempted, completed_chars: 0, key_events: 0, reason: dispatchAttempted ? "frame_key_delivery_uncertain" : "frame_key_preflight_rejected", error: safeNativeError(String(error)) };
+  } finally {
+    if (keyDownAttempted) {
+      try {
+        const cleanup = await sendCdpCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration: guard,
+          arguments: [{ value: cleanupExpected }, { value: false }, { value: normalizeParagraphs }], returnByValue: true });
+        if (cleanup.result?.value?.ok === true) await sendCdpCommand(child, "Input.dispatchKeyEvent", cleanupKey);
+      } catch { /* dispatch outcome is already unknown; cleanup was attempted once */ }
+    }
+    await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+  }
+}
 async function scheduleNativeReconnect() {
   if (reconnectTimer || nativePort) return;
   const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
@@ -2487,6 +2555,12 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       } finally {
         await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
       }
+      return;
+    }
+    if (request.method === "Controlla.frameHumanTypeCharacter") {
+      const result = await frameHumanTypeCharacter(tabId, request.params, isAuthorized);
+      traceSharedCommand("settled", request, tabId, startedAt, { outcome: result.status, completedChars: result.completed_chars, keyEvents: result.key_events });
+      respond({ type: "result", id: request.id, result });
       return;
     }
     if (request.method === "Controlla.frameAccessibility") {

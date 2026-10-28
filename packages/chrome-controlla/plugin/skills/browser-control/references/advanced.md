@@ -12,7 +12,7 @@ Use `collect_virtual` when the page recycles rows or reveals items only through 
 
 ## Typing
 
-Omit `typing_mode` normally. Controlla chooses block insertion, fast trusted key events, or IME based on the target. Use `human_keys` only when the user explicitly asks for human-paced input.
+Omit `typing_mode` normally. Controlla chooses block insertion, fast trusted key events, or IME based on the target. For a fresh `@f:<frame>:<loader>:<backend-node>` reference, omitted mode defaults to guarded `human_keys` because child-frame editors must receive ordered input events; composition mode remains unsupported there. Use `human_keys` on other targets only when the user explicitly asks for human-paced input. A verified editor readback confirms the live field value, not server-side save or persistence.
 
 ## Page tools
 

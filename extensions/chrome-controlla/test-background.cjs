@@ -133,6 +133,7 @@ let nestedOwnerBoxReads = 0;
 let frameActionable = true;
 let frameShadowRootFixture = false;
 let frameFillMockEvidence;
+let frameHumanTypeGuardResults = [];
 let childFrameLoaderId = "fixture-loader";
 let navigateFrameDuringFileReadback = false;
 let fileReadbackEmpty = false;
@@ -578,7 +579,8 @@ const chrome = {
       }
       if (method === "DOM.getBoxModel" && target.sessionId === "fixture-oopif-session") return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
-      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
+      if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 92 ? "fixture-frame-textbox" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
+      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")) return { result: { value: frameHumanTypeGuardResults.shift() || { ok: true } } };
       if (method === "DOM.setFileInputFiles" && target.sessionId === "fixture-oopif-session") {
         fileReadbackFiles = (params?.files || []).map(path => ({ name: String(path).split("/").at(-1), size: 12 }));
         return {};
@@ -1527,6 +1529,42 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.at(-1).result.dispatch_may_have_occurred, false, "a changed frame loader is rejected before dispatch");
   assert.equal(debuggerCalls.filter(call => call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,value){const e=this;const blocked")).length, frameFillDispatchesBeforeStale);
+  identityAxNodes = [{ nodeId: "field", role: { value: "textbox" }, name: { value: "Document editor" }, backendDOMNodeId: 92 }];
+  childFrameLoaderId = "fixture-loader";
+  const frameKeyStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "oopif-human-type", target_id: "41", method: "Controlla.frameHumanTypeCharacter", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected: "old", character: "G", normalize_paragraphs: true, prepare: true, deadline_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const frameHumanReceipt = native.sent.findLast(message => message.id === "oopif-human-type")?.result;
+  assert.equal(frameHumanReceipt.status, "verified", JSON.stringify(frameHumanReceipt));
+  assert.equal(frameHumanReceipt.completed_chars, 1);
+  assert.ok(debuggerCalls.slice(frameKeyStart).some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Runtime.callFunctionOn" && call.params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")), "frame editor guard runs in the owning child target");
+  assert.deepEqual(debuggerCalls.slice(frameKeyStart).filter(call => call.method === "Input.dispatchKeyEvent").map(call => call.params.type), ["keyDown", "char", "keyUp"], "frame HumanKeys sends and releases one character to the child target");
+  frameHumanTypeGuardResults = [{ ok: false, reason: "stale_value" }];
+  const frameKeysBeforeStaleValue = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "oopif-human-type-stale-value", target_id: "41", method: "Controlla.frameHumanTypeCharacter", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected: "wrong", character: "x", normalize_paragraphs: true, prepare: true, deadline_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "oopif-human-type-stale-value")?.result?.status, "not_dispatched");
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length, frameKeysBeforeStaleValue, "changed child-editor text is refused before key dispatch");
+  frameHumanTypeGuardResults = [{ ok: true }, { ok: false, reason: "focus_or_selection_changed" }, { ok: false, reason: "focus_or_selection_changed" }];
+  const frameKeysBeforeFocusTheft = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "oopif-human-type-focus-theft", target_id: "41", method: "Controlla.frameHumanTypeCharacter", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92, expected: "old", character: "x", normalize_paragraphs: true, prepare: true, deadline_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "oopif-human-type-focus-theft")?.result?.status, "unknown");
+  assert.deepEqual(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").slice(frameKeysBeforeFocusTheft).map(call => call.params.type), ["keyDown"], "focus theft suppresses character and key-up events to avoid retargeting");
+  frameHumanTypeGuardResults = [];
+  const frameKeysBeforeStaleLoader = debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length;
+  native.hostMessage({ type: "command", id: "oopif-human-type-stale-loader", target_id: "41", method: "Controlla.frameHumanTypeCharacter", params: {
+    frame_id: "frame-oopif", loader_id: "old-loader", backend_node_id: 92, expected: "old", character: "x", normalize_paragraphs: true, prepare: true, deadline_ms: 1000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.findLast(message => message.id === "oopif-human-type-stale-loader")?.result?.status, "not_dispatched");
+  assert.equal(debuggerCalls.filter(call => call.method === "Input.dispatchKeyEvent").length, frameKeysBeforeStaleLoader, "stale child-frame identity refuses before key dispatch");
   identityAxNodes = [];
   const frameInputCountBeforeInvalidUrl = debuggerCalls.filter(call => call.method === "Input.dispatchMouseEvent").length;
   for (const [index, url] of ["/relative-story", "javascript:alert(1)", "https://user:secret@example.test/", "https://example.test:bad", "https://[:::]/", "https://[gggg::1]/", " https://example.test/", `https://example.test/${"x".repeat(2048)}`].entries()) {
