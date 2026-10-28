@@ -1064,7 +1064,7 @@ async fn persisted_job_deadline_marks_unsent_and_dispatched_effects_differently(
     assert_eq!(expired_started.delivery, Delivery::NotSent);
 
     let sent = journal
-        .admit_with_deadline("p", "s", "sent-deadline", &json!({"effect":"save"}), 100)
+        .admit_with_deadline("p", "s", "sent-deadline", &json!({"effect":"save"}), 60_000)
         .unwrap();
     assert!(
         journal
@@ -1085,7 +1085,15 @@ async fn persisted_job_deadline_marks_unsent_and_dispatched_effects_differently(
             .delivery,
         Delivery::Sent
     );
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    // Advance the durable deadline instead of sleeping so a dispatched-unsent
+    // transition cannot race a loaded Windows runner.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE operations SET deadline_at_ms=1 WHERE id=?1",
+        [&sent.operation.id],
+    )
+    .unwrap();
+    drop(db);
     let expired = journal.get("p", "s", &sent.operation.id).unwrap().unwrap();
     assert_eq!(expired.status, JobStatus::Unknown);
     assert_eq!(expired.delivery, Delivery::Sent);
