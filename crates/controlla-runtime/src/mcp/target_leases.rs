@@ -10,6 +10,8 @@ pub(super) fn lease_target_key(_session_id: &str, tab_id: &str) -> crate::v3::Ta
 }
 
 pub(super) const TARGET_LEASE_QUEUE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(super) const TARGET_READ_LEASE_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const TARGET_READ_LEASE_TTL_MS: u64 = 30_000;
 
 pub(super) fn process_lease_key(target: &crate::v3::TargetKey) -> crate::process_lease::LeaseKey {
     crate::process_lease::LeaseKey {
@@ -27,6 +29,34 @@ pub(super) fn process_lease_coordinator() -> &'static crate::process_lease::Leas
     static COORDINATOR: std::sync::OnceLock<crate::process_lease::LeaseCoordinator> =
         std::sync::OnceLock::new();
     COORDINATOR.get_or_init(crate::process_lease::LeaseCoordinator::new)
+}
+
+/// Acquire a short, shared observation lease. Readers never take the
+/// process-wide mutation lock and never fence another reader.
+pub(super) async fn acquire_queued_read_lease(
+    leases: &Mutex<crate::v3::LeaseTable>,
+    target: &crate::v3::TargetKey,
+    owner: &str,
+) -> Result<crate::v3::TargetReadLease, crate::v3::TargetLease> {
+    let deadline = tokio::time::Instant::now() + TARGET_READ_LEASE_QUEUE_TIMEOUT;
+    loop {
+        let changed = process_lease_coordinator().changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let mut table = leases.lock().await;
+        let result = table.acquire_read(target.clone(), owner, now_ms(), TARGET_READ_LEASE_TTL_MS);
+        drop(table);
+        match result {
+            Ok(lease) => return Ok(lease),
+            Err(existing) if tokio::time::Instant::now() >= deadline => return Err(existing),
+            Err(_) => {
+                tokio::select! {
+                    _ = changed.as_mut() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                }
+            }
+        }
+    }
 }
 
 pub(super) async fn acquire_queued_lease(

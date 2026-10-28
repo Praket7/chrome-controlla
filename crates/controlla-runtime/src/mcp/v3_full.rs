@@ -2538,18 +2538,27 @@ struct WorkflowLeaseGuard {
     owners: Arc<Mutex<std::collections::BTreeSet<String>>>,
     target: crate::v3::TargetKey,
     owner: String,
+    shared: bool,
     active: bool,
 }
 
 impl WorkflowLeaseGuard {
     async fn release(mut self, retain_process_lock: bool) {
         self.owners.lock().await.remove(&self.owner);
-        self.leases.lock().await.release(&self.target, &self.owner);
-        if retain_process_lock {
-            process_lease_coordinator()
-                .retain_on_unknown(&process_lease_key(&self.target), &self.owner);
+        if self.shared {
+            self.leases
+                .lock()
+                .await
+                .release_read(&self.target, &self.owner);
         } else {
-            process_lease_coordinator().release(&process_lease_key(&self.target), &self.owner);
+            self.leases.lock().await.release(&self.target, &self.owner);
+            if retain_process_lock {
+                process_lease_coordinator()
+                    .retain_on_unknown(&process_lease_key(&self.target), &self.owner);
+            } else {
+                process_lease_coordinator()
+                    .release(&process_lease_key(&self.target), &self.owner);
+            }
         }
         self.active = false;
     }
@@ -20640,15 +20649,34 @@ impl AppV3 {
             now_ms()
         );
         let target = lease_target_key(&args.session_id, &args.chrome_tab_id);
-        acquire_queued_lease(&self.leases, &target, &owner, false)
-            .await
-            .map_err(|lease| {
-                invalid(format!(
-                    "target remained busy for up to {} seconds (current owner: {})",
-                    TARGET_LEASE_QUEUE_TIMEOUT.as_secs(),
-                    lease.owner
-                ))
-            })?;
+        // A workflow made only of observation steps is a shared read. It must
+        // not fence another reader behind the mutation lease.
+        let shared = args.program.is_none()
+            && args.dag.is_none()
+            && args
+                .steps
+                .iter()
+                .all(|step| crate::workflow_vm::VmOperation::effect(step) == crate::workflow::EffectClass::ReadOnly);
+        if shared {
+            acquire_queued_read_lease(&self.leases, &target, &owner)
+                .await
+                .map_err(|lease| {
+                    invalid(format!(
+                        "target is busy with a mutation (current owner: {})",
+                        lease.owner
+                    ))
+                })?;
+        } else {
+            acquire_queued_lease(&self.leases, &target, &owner, false)
+                .await
+                .map_err(|lease| {
+                    invalid(format!(
+                        "target remained busy for up to {} seconds (current owner: {})",
+                        TARGET_LEASE_QUEUE_TIMEOUT.as_secs(),
+                        lease.owner
+                    ))
+                })?;
+        }
         self.workflow_lease_owners
             .lock()
             .await
@@ -20659,6 +20687,7 @@ impl AppV3 {
             owners: self.workflow_lease_owners.clone(),
             target,
             owner,
+            shared,
             active: true,
         };
         let result = self.workflow_inner_unleased(args).await;
@@ -21637,6 +21666,7 @@ impl AppV3 {
                 owners: self.workflow_lease_owners.clone(),
                 target,
                 owner,
+                shared: false,
                 active: true,
             })
         } else {
@@ -22641,7 +22671,7 @@ impl AppV3 {
                         return (false, vec![json!({"kind":"navigate","status":"not_dispatched","url":url,"verified":false,"reason":"research target remained busy after waiting for its active operation","lease_owner":existing.owner})]);
                     }
                     self.workflow_lease_owners.lock().await.insert(owner.clone());
-                    Some(WorkflowLeaseGuard { leases:self.leases.clone(), owners:self.workflow_lease_owners.clone(), target, owner, active:true })
+                    Some(WorkflowLeaseGuard { leases:self.leases.clone(), owners:self.workflow_lease_owners.clone(), target, owner, shared:false, active:true })
                 };
                 with_lease_release(lease, async {
                 let can_resume_target = if let Some(resume) = resume.as_ref() {
@@ -24142,6 +24172,7 @@ mod v3_batch_delivery_tests {
             owners: owners.clone(),
             target: target.clone(),
             owner: owner.clone(),
+            shared: false,
             active: true,
         };
         let result = with_lease_release(Some(guard), async {
@@ -24282,6 +24313,7 @@ mod v3_batch_delivery_tests {
             owners: owners.clone(),
             target: target.clone(),
             owner: owner.to_owned(),
+            shared: false,
             active: true,
         });
 

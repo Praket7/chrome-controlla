@@ -193,10 +193,18 @@ pub struct TargetLease {
     pub expires_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TargetReadLease {
+    pub owner: String,
+    pub acquired_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LeaseTable {
     leases: BTreeMap<TargetKey, TargetLease>,
     reentrant_depth: BTreeMap<TargetKey, usize>,
+    readers: BTreeMap<TargetKey, BTreeMap<String, u64>>,
 }
 
 impl LeaseTable {
@@ -211,6 +219,20 @@ impl LeaseTable {
         if let Some(existing) = self.leases.get(&target) {
             return Err(existing.clone());
         }
+        // A writer must wait for every shared reader to finish. Readers only
+        // hold short, observation-scoped leases.
+        if self
+            .readers
+            .get(&target)
+            .is_some_and(|readers| !readers.is_empty())
+        {
+            let now = now_ms;
+            return Err(TargetLease {
+                owner: "shared reader".into(),
+                acquired_at_ms: now,
+                expires_at_ms: now,
+            });
+        }
         let lease = TargetLease {
             owner: owner.to_owned(),
             acquired_at_ms: now_ms,
@@ -219,6 +241,42 @@ impl LeaseTable {
         self.leases.insert(target.clone(), lease.clone());
         self.reentrant_depth.insert(target, 1);
         Ok(lease)
+    }
+
+    /// Acquire a shared observation lease. Multiple readers may hold the same
+    /// target concurrently; a mutation writer is mutually exclusive with them.
+    pub fn acquire_read(
+        &mut self,
+        target: TargetKey,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<TargetReadLease, TargetLease> {
+        self.expire(now_ms);
+        if let Some(existing) = self.leases.get(&target) {
+            return Err(existing.clone());
+        }
+        let expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(250, 120_000));
+        self.readers
+            .entry(target)
+            .or_default()
+            .insert(owner.to_owned(), expires_at_ms);
+        Ok(TargetReadLease {
+            owner: owner.to_owned(),
+            acquired_at_ms: now_ms,
+            expires_at_ms,
+        })
+    }
+
+    pub fn release_read(&mut self, target: &TargetKey, owner: &str) -> bool {
+        let Some(readers) = self.readers.get_mut(target) else {
+            return false;
+        };
+        let removed = readers.remove(owner).is_some();
+        if readers.is_empty() {
+            self.readers.remove(target);
+        }
+        removed
     }
 
     pub fn acquire_nested(
@@ -287,6 +345,10 @@ impl LeaseTable {
         self.leases.retain(|_, lease| lease.expires_at_ms > now_ms);
         self.reentrant_depth
             .retain(|target, _| self.leases.contains_key(target));
+        self.readers.retain(|_, readers| {
+            readers.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+            !readers.is_empty()
+        });
     }
 }
 
@@ -480,6 +542,54 @@ mod lease_recovery_tests {
             "interfering caller cannot release another owner's lease"
         );
         assert_eq!(leases.owner(&target_a, 1_002).as_deref(), Some("owner-1"));
+    }
+
+    #[test]
+    fn shared_reads_run_concurrently_while_a_mutation_waits() {
+        let mut leases = LeaseTable::default();
+        let target = target("session", "tab");
+        leases
+            .acquire_read(target.clone(), "reader-a", 100, 5_000)
+            .unwrap();
+        leases
+            .acquire_read(target.clone(), "reader-b", 101, 5_000)
+            .unwrap();
+        assert!(
+            leases.acquire(target.clone(), "writer", 102, 5_000).is_err(),
+            "a writer must wait for active readers"
+        );
+        assert!(leases.release_read(&target, "reader-a"));
+        assert!(
+            leases.acquire(target.clone(), "writer", 103, 5_000).is_err(),
+            "one remaining reader still fences the writer"
+        );
+        assert!(leases.release_read(&target, "reader-b"));
+        assert!(leases.acquire(target.clone(), "writer", 104, 5_000).is_ok());
+        assert!(
+            leases
+                .acquire_read(target.clone(), "reader-c", 105, 5_000)
+                .is_err(),
+            "a reader must wait for an active mutation"
+        );
+    }
+
+    #[test]
+    fn expired_read_leases_release_the_writer_without_dropping_live_readers() {
+        let mut leases = LeaseTable::default();
+        let target = target("session", "tab");
+        leases
+            .acquire_read(target.clone(), "short-reader", 100, 250)
+            .unwrap();
+        leases
+            .acquire_read(target.clone(), "long-reader", 100, 5_000)
+            .unwrap();
+        leases.expire(351);
+        assert!(
+            leases.acquire(target.clone(), "writer", 352, 5_000).is_err(),
+            "the still-live reader keeps the writer fenced"
+        );
+        leases.expire(5_101);
+        assert!(leases.acquire(target.clone(), "writer", 5_102, 5_000).is_ok());
     }
 
     #[test]
