@@ -41,6 +41,7 @@ pub mod skill_store;
 pub mod skills;
 pub mod slides_deck;
 pub mod target_graph;
+pub mod target_registry;
 pub mod task_capsule;
 pub mod task_checkpoints;
 pub mod task_program;

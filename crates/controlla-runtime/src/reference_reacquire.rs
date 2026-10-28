@@ -24,6 +24,8 @@ pub struct SemanticIdentity {
     pub dom_path_fingerprint: String,
     pub rect_bucket: Option<String>,
     pub ancestor_id: Option<String>,
+    pub test_id: Option<String>,
+    pub section: Option<String>,
 }
 
 impl SemanticIdentity {
@@ -62,6 +64,16 @@ impl SemanticIdentity {
                 .pointer("/semantic_ancestor/id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            test_id: item
+                .get("test_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            section: item
+                .get("section")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
         }
     }
 }
@@ -73,7 +85,7 @@ pub struct ReacquiredReference {
     pub confidence: IdentityConfidence,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ReacquireError {
     #[error("no candidate with high confidence")]
     Ambiguous,
@@ -128,9 +140,32 @@ pub fn reacquire_reference(
             .pointer("/semantic_ancestor/id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let current_test_id = item
+            .get("test_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let current_section = item
+            .get("section")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
         let rect_matched = expected.rect_bucket.is_some() && current_rect == expected.rect_bucket;
         let ancestor_matched = expected.ancestor_id.is_some()
             && current_ancestor == expected.ancestor_id;
+        let test_id_matched = expected.test_id.is_some()
+            && current_test_id == expected.test_id.as_deref();
+        let section_matched = expected.section.is_some()
+            && current_section == expected.section.as_deref();
+        // A control that moved to a different semantic ancestor is a different
+        // target unless a stable test attribute proves that it is the same one.
+        let ancestor_conflict = expected
+            .ancestor_id
+            .as_deref()
+            .is_some_and(|expected| {
+                current_ancestor
+                    .as_deref()
+                    .is_some_and(|current| current != expected)
+            })
+            && !test_id_matched;
         // Score deterministically. Textual identity is necessary for a
         // context rebind; geometry and ancestor context break ties between
         // otherwise identical repeated controls.
@@ -153,23 +188,35 @@ pub fn reacquire_reference(
         if ancestor_matched {
             score += 12;
         }
+        if test_id_matched {
+            score += 40;
+        }
+        if section_matched {
+            score += 6;
+        }
         let backend_id_matched = expected.backend_node_id.is_some()
             && current_backend_node_id == expected.backend_node_id;
         if backend_id_matched {
             score += 50;
         }
+        // A recorded test attribute is part of the core identity; a control
+        // that kept the same name but changed its test id is not the same target.
+        let test_id_conflict = expected.test_id.is_some() && !test_id_matched;
         let same_core = role == expected.role
             && name == expected.name
-            && href == expected.href;
+            && href == expected.href
+            && !test_id_conflict;
         let fingerprint_matched = !fp.is_empty() && fp == expected.dom_path_fingerprint;
         let context_required = expected.rect_bucket.is_some() || expected.ancestor_id.is_some();
+        let context_matched = rect_matched || ancestor_matched || test_id_matched;
         let is_high = if backend_id_matched {
             score >= 50
-        } else if same_core && fingerprint_matched {
-            // When the stale reference carried context, an otherwise identical
-            // repeated control must also match that context. Without context,
-            // duplicate fingerprint matches remain ambiguous.
-            !context_required || rect_matched || ancestor_matched
+        } else if same_core && !ancestor_conflict {
+            // Geometry and ancestry can carry identity across a rerender or a
+            // row insertion that changed the DOM path; duplicates in the same
+            // context remain ambiguous because they produce several matches.
+            (fingerprint_matched || test_id_matched || context_matched)
+                && (!context_required || context_matched)
         } else {
             false
         };
@@ -212,6 +259,8 @@ mod tests {
             dom_path_fingerprint: "a:0".into(),
             rect_bucket: None,
             ancestor_id: None,
+            test_id: None,
+            section: None,
         };
         let items = vec![
             json!({"reference":"@c1","source_frame":"f","role":"link","name":"Bills latest","href":"https://example.test/a","dom_path_fingerprint":"a:0"}),
@@ -239,6 +288,8 @@ mod tests {
             dom_path_fingerprint: "a:0".into(),
             rect_bucket: None,
             ancestor_id: None,
+            test_id: None,
+            section: None,
         };
         let items = vec![
             json!({"reference":"@c1","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
@@ -269,6 +320,8 @@ mod tests {
             dom_path_fingerprint: "button:0".into(),
             rect_bucket: Some("\"10,20,30,40\"".into()),
             ancestor_id: Some("toolbar-main".into()),
+            test_id: None,
+            section: None,
         };
         let items = vec![
             json!({"reference":"@c1","source_frame":"f","role":"button","name":"Save",
@@ -283,6 +336,8 @@ mod tests {
         let contextless = SemanticIdentity {
             rect_bucket: None,
             ancestor_id: None,
+            test_id: None,
+            section: None,
             ..expected
         };
         assert!(matches!(
@@ -311,6 +366,8 @@ mod tests {
             dom_path_fingerprint: "a:0".into(),
             rect_bucket: None,
             ancestor_id: None,
+            test_id: None,
+            section: None,
         };
         let current = [
             json!({"reference":"@c1","source_frame":"f","backend_node_id":456,
@@ -333,6 +390,112 @@ mod tests {
         ];
         assert!(matches!(
             reacquire_reference(&expected, &doc, &changed_href),
+            Err(ReacquireError::Ambiguous)
+        ));
+    }
+
+    fn base_document() -> SemanticDocumentKey {
+        SemanticDocumentKey {
+            frame_id: "f".into(),
+            loader_id: "l".into(),
+            url: "https://example.test".into(),
+            frame_revision: None,
+            document_revision: None,
+        }
+    }
+
+    fn row_target() -> SemanticIdentity {
+        SemanticIdentity {
+            document: base_document(),
+            frame_id: "f".into(),
+            frame_revision: String::new(),
+            backend_node_id: Some(9),
+            role: "button".into(),
+            name: "Archive".into(),
+            href: None,
+            dom_path_fingerprint: "tbody:0:tr:2:button:0".into(),
+            rect_bucket: Some("\"10,300,20,20\"".into()),
+            ancestor_id: Some("inbox-list".into()),
+            test_id: None,
+            section: Some("Inbox".into()),
+        }
+    }
+
+    #[test]
+    fn row_insertion_above_target_rebinds_within_the_same_context() {
+        let items = [
+            json!({"reference":"@c1","source_frame":"f","backend_node_id":10,
+                "role":"button","name":"Archive","dom_path_fingerprint":"tbody:0:tr:3:button:0",
+                "rect_bucket":"10,320,20,20","semantic_ancestor":{"id":"inbox-list"},"section":"Inbox"}),
+        ];
+        let reacquired = reacquire_reference(&row_target(), &base_document(), &items).unwrap();
+        assert_eq!(reacquired.reference, "@c1");
+    }
+
+    #[test]
+    fn pure_geometry_shift_keeps_the_same_fingerprint_target() {
+        let items = [
+            json!({"reference":"@c2","source_frame":"f","role":"button","name":"Archive",
+                "dom_path_fingerprint":"tbody:0:tr:2:button:0","rect_bucket":"10,340,20,20",
+                "semantic_ancestor":{"id":"inbox-list"},"section":"Inbox"}),
+        ];
+        assert_eq!(
+            reacquire_reference(&row_target(), &base_document(), &items)
+                .unwrap()
+                .reference,
+            "@c2"
+        );
+    }
+
+    #[test]
+    fn moving_to_a_different_ancestor_is_rejected() {
+        let items = [
+            json!({"reference":"@c3","source_frame":"f","role":"button","name":"Archive",
+                "dom_path_fingerprint":"tbody:0:tr:2:button:0","rect_bucket":"10,300,20,20",
+                "semantic_ancestor":{"id":"archive-dialog"},"section":"Inbox"}),
+        ];
+        assert!(matches!(
+            reacquire_reference(&row_target(), &base_document(), &items),
+            Err(ReacquireError::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn stable_test_id_proves_identity_across_a_moved_ancestor() {
+        let expected = SemanticIdentity {
+            ancestor_id: Some("inbox-list".into()),
+            test_id: Some("archive-row-9".into()),
+            ..row_target()
+        };
+        let items = [
+            json!({"reference":"@c4","source_frame":"f","role":"button","name":"Archive",
+                "dom_path_fingerprint":"dialog:0:button:0","rect_bucket":"500,100,20,20",
+                "semantic_ancestor":{"id":"archive-dialog"},"test_id":"archive-row-9","section":"Inbox"}),
+        ];
+        assert_eq!(
+            reacquire_reference(&expected, &base_document(), &items)
+                .unwrap()
+                .reference,
+            "@c4"
+        );
+        let wrong_test_id = [json!({"reference":"@c5","source_frame":"f","role":"button",
+            "name":"Archive","dom_path_fingerprint":"dialog:0:button:0",
+            "test_id":"archive-row-10","section":"Inbox"})];
+        assert!(matches!(
+            reacquire_reference(&expected, &base_document(), &wrong_test_id),
+            Err(ReacquireError::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn same_role_and_name_in_another_frame_is_not_rebound() {
+        let items = [
+            json!({"reference":"@c6","source_frame":"other-frame","role":"button",
+                "name":"Archive","dom_path_fingerprint":"tbody:0:tr:2:button:0",
+                "rect_bucket":"10,300,20,20","semantic_ancestor":{"id":"inbox-list"},"section":"Inbox"}),
+        ];
+        assert!(matches!(
+            reacquire_reference(&row_target(), &base_document(), &items),
             Err(ReacquireError::Ambiguous)
         ));
     }

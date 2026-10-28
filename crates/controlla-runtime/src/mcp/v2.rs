@@ -1416,9 +1416,10 @@ async fn resolve_reference(
         invalid("semantic document identity is unavailable; take a fresh browser_snapshot")
     })?;
     let items = state.items.values().cloned().collect::<Vec<_>>();
-    let candidate =
-        crate::reference_reacquire::reacquire_reference(expected, current_document, &items)
-            .map_err(|error| invalid(format!("reference could not be rebound safely: {error}")))?;
+    let candidate = crate::target_registry::rebind_result(expected, Some(current_document), &items)
+        .map_err(|error| {
+            invalid(format!("reference could not be rebound safely: {error}"))
+        })?;
     let current = state
         .items
         .get(&candidate.reference)
@@ -1753,7 +1754,7 @@ async fn retained_mutation(
             return Ok(first);
         };
         let items = state.items.values().cloned().collect::<Vec<_>>();
-        crate::reference_reacquire::reacquire_reference(&expected, document, &items)
+        crate::target_registry::rebind_result(&expected, Some(document), &items)
     };
     let candidate = match candidate {
         Ok(candidate) => candidate.reference,
@@ -1827,9 +1828,9 @@ async fn retained_click(
         let Some(document) = state.document.as_ref() else {
             return Ok(first);
         };
-        crate::reference_reacquire::reacquire_reference(
+        crate::target_registry::rebind_result(
             &expected,
-            document,
+            Some(document),
             &state.items.values().cloned().collect::<Vec<_>>(),
         )
     };
