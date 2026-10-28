@@ -498,7 +498,7 @@ const chrome = {
         if (params.type === "keyDown" && params.key === "Enter") fastTypeValue += "\n";
         return {};
       }
-      if (method === "Input.insertText") { fastTypeValue += params.text; return {}; }
+      if (method === "Input.insertText") { fastTypeValue += params.text; transactionFixtureValue += String(params?.text ?? ""); return {}; }
       if (method === "Network.enable" && networkEventsOnEnable.length) {
         const events = networkEventsOnEnable;
         networkEventsOnEnable = [];
@@ -592,7 +592,7 @@ const chrome = {
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 92 ? "fixture-frame-textbox" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")) return { result: { value: frameHumanTypeGuardResults.shift() || { ok: true } } };
-      if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expectedKind")) {
+      if (method === "Runtime.callFunctionOn" && ["fixture-frame-textbox", "fixture-root-textbox"].includes(params?.objectId) && params?.functionDeclaration?.startsWith("function(expectedKind")) {
         const kind = params.arguments?.[0]?.value;
         const expected = params.arguments?.[1]?.value;
         const operation = params.arguments?.[3]?.value;
@@ -603,6 +603,7 @@ const chrome = {
         if (prepare && operation === "replace") transactionFixtureReplacePending = true;
         return { result: { value: { ok: true, value: transactionFixtureValue, length: transactionFixtureValue.length, rich: true, focused: true, selectionStart: transactionFixtureValue.length, selectionEnd: transactionFixtureValue.length } } };
       }
+      if (method === "Input.imeSetComposition") return { accepted: true };
       if (method === "Input.insertText" && target.sessionId === "fixture-oopif-session") {
         transactionFixtureValue = transactionFixtureReplacePending ? String(params?.text ?? "") : transactionFixtureValue + String(params?.text ?? "");
         transactionFixtureReplacePending = false;
@@ -1646,6 +1647,40 @@ async function waitFor(predicate, description) {
     "warm whole-text transaction never toggles auto-attach");
   assert.equal(native.sent.filter(message => message.method === "Controlla.frameHumanTypeCharacter").length, perCharacterNativeBefore,
     "no per-character native bridge call is issued");
+  // Root rich-editor IME uses the same transaction engine.
+  transactionFixtureValue = "old";
+  transactionFixtureReplacePending = false;
+  const rootImeStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "root-ime-transaction", target_id: "41", method: "Controlla.typeTextTransaction", params: {
+    object_id: "fixture-root-textbox",
+    expected: { kind: "exact_value", value: "old" }, operation: "append", text: "こんにちは",
+    strategy: "ime", chunk_chars: 4, verify_every_chunks: 1, pacing_ms: 0, deadline_ms: 30000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const rootIme = native.sent.findLast(message => message.id === "root-ime-transaction")?.result;
+  assert.equal(rootIme?.status, "verified", JSON.stringify(rootIme));
+  assert.equal(rootIme?.backend, "ime_composition");
+  assert.equal(rootIme?.completed_chars, 5);
+  assert.ok(debuggerCalls.slice(rootImeStart).some(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.imeSetComposition"),
+    "root IME composes in the root target before insertion");
+  assert.equal(transactionFixtureValue, "oldこんにちは");
+  // The OOPIF IME path resolves and composes inside the owning child session.
+  transactionFixtureValue = "old";
+  transactionFixtureReplacePending = false;
+  const oopifImeStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "oopif-ime-transaction", target_id: "41", method: "Controlla.typeTextTransaction", params: {
+    frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 92,
+    expected: { kind: "exact_value", value: "old" }, operation: "append", text: "こんにちは",
+    strategy: "ime", chunk_chars: 4, verify_every_chunks: 1, pacing_ms: 0, deadline_ms: 30000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const oopifIme = native.sent.findLast(message => message.id === "oopif-ime-transaction")?.result;
+  assert.equal(oopifIme?.status, "verified", JSON.stringify(oopifIme));
+  assert.equal(oopifIme?.backend, "ime_composition");
+  assert.equal(oopifIme?.completed_chars, 5);
+  assert.ok(debuggerCalls.slice(oopifImeStart).some(call => call.target.sessionId === "fixture-oopif-session" && call.method === "Input.imeSetComposition"),
+    "OOPIF IME composes in the owning child target");
+  assert.equal(transactionFixtureValue, "oldこんにちは");
   const transactionCounters = backgroundContext.__testHooks.executionCounters();
   assert.equal(transactionCounters.auto_attach_calls, 0, "auto-attach stays warm across transactions");
   assert.equal(transactionCounters.frame_tree_reads, 0, "frame tree reads are recovery-only when warm");

@@ -183,9 +183,8 @@ async function guard(ctx, target, objectId, transaction, values, prepare) {
   return response?.result?.value ?? { ok: false, reason: "guard_response_missing" };
 }
 
-function expectedProgress(transaction, dispatched) {
-  const base = typeof transaction.expected.value === "string" ? transaction.expected.value : "";
-  if (transaction.operation === "append") return { kind: "exact_value", value: base + dispatched };
+function expectedProgress(transaction, dispatched, baseValue = "") {
+  if (transaction.operation === "append") return { kind: "exact_value", value: baseValue + dispatched };
   if (transaction.operation === "replace") return { kind: "exact_value", value: dispatched };
   return { kind: "contains", value: dispatched };
 }
@@ -246,6 +245,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
     }
     prepared = true;
     lastReadback = before.value;
+    const initialValue = typeof before.value === "string" ? before.value : "";
     const probe = {
       tag: before.rich ? "DIV" : "TEXTAREA",
       contenteditable: before.rich === true,
@@ -348,7 +348,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
         ? index === chunks.length - 1
         : (index + 1) % transaction.verifyEvery === 0 || index === chunks.length - 1;
       if (shouldVerify) {
-        const expected = expectedProgress(transaction, dispatched);
+        const expected = expectedProgress(transaction, dispatched, initialValue);
         const after = await guard(ctx, resolved.target, resolved.objectId, transaction, expected, false);
         if (after.ok !== true) {
           lastReadback = after.value ?? lastReadback;
@@ -366,7 +366,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
 
     const finalExpected = transaction.operation === "insert_at_caret"
       ? { kind: "contains", value: transaction.text }
-      : expectedProgress(transaction, dispatched);
+      : expectedProgress(transaction, dispatched, initialValue);
     const final = await guard(ctx, resolved.target, resolved.objectId, transaction, finalExpected, false);
     if (final.ok !== true) {
       lastReadback = final.value ?? lastReadback;

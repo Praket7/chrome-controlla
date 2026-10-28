@@ -278,6 +278,28 @@ mod tests {
     }
 
     #[test]
+    fn frame_ime_payload_keeps_one_transaction_and_frame_identity() {
+        let payload = extension_transaction_payload(
+            &TransactionTarget::Frame {
+                frame_id: "frame-oopif".into(),
+                loader_id: "loader-1".into(),
+                backend_node_id: 92,
+            },
+            "old",
+            "こんにちは",
+            PublicTypingMode::Ime,
+            0,
+            5_000,
+        );
+        assert_eq!(payload["strategy"], "ime");
+        assert_eq!(payload["frame_id"], "frame-oopif");
+        assert_eq!(payload["loader_id"], "loader-1");
+        assert_eq!(payload["backend_node_id"], 92);
+        assert_eq!(payload["expected"]["kind"], "exact_value");
+        assert!(payload.get("object_id").is_none());
+    }
+
+    #[test]
     fn payload_exposes_canonical_expectation_shape() {
         let transaction = compile_transaction(
             PublicTypingMode::Ime,
