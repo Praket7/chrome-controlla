@@ -64,9 +64,42 @@ pub fn speculative_result_matches(query: &str, result: &Value) -> bool {
     !evidence.trim().is_empty() && score_text(query, &evidence) >= 0.75
 }
 pub fn filter_items(items: &[Value], query: Option<&str>, limit: usize) -> Vec<Value> {
+    filter_items_for_task(items, query, &[], limit)
+}
+
+/// Task-conditioned pruning. Controls that satisfy an explicitly required role,
+/// live in a feedback region, or hold focus are retained before relevance
+/// ranking, so a compact observation cannot drop the one node a task needs.
+/// Everything else is ranked by query overlap with a deterministic tail.
+pub fn filter_items_for_task(
+    items: &[Value],
+    query: Option<&str>,
+    required_roles: &[String],
+    limit: usize,
+) -> Vec<Value> {
+    let limit = limit.clamp(1, MAX_RELEVANCE_ITEMS);
+    let required = required_roles
+        .iter()
+        .map(|role| role.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mandatory = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let role = item["role"].as_str().unwrap_or_default();
+            required.contains(&role.to_ascii_lowercase())
+                || matches!(role, "alert" | "status" | "log")
+                || item["feedback_region"] == true
+                || item["focused"] == true
+        })
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let mut selected = mandatory.iter().copied().take(limit).collect::<BTreeSet<_>>();
+    let mut output = mandatory.iter().copied().take(limit).collect::<Vec<_>>();
     let mut ranked = items
         .iter()
         .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
         .map(|(i, item)| {
             let content = ["name", "text", "role", "value", "href", "datetime"]
                 .iter()
@@ -82,10 +115,17 @@ pub fn filter_items(items: &[Value], query: Option<&str>, limit: usize) -> Vec<V
         // controls or warnings when page wording differs from the task.
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     }
-    ranked
+    for (_, index, _) in ranked {
+        if output.len() >= limit {
+            break;
+        }
+        if selected.insert(index) {
+            output.push(index);
+        }
+    }
+    output
         .into_iter()
-        .take(limit.clamp(1, MAX_RELEVANCE_ITEMS))
-        .map(|(_, _, v)| v.clone())
+        .filter_map(|index| items.get(index).cloned())
         .collect()
 }
 pub fn mark_untrusted(envelope: &mut Value) {
@@ -119,6 +159,22 @@ mod tests {
         let kept = filter_items(&items, Some("find recent stories"), 2);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().any(|item| item["role"] == "alert"));
+    }
+
+    #[test]
+    fn task_required_roles_and_feedback_survive_pruning() {
+        let mut items = (0..200)
+            .map(|index| json!({"reference":format!("@c{index}"),"role":"button","name":format!("Filler {index}")}))
+            .collect::<Vec<_>>();
+        items.push(json!({"reference":"@c900","role":"textbox","name":"Search"}));
+        items.push(json!({"reference":"@c901","role":"alert","name":"Billing warning"}));
+        items.push(json!({"reference":"@c902","role":"button","name":"Save","focused":true}));
+        let kept = filter_items_for_task(&items, Some("Save"), &["textbox".into()], 15);
+        assert_eq!(kept.len(), 15);
+        assert!(kept.iter().any(|item| item["reference"] == "@c900"));
+        assert!(kept.iter().any(|item| item["reference"] == "@c901"));
+        assert!(kept.iter().any(|item| item["reference"] == "@c902"));
+        assert_eq!(kept[0]["reference"], "@c900", "page order is preserved");
     }
 
     #[test]

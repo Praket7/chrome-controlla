@@ -299,6 +299,26 @@ fn annotate_foreground_open_presentation(result: &mut Value) {
     }
 }
 
+/// Keep a prior-baseline observation compact: unchanged controls stay
+/// addressable by their existing `@cN` refs and are omitted from the payload.
+/// Without a usable baseline the full observation is returned unchanged.
+fn shape_incremental_snapshot(snapshot: &mut Value) -> bool {
+    let incremental = snapshot["delta"]["full"] != true;
+    snapshot["incremental"] = json!(incremental);
+    snapshot["delta_basis"] = json!(if incremental {
+        "immediately_prior_observation"
+    } else {
+        "full_observation_required"
+    });
+    if incremental {
+        snapshot["unchanged_items_omitted"] =
+            json!(snapshot["items"].as_array().map_or(0, Vec::len));
+        snapshot["items"] = json!([]);
+        snapshot["items_returned"] = json!(0);
+    }
+    incremental
+}
+
 #[cfg(test)]
 mod route_telemetry_tests {
     use super::{
@@ -307,10 +327,30 @@ mod route_telemetry_tests {
         contains_returned_page_evidence, finalize_visual_requirement, foreground_open_invariant,
         navigation_ready_event_matches, observe_site_warmth, open_workflow_route_receipt,
         page_tool_route_receipt, readiness_wait_expression, selected_automation_window_invariant,
-        task_cost_context, task_parallel_research_allowed, task_route_signals, task_trace_steps,
-        upload_acceptance_baseline_allows_dispatch, verify_visual_region_change,
+        shape_incremental_snapshot, task_cost_context, task_parallel_research_allowed,
+        task_route_signals, task_trace_steps, upload_acceptance_baseline_allows_dispatch,
+        verify_visual_region_change,
     };
     use serde_json::json;
+
+    #[test]
+    fn incremental_snapshot_omits_unchanged_items_only_with_a_baseline() {
+        let mut with_baseline = json!({
+            "items": [{"reference":"@c1"},{"reference":"@c2"}],
+            "delta": {"full": false, "upsert": [{"reference":"@c2"}], "removed": []}
+        });
+        assert!(shape_incremental_snapshot(&mut with_baseline));
+        assert_eq!(with_baseline["items"], json!([]));
+        assert_eq!(with_baseline["unchanged_items_omitted"], 2);
+        assert_eq!(with_baseline["delta"]["upsert"][0]["reference"], "@c2");
+        let mut without_baseline = json!({
+            "items": [{"reference":"@c1"}],
+            "delta": {"full": true, "upsert": [{"reference":"@c1"}], "removed": []}
+        });
+        assert!(!shape_incremental_snapshot(&mut without_baseline));
+        assert_eq!(without_baseline["items"].as_array().unwrap().len(), 1);
+        assert_eq!(without_baseline["delta_basis"], "full_observation_required");
+    }
 
     #[test]
     fn act_value_contract_accepts_value_actions_and_preserves_password_limits() {
@@ -3039,6 +3079,11 @@ struct V3SnapshotArgs {
     include_frames: Option<bool>,
     goal: Option<super::SnapshotGoal>,
     max_scan_nodes: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Return an incremental observation: unchanged controls are omitted and only the delta plus required context is returned. The runtime still validates document identity; a full observation is returned when no prior baseline exists."
+    )]
+    since_snapshot_id: Option<String>,
     /// Optional bounded visual refinement in the same six-tool snapshot call.
     probe: Option<V3SnapshotProbe>,
 }
@@ -17321,6 +17366,9 @@ impl AppV3 {
                 max_scan_nodes: args.max_scan_nodes,
             };
             let mut snapshot = snapshot_impl(&self.core, &base).await?;
+            if args.since_snapshot_id.is_some() {
+                shape_incremental_snapshot(&mut snapshot);
+            }
             if let Some(probe) = args.probe {
                 let (reference, region, full_page, max_bytes, timeout_ms, save_artifact, omit_image_payload) = match probe {
                     V3SnapshotProbe::ElementFocus { reference, max_bytes, timeout_ms, save_artifact, omit_image_payload } =>

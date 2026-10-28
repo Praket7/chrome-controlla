@@ -1119,7 +1119,25 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .cloned()
         .unwrap_or_default();
     let intent_query = args.goal.as_ref().and_then(|goal| goal.query.as_deref());
-    let items = crate::relevance::filter_items(&items, intent_query, args.max_items.unwrap_or(200));
+    let candidate_count = items.len();
+    let required_roles = args
+        .goal
+        .as_ref()
+        .and_then(|goal| goal.roles.as_deref())
+        .unwrap_or_default();
+    let items = crate::relevance::filter_items_for_task(
+        &items,
+        intent_query,
+        required_roles,
+        args.max_items.unwrap_or(200),
+    );
+    snapshot["observation_pruning"] = json!({
+        "candidate_count": candidate_count,
+        "returned_count": items.len(),
+        "required_roles": required_roles,
+        "policy": "required_roles_feedback_and_focus_first_then_query_rank",
+        "recall": "bounded; omitted_count is exact for this collection but richer scopes may hold more controls"
+    });
     let item_keys = crate::semantic_state::stable_item_keys(
         &items,
         snapshot["snapshot_id"].as_str().unwrap_or_default(),
