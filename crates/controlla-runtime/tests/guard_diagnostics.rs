@@ -39,7 +39,7 @@ const snapshotFn = {SNAPSHOT_JS};
 const guardFn = {guard};
 const cases = {{
   ok: {{html:'<button>Go</button>'}},
-  unsafe_page: {{html:'<input type="checkbox" aria-label="Go">'}},
+  unsupported_renderer_surface: {{html:'<input type="checkbox" aria-label="Go">'}},
   stale_reference: {{html:'<button>Go</button>', index:99}},
   changed_target: {{html:'<button aria-label="Go">Go</button>', mutate:()=>stage.querySelector('button').setAttribute('aria-label','Other')}},
   hidden: {{html:'<button>Go</button>', mutate:()=>stage.querySelector('button').style.display='none'}},
@@ -181,7 +181,10 @@ fn every_guard_predicate_reports_its_own_reason_code() {
         results["rerender_ambiguous"]
     );
     let expected = [
-        ("unsafe_page", GuardReason::UnsafePage),
+        (
+            "unsupported_renderer_surface",
+            GuardReason::UnsupportedRendererSurface,
+        ),
         ("stale_reference", GuardReason::StaleReference),
         ("changed_target", GuardReason::ChangedTarget),
         ("hidden", GuardReason::Hidden),

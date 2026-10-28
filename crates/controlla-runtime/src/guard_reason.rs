@@ -12,7 +12,16 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardReason {
-    UnsafePage,
+    /// The control lives in a child frame and must use the frame-local route.
+    FrameLocalRouteRequired,
+    /// A protected browser surface (permissions, chooser, native dialog).
+    ProtectedBrowserSurface,
+    /// The renderer surface is not supported for this operation.
+    UnsupportedRendererSurface,
+    /// The frame exists but its document cannot be resolved cross-origin.
+    CrossOriginFrameUnresolved,
+    /// A native dialog needs its own interaction route.
+    NativeDialogRouteRequired,
     StaleReference,
     ChangedTarget,
     Hidden,
@@ -49,8 +58,12 @@ pub enum RetryClass {
 }
 
 impl GuardReason {
-    pub const ALL: [GuardReason; 17] = [
-        GuardReason::UnsafePage,
+    pub const ALL: [GuardReason; 21] = [
+        GuardReason::FrameLocalRouteRequired,
+        GuardReason::ProtectedBrowserSurface,
+        GuardReason::UnsupportedRendererSurface,
+        GuardReason::CrossOriginFrameUnresolved,
+        GuardReason::NativeDialogRouteRequired,
         GuardReason::StaleReference,
         GuardReason::ChangedTarget,
         GuardReason::Hidden,
@@ -71,7 +84,11 @@ impl GuardReason {
 
     pub fn code(self) -> &'static str {
         match self {
-            GuardReason::UnsafePage => "unsafe_page",
+            GuardReason::FrameLocalRouteRequired => "frame_local_route_required",
+            GuardReason::ProtectedBrowserSurface => "protected_browser_surface",
+            GuardReason::UnsupportedRendererSurface => "unsupported_renderer_surface",
+            GuardReason::CrossOriginFrameUnresolved => "cross_origin_frame_unresolved",
+            GuardReason::NativeDialogRouteRequired => "native_dialog_route_required",
             GuardReason::StaleReference => "stale_reference",
             GuardReason::ChangedTarget => "changed_target",
             GuardReason::Hidden => "hidden",
@@ -92,6 +109,11 @@ impl GuardReason {
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
+        // `unsafe_page` was a catch-all in older receipts. Map it to the
+        // concrete unsupported-surface reason for one compatibility release.
+        if code == "unsafe_page" {
+            return Some(GuardReason::UnsupportedRendererSurface);
+        }
         Self::ALL.into_iter().find(|reason| reason.code() == code)
     }
 
@@ -112,7 +134,13 @@ impl GuardReason {
             GuardReason::MaskedBoundary | GuardReason::TrustedBoundary | GuardReason::ReadOnly => {
                 RetryClass::RequiresUser
             }
-            GuardReason::UnsafePage | GuardReason::UnsupportedControl => RetryClass::DoNotRetry,
+            GuardReason::UnsupportedControl
+            | GuardReason::UnsupportedRendererSurface
+            | GuardReason::ProtectedBrowserSurface
+            | GuardReason::NativeDialogRouteRequired => RetryClass::DoNotRetry,
+            GuardReason::FrameLocalRouteRequired | GuardReason::CrossOriginFrameUnresolved => {
+                RetryClass::SafeInternal
+            }
         }
     }
 
@@ -120,7 +148,9 @@ impl GuardReason {
     pub fn is_boundary(self) -> bool {
         matches!(
             self,
-            GuardReason::UnsafePage
+            GuardReason::UnsupportedRendererSurface
+                | GuardReason::ProtectedBrowserSurface
+                | GuardReason::NativeDialogRouteRequired
                 | GuardReason::MaskedBoundary
                 | GuardReason::TrustedBoundary
                 | GuardReason::Hidden
@@ -173,6 +203,9 @@ pub fn refusal(guard_result: &Value) -> Value {
     {
         out["blocker"] = blocker.clone();
     }
+    if let Some(reason) = GuardReason::from_code(raw) {
+        crate::action_recovery::attach_to_refusal(&mut out, reason);
+    }
     out
 }
 
@@ -206,12 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn only_viewport_and_obscured_are_safe_internal_and_boundaries_never_are() {
+    fn only_repairable_guards_are_safe_internal_and_boundaries_never_are() {
         for reason in GuardReason::ALL {
             let safe = reason.retry_class() == RetryClass::SafeInternal;
             assert_eq!(
                 safe,
-                matches!(reason, GuardReason::OutsideViewport | GuardReason::Obscured),
+                matches!(
+                    reason,
+                    GuardReason::OutsideViewport
+                        | GuardReason::Obscured
+                        | GuardReason::FrameLocalRouteRequired
+                        | GuardReason::CrossOriginFrameUnresolved
+                ),
                 "{reason:?}"
             );
             if reason.is_boundary() {
@@ -228,7 +267,10 @@ mod tests {
             "non-link child-frame controls must reach the frame-local route"
         );
         assert!(script.contains("const frame = e.ownerDocument === document"), "frame ownership remains checked");
-        assert!(script.contains("unsafe_page"), "the actual unsafe-control predicate stays enforced");
+        assert!(
+            script.contains("unsupported_renderer_surface"),
+            "the actual unsafe-control predicate stays enforced with a precise reason"
+        );
         assert_eq!(GuardReason::UnsupportedControl.retry_class(), RetryClass::DoNotRetry);
         assert_eq!(GuardReason::ReadOnly.retry_class(), RetryClass::RequiresUser);
     }

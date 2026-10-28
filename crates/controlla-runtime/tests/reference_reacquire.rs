@@ -23,6 +23,8 @@ fn lost_cdp_object_reacquires_with_high_confidence() {
         dom_path_fingerprint: "a:0".into(),
         rect_bucket: None,
         ancestor_id: None,
+        test_id: None,
+        section: None,
     };
     let items = vec![
         json!({"reference":"@c1","source_frame":"f","role":"link","name":"Go","href":"https://example.test/a","dom_path_fingerprint":"a:0","backend_node_id":123}),
@@ -51,6 +53,8 @@ fn reordered_duplicates_do_not_alias() {
         dom_path_fingerprint: "a:0".into(),
         rect_bucket: None,
         ancestor_id: None,
+        test_id: None,
+        section: None,
     };
     let items = vec![
         json!({"reference":"@c1","source_frame":"f","role":"link","name":"Item","href":null,"dom_path_fingerprint":"a:1"}),
@@ -81,6 +85,8 @@ fn child_frame_navigation_invalidates_semantic_reacquisition() {
         dom_path_fingerprint: "a:0".into(),
         rect_bucket: None,
         ancestor_id: None,
+        test_id: None,
+        section: None,
     };
     let reloaded_frame = json!({"reference":"@c2","source_frame":"main/iframe[1]","source_frame_revision":"2000","role":"link","name":"Continue","href":null,"dom_path_fingerprint":"a:0"});
     assert!(
