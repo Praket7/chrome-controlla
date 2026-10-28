@@ -1353,6 +1353,12 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(native.sent.at(-1).result.dispatch_acknowledged, true, `frame control click is dispatched only after child-tree identity validation: ${JSON.stringify(native.sent.at(-1).result)}`);
   assert.equal(native.sent.at(-1).result.verified, true, "frame click evaluates the requested postcondition before acknowledging success");
+  const warmFrameClickStart = debuggerCalls.length;
+  native.hostMessage({ type: "command", id: "oopif-click-warm", target_id: "41", method: "Controlla.frameClick", params: { frame_id: "frame-oopif", loader_id: "fixture-loader", backend_node_id: 91, outcome: { kind: "focused" }, timeout_ms: 250 } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(native.sent.at(-1).result.verified, true);
+  assert.equal(debuggerCalls.slice(warmFrameClickStart).filter(call => call.method === "Target.setAutoAttach").length, 0,
+    "a warm frame click reuses the persistent session graph without toggling auto-attach");
   const rootFrameInput = debuggerCalls.find(call => call.target.tabId === 41 && !call.target.sessionId && call.method === "Input.dispatchMouseEvent" && call.params.type === "mousePressed");
   assert.ok(rootFrameInput, "frame click input is routed through the root viewport coordinate space");
   assert.deepEqual([rootFrameInput.params.x, rootFrameInput.params.y], [140, 260], "OOPIF-local coordinates are translated through the frame owner into root viewport coordinates");

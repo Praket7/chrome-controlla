@@ -16,6 +16,7 @@ export class DebuggerSessionManager {
     this.detachImpl = detach ?? (async () => {});
     this.now = now;
     this.state = new Map();
+    this.waiters = new Map();
   }
 
   ensureState(tabId) {
@@ -79,6 +80,69 @@ export class DebuggerSessionManager {
     return this.frames.sessionForFrame(tabId, frameId) ?? this.ensureState(tabId).root_session_id;
   }
 
+  waitForFrameSession(tabId, frameId, timeoutMs = 400) {
+    const existing = this.frames.sessionForFrame(tabId, frameId);
+    if (existing) return Promise.resolve(existing);
+    const key = `${tabId}:${frameId}`;
+    const pending = this.waiters.get(key);
+    if (pending) return pending.promise;
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    const waiter = {
+      promise,
+      resolve: value => {
+        this.waiters.delete(key);
+        resolve(value);
+      },
+      timer: setTimeout(() => {
+        const current = this.waiters.get(key);
+        if (current === waiter) this.waiters.delete(key);
+        resolve(undefined);
+      }, Math.max(1, timeoutMs)),
+    };
+    this.waiters.set(key, waiter);
+    return promise;
+  }
+
+  resolveFrameWaiters(tabId, frameId, sessionId) {
+    const waiter = this.waiters.get(`${tabId}:${frameId}`);
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(sessionId);
+    }
+  }
+
+  async recoverAutoAttach(tabId) {
+    // Recovery-only: re-request current iframe targets after a frame appears in
+    // the tree without a session. The warm path never calls this.
+    const state = this.ensureState(tabId);
+    state.auto_attach = false;
+    await this.ensureAutoAttach(tabId).catch(() => {});
+  }
+
+  async ensureFrameSession(tabId, frameId, { timeoutMs = 400, hydrate = true } = {}) {
+    const existing = this.frames.sessionForFrame(tabId, frameId);
+    if (existing) return existing;
+    await this.ensureAutoAttach(tabId);
+    let sessionId = this.frames.sessionForFrame(tabId, frameId);
+    if (!sessionId && hydrate) {
+      await this.syncFrameTree(tabId).catch(() => null);
+      sessionId = this.frames.sessionForFrame(tabId, frameId);
+    }
+    if (sessionId) return sessionId;
+    await this.recoverAutoAttach(tabId);
+    return this.waitForFrameSession(tabId, frameId, timeoutMs);
+  }
+
+  clearWaiters(tabId) {
+    for (const [key, waiter] of this.waiters) {
+      if (!key.startsWith(`${tabId}:`)) continue;
+      clearTimeout(waiter.timer);
+      this.waiters.delete(key);
+      waiter.resolve(undefined);
+    }
+  }
+
   currentDocument(tabId) {
     return this.frames.ensureTab(tabId).document_id ?? null;
   }
@@ -101,6 +165,7 @@ export class DebuggerSessionManager {
       if (target.type === "page" && !state.root_session_id) state.root_session_id = sessionId;
       if (frameId && target.type === "iframe") {
         this.frames.bindSession(tabId, frameId, sessionId);
+        this.resolveFrameWaiters(tabId, frameId, sessionId);
       }
       // Child targets receive nested OOPIF discovery exactly once.
       void this.ensureAutoAttach(tabId, { sessionId }).catch(() => {});
@@ -119,8 +184,7 @@ export class DebuggerSessionManager {
         loader_id: null,
       });
     } else if (method === "Page.frameNavigated") {
-      const frame = params.frame ?? {};
-      if (frame.id) {
+      const frame = params.frame ?? {};        if (frame.id) {
         this.frames.upsert(tabId, {
           frame_id: frame.id,
           loader_id: frame.loaderId,
@@ -133,6 +197,7 @@ export class DebuggerSessionManager {
           this.setCurrentDocument(tabId, frame.loaderId ?? null);
           state.root_session_id = state.root_session_id ?? sessionId ?? null;
         }
+        if (sessionId) this.resolveFrameWaiters(tabId, frame.id, sessionId);
       }
     } else if (method === "Page.frameDetached") {
       this.frames.remove(tabId, params.frameId);
@@ -175,12 +240,14 @@ export class DebuggerSessionManager {
 
   invalidateTab(tabId, reason = "unknown") {
     this.state.delete(tabId);
+    this.clearWaiters(tabId);
     this.frames.invalidateTab(tabId, reason);
   }
 
   async release(tabId) {
     const state = this.state.get(tabId);
     this.state.delete(tabId);
+    this.clearWaiters(tabId);
     this.frames.release(tabId);
     if (!state) return;
     await this.detachImpl(tabId).catch(() => {});

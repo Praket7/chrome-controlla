@@ -191,8 +191,6 @@ const fileChooserOperations = new Map();
 const downloadObservers = new Map();
 const recentlyCreatedTabs = new Map();
 let fileChooserEventSequence = 0;
-const frameSessions = new Map();
-const frameSessionWaiters = new Map();
 const pendingSecureInputs = new Map();
 const openTabInflight = new Map();
 const cancelledScreenshotRequests = new Set();
@@ -437,12 +435,9 @@ chrome.tabs.onAttached.addListener(tabId => {
 chrome.tabs.onMoved.addListener(tabId => bumpPairedTabTopology(tabId));
 chrome.windows.onFocusChanged.addListener(() => { focusEpoch++; });
 function recordFrameSession(tabId, frameId, sessionId) {
-  let frames = frameSessions.get(tabId);
-  if (!frames) { frames = new Map(); frameSessions.set(tabId, frames); }
-  frames.set(frameId, sessionId);
+  // The persistent manager owns the frame/session graph. Event handling in
+  // `debuggerSessions` binds the session before this compatibility hook runs.
   frameTreeRegistry.bindSession(tabId, frameId, sessionId);
-  const waiter = frameSessionWaiters.get(`${tabId}:${frameId}`);
-  if (waiter) { clearTimeout(waiter.timer); frameSessionWaiters.delete(`${tabId}:${frameId}`); waiter.resolve(sessionId); }
 }
 function isExactHttpUrl(value) {
   if (typeof value !== "string" || !value || value.length > 2048 || /\s/.test(value)) return false;
@@ -451,20 +446,17 @@ function isExactHttpUrl(value) {
     return (url.protocol === "http:" || url.protocol === "https:") && !!url.hostname && !url.username && !url.password;
   } catch { return false; }
 }
-function waitForFrameSession(tabId, frameId, timeoutMs) {
-  const existing = frameSessions.get(tabId)?.get(frameId);
-  if (existing) return Promise.resolve(existing);
-  const key = `${tabId}:${frameId}`;
-  if (frameSessionWaiters.has(key)) return frameSessionWaiters.get(key).promise;
-  let resolve;
-  const promise = new Promise(done => { resolve = done; });
-  const waiter = { promise, resolve, timer: setTimeout(() => { frameSessionWaiters.delete(key); resolve(undefined); }, timeoutMs) };
-  frameSessionWaiters.set(key, waiter);
-  return promise;
+async function waitForFrameSession(tabId, frameId, timeoutMs) {
+  const existing = frameTreeRegistry.sessionForFrame(tabId, frameId);
+  if (existing) return existing;
+  // A frame may have appeared after the last auto-attach event. Re-request
+  // current iframe targets once before waiting; the steady-state path is warm.
+  await debuggerSessions.recoverAutoAttach(tabId);
+  const resolved = await debuggerSessions.waitForFrameSession(tabId, frameId, timeoutMs);
+    return resolved;
 }
 function clearFrameSessions(tabId) {
-  frameSessions.delete(tabId);
-  for (const [key, waiter] of frameSessionWaiters) if (key.startsWith(`${tabId}:`)) { clearTimeout(waiter.timer); frameSessionWaiters.delete(key); waiter.resolve(undefined); }
+  debuggerSessions.invalidateTab(tabId, "detached");
 }
 
 function clearFileChooserState(tabId, error = "Target detached before the file chooser opened.") {
@@ -652,11 +644,11 @@ async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) 
   const chain = path(tree.frameTree, []);
   if (!chain?.length || chain.length < 2 || chain.length > 9) throw new Error("Frame ancestry is unavailable or too deep.");
   if (chain.some(frame => !frame?.id || !frame?.loaderId)) throw new Error("Frame or loader identity is unavailable in the ancestry.");
-  const initialSessions = chain.slice(0, -1).map(frame => frameSessions.get(tabId)?.get(frame.id) || null);
+  const initialSessions = chain.slice(0, -1).map(frame => frameTreeRegistry.sessionForFrame(tabId, frame.id) || null);
   const owners = [];
   let viewport = childViewport;
   if (!(viewport?.width > 0) || !(viewport?.height > 0)) {
-    const measured = await sendCdpCommand({ tabId, sessionId: frameSessions.get(tabId)?.get(frameId) }, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
+    const measured = await sendCdpCommand({ tabId, sessionId: frameTreeRegistry.sessionForFrame(tabId, frameId) }, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){return {width:this.ownerDocument.defaultView.innerWidth,height:this.ownerDocument.defaultView.innerHeight}}", returnByValue: true });
     viewport = measured.result?.value;
   }
   // Each child owner belongs to its immediate parent document. Route that
@@ -664,7 +656,7 @@ async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) 
   // compose the resulting affine mapping into the next ancestor viewport.
   for (let index = chain.length - 1; index > 0; index--) {
     const childFrame = chain[index], parentFrame = chain[index - 1];
-    const parentSession = frameSessions.get(tabId)?.get(parentFrame.id);
+    const parentSession = frameTreeRegistry.sessionForFrame(tabId, parentFrame.id);
     const parentRoute = parentSession ? { tabId, sessionId: parentSession } : root;
     const owner = await sendCdpCommand(parentRoute, "DOM.getFrameOwner", { frameId: childFrame.id });
     const ownerId = owner?.backendNodeId;
@@ -697,7 +689,7 @@ async function rootPointForFrame(tabId, frameId, objectId, x, y, childViewport) 
   const latestTree = await sendCdpCommand(root, "Page.getFrameTree", {});
   const latestChain = path(latestTree.frameTree, []);
   if (!latestChain || latestChain.length !== chain.length || latestChain.some((frame, index) => frame.id !== chain[index].id || frame.loaderId !== chain[index].loaderId)) throw new Error("Frame ancestry or loader changed during owner mapping.");
-  if (chain.slice(0, -1).some((frame, index) => (frameSessions.get(tabId)?.get(frame.id) || null) !== initialSessions[index])) throw new Error("Frame owner session changed during owner mapping.");
+  if (chain.slice(0, -1).some((frame, index) => (frameTreeRegistry.sessionForFrame(tabId, frame.id) || null) !== initialSessions[index])) throw new Error("Frame owner session changed during owner mapping.");
   return { x, y, owner_signature: owners };
 }
 async function directFramePoint(tabId, frameId, loaderId, x, y, childViewport) {
@@ -749,10 +741,10 @@ async function fileInputsInFrames(tabId, frameTree) {
   const visit = node => { for (const child of node?.childFrames || []) { if (child.frame?.id && child.frame.loaderId) frames.push(child.frame); visit(child); } };
   visit(frameTree);
   if (frames.length > 128) throw new Error("Too many frames for bounded file-input discovery.");
-  await sendCdpCommand({ tabId }, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+  await debuggerSessions.ensureAutoAttach(tabId);
   try {
     const inventoryGeneration = pairedTabTopologyGenerations.get(tabId) || 0;
-    const sessions = await Promise.all(frames.map(async child => [child, frameSessions.get(tabId)?.get(child.id) || await waitForFrameSession(tabId, child.id, 400)]));
+    const sessions = await Promise.all(frames.map(async child => [child, frameTreeRegistry.sessionForFrame(tabId, child.id) || await waitForFrameSession(tabId, child.id, 400)]));
     if (!pairedTabTopologyStable(tabId, inventoryGeneration)) throw new Error("Frame inventory target topology changed while resolving child sessions.");
     const routes = [{ frameId: root.id, loaderId: root.loaderId, target: { tabId } }, ...sessions.filter(([, sessionId]) => sessionId).map(([child, sessionId]) => ({ frameId: child.id, loaderId: child.loaderId, target: { tabId, sessionId } }))];
     const inputs = [];
@@ -765,7 +757,7 @@ async function fileInputsInFrames(tabId, frameTree) {
     }
     return inputs;
   } finally {
-    await sendCdpCommand({ tabId }, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+    /* auto-attach stays warm for the bound tab */
   }
 }
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -778,8 +770,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     } else if (method === "Page.frameNavigated" && typeof source.sessionId === "string" && typeof params?.frame?.id === "string") {
       recordFrameSession(tabId, params.frame.id, source.sessionId);
     } else if (method === "Target.detachedFromTarget") {
-      const frames = frameSessions.get(tabId);
-      if (frames) for (const [frameId, sessionId] of frames) if (sessionId === params?.sessionId) frames.delete(frameId);
       bumpPairedTabTopology(tabId);
     }
   }
@@ -821,7 +811,14 @@ function trackTabDetach(tabId, current) {
   current.then(cleanup, cleanup);
 }
 async function performDebuggerDetach(tabId) { try { await chrome.debugger.detach({ tabId }); } catch {} }
-async function attachDebugger(tabId) { await (pendingTabDetaches.get(tabId) || Promise.resolve()).catch(() => {}); return chrome.debugger.attach({ tabId }, "1.3"); }
+async function attachDebugger(tabId) {
+  await (pendingTabDetaches.get(tabId) || Promise.resolve()).catch(() => {});
+  const attached = await chrome.debugger.attach({ tabId }, "1.3");
+  // Auto-attach is warmed by the first frame operation and then stays on for
+  // the life of this attachment; pairing itself stays command-free.
+  debuggerSessions.markAttached(tabId);
+  return attached;
+}
 function queueNativeMutation(operation) { const result = nativeMutation.then(operation, operation); nativeMutation = result.catch(() => {}); return result; }
 function sendNative(port, generation, message) {
   if (nativePort !== port || nativePortGeneration !== generation) return false;
@@ -1026,21 +1023,21 @@ async function frameHumanTypeCharacter(tabId, params, isAuthorized) {
     const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
     return visit(tree.frameTree);
   };
-  await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+  await debuggerSessions.ensureAutoAttach(tabId);
   let dispatchAttempted = false, keyDownAttempted = false, child = route, cleanupKey, cleanupExpected = expected, guard, objectId;
   try {
     if (!isAuthorized(tabId) || performance.now() >= deadline || await frameLoader() !== loaderId) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_identity_stale" };
-    let sessionId = frameSessions.get(tabId)?.get(frameId);
+    let sessionId = frameTreeRegistry.sessionForFrame(tabId, frameId);
     if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
     child = sessionId ? { tabId, sessionId } : route;
     const ax = await sendCdpCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
     if (!ax.nodes?.some(item => item.backendDOMNodeId === backendNodeId && ["textbox", "searchbox", "combobox"].includes(item.role?.value))) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_editor_not_accessible_textbox" };
     const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
     objectId = resolved.object?.objectId;
-    if (!objectId || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_identity_stale" };
+    if (!objectId || (sessionId && frameTreeRegistry.sessionForFrame(tabId, frameId) !== sessionId) || await frameLoader() !== loaderId) return { status: "not_dispatched", dispatch_may_have_occurred: false, completed_chars: 0, key_events: 0, reason: "frame_identity_stale" };
     guard = "function(expected,prepare,normalize){const e=this;if(!e||!e.isConnected)return {ok:false,reason:'target_stale'};const rich=e instanceof HTMLElement&&!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)&&(e.isContentEditable||e.getAttribute('role')==='textbox'),plain=e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type),trusted=e.closest('[data-requires-trusted]');if(!rich&&!plain||e.matches(':disabled,[aria-disabled=\\\"true\\\"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||trusted&&trusted!==e)return {ok:false,reason:'blocked'};const value=()=>{const raw=rich?(e.innerText??e.textContent??'').replace(/\\r\\n/g,'\\n').replace(/\\u00a0/g,' '):e.value;return rich?(raw==='\\n'?'':normalize?raw.replace(/\\n{2,}/g,b=> '\\n'.repeat(Math.ceil(b.length/2))):raw):raw};if(value()!==(rich&&expected==='\\n'?'':expected))return {ok:false,reason:'stale_value'};if(prepare){e.focus();if(rich){const s=e.ownerDocument.getSelection(),r=e.ownerDocument.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r)}else e.setSelectionRange(e.value.length,e.value.length)}const s=e.ownerDocument.getSelection(),focused=e.ownerDocument.activeElement===e,atEnd=rich?s?.isCollapsed&&s.anchorNode&&e.contains(s.anchorNode)&&(()=>{const r=e.ownerDocument.createRange();r.selectNodeContents(e);r.setStart(s.anchorNode,s.anchorOffset);return r.toString()===''})():e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;return focused&&atEnd?{ok:true,value:value()}:{ok:false,reason:'focus_or_selection_changed'}}";
     const check = async value => {
-      if (!isAuthorized(tabId) || performance.now() >= deadline || await frameLoader() !== loaderId || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId)) return { ok: false, reason: "frame_identity_stale" };
+      if (!isAuthorized(tabId) || performance.now() >= deadline || await frameLoader() !== loaderId || (sessionId && frameTreeRegistry.sessionForFrame(tabId, frameId) !== sessionId)) return { ok: false, reason: "frame_identity_stale" };
       const response = await sendCdpCommand(child, "Runtime.callFunctionOn", { objectId, functionDeclaration: guard, arguments: [{ value }, { value: false }, { value: normalizeParagraphs }], returnByValue: true });
       return response.result?.value || { ok: false, reason: "guard_response_missing" };
     };
@@ -1078,7 +1075,7 @@ async function frameHumanTypeCharacter(tabId, params, isAuthorized) {
         if (cleanup.result?.value?.ok === true) await sendCdpCommand(child, "Input.dispatchKeyEvent", cleanupKey);
       } catch { /* dispatch outcome is already unknown; cleanup was attempted once */ }
     }
-    await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+    /* auto-attach stays warm for the bound tab */
   }
 }
 async function scheduleNativeReconnect() {
@@ -2047,7 +2044,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if(!documentId||!(await identityStillOwned())){
           respond({type:"result",id:request.id,result:{status:"not_dispatched",reason_code:"inactive_target_or_identity_changed",dispatch_acknowledged:false,dispatch_may_have_occurred:false}});return;
         }
-        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
+        await debuggerSessions.ensureAutoAttach(tabId);
         try{
           const info=await currentFrame();
           if(!info||info.frame.loaderId!==loaderId||!validFrameChain(info))throw new Error("Frame ancestry is stale, too deep, or unavailable.");
@@ -2078,12 +2075,12 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           if(final.scalar("ok")!==true||final.scalar("x")!==state("x")||final.scalar("y")!==state("y")||final.containerId!==containerId)throw new Error("Frame scroll target or nearest container changed before dispatch.");
           let finalInfo=await currentFrame();
           const sameChain=info=>info?.chain?.length===expectedChain.length&&info.chain.every((frame,index)=>frame.id===expectedChain[index].id&&frame.loaderId===expectedChain[index].loaderId);
-          if(!sameChain(finalInfo)||frameSessions.get(tabId)?.get(frameId)!==(frameSessionId||undefined))throw new Error("Frame ancestry or owner session changed before wheel dispatch.");
+          if(!sameChain(finalInfo)||frameTreeRegistry.sessionForFrame(tabId, frameId)!==(frameSessionId||undefined))throw new Error("Frame ancestry or owner session changed before wheel dispatch.");
           finalInfo=await currentFrame();
           if(!sameChain(finalInfo))throw new Error("Frame or loader identity changed during final scroll preflight.");
           const finalPoint=await rootPointForFrame(tabId,frameId,objectId,final.scalar("x"),final.scalar("y"),{width:final.scalar("width"),height:final.scalar("height")});
           const dispatchInfo=await currentFrame();
-          if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||frameSessions.get(tabId)?.get(frameId)!==(frameSessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
+          if(Math.abs(finalPoint.x-initialPoint.x)>0.5||Math.abs(finalPoint.y-initialPoint.y)>0.5||!sameChain(dispatchInfo)||frameTreeRegistry.sessionForFrame(tabId, frameId)!==(frameSessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame transform, ancestry, document, or activation changed before wheel dispatch.");
           await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseMoved",button:"none",...finalPoint});
           wheelAttempted=true;
           await sendCdpCommand(root,"Input.dispatchMouseEvent",{type:"mouseWheel",...finalPoint,deltaX:dx,deltaY:dy});
@@ -2098,7 +2095,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           if(containerId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:containerId}).catch(()=>{});
           if(descriptorId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:descriptorId}).catch(()=>{});
           if(finalDescriptorId)await sendCdpCommand(frameRoute||root,"Runtime.releaseObject",{objectId:finalDescriptorId}).catch(()=>{});
-          await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+          /* auto-attach stays warm for the bound tab */
         }
       }catch(error){
         respond({type:"result",id:request.id,result:{status:wheelAttempted?"unknown":"not_dispatched",reason_code:wheelAttempted?"wheel_delivery_unknown":"frame_scroll_preflight_rejected",dispatch_acknowledged:wheelAcknowledged,dispatch_may_have_occurred:wheelAttempted,reason:safeNativeError(String(error))}});return;
@@ -2125,7 +2122,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       };
       const origin = originForFrame(frame);
       if (!origin) throw new Error("Password field has no trustworthy HTTP(S) frame origin.");
-      await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await debuggerSessions.ensureAutoAttach(tabId);
       let promptTab, promptActivationEpoch;
       const capturePromptActivation = info => {
         if (promptTab?.id === info.tabId && promptActivationEpoch === undefined) promptActivationEpoch = activationEpoch;
@@ -2138,7 +2135,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const active = await chrome.tabs.query({ active: true, windowId: target.windowId });
         return activationEpoch === observedEpoch && active[0]?.id === promptTab.id;
       };
-      const route = () => { const sessionId = frameSessions.get(tabId)?.get(frameId); return sessionId ? { tabId, sessionId } : root; };
+      const route = () => { const sessionId = frameTreeRegistry.sessionForFrame(tabId, frameId); return sessionId ? { tabId, sessionId } : root; };
       const checkPassword = async () => {
         if (pairedTabDocumentIds.get(tabId) !== expectedDocumentId || !isAuthorized(tabId)) throw new Error("Target document or Controlla lease changed during secure entry.");
         const current = await sendCdpCommand(root, "Page.getFrameTree", {});
@@ -2212,7 +2209,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         for (const [nonce, pending] of pendingSecureInputs) if (pending.tabId === tabId) { clearTimeout(pending.timer); pendingSecureInputs.delete(nonce); }
         if (promptTab?.id != null) await chrome.tabs.remove(promptTab.id).catch(() => {});
         chrome.tabs.onActivated.removeListener(capturePromptActivation);
-        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        /* auto-attach stays warm for the bound tab */
       }
       return;
     }
@@ -2307,7 +2304,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const readTree = () => sendCdpCommand({ tabId }, "Page.getFrameTree", {});
       const find = node => node?.frame?.id === frameId ? node.frame : (node?.childFrames || []).map(find).find(Boolean);
       if (find((await readTree()).frameTree)?.loaderId !== loaderId) throw new Error("Upload frame navigated after the chooser opened.");
-      const childSessionId = frameSessions.get(tabId)?.get(frameId);
+      const childSessionId = frameTreeRegistry.sessionForFrame(tabId, frameId);
       const route = childSessionId ? { tabId, sessionId: childSessionId } : { tabId };
       const resolved = await sendCdpCommand(route, "DOM.resolveNode", { backendNodeId });
       if (!resolved.object?.objectId) throw new Error("Chooser input could not be resolved for accept-filter validation.");
@@ -2337,8 +2334,8 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       fileChooserOperations.set(tabId, operation);
       let route, interceptionEnabled = false, networkEnabled = false, pressAttempted = false, dispatched = false, selectionResult;
       try {
-        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
-        const sessionId = frameSessions.get(tabId)?.get(frameId) || await waitForFrameSession(tabId, frameId, 400);
+        await debuggerSessions.ensureAutoAttach(tabId);
+        const sessionId = frameTreeRegistry.sessionForFrame(tabId, frameId) || await waitForFrameSession(tabId, frameId, 400);
         route = sessionId ? { tabId, sessionId } : root;
         operation.networkSessionId = sessionId || null;
         await sendCdpCommand(route, "Network.enable", {});
@@ -2395,7 +2392,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (selectionResult) selectionResult.network_events = operation.networkEvents;
         if (fileChooserOperations.get(tabId) === operation) fileChooserOperations.delete(tabId);
         if (interceptionEnabled) await sendCdpCommand(route, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
-        await sendCdpCommand(root, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        /* auto-attach stays warm for the bound tab */
       }
       respond({ type: "result", id: request.id, result: selectionResult });
       return;
@@ -2418,10 +2415,10 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const visit = node => node?.frame?.id === frameId ? node.frame.url : (node?.childFrames || []).map(visit).find(Boolean);
         return visit(tree.frameTree);
       };
-      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await debuggerSessions.ensureAutoAttach(tabId);
       try {
         if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
-        let sessionId = frameSessions.get(tabId)?.get(frameId);
+        let sessionId = frameTreeRegistry.sessionForFrame(tabId, frameId);
         if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
         const child = sessionId ? { tabId, sessionId } : route;
         const beforeUrl = await frameUrl();
@@ -2430,7 +2427,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if (!node || !["button", "link", "checkbox", "radio", "option", "menuitem", "tab", "switch"].includes(node.role?.value)) throw new Error("Frame control is stale or is not an actionable control.");
         const box = await sendCdpCommand(child, "DOM.getBoxModel", { backendNodeId });
         const quad = box.model?.content;
-        if (!Array.isArray(quad) || quad.length !== 8 || (sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
+        if (!Array.isArray(quad) || quad.length !== 8 || (sessionId && frameTreeRegistry.sessionForFrame(tabId, frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame control changed before dispatch.");
         const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Frame click target could not be resolved for outcome verification.");
@@ -2475,7 +2472,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         do { verified = await verifyOutcome().catch(() => false); if (verified || Date.now() >= deadline) break; await new Promise(resolve => setTimeout(resolve, 50)); } while (Date.now() < deadline);
         respond({ type: "result", id: request.id, result: { frame_id: frameId, backend_node_id: backendNodeId, input_mode: inputMode, dispatch_acknowledged: true, dispatch_may_have_occurred: true, verified, reason: verified ? undefined : "requested frame click outcome was not observed before its deadline" } });
       } finally {
-        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        /* auto-attach stays warm for the bound tab */
       }
       return;
     }
@@ -2508,10 +2505,10 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       };
       let sessionId,child,objectId,touchStartAttempted=false,dispatchAcknowledged=false,releaseAcknowledged=false,receipt;
       try {
-        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true,filter:[{type:"iframe",exclude:false}]});
+        await debuggerSessions.ensureAutoAttach(tabId);
         const initialInfo=await currentInfo();
         if(!safeOrigins(initialInfo)||initialInfo.frame.loaderId!==loaderId)throw new Error("Frame identity or non-opaque HTTP(S) origin could not be proven.");
-        sessionId=frameSessions.get(tabId)?.get(frameId)||await waitForFrameSession(tabId,frameId,400);
+        sessionId=frameTreeRegistry.sessionForFrame(tabId, frameId)||await waitForFrameSession(tabId,frameId,400);
         child=sessionId?{tabId,sessionId}:root;
         const ax=await sendCdpCommand(child,"Accessibility.getFullAXTree",sessionId?{}:{frameId});
         if(!ax.nodes?.some(node=>node.backendDOMNodeId===backendNodeId))throw new Error("Swipe target is absent from the selected frame accessibility tree.");
@@ -2530,7 +2527,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         if(JSON.stringify(initialStart.owner_signature)!==JSON.stringify(initialEnd.owner_signature))throw new Error("Frame owner transform differed across swipe endpoints.");
         const finalGuard=await guardCall("before",before.viewport),finalInfo=await currentInfo();
         if(finalGuard?.ok!==true||JSON.stringify(finalGuard.rect)!==JSON.stringify(before.rect)||!sameChain(initialInfo,finalInfo)||
-            frameSessions.get(tabId)?.get(frameId)!==(sessionId||undefined))throw new Error("Frame target, loader, or session changed during swipe preflight.");
+            frameTreeRegistry.sessionForFrame(tabId, frameId)!==(sessionId||undefined))throw new Error("Frame target, loader, or session changed during swipe preflight.");
         const finalStart=await rootPointForFrame(tabId,frameId,objectId,sx,sy,{width:JSON.parse(finalGuard.viewport)[0],height:JSON.parse(finalGuard.viewport)[1]});
         const finalEnd=await rootPointForFrame(tabId,frameId,objectId,ex,ey,{width:JSON.parse(finalGuard.viewport)[0],height:JSON.parse(finalGuard.viewport)[1]});
         const dispatchInfo=await currentInfo();
@@ -2542,7 +2539,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchStart",touchPoints:[{id:1,x:finalStart.x,y:finalStart.y,radiusX:1,radiusY:1,force:1}]});
         await sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchMove",touchPoints:[{id:1,x:finalEnd.x,y:finalEnd.y,radiusX:1,radiusY:1,force:1}]});
         dispatchAcknowledged=true;
-        if(!sameChain(initialInfo,await currentInfo())||frameSessions.get(tabId)?.get(frameId)!==(sessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame identity changed after swipe dispatch.");
+        if(!sameChain(initialInfo,await currentInfo())||frameTreeRegistry.sessionForFrame(tabId, frameId)!==(sessionId||undefined)||!(await identityStillOwned()))throw new Error("Frame identity changed after swipe dispatch.");
         const after=await guardCall("after",before.viewport);
         if(after?.ok!==true)throw new Error("Frame swipe readback could not revalidate the target.");
         const moved=JSON.stringify(after.rect)!==JSON.stringify(before.rect)||JSON.stringify(after.scroll)!==JSON.stringify(before.scroll);
@@ -2552,7 +2549,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       } finally {
         if(touchStartAttempted)releaseAcknowledged=await Promise.race([sendCdpCommand(root,"Input.dispatchTouchEvent",{type:"touchEnd",touchPoints:[]}).then(()=>true).catch(()=>false),new Promise(resolve=>setTimeout(()=>resolve(false),1000))]);
         if(objectId&&child)await sendCdpCommand(child,"Runtime.releaseObject",{objectId}).catch(()=>{});
-        await sendCdpCommand(root,"Target.setAutoAttach",{autoAttach:false,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+        /* auto-attach stays warm for the bound tab */
       }
       if(touchStartAttempted&&!releaseAcknowledged)receipt={status:"unknown",reason_code:"touch_release_unconfirmed",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:true};
       respond({type:"result",id:request.id,result:receipt||{status:"unknown",reason_code:"frame_swipe_receipt_missing",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:touchStartAttempted}});
@@ -2569,11 +2566,11 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const visit = node => node?.frame?.id === frameId ? node.frame.loaderId : (node?.childFrames || []).map(visit).find(Boolean);
         return visit(tree.frameTree);
       };
-      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await debuggerSessions.ensureAutoAttach(tabId);
       let dispatchAttempted = false;
       try {
         if (await frameLoader() !== loaderId) throw new Error("Frame document changed since the accessibility snapshot.");
-        let sessionId = frameSessions.get(tabId)?.get(frameId);
+        let sessionId = frameTreeRegistry.sessionForFrame(tabId, frameId);
         if (!sessionId) sessionId = await waitForFrameSession(tabId, frameId, 400);
         const child = sessionId ? { tabId, sessionId } : route;
         const ax = await sendCdpCommand(child, "Accessibility.getFullAXTree", sessionId ? {} : { frameId });
@@ -2582,7 +2579,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         const resolved = await sendCdpCommand(child, "DOM.resolveNode", { backendNodeId });
         const objectId = resolved.object?.objectId;
         if (!objectId) throw new Error("Frame field could not be resolved for guarded fill.");
-        if ((sessionId && frameSessions.get(tabId)?.get(frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame document changed before fill dispatch.");
+        if ((sessionId && frameTreeRegistry.sessionForFrame(tabId, frameId) !== sessionId) || await frameLoader() !== loaderId) throw new Error("Frame document changed before fill dispatch.");
         const functionDeclaration = "function(expected,value){const e=this;const blocked=r=>({dispatch_may_have_occurred:false,verified:false,matches_requested_value:false,reason_code:r});if(!e||!e.isConnected)return blocked('target_stale');const input=e instanceof HTMLInputElement,area=e instanceof HTMLTextAreaElement;if(!input&&!area)return blocked('unsupported_control');if(input&&['password','file','hidden','checkbox','radio','submit','button','reset'].includes((e.type||'').toLowerCase()))return blocked('protected_or_nontext_control');if(e.disabled||e.readOnly||e.getAttribute('aria-disabled')==='true'||e.getAttribute('aria-readonly')==='true'||e.hasAttribute('data-masked')||e.hasAttribute('data-requires-trusted'))return blocked('field_blocked');const r=e.getBoundingClientRect(),s=getComputedStyle(e),x=Math.min(innerWidth-1,Math.max(0,r.left+r.width/2)),y=Math.min(innerHeight-1,Math.max(0,r.top+r.height/2));if(r.width<=0||r.height<=0||s.display==='none'||s.visibility!=='visible'||Number.parseFloat(s.opacity||'1')<=0||document.elementFromPoint(x,y)!==e)return blocked('field_not_actionable');if(e.value!==expected)return blocked('stale_value');try{e.focus({preventScroll:true});if(document.activeElement!==e)return blocked('focus_failed');const proto=input?HTMLInputElement.prototype:HTMLTextAreaElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return blocked('native_setter_unavailable');setter.call(e,value);e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));const matches=e.value===value;return {dispatch_may_have_occurred:true,verified:matches,matches_requested_value:matches,length:e.value.length,reason_code:matches?null:'readback_mismatch'}}catch(_){return {dispatch_may_have_occurred:true,verified:false,matches_requested_value:false,reason_code:'fill_delivery_uncertain'}}}";
         let result;
         try {
@@ -2600,7 +2597,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
           verified: false, matches_requested_value: false, reason_code: dispatchAttempted ? "frame_fill_delivery_uncertain" : "frame_fill_preflight_rejected",
           reason: String(error) } });
       } finally {
-        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        /* auto-attach stays warm for the bound tab */
       }
       return;
     }
@@ -2610,7 +2607,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         isAuthorized,
         now: () => performance.now(),
         commandCount: () => executionCounters.cdp_commands,
-        sessionForFrame: (tab, frame) => frameSessions.get(tab)?.get(frame) ?? frameTreeRegistry.sessionForFrame(tab, frame),
+        sessionForFrame: (tab, frame) => frameTreeRegistry.sessionForFrame(tab, frame),
         loaderForFrame: (tab, frame) => frameTreeRegistry.loaderForFrame(tab, frame) ?? null,
         syncFrameTree: async tab => {
           const response = await sendCdpCommand({ tabId: tab }, "Page.getFrameTree", {});
@@ -2633,14 +2630,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       const frameId = request.params?.frame_id;
       if (typeof frameId !== "string" || !frameId || frameId.length > 256) throw new Error("frame_id must be a bounded nonempty string.");
       const route = { tabId };
-      await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe", exclude: false }] });
+      await debuggerSessions.ensureAutoAttach(tabId);
       try {
         const sessionId = await waitForFrameSession(tabId, frameId, 1500);
         if (!sessionId) throw new Error("No attached OOPIF session matched the requested frame.");
         const result = await sendCdpCommand({ tabId, sessionId }, "Accessibility.getFullAXTree", {});
         respond({ type: "result", id: request.id, result: { ...result, source_frame_id: frameId, routing: "oopif_child_session" } });
       } finally {
-        await sendCdpCommand(route, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+        /* auto-attach stays warm for the bound tab */
       }
       return;
     }
