@@ -532,6 +532,54 @@ mod tests {
         let _ = m1;
     }
 
+    /// A crashed holder leaves an owner record behind but its OS lock is
+    /// released by the kernel, so a stale record alone must never block
+    /// acquisition. This is the cross-platform contract.
+    #[test]
+    fn a_stale_owner_record_does_not_block_acquisition() {
+        let dir = test_dir();
+        let state = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let coord = LeaseCoordinator::with_lock_and_state_dir(&dir, &state);
+        let key = key();
+        let path = dir.join(format!("{}.lock", lease_key_digest(&key)));
+        // No runtime record exists for this state directory, so the recorded
+        // generation is absent from the live records and the lease is dead.
+        let record = OwnerRecord {
+            schema_version: 1,
+            pid: 4_000_000,
+            process_generation: "dead-generation".into(),
+            state_dir: state.display().to_string(),
+            owner: "crashed-client".into(),
+            expires_unix_seconds: 0,
+        };
+        std::fs::write(
+            path.with_extension("lock.owner.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let lease = coord
+            .try_acquire(
+                key.clone(),
+                "recovering-owner",
+                Duration::from_secs(10),
+                false,
+            )
+            .expect("a stale owner record must not block acquisition");
+        assert_eq!(lease.owner, "recovering-owner");
+        let written: OwnerRecord =
+            serde_json::from_slice(&std::fs::read(path.with_extension("lock.owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(written.owner, "recovering-owner");
+        assert_eq!(written.pid, std::process::id());
+    }
+
+    /// POSIX can replace a lock file that another process still has open, so a
+    /// dead generation can be taken over even while its stale handle is alive.
+    /// Windows reports a sharing violation instead; there the kernel releases a
+    /// crashed holder's lock, which the test above covers.
+    #[cfg(unix)]
     #[test]
     fn dead_owner_generation_is_taken_over_immediately() {
         let dir = test_dir();
