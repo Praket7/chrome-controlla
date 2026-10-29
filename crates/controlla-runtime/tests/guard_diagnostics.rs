@@ -189,7 +189,6 @@ fn every_guard_predicate_reports_its_own_reason_code() {
         ("changed_target", GuardReason::ChangedTarget),
         ("hidden", GuardReason::Hidden),
         ("disabled", GuardReason::Disabled),
-        ("aria_disabled", GuardReason::AriaDisabled),
         ("masked_boundary", GuardReason::MaskedBoundary),
         ("trusted_boundary", GuardReason::TrustedBoundary),
         ("pointer_events_none", GuardReason::PointerEventsNone),
@@ -211,8 +210,16 @@ fn every_guard_predicate_reports_its_own_reason_code() {
             "{case}: {result}"
         );
     }
+    // aria-disabled is an accessibility annotation, not a browser-level
+    // pointer block: the click guard deliberately permits it, and fill/select
+    // guards are the ones that honor it.
+    assert_eq!(
+        results["aria_disabled"]["ok"], true,
+        "a stale ARIA annotation must not block pointer dispatch: {}",
+        results["aria_disabled"]
+    );
     // Every code the plan names is covered by at least one case above.
-    assert_eq!(expected.len(), 14);
+    assert_eq!(expected.len(), 13);
 }
 
 #[test]
@@ -239,19 +246,24 @@ fn guard_detail_never_leaks_page_text_or_protected_blockers() {
 
 #[test]
 #[ignore]
-fn only_viewport_and_obscured_are_internally_repairable() {
+fn every_route_mismatch_is_internally_repairable() {
     let results = run_cases();
+    // Only a fresh document, a hidden element, an unauthorized secret entry,
+    // and a Chrome-owned surface may ask the caller to do something.
+    let caller_visible = [
+        "hidden",
+        "document_changed",
+        "masked_boundary",
+        "protected_browser_surface",
+    ];
     for (case, value) in results.as_object().unwrap() {
-        if value["ok"] == true {
+        if value["ok"] == true || !value.is_object() || value.get("reason").is_none() {
             continue;
         }
         let internal = value["retry_class"] == RetryClass::SafeInternal.code();
         assert_eq!(
             internal,
-            matches!(
-                case.as_str(),
-                "outside_viewport" | "obscured" | "obscured_protected"
-            ),
+            !caller_visible.contains(&case.as_str()),
             "{case}: {value}"
         );
     }

@@ -486,6 +486,9 @@ fn tab_key(session_id: &str, chrome_tab_id: &str) -> String {
     format!("{session_id}\u{1f}{chrome_tab_id}")
 }
 
+// Chrome identifies a document by its frame plus loader pair. The URL is route
+// metadata: a same-document `history.pushState` keeps both identities and must
+// keep existing @cN references valid instead of restarting the namespace.
 fn document_key(snapshot: &Value) -> String {
     let frame = snapshot
         .pointer("/document/frame_id")
@@ -495,11 +498,7 @@ fn document_key(snapshot: &Value) -> String {
         .pointer("/document/loader_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let url = snapshot
-        .pointer("/document/url")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    format!("{frame}\u{1f}{loader}\u{1f}{url}")
+    format!("{frame}\u{1f}{loader}")
 }
 
 fn semantic_string_field_equals(item: Option<&Value>, field: &str, expected: &str) -> bool {
@@ -590,45 +589,73 @@ fn bound_snapshot_response(value: &mut Value, max_bytes: usize) -> u64 {
             .as_array()
             .map_or(0, |items| items.len() as u64)
     });
-    let mut truncated = false;
-    loop {
-        if truncated {
-            value["truncated"] = json!(true);
-            value["truncation_reason"] = json!("response_byte_limit");
-            value["scope_complete"] = json!(false);
-            value["root_scope_complete"] = json!(false);
-            value["global_complete"] = json!(false);
-            value["count"] = json!(original_count);
-            value["items_returned"] = json!(value["items"].as_array().map_or(0, Vec::len));
-        }
-        let bytes = update_observation_bytes(value);
-        if bytes <= max_bytes as u64 {
-            return bytes;
-        }
-        truncated = true;
-        let Some(items) = value["items"].as_array_mut() else {
-            break;
-        };
-        if items.pop().is_none() {
-            break;
-        }
-        let visible_references = value["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item["reference"].as_str().map(str::to_owned))
-            .collect::<std::collections::HashSet<_>>();
-        if let Some(upserts) = value
-            .pointer_mut("/delta/upsert")
-            .and_then(Value::as_array_mut)
-        {
-            upserts.retain(|item| {
-                item["reference"]
-                    .as_str()
-                    .is_some_and(|reference| visible_references.contains(reference))
-            });
-        }
+    let bytes = update_observation_bytes(value);
+    if bytes <= max_bytes as u64 {
+        return bytes;
     }
+    let Some(full_items) = value["items"].as_array().cloned() else {
+        return snapshot_byte_budget_fallback(value, max_bytes);
+    };
+    value["truncated"] = json!(true);
+    value["truncation_reason"] = json!("response_byte_limit");
+    value["scope_complete"] = json!(false);
+    value["root_scope_complete"] = json!(false);
+    value["global_complete"] = json!(false);
+    value["count"] = json!(original_count);
+    // Dropping a suffix of items can only lower the serialized size. Measure the
+    // fixed envelope once and each item once, then keep the longest prefix that
+    // fits. The old loop re-serialized the whole snapshot per dropped item,
+    // which is quadratic on pages with hundreds of controls.
+    let item_sizes = full_items
+        .iter()
+        .map(serialized_bytes)
+        .collect::<Vec<_>>();
+    value["items"] = json!([]);
+    value["items_returned"] = json!(0);
+    let mut retained = 0usize;
+    let mut running = update_observation_bytes(value) as usize;
+    for (index, size) in item_sizes.iter().enumerate() {
+        let projected = running
+            .saturating_add(*size)
+            .saturating_add(usize::from(index > 0));
+        if projected > max_bytes {
+            break;
+        }
+        running = projected;
+        retained = index + 1;
+    }
+    loop {
+        value["items"] = json!(full_items[..retained]);
+        value["items_returned"] = json!(retained);
+        let measured = update_observation_bytes(value);
+        if measured <= max_bytes as u64 {
+            break;
+        }
+        if retained == 0 {
+            return snapshot_byte_budget_fallback(value, max_bytes);
+        }
+        retained -= 1;
+    }
+    let visible_references = value["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["reference"].as_str().map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(upserts) = value
+        .pointer_mut("/delta/upsert")
+        .and_then(Value::as_array_mut)
+    {
+        upserts.retain(|item| {
+            item["reference"]
+                .as_str()
+                .is_some_and(|reference| visible_references.contains(reference))
+        });
+    }
+    update_observation_bytes(value)
+}
+
+fn snapshot_byte_budget_fallback(value: &mut Value, max_bytes: usize) -> u64 {
     *value = json!({
         "status":"incomplete",
         "reason_code":"response_byte_limit",
@@ -2965,18 +2992,24 @@ fn normalize_unknown_receipts(value: &mut Value) {
                 if receipt
                     && object.get("status").and_then(Value::as_str) == Some("not_dispatched")
                 {
-                    let next_action = match object.get("reason_code").and_then(Value::as_str) {
-                        Some("stale_watcher_revision" | "stale_watcher_document") => "refresh_and_reacquire_once",
-                        Some("stale_reference" | "stale_document" | "changed_target") => {
-                            "take_fresh_snapshot_and_retry"
-                        }
-                        Some("activation_forbidden") => "use_a_controlla_owned_automation_window_or_navigate_by_observed_href",
-                        Some("challenge_handoff_required") => "let_the_user_complete_the_challenge_then_observe_again",
-                        _ => "correct_the_named_cause_before_retrying",
-                    };
-                    object
-                        .entry("next_action")
-                        .or_insert_with(|| json!(next_action));
+                    if object.get("automatic_recovery") == Some(&Value::Bool(true)) {
+                        // An automatic recovery is the runtime's job. Do not tell
+                        // the caller to correct a cause it must not choose.
+                        object.remove("next_action");
+                    } else {
+                        let next_action = match object.get("reason_code").and_then(Value::as_str) {
+                            Some("stale_watcher_revision" | "stale_watcher_document") => "refresh_and_reacquire_once",
+                            Some("stale_reference" | "stale_document" | "changed_target") => {
+                                "take_fresh_snapshot_and_retry"
+                            }
+                            Some("activation_forbidden") => "use_a_controlla_owned_automation_window_or_navigate_by_observed_href",
+                            Some("challenge_handoff_required") => "let_the_user_complete_the_challenge_then_observe_again",
+                            _ => "correct_the_named_cause_before_retrying",
+                        };
+                        object
+                            .entry("next_action")
+                            .or_insert_with(|| json!(next_action));
+                    }
                 }
                 for key in ["receipts", "steps"] {
                     if let Some(child) = object.get_mut(key) {
@@ -3938,6 +3971,23 @@ mod tests {
     }
 
     #[test]
+    fn same_document_route_change_keeps_the_reference_namespace() {
+        let before = json!({"document":{"frame_id":"f","loader_id":"loader-1","url":"https://example.test/a"}});
+        let pushed = json!({"document":{"frame_id":"f","loader_id":"loader-1","url":"https://example.test/b"}});
+        let navigated = json!({"document":{"frame_id":"f","loader_id":"loader-2","url":"https://example.test/b"}});
+        assert_eq!(
+            document_key(&before),
+            document_key(&pushed),
+            "history.pushState keeps the loader and must not reset @cN"
+        );
+        assert_ne!(
+            document_key(&before),
+            document_key(&navigated),
+            "a real navigation replaces the loader"
+        );
+    }
+
+    #[test]
     fn extraction_selector_failures_are_typed_and_field_bound() {
         let receipt = selector_error_receipt(
             "browser response was invalid: selector_error:announcement:invalid_selector",
@@ -4300,6 +4350,79 @@ mod tests {
             &[unique[0].clone(), unique[0].clone()]
         ));
         assert!(!find_is_ambiguous("all", false, &unique));
+    }
+
+    fn snapshot_with_items(count: usize) -> Value {
+        json!({
+            "snapshot_id":"test",
+            "items": (0..count).map(|index| json!({
+                "reference":format!("@c{index}"),
+                "name":format!("control {index}"),
+                "payload":"x".repeat(200)
+            })).collect::<Vec<_>>(),
+            "count": count,
+            "scope_complete": true,
+            "observation": {"mode":"test","reason":"test","bytes":0},
+            "delta": {
+                "full": false,
+                "upsert": (0..count).map(|index| json!({"reference":format!("@c{index}")})).collect::<Vec<_>>()
+            },
+            "response_budget": {"max_bytes": 4096}
+        })
+    }
+
+    #[test]
+    fn byte_budget_keeps_the_longest_prefix_and_reports_truncation() {
+        let mut value = snapshot_with_items(20);
+        let bytes = bound_snapshot_response(&mut value, 4096) as usize;
+        assert!(bytes <= 4096, "measured {bytes} bytes for a 4096 byte budget");
+        assert_eq!(bytes, serde_json::to_vec(&value).unwrap().len());
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value["truncation_reason"], json!("response_byte_limit"));
+        assert_eq!(value["count"], json!(20));
+        assert_eq!(value["scope_complete"], json!(false));
+        let returned = value["items"].as_array().expect("items").len();
+        assert!(returned > 0 && returned < 20, "returned {returned} items");
+        assert_eq!(value["items_returned"], json!(returned));
+        assert_eq!(value["items"][0]["reference"], json!("@c0"));
+        assert_eq!(
+            value["items"][returned - 1]["reference"],
+            json!(format!("@c{}", returned - 1))
+        );
+        let upserts = value["delta"]["upsert"].as_array().expect("upserts");
+        assert_eq!(upserts.len(), returned);
+        // Keeping one more item would exceed the same budget.
+        let mut larger = snapshot_with_items(20);
+        larger["items"] = json!(snapshot_with_items(20)["items"]
+            .as_array()
+            .expect("items")[..=returned]);
+        larger["truncated"] = json!(true);
+        larger["truncation_reason"] = json!("response_byte_limit");
+        larger["count"] = json!(20);
+        larger["items_returned"] = json!(returned + 1);
+        assert!(update_observation_bytes(&mut larger) > 4096);
+    }
+
+    #[test]
+    fn byte_budget_leaves_a_payload_that_already_fits_untouched() {
+        let mut value = snapshot_with_items(3);
+        let before = value.clone();
+        let bytes = bound_snapshot_response(&mut value, 100_000) as usize;
+        assert!(bytes <= 100_000);
+        assert_eq!(bytes, serde_json::to_vec(&value).unwrap().len());
+        assert_eq!(value["items"], before["items"]);
+        assert!(value.get("truncation_reason").is_none());
+        assert_eq!(value["scope_complete"], json!(true));
+        assert_eq!(value["delta"]["upsert"], before["delta"]["upsert"]);
+    }
+
+    #[test]
+    fn byte_budget_falls_back_when_the_envelope_cannot_fit() {
+        let mut value = snapshot_with_items(3);
+        assert_eq!(bound_snapshot_response(&mut value, 64), 0);
+        assert_eq!(value["status"], json!("incomplete"));
+        assert_eq!(value["reason_code"], json!("response_byte_limit"));
+        assert!(value.get("items").is_none());
     }
 
     #[test]

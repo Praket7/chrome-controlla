@@ -485,6 +485,9 @@ const chrome = {
       if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session") {
         if (params?.type === "char") { transactionFixtureValue += String(params?.text ?? ""); return {}; }
         if (params?.type === "keyDown" && params?.key === "Enter") { transactionFixtureValue += "\n"; return {}; }
+        // A keyDown carrying `text` inserts the character, which is how the
+        // human-keys transaction delivers text without a separate char event.
+        if (params?.type === "keyDown" && typeof params?.text === "string" && params.text) { transactionFixtureValue += params.text; return {}; }
       }
       if (method === "Input.dispatchKeyEvent") {
         if (params.type === "keyDown" && blockNextHumanKeydown) {
@@ -620,6 +623,10 @@ const chrome = {
       }
       if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session" && params?.type === "keyDown" && params?.key === "Enter") {
         transactionFixtureValue += "\n";
+        return { accepted: true };
+      }
+      if (method === "Input.dispatchKeyEvent" && target.sessionId === "fixture-oopif-session" && params?.type === "keyDown" && typeof params?.text === "string" && params.text) {
+        transactionFixtureValue += params.text;
         return { accepted: true };
       }
       if (method === "DOM.setFileInputFiles" && target.sessionId === "fixture-oopif-session") {
@@ -3502,7 +3509,12 @@ async function waitFor(predicate, description) {
   assert.equal(tabList.length, originalTabCount + 1, "same logical open cannot duplicate the tab");
   tabUrlOverrides.set(Number(owned.tab_id), "https://example.test/owned-new/next");
   tabDocumentOverrides.set(Number(owned.tab_id), "document-owned-new-next");
-  const ownedAfterNavigation = await message({ type: "list_tabs", offset: 0, page_size: 100 });
+  // Tab inventory is a native-bridge request; ask the live port rather than the
+  // popup message channel, which does not implement list_tabs.
+  const inventoryPort = nativePorts.at(-1);
+  inventoryPort.hostMessage({ type: "list_tabs", request_id: "owned-after-navigation", offset: 0, page_size: 100 });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const ownedAfterNavigation = inventoryPort.sent.findLast(message => message.request_id === "owned-after-navigation");
   assert.equal(ownedAfterNavigation.tabs.find(tab => tab.id === Number(owned.tab_id))?.owned_by_controlla, true,
     "a Controlla-created tab remains owned after navigation replaces its original document");
   const inOtherWindow = await backgroundContext.__testHooks.createOwnedTabFromNative({

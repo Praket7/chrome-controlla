@@ -43,7 +43,7 @@ struct StdioRuntime {
     extension_build_id: Option<String>,
 }
 
-fn process_generation() -> &'static str {
+pub(crate) fn process_generation() -> &'static str {
     static GENERATION: OnceLock<String> = OnceLock::new();
     GENERATION.get_or_init(|| {
         let started = SystemTime::now()

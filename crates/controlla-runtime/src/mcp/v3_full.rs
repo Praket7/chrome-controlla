@@ -3,6 +3,7 @@ use super::{
     BrowserPredicate, BrowserSessionArgs, BrowserSnapshotArgs, BrowserVerifyArgs, find_impl,
     resolve_reference, retained_mutation, snapshot_impl, verify_impl,
 };
+use super::recovery::{complete_download_guard, complete_editor_guard};
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -1392,6 +1393,28 @@ mod route_telemetry_tests {
     }
 
     #[test]
+    fn stale_freshness_is_reported_as_a_precondition_not_an_unknown_delivery() {
+        let receipt = super::pre_dispatch_stale_receipt("type", Some("human_keys"));
+        assert_eq!(receipt["status"], "not_dispatched");
+        assert_eq!(receipt["reason_code"], "stale_document");
+        assert_eq!(receipt["dispatch_may_have_occurred"], false);
+        assert_eq!(receipt["typing_mode"], "human_keys");
+        // A receipt that already names the precondition must survive normalization
+        // without acquiring the read-only reconciliation contract of an unknown
+        // mutation; nothing was dispatched, so there is nothing to reconcile.
+        let mut normalized = receipt.clone();
+        super::normalize_receipt_outcomes(&mut normalized);
+        assert_eq!(normalized["status"], "not_dispatched");
+        assert_eq!(normalized["reason_code"], "stale_document");
+        assert!(normalized.get("mutation_retry_policy").is_none());
+        assert!(
+            normalized["next_action"]
+                .as_str()
+                .is_some_and(|value| value.contains("fresh snapshot"))
+        );
+    }
+
+    #[test]
     fn compact_receipts_normalize_unknown_outcomes_without_touching_page_data() {
         let mut receipt = json!({
             "status":"completed_unverified",
@@ -2624,7 +2647,21 @@ impl HasUnknownOutcome for (bool, Vec<Value>) {
 }
 
 fn value_has_unknown(value: &Value) -> bool {
-    let resolved = matches!(value["status"].as_str(), Some("verified" | "complete" | "completed" | "passed" | "not_dispatched"));
+    // `dispatched_unverified` is a finished transaction with acknowledged
+    // dispatch, not an ambiguous delivery: the mutation is complete and the
+    // receipt tells the caller to inspect before retrying. Retaining the target
+    // lock for two minutes after it made a typed document unusable.
+    let resolved = matches!(
+        value["status"].as_str(),
+        Some(
+            "verified"
+                | "complete"
+                | "completed"
+                | "passed"
+                | "not_dispatched"
+                | "dispatched_unverified"
+        )
+    );
     value["status"] == "unknown"
         || (!resolved && (value["dispatch_may_have_occurred"] == true
             || value["dispatch_may_have_occurred"] == "unknown"))
@@ -3639,6 +3676,29 @@ fn invalid(message: impl Into<String>) -> rmcp::ErrorData {
     rmcp::ErrorData::invalid_params(message.into(), None)
 }
 
+/// A freshness guard rejected the action before any command reached the page.
+///
+/// These are preconditions, not deliveries: nothing was dispatched, so the caller
+/// can retry once it corrects the named cause. Reporting them as `unknown` would
+/// imply a mutation may have happened and force a read-only reconciliation for an
+/// effect that provably did not occur.
+fn pre_dispatch_stale_receipt(action: &str, typing_mode: Option<&str>) -> Value {
+    let mut receipt = json!({
+        "status":"not_dispatched",
+        "action":action,
+        "reason_code":"stale_document",
+        "reason":"document changed since snapshot; nothing was dispatched",
+        "dispatch_acknowledged":false,
+        "dispatch_may_have_occurred":false,
+        "requires_fresh_snapshot":true,
+        "next_action":"take a fresh snapshot and retry against the current document revision"
+    });
+    if let Some(mode) = typing_mode {
+        receipt["typing_mode"] = json!(mode);
+    }
+    receipt
+}
+
 fn tool_validation_result(error: rmcp::ErrorData) -> rmcp::model::CallToolResult {
     let reason = error.message.to_string();
     let next_action = "Correct the named argument or refresh the selected tab and document identity; inspect any uncertain mutation before retrying.";
@@ -3999,13 +4059,16 @@ async fn type_frame_reference(
                     30_000
                 }
             })
-            .clamp(1_000, 600_000),
+            .clamp(1_000, 900_000),
     );
     let deadline = tokio::time::Instant::now() + timeout;
+    // The extension accepts a transaction deadline up to its own 600 s ceiling.
+    // Clamping it to 60 s here aborted every human-paced document longer than a
+    // few hundred characters while later characters were still undelivered.
     let transaction_deadline = deadline
         .saturating_duration_since(tokio::time::Instant::now())
         .as_millis()
-        .clamp(1, 60_000) as u64;
+        .clamp(1, 600_000) as u64;
     let payload = extension_transaction_payload(
         &TransactionTarget::Frame {
             frame_id: parts.0.to_owned(),
@@ -4106,13 +4169,15 @@ async fn swipe_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, r
 
 async fn visual_click_impl(
     app: &AppV3,
-    args: &V3WorkflowArgs,
+    session_id: &str,
+    chrome_tab_id: &str,
     probe: &Value,
+    point: Option<(f64, f64)>,
 ) -> Result<Value, rmcp::ErrorData> {
-    if app.browser_modes.lock().await.get(&args.session_id)
+    if app.browser_modes.lock().await.get(session_id)
         == Some(&crate::v3::BrowserMode::Background)
     {
-        let presentation = presentation_state(app, &args.session_id, &args.chrome_tab_id).await;
+        let presentation = presentation_state(app, session_id, chrome_tab_id).await;
         if let Some(refusal) = background_pointer_refusal(presentation.as_ref()) {
             return Ok(refusal);
         }
@@ -4133,14 +4198,16 @@ async fn visual_click_impl(
     let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) else {
         return Err(invalid("registered visual region has invalid coordinates"));
     };
-    let (x, y) = (x + w / 2.0, y + h / 2.0);
+    let _ = (w, h);
+    // A caller-supplied point stays exact; a registered region clicks its center.
+    let (x, y) = point.unwrap_or((x + w / 2.0, y + h / 2.0));
     let shared = app
         .core
         .legacy
         .shared_sessions
         .lock()
         .await
-        .get(&args.session_id)
+        .get(session_id)
         .cloned()
         .ok_or_else(|| invalid("unknown shared session"))?;
     let shared = shared.lock().await;
@@ -4156,7 +4223,7 @@ async fn visual_click_impl(
         connection,
         registry,
         &shared.handle,
-        &args.chrome_tab_id,
+        chrome_tab_id,
     )
     .await
     .map_err(invalid)?;
@@ -4175,7 +4242,7 @@ async fn visual_click_impl(
         .command(
             registry,
             &shared.handle,
-            &args.chrome_tab_id,
+            chrome_tab_id,
             "Runtime.evaluate",
             json!({"expression":expression,"returnByValue":true}),
         )
@@ -4191,21 +4258,21 @@ async fn visual_click_impl(
         connection,
         registry,
         &shared.handle,
-        &args.chrome_tab_id,
+        chrome_tab_id,
     )
     .await
     .map_err(invalid)?;
     if fresh != before {
         return Ok(json!({"status":"not_dispatched","reason_code":"document_epoch_changed"}));
     }
-    if app.browser_modes.lock().await.get(&args.session_id)
+    if app.browser_modes.lock().await.get(session_id)
         == Some(&crate::v3::BrowserMode::Background)
     {
         let presentation = connection
             .command(
                 registry,
                 &shared.handle,
-                &args.chrome_tab_id,
+                chrome_tab_id,
                 "Controlla.presentationState",
                 Value::Null,
             )
@@ -4220,7 +4287,7 @@ async fn visual_click_impl(
         .command(
             registry,
             &shared.handle,
-            &args.chrome_tab_id,
+            chrome_tab_id,
             "Input.dispatchMouseEvent",
             json!({"type":"mousePressed","button":"left","clickCount":1,"x":x,"y":y}),
         )
@@ -4229,7 +4296,7 @@ async fn visual_click_impl(
         .command(
             registry,
             &shared.handle,
-            &args.chrome_tab_id,
+            chrome_tab_id,
             "Input.dispatchMouseEvent",
             json!({"type":"mouseReleased","button":"left","clickCount":1,"x":x,"y":y}),
         )
@@ -4242,6 +4309,75 @@ async fn visual_click_impl(
     Ok(
         json!({"status":"dispatched","dispatch_acknowledged":true,"requires_verify":true,"target":hit,"page_content_is_untrusted":true}),
     )
+}
+
+/// Click a page coordinate that no semantic reference can carry.
+///
+/// Virtualized canvas editors report `bounds: null`, so the one control that
+/// must be clicked has no semantic geometry. A raw coordinate is not enough:
+/// the point is bound to a visual revision captured immediately before
+/// dispatch, hit-tested against the live document, and refused if the element
+/// under it is protected or obscured. The receipt records that binding; an
+/// uncertain delivery keeps the same no-blind-retry rule as every mutation.
+async fn guarded_coordinate_click(
+    app: &AppV3,
+    args: &V3ActArgs,
+    x: f64,
+    y: f64,
+) -> Result<Value, rmcp::ErrorData> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x > 32_767.0
+        || y > 32_767.0
+    {
+        return Ok(json!({"status":"not_dispatched","action":"click",
+            "reason_code":"invalid_coordinate_click","dispatch_may_have_occurred":false,
+            "reason":"center_x and center_y must be finite non-negative CSS pixels inside the viewport."}));
+    }
+    // Capture a bounded revision around the point first. The probe proves the
+    // document, frame, loader, URL and viewport at dispatch time; it is not a
+    // stored reference a caller can replay later.
+    let probe = super::full::visual_probe(
+        &app.core,
+        super::full::FullProbeArgs {
+            session_id: args.session_id.clone(),
+            chrome_tab_id: args.chrome_tab_id.clone(),
+            reference: None,
+            selector: None,
+            region: Some(super::full::ProbeRegionArgs {
+                x: (x - 16.0).max(0.0),
+                y: (y - 16.0).max(0.0),
+                width: 32.0,
+                height: 32.0,
+            }),
+            full_page: None,
+            max_bytes: Some(65_536),
+            timeout_ms: Some(10_000),
+            save_artifact: None,
+            omit_image_payload: None,
+        },
+    )
+    .await?;
+    let mut receipt = visual_click_impl(
+        app,
+        &args.session_id,
+        &args.chrome_tab_id,
+        &probe,
+        Some((x, y)),
+    )
+    .await?;
+    receipt["coordinate_binding"] = json!({
+        "kind":"fresh_same_document_visual_revision",
+        "x":x,"y":y,
+        "observed_at_ms":probe["visual_ref"]["observed_at_ms"],
+        "frame_id":probe["visual_ref"]["frame_id"],
+        "loader_id":probe["visual_ref"]["loader_id"],
+        "url":probe["visual_ref"]["url"],
+        "replayable":false
+    });
+    Ok(receipt)
 }
 
 fn semantic_item_center(item: &Value) -> Option<(f64, f64)> {
@@ -5997,6 +6133,10 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "account_marker_matches",
         "reason",
         "next_action",
+        "resolution",
+        "surface",
+        "coordinate_binding",
+        "lease_takeover",
         "blocker",
         "retry_class",
         "dispatch_acknowledged",
@@ -6032,6 +6172,16 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "text",
         "value",
         "resumed_from_checkpoint",
+        // "Why was this refused" is the one fact a caller cannot recover from
+        // the page, so it survives every budget fallback.
+        "target_state",
+        // Recovery evidence explains what the runtime did before refusing.
+        "recovery",
+        "recovery_stage",
+        "recovered_via",
+        "automatic_recovery",
+        "model_action_required",
+        "dispatch_may_have_occurred",
     ];
     let encoded = serde_json::to_vec(&compacted).unwrap_or_default();
     use sha2::Digest;
@@ -6074,6 +6224,12 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "verified",
         "dispatch_acknowledged",
         "reason_code",
+        "reason",
+        "next_action",
+        "resolution",
+        "surface",
+        "coordinate_binding",
+        "lease_takeover",
         "blocker",
         "retry_class",
         "url",
@@ -6118,6 +6274,15 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "text",
         "value",
         "resumed_from_checkpoint",
+        "target_state",
+        // Recovery evidence is the receipt's explanation of what the runtime
+        // did before refusing, so compaction must never drop it.
+        "recovery",
+        "recovery_stage",
+        "recovered_via",
+        "automatic_recovery",
+        "model_action_required",
+        "dispatch_may_have_occurred",
     ];
     while v3_workflow_response_size(&result) > 640 {
         let removable = result
@@ -6151,6 +6316,12 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "reason_code",
             "blocker",
             "retry_class",
+            "recovery",
+            "recovery_stage",
+            "recovered_via",
+            "automatic_recovery",
+            "model_action_required",
+            "dispatch_may_have_occurred",
             "filename",
             "application_accepted",
             "persisted",
@@ -6187,8 +6358,23 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "url_truncated",
             "verified",
             "dispatch_acknowledged",
+            // A failure reason is the whole value of a receipt. Keep the cause
+            // and the recovery step through every response-budget fallback: a
+            // caller without source access cannot reconstruct "document change".
+            "reason",
+            "reason_code",
+            "next_action",
+            "resolution",
+            "verification",
+            "surface",
             "blocker",
             "retry_class",
+            "recovery",
+            "recovery_stage",
+            "recovered_via",
+            "automatic_recovery",
+            "model_action_required",
+            "dispatch_may_have_occurred",
             "filename",
             "application_accepted",
             "persisted",
@@ -6321,12 +6507,26 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         // malformed receipt values cannot defeat the per-step wire ceiling.
         let kind = result["kind"].as_str().unwrap_or_default();
         let mut bounded = serde_json::Map::new();
-        for key in ["status", "kind", "action", "reason_code"] {
+        for key in ["status", "kind", "action", "reason_code", "reason", "next_action"] {
             if let Some(value) = result.get(key).filter(|value| !value.is_null()) {
-                bounded.insert(
-                    key.to_owned(),
-                    compact_v3_bounded_string(value, if key == "status" { 16 } else { 32 }),
-                );
+                let limit = match key {
+                    "status" => 16,
+                    "action" | "reason_code" => 32,
+                    // A failure cause is the value of the receipt; give it room
+                    // to stay diagnosable inside the hard wire ceiling.
+                    _ => 128,
+                };
+                bounded.insert(key.to_owned(), compact_v3_bounded_string(value, limit));
+            }
+        }
+        // A refusal's cause and its executed recovery are the two facts a
+        // caller cannot reconstruct from the page. Keep them in the hard
+        // fallback while they fit the fixed wire budget.
+        for key in ["blocker", "recovery"] {
+            if let Some(value) = result.get(key).filter(|value| !value.is_null())
+                && v3_workflow_response_size(value) <= 192
+            {
+                bounded.insert(key.to_owned(), value.clone());
             }
         }
         // Preserve a small, untrusted text proof for read/extract receipts even
@@ -6418,6 +6618,61 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
                     compact_v3_source_identity_value(identity),
                 );
             }
+        }
+        // The fixed rebuild is assembled from many bounded fields, and their
+        // sum can still exceed the per-step ceiling when hostile values are
+        // near every individual limit. Drop optional evidence rather than ship
+        // a receipt that is larger than the ceiling it promises. The cause and
+        // the outcome always survive.
+        const BOUNDED_ESSENTIAL: &[&str] = &[
+            "status",
+            "kind",
+            "reason_code",
+            "reason",
+            "next_action",
+            "verified",
+            "dispatch_acknowledged",
+            "dispatch_may_have_occurred",
+            "application_accepted",
+            "persisted",
+            "chrome_selected_file",
+            "selection_readback_verified",
+            "file_input_consumed_by_page",
+            "downloaded_artifact_available",
+            "resumed_from_checkpoint",
+            "artifact_handle",
+            "filename",
+            "evidence_hash",
+        ];
+        // Structured evidence that can be summarized away before any outcome
+        // flag or artifact identity is discarded.
+        const BOUNDED_DROP_ORDER: &[&str] = &[
+            "network_events",
+            // The artifact handle is content-addressed, so the digest it already
+            // carries survives when the separate sha256 field cannot fit.
+            "sha256",
+            "mime",
+            "url_prefix",
+            "url_sha256",
+            "url_truncated",
+            "size",
+            "download_lifecycle",
+            "files",
+            "source_identity",
+        ];
+        while serde_json::to_vec(&bounded).map_or(usize::MAX, |bytes| bytes.len()) > 640 {
+            let removable = BOUNDED_DROP_ORDER
+                .iter()
+                .find(|key| bounded.contains_key(**key))
+                .map(|key| (*key).to_owned())
+                .or_else(|| {
+                    bounded
+                        .keys()
+                        .find(|key| !BOUNDED_ESSENTIAL.contains(&key.as_str()))
+                        .cloned()
+                });
+            let Some(key) = removable else { break };
+            bounded.remove(&key);
         }
         result = Value::Object(bounded);
     }
@@ -6692,6 +6947,27 @@ fn compact_v3_source_identity_value(value: &Value) -> Value {
 }
 
 fn compact_v3_evidence_field(key: &str, value: &Value) -> Value {
+    if key == "recovery" {
+        // Recovery evidence is small, but keep the projection explicit so a
+        // later field cannot push it over the generic 384-byte hash limit.
+        let mut recovery = serde_json::Map::new();
+        for field in ["class", "backend", "max_attempts", "planned_steps"] {
+            if let Some(item) = value.get(field).filter(|item| !item.is_null()) {
+                recovery.insert(field.to_owned(), item.clone());
+            }
+        }
+        for field in ["automatic", "internal", "model_action_required", "resolved", "exhausted"] {
+            if let Some(item) = value.get(field).filter(|item| !item.is_null()) {
+                recovery.insert(field.to_owned(), item.clone());
+            }
+        }
+        for field in ["executed", "resolved_via", "recovery_stage"] {
+            if let Some(item) = value.get(field).filter(|item| !item.is_null()) {
+                recovery.insert(field.to_owned(), item.clone());
+            }
+        }
+        return Value::Object(recovery);
+    }
     if key == "url" {
         return compact_v3_bounded_string(value, 2048);
     }
@@ -6733,7 +7009,10 @@ fn compact_v3_evidence_field(key: &str, value: &Value) -> Value {
     if let Some(text) = value.as_str() {
         // Read receipts need enough bounded text to prove the requested fact;
         // mutation/debug strings remain on the smaller default budget.
-        let limit = if matches!(key, "title" | "snippet" | "text" | "value") {
+        let limit = if matches!(
+            key,
+            "title" | "snippet" | "text" | "value" | "reason" | "next_action"
+        ) {
             256
         } else {
             64
@@ -10614,8 +10893,26 @@ async fn headless_download(
         .await
         .map_err(invalid)?;
     let first = super::super::shared_value(&first).map_err(invalid)?;
+    let (first, executed) = if first["ok"] == true {
+        (first, crate::recovery_exec::Executed::default())
+    } else {
+        complete_download_guard(
+            transport,
+            registry,
+            &live.handle,
+            tab_id,
+            &snapshot.object_id,
+            index,
+            &guard,
+            &[json!({"kind":"download"})],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await?
+    };
     if first["ok"] != true {
-        return Ok(crate::guard_reason::refusal(&first));
+        let mut refusal = crate::recovery_exec::exhausted_refusal(&first, &executed);
+        refusal["action"] = json!("download");
+        return Ok(refusal);
     }
     let directory = browser.profile_directory().join("controlla-downloads");
     if directory.exists() {
@@ -10992,8 +11289,26 @@ async fn shared_download(
         json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":{"kind":"download"}}],"returnByValue":true}),
     ).await.map_err(invalid)?;
     let checked = super::super::shared_value(&checked).map_err(invalid)?;
+    let (checked, executed) = if checked["ok"] == true {
+        (checked, crate::recovery_exec::Executed::default())
+    } else {
+        complete_download_guard(
+            transport,
+            registry,
+            &live.handle,
+            tab_id,
+            &snapshot.object_id,
+            index,
+            &guard,
+            &[json!({"kind":"download"})],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await?
+    };
     if checked["ok"] != true {
-        return Ok(crate::guard_reason::refusal(&checked));
+        let mut refusal = crate::recovery_exec::exhausted_refusal(&checked, &executed);
+        refusal["action"] = json!("download");
+        return Ok(refusal);
     }
     let preflight = super::super::shared_identity_and_epoch(
         transport,
@@ -11425,8 +11740,30 @@ async fn shared_browser_download_lifecycle(
         })).await.map_err(invalid)?;
         super::super::shared_value(&response).map_err(invalid)
     }.await?;
+    let (actionable, executed) = if actionable["ok"] == true {
+        (actionable, crate::recovery_exec::Executed::default())
+    } else {
+        let live = live.lock().await;
+        let registry = live.registry()?;
+        complete_download_guard(
+            live.connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension transport detached"))?,
+            registry,
+            &live.handle,
+            tab_id,
+            &snapshot.object_id,
+            index,
+            &guard,
+            &[json!({"kind":"download"})],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await?
+    };
     if actionable["ok"] != true {
-        return Ok(crate::guard_reason::refusal(&actionable));
+        let mut refusal = crate::recovery_exec::exhausted_refusal(&actionable, &executed);
+        refusal["action"] = json!("download");
+        return Ok(refusal);
     }
     let arm = async {
         let live = live.lock().await;
@@ -13189,7 +13526,12 @@ async fn requires_key_events(app: &AppV3, args: &V3ActArgs) -> bool {
 }
 
 // shortcut: rich key entry collapses Enter-created innerText runs in pairs; use structured block readback for editors with different semantics.
-const EDITOR_GUARD: &str = r#"function(index,expected,prepare=false,normalizeParagraphs=false,requireFocus=true){let e=this.nodes[index],rebound=false;const valueOf=n=>{const rich=n instanceof HTMLElement&&!(n instanceof HTMLInputElement||n instanceof HTMLTextAreaElement)&&(n.isContentEditable||n.getAttribute('role')==='textbox');const raw=rich?(n.innerText??n.textContent??'').replace(/\r\n/g,'\n').replace(/\u00a0/g,' '):n.value;return rich?(raw==='\n'?'':normalizeParagraphs?raw.replace(/\n{2,}/g,breaks=>'\n'.repeat(Math.ceil(breaks.length/2))):raw):raw};if(!e||!e.isConnected){if(!prepare||!e)return {ok:false,reason:'target_replaced'};const candidates=Array.from(document.querySelectorAll('[contenteditable],[role=\"textbox\"]')).filter(n=>n.tagName===e.tagName&&n.className===e.className&&n.getAttribute('role')===e.getAttribute('role')&&n.getAttribute('aria-label')===e.getAttribute('aria-label')&&n.getAttribute('data-placeholder')===e.getAttribute('data-placeholder')&&valueOf(n)===(n instanceof HTMLElement&&!(n instanceof HTMLInputElement||n instanceof HTMLTextAreaElement)&&(n.isContentEditable||n.getAttribute('role')==='textbox')&&expected==='\n'?'':expected));if(candidates.length!==1)return {ok:false,reason:'target_replaced',candidates:candidates.length};this.nodes[index]=e=candidates[0];rebound=true}const rich=e instanceof HTMLElement&&!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)&&e.getAttribute('aria-readonly')!=='true'&&e.getAttribute('contenteditable')?.toLowerCase()!=='false'&&(e.isContentEditable||e.getAttribute('role')==='textbox'),plain=e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type);if(!rich&&!plain)return {ok:false,reason:'not_editable'};const trustedBoundary=e.closest('[data-requires-trusted]');if(e.matches(':disabled,[aria-disabled=\"true\"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||trustedBoundary&&trustedBoundary!==e)return {ok:false,reason:'blocked'};const value=valueOf(e);if(value!==(rich&&expected==='\n'?'':expected))return {ok:false,reason:'stale_value',value};if(prepare){e.focus();if(rich){const s=e.ownerDocument.getSelection(),r=e.ownerDocument.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r)}else e.setSelectionRange(e.value.length,e.value.length)}const s=e.ownerDocument.getSelection(),focused=e.ownerDocument.activeElement===e,atEnd=rich?s?.isCollapsed&&s.anchorNode&&e.contains(s.anchorNode)&&(()=>{const after=e.ownerDocument.createRange();after.selectNodeContents(e);after.setStart(s.anchorNode,s.anchorOffset);return after.toString()===''})():e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;if(requireFocus&&(!focused||!atEnd))return {ok:false,reason:'focus_or_selection_changed',value,focused,atEnd,rebound};return {ok:true,rich,value,focused,atEnd,rebound}}"#;
+pub(super) const EDITOR_GUARD: &str = r#"function(index,expected,prepare=false,normalizeParagraphs=false,requireFocus=true,checkValue=true){let arr=this.nodes||null,e=arr?arr[index]:this,rebound=false;const richOf=n=>!!n&&n.nodeType===1&&typeof n.getAttribute==='function'&&String(n.tagName).toUpperCase()!=='INPUT'&&String(n.tagName).toUpperCase()!=='TEXTAREA'&&(n.isContentEditable===true||(n.getAttribute('role')==='textbox'&&String(n.getAttribute('contenteditable')||'').toLowerCase()==='true')),valueOf=n=>{const rich=richOf(n);const raw=rich?(n.innerText??n.textContent??'').replace(/\r\n/g,'\n').replace(/\u00a0/g,' '):n.value;return rich?(/^\s*$/.test(raw)?'':normalizeParagraphs?raw.replace(/\n{2,}/g,breaks=>'\n'.repeat(Math.ceil(breaks.length/2))):raw):raw};if(!e||!e.isConnected){if(!prepare||!e)return {ok:false,reason:'target_replaced'};const candidates=Array.from(document.querySelectorAll('[contenteditable],[role=\"textbox\"]')).filter(n=>n.tagName===e.tagName&&n.className===e.className&&n.getAttribute('role')===e.getAttribute('role')&&n.getAttribute('aria-label')===e.getAttribute('aria-label')&&n.getAttribute('data-placeholder')===e.getAttribute('data-placeholder')&&valueOf(n)===(richOf(n)&&expected==='\n'?'':expected));if(candidates.length!==1)return {ok:false,reason:'target_replaced',candidates:candidates.length};if(arr)arr[index]=e=candidates[0];rebound=true}const tagName=String(e.tagName).toUpperCase(),rich=richOf(e)&&e.getAttribute('aria-readonly')!=='true'&&e.getAttribute('contenteditable')?.toLowerCase()!=='false',plain=tagName==='TEXTAREA'||tagName==='INPUT'&&['text','search','email','url','tel'].includes(e.type);if(!rich&&!plain)return {ok:false,reason:'not_editable'};const trustedBoundary=e.closest('[data-requires-trusted]');if(e.matches(':disabled,[aria-disabled=\"true\"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||trustedBoundary&&trustedBoundary!==e)return {ok:false,reason:'blocked'};const value=valueOf(e);if(checkValue&&value!==(rich&&/^\s*$/.test(expected)?'':expected))return {ok:false,reason:'stale_value',value};if(prepare){e.focus();if(rich){const s=e.ownerDocument.getSelection(),r=e.ownerDocument.createRange();r.selectNodeContents(e);r.collapse(false);s.removeAllRanges();s.addRange(r)}else e.setSelectionRange(e.value.length,e.value.length)}const s=e.ownerDocument.getSelection(),focused=e.ownerDocument.activeElement===e,atEnd=rich?s?.isCollapsed&&s.anchorNode&&e.contains(s.anchorNode)&&(()=>{const after=e.ownerDocument.createRange();after.selectNodeContents(e);after.setStart(s.anchorNode,s.anchorOffset);return after.toString()===''})():e.selectionStart===e.selectionEnd&&e.selectionEnd===e.value.length;if(requireFocus&&(!focused||!atEnd))return {ok:false,reason:'focus_or_selection_changed',value,focused,atEnd,rebound};return {ok:true,rich,value,focused,atEnd,rebound}}"#;
+
+// A refused editor transaction must say why: `not_editable` alone does not
+// distinguish a canvas host, a stale binding, or a read-only region, and the
+// caller cannot inspect the page. Read-only and bounded to the resolved object.
+const EDITOR_TARGET_STATE: &str = r#"function(index){const arr=this.nodes||null,e=arr?arr[index]:this;if(!e)return {exists:false};const attr=n=>{try{return typeof e.getAttribute==='function'?e.getAttribute(n):null}catch(_){return null}};const style=typeof getComputedStyle==='function'&&e.nodeType===1?getComputedStyle(e):null;return {exists:true,connected:e.isConnected===true,html:typeof HTMLElement!=='undefined'&&e instanceof HTMLElement,tag:typeof e.tagName==='string'?e.tagName.toLowerCase():null,role:attr('role'),aria_label:attr('aria-label'),contenteditable:attr('contenteditable'),is_content_editable:e.isContentEditable===true,aria_readonly:attr('aria-readonly'),read_only:e.readOnly===true,disabled:typeof e.matches==='function'?e.matches(':disabled,[aria-disabled="true"]'):null,masked:typeof e.closest==='function'?e.closest('[data-masked]')===e:null,display:style?style.display:null,visibility:style?style.visibility:null,child_elems:e.childElementCount??null,text_len:typeof e.innerText==='string'?e.innerText.length:null}}"#;
 
 async fn rich_editor_reference(app: &AppV3, args: &V3ActArgs, reference: &str) -> bool {
     app.core
@@ -13199,6 +13541,359 @@ async fn rich_editor_reference(app: &AppV3, args: &V3ActArgs, reference: &str) -
         .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
         .and_then(|state| state.items.get(reference))
         .is_some_and(|item| item["editable_kind"] == "rich_text")
+}
+
+/// True when the editable element's DOM value cannot represent what was typed.
+///
+/// Canvas-backed editors paint their text (Google Docs), and some host the
+/// editable element in a blank same-origin frame that only relays key events.
+/// The snapshot marks those items `value_readable: false`; the blank-frame
+/// `source_kind` is kept as a fallback for observations taken before that field
+/// existed. A value precondition is meaningless on these surfaces, so demanding
+/// one is how an empty Google Doc refused an empty `expected_value`.
+async fn editor_value_unreadable(app: &AppV3, args: &V3ActArgs, reference: &str) -> bool {
+    app.core
+        .semantic
+        .lock()
+        .await
+        .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
+        .and_then(|state| state.items.get(reference))
+        .is_some_and(|item| {
+            item["value_readable"] == false
+                || item["source_kind"] == "same_origin_blank_frame"
+        })
+}
+
+/// Dispatch one trusted key chord through the shared extension. Used only for
+/// the document-text readback copy: select all, copy, and collapse the
+/// resulting selection.
+#[allow(clippy::too_many_arguments)]
+async fn press_shortcut(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    cutoff: tokio::time::Instant,
+    key: &'static str,
+    code: &'static str,
+    virtual_key: u64,
+    modifiers: u64,
+) -> bool {
+    // Editing commands are what makes a shortcut act on the focused editor.
+    // A bare key event is delivered as input, but copy is a browser editing
+    // command: Chrome runs it here only when the command is named. Select-all is
+    // left as a plain key event so the editor's own handler performs it, which
+    // is the only way a canvas editor updates its internal selection.
+    let commands = (key == "c").then(|| json!(["Copy"]));
+    for event_type in ["rawKeyDown", "keyUp"] {
+        let mut event = json!({
+            "type": event_type,
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": virtual_key,
+            "nativeVirtualKeyCode": 0,
+            "modifiers": modifiers
+        });
+        if event_type == "rawKeyDown"
+            && let (Some(commands), Some(object)) = (commands.as_ref(), event.as_object_mut())
+        {
+            object.insert("commands".into(), commands.clone());
+        }
+        match tokio::time::timeout_at(
+            cutoff,
+            connection.command(registry, handle, tab_id, "Input.dispatchKeyEvent", event),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether Chrome reports this tab as visible right now. `None` means the
+/// presentation state could not be read, so the caller should attempt the
+/// copy rather than refuse on a guess.
+async fn document_tab_visible(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    cutoff: tokio::time::Instant,
+) -> Option<bool> {
+    let response = tokio::time::timeout_at(
+        cutoff,
+        connection.command(
+            registry,
+            handle,
+            tab_id,
+            "Controlla.presentationState",
+            Value::Null,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let state = normalize_presentation_state(&response)?;
+    Some(state["visibility_state"] == "visible" && state["document_hidden"] != true)
+}
+
+/// Ask the editor to copy its selection into a caller-owned buffer.
+///
+/// The `copy` event's `clipboardData` is writable, so dispatching the event
+/// with our own `DataTransfer` lets a canvas editor write exactly what its
+/// selection holds without touching the system clipboard or requiring the tab
+/// to be visible. Returns the plain-text the editor produced, or `None` when
+/// the editor ignores the event.
+async fn copy_document_selection_event(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    object_id: &str,
+    cutoff: tokio::time::Instant,
+) -> Option<String> {
+    // Dispatch in every realm that could own the clipboard handler: the
+    // editable itself, its own document, and the top document (a same-origin
+    // editor frame may install its handler on the app window). Each target uses
+    // its own realm's constructors, and the shared buffer is read from ours.
+    // Editors that copy through the async Clipboard API are captured too, by
+    // holding the `write` call for the duration of this read.
+    const FUNCTION: &str = r#"async function(){const targets=[[this,window]];try{if(this.ownerDocument)targets.push([this.ownerDocument,this.ownerDocument.defaultView||window])}catch(_){}try{if(window.top&&window.top.document){const doc=window.top.document;targets.push([doc.body,window.top]);targets.push([doc.activeElement,window.top]);targets.push([doc,window.top])}}catch(_){}const transfer=new DataTransfer();const realms=[...new Set(targets.map(([,realm])=>realm))];let captured=null;const patched=[];for(const realm of realms){try{const clip=realm.navigator&&realm.navigator.clipboard;const write=clip&&clip.write;if(typeof write==="function"){Object.defineProperty(clip,"write",{configurable:true,value:(items)=>{captured=items;return Promise.resolve()}});patched.push([clip,write])}}catch(_){}}try{for(const [target,realm] of targets){if(!target)continue;try{const event=new (realm.ClipboardEvent||ClipboardEvent)("copy",{clipboardData:transfer,bubbles:true,cancelable:true});target.dispatchEvent(event)}catch(_){}const text=transfer.getData("text/plain");if(text)return {length:text.length,text:text.slice(0,1000000)}}if(captured){for(const item of captured){try{if(item.types&&item.types.includes("text/plain")){const blob=await item.getType("text/plain");const text=await blob.text();if(text)return {length:text.length,text:text.slice(0,1000000)}}}catch(_){}}}}finally{for(const [clip,write] of patched){try{Object.defineProperty(clip,"write",{configurable:true,value:write})}catch(_){}}}return {length:0,text:""}}"#;
+    let response = tokio::time::timeout_at(
+        cutoff,
+        connection.command(
+            registry,
+            handle,
+            tab_id,
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId":object_id,
+                "functionDeclaration":FUNCTION,
+                "arguments":[],
+                "awaitPromise":true,
+                "returnByValue":true
+            }),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let value = super::super::shared_value(&response).ok()?;
+    let text = value["text"].as_str()?;
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Ask the document itself to run the copy command, with user activation.
+///
+/// `document.execCommand('copy')` fires the same `copy` event a shortcut does,
+/// so an editor that owns a canvas selection writes that selection to the
+/// clipboard without the browser needing to route a key event to a background
+/// tab. Returns true when the document accepted the command.
+async fn execute_page_copy(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    cutoff: tokio::time::Instant,
+) -> bool {
+    let expression = "(()=>{try{return document.execCommand('copy')===true}catch(_){return false}})()";
+    match tokio::time::timeout_at(
+        cutoff,
+        connection.command(
+            registry,
+            handle,
+            tab_id,
+            "Runtime.evaluate",
+            json!({"expression":expression,"userGesture":true,"returnByValue":true}),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => super::super::shared_value(&response)
+            .map(|value| value == true)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Prove a canvas-editor insertion against the document itself.
+///
+/// The editable element never reports the typed text, and the page's DOM text
+/// does not contain it (Google Docs paints a canvas). The document's own copy
+/// path does: select all, copy, and read the plain-text flavor from the local
+/// clipboard. The browser's editing commands are used (not bare key events), so
+/// the editor that owns the selection performs the copy the same way a user's
+/// shortcut would. The user's clipboard is captured first and restored
+/// afterwards, and only derived evidence (lengths, a hash, and window-match
+/// counts) is returned.
+async fn verify_canvas_document_text(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    object_id: &str,
+    typed: &str,
+    deadline: tokio::time::Instant,
+) -> Value {
+    use crate::document_text;
+    let unavailable = |verification: &'static str| {
+        json!({
+            "status": "dispatched_unverified",
+            "verification": verification,
+            "document_text": Value::Null
+        })
+    };
+    let sampled = document_text::verification_windows(typed).len();
+    if sampled == 0 {
+        return unavailable("too_short_for_text_match");
+    }
+    let cutoff = deadline.min(tokio::time::Instant::now() + Duration::from_secs(8));
+    // Chrome withholds the document copy path from a hidden tab: the selection
+    // never reaches the editor, so every readback would compare the user's
+    // untouched clipboard against the document and call a successful insert a
+    // mismatch. Say why instead, and leave the clipboard alone.
+    if document_tab_visible(connection, registry, handle, tab_id, cutoff).await == Some(false) {
+        return json!({
+            "status": "dispatched_unverified",
+            "verification": "tab_hidden",
+            "document_text": Value::Null,
+            "reason": "the document was not read because Chrome keeps a hidden tab's selection and clipboard out of reach",
+            "next_action": "Bring this tab to the foreground and read the inserted text in the document; do not replay the insertion."
+        });
+    }
+    let modifiers = if cfg!(target_os = "macos") { 4 } else { 2 };
+    let selected = press_shortcut(connection, registry, handle, tab_id, cutoff, "a", "KeyA", 65, modifiers).await;
+    // A background tab can swallow the OS copy shortcut, but the document can
+    // still answer the copy event itself: dispatching `copy` with a writable
+    // DataTransfer lets the editor write the selection into our own buffer.
+    // That proves the insertion without touching the user's clipboard at all.
+    let mut copy_event_characters = 0_usize;
+    for attempt in 0..6 {
+        if tokio::time::Instant::now() >= cutoff {
+            break;
+        }
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        if let Some(document) = copy_document_selection_event(
+            connection,
+            registry,
+            handle,
+            tab_id,
+            object_id,
+            cutoff,
+        )
+        .await
+        {
+            copy_event_characters = document.chars().count();
+            let result = document_text::verify_typed_text(typed, &document);
+            if result.proven() {
+                return json!({
+                    "status": "verified",
+                    "verification": "document_copy_event",
+                    "document_text": {
+                        "characters": document.chars().count(),
+                        "hash": document_text::text_hash(&document),
+                        "matched_windows": result.matched_windows,
+                        "sampled_windows": result.sampled_windows,
+                        "exact_contains": result.exact_contains,
+                        "attempts": attempt + 1
+                    }
+                });
+            }
+        }
+    }
+    let Some(clipboard) = document_text::Clipboard::capture().await else {
+        let mut receipt = unavailable("clipboard_unavailable");
+        receipt["copy_event_characters"] = json!(copy_event_characters);
+        return receipt;
+    };
+    let copied = if selected {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        press_shortcut(connection, registry, handle, tab_id, cutoff, "c", "KeyC", 67, modifiers).await
+    } else {
+        false
+    };
+    let mut latest: Option<(String, document_text::TextMatch)> = None;
+    if copied {
+        for _ in 0..24 {
+            if tokio::time::Instant::now() >= cutoff {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if let Some(text) = clipboard.read().await {
+                let result = document_text::verify_typed_text(typed, &text);
+                let proven = result.proven();
+                latest = Some((text, result));
+                if proven {
+                    break;
+                }
+            }
+        }
+        // A hidden tab can swallow the shortcut before the editor sees it. The
+        // same copy command is still reachable from the document itself with
+        // user activation, so ask for it once more before giving up.
+        if !latest.as_ref().is_some_and(|(_, result)| result.proven()) {
+            let _ = execute_page_copy(connection, registry, handle, tab_id, cutoff).await;
+            for _ in 0..12 {
+                if tokio::time::Instant::now() >= cutoff {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                if let Some(text) = clipboard.read().await {
+                    let result = document_text::verify_typed_text(typed, &text);
+                    let proven = result.proven();
+                    latest = Some((text, result));
+                    if proven {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Collapse the select-all selection and return the user's clipboard even if
+    // the copy or comparison failed.
+    let _ = press_shortcut(connection, registry, handle, tab_id, cutoff, "ArrowRight", "ArrowRight", 39, 0).await;
+    let restored = clipboard.restore().await;
+    match latest {
+        Some((document, result)) if result.proven() => json!({
+            "status": "verified",
+            "verification": "clipboard_document_text",
+            "document_text": {
+                "characters": document.chars().count(),
+                "hash": document_text::text_hash(&document),
+                "matched_windows": result.matched_windows,
+                "sampled_windows": result.sampled_windows,
+                "exact_contains": result.exact_contains,
+                "clipboard_restored": restored
+            }
+        }),
+        Some((document, result)) => json!({
+            "status": "dispatched_unverified",
+            "verification": "clipboard_text_mismatch",
+            "copy_event_characters": copy_event_characters,
+            "document_text": {
+                "characters": document.chars().count(),
+                "hash": document_text::text_hash(&document),
+                "matched_windows": result.matched_windows,
+                "sampled_windows": result.sampled_windows,
+                "exact_contains": result.exact_contains,
+                "clipboard_restored": restored
+            }
+        }),
+        None => {
+            let mut unavailable = unavailable(if copied {
+                "clipboard_read_failed"
+            } else {
+                "clipboard_copy_failed"
+            });
+            unavailable["copy_event_characters"] = json!(copy_event_characters);
+            unavailable["document_text"] = json!({"characters": Value::Null, "clipboard_restored": restored});
+            unavailable
+        }
+    }
 }
 
 fn direct_action_budget(args: &V3ActArgs) -> crate::v3::CommandBudget {
@@ -13219,7 +13914,7 @@ fn direct_action_budget(args: &V3ActArgs) -> crate::v3::CommandBudget {
                 0
             },
         );
-        budget.max_wall_ms = args.timeout_ms.unwrap_or(pacing).clamp(1_000, 600_000);
+        budget.max_wall_ms = args.timeout_ms.unwrap_or(pacing).clamp(1_000, 900_000);
         budget.max_browser_commands = budget
             .max_browser_commands
             .max((count * (if frame_target { 6 } else { 4 }) + 32) as u32);
@@ -13236,6 +13931,7 @@ struct ActionLeaseGuard {
     owner: String,
     owns_process: bool,
     active: bool,
+    takeover: Option<String>,
 }
 
 impl ActionLeaseGuard {
@@ -13279,13 +13975,18 @@ async fn acquire_lease(app: &AppV3, args: &V3ActArgs) -> Result<ActionLeaseGuard
     let target = lease_target_key(&args.session_id, &args.chrome_tab_id);
     let active = !crate::guard_reason::unrestricted_mode();
     let nested = app.workflow_lease_owners.lock().await.contains(owner);
-    if active {
-        acquire_queued_lease(&app.leases, &target, owner, nested).await.map_err(|lease| {
-            invalid(format!("target remained busy for up to {} seconds (current owner: {})",
-                TARGET_LEASE_QUEUE_TIMEOUT.as_secs(), lease.owner))
-        })?;
-    }
-    Ok(ActionLeaseGuard { leases: app.leases.clone(), target, owner: owner.to_owned(), owns_process: !nested, active })
+    let takeover = if active {
+        let (_, takeover) = acquire_queued_lease_with_admission(&app.leases, &target, owner, nested)
+            .await
+            .map_err(|lease| {
+                invalid(format!("target remained busy for up to {} seconds (current owner: {})",
+                    TARGET_LEASE_QUEUE_TIMEOUT.as_secs(), lease.owner))
+            })?;
+        takeover
+    } else {
+        None
+    };
+    Ok(ActionLeaseGuard { leases: app.leases.clone(), target, owner: owner.to_owned(), owns_process: !nested, active, takeover })
 }
 
 async fn block_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
@@ -13386,19 +14087,36 @@ async fn rich_block_type(
         .map_err(invalid)?
     };
     if identity != snapshot.identity {
-        return Err(invalid(
-            "document changed since snapshot; take a fresh browser_snapshot",
-        ));
+        // Rejected before any command was sent to the editor. Reporting this as a
+        // tool error or an `unknown` delivery both overstate what happened; the
+        // caller needs the precondition named so it can take one fresh snapshot.
+        // Rejected before any command was sent to the editor.
+        return Ok(pre_dispatch_stale_receipt("type", Some(typing_mode)));
     }
-    let prepared = {
-        let connection = shared.connection.as_ref().unwrap();
-        connection.command(shared.registry()?,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":EDITOR_GUARD,"arguments":[{"value":index},{"value":expected},{"value":true}],"returnByValue":true})).await.map_err(|error|invalid(error.to_string()))?
-    };
-    let prepared = super::super::shared_value(&prepared).map_err(invalid)?;
+    // Run the editor ladder rather than returning its plan. A wrapper control
+    // binds its one editable descendant, a blocked/read-only surface is
+    // re-probed, and a replaced target is re-read before any insertion.
+    let (prepared, executed) = complete_editor_guard(
+        shared.connection.as_ref().unwrap(),
+        shared.registry()?,
+        &shared.handle,
+        &args.chrome_tab_id,
+        &snapshot.object_id,
+        index,
+        expected,
+        true,
+        true,
+        true,
+        true,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await?;
     if prepared["ok"] != true {
-        return Ok(
-            json!({"status":"not_dispatched","action":"type","typing_mode":"block","reason":prepared["reason"],"readback":prepared}),
-        );
+        let mut refusal = crate::recovery_exec::exhausted_refusal(&prepared, &executed);
+        refusal["action"] = json!("type");
+        refusal["typing_mode"] = json!("block");
+        refusal["readback"] = prepared.clone();
+        return Ok(refusal);
     }
     shared
         .snapshots
@@ -13451,7 +14169,11 @@ async fn rich_block_type(
         super::super::authorize_internal_workflow_snapshot(&snapshot.token);
     }
     Ok(if verified {
-        json!({"status":"verified","action":"type","typing_mode":typing_mode,"dispatch_acknowledged":true,"readback":final_value})
+        // Report the rungs that repaired this transaction, not just the result:
+        // a resolved ladder is why the readback could pass at all.
+        let mut receipt = json!({"status":"verified","action":"type","typing_mode":typing_mode,"dispatch_acknowledged":true,"readback":final_value});
+        executed.attach(&mut receipt);
+        receipt
     } else {
         json!({"status":"unknown","action":"type","typing_mode":typing_mode,"dispatch_acknowledged":true,"reason":"inserted text did not pass editor readback and document identity; inspect before retrying","readback_guard":readback_value.as_ref().and_then(|value|value["reason"].as_str()),"identity_same":identity_same})
     })
@@ -13540,22 +14262,33 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             crate::v3::EpochUse::TextMutation,
         )
     {
-        return Err(invalid(
-            "document changed since snapshot; take a fresh browser_snapshot",
-        ));
+        return Ok(pre_dispatch_stale_receipt("type", Some("ime")));
     }
+    // Same internal ladder as block and key typing: bind a wrapper to its
+    // editable descendant, place a trusted caret, and revalidate before any
+    // composition state is created.
     let guard = EDITOR_GUARD;
-    let initial = {
-        let connection = shared.connection.as_ref().unwrap();
-        connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
-            "objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":expected},{"value":true}],"returnByValue":true
-        })).await.map_err(|error| invalid(error.to_string()))?
-    };
-    let initial = super::super::shared_value(&initial).map_err(invalid)?;
+    let (initial, executed) = complete_editor_guard(
+        shared.connection.as_ref().unwrap(),
+        shared.registry()?,
+        &shared.handle,
+        &args.chrome_tab_id,
+        &snapshot.object_id,
+        index,
+        expected,
+        true,
+        false,
+        true,
+        true,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await?;
     if initial != json!(true) && initial["ok"] != true {
-        return Ok(
-            json!({"status":"not_dispatched","action":"type","typing_mode":"ime","reason":"field, focus, or caret changed before composition"}),
-        );
+        let mut refusal = crate::recovery_exec::exhausted_refusal(&initial, &executed);
+        refusal["action"] = json!("type");
+        refusal["typing_mode"] = json!("ime");
+        refusal["reason"] = json!("field, focus, or caret changed before composition");
+        return Ok(refusal);
     }
     if !unrestricted {
         shared
@@ -13648,9 +14381,9 @@ async fn ime_type(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorDat
             "reason":"IME commit did not pass retained-node and document readback; inspect before retrying"}),
         );
     }
-    Ok(
-        json!({"status":"verified","action":"type","typing_mode":"ime","dispatch_acknowledged":true,"readback":final_value}),
-    )
+    let mut receipt = json!({"status":"verified","action":"type","typing_mode":"ime","dispatch_acknowledged":true,"readback":final_value});
+    executed.attach(&mut receipt);
+    Ok(receipt)
 }
 
 fn cdp_character_events(character: char) -> Vec<(Value, bool)> {
@@ -13685,6 +14418,85 @@ fn human_keys_control_character(text: &str) -> Option<char> {
     crate::v3_execution::typing::human_keys_control_character(text)
 }
 
+/// Outcome of resolving a stale rich-editor reference immediately before
+/// dispatch. Rebinding is bounded to one attempt and must prove uniqueness.
+enum EditorRebind {
+    Rebound { object_id: String },
+    Refused {
+        reason: &'static str,
+        candidates: u64,
+        editable: u64,
+    },
+}
+
+/// Resolve the editor again by stable identity — tag, role, and accessible
+/// name — in the live document and its same-origin frames.
+///
+/// A virtualized editor (Google Docs and similar canvas surfaces) rewrites its
+/// DOM continuously, and some host the editable element inside a blank
+/// same-origin frame, so a top-document-only search finds nothing after the
+/// document revision moves. The identity survives that churn; the document
+/// revision does not. Mutations still refuse to dispatch unless exactly one
+/// editable candidate matches — a focused match is accepted when every other
+/// named candidate is unpainted.
+async fn rebind_editor_object(
+    connection: &super::super::PageSessionTransport,
+    registry: &controlla_browser::sessions::SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    role: &str,
+    name: &str,
+    tag: &str,
+) -> Result<EditorRebind, rmcp::ErrorData> {
+    let selector = r#"(()=>{const role=__ROLE__,name=__NAME__,tag=__TAG__;const roots=[document],seen=new Set([document]);for(let depth=0,frontier=[document];depth<4&&frontier.length;depth+=1){const next=[];for(const doc of frontier){let frames=[];try{frames=Array.from(doc.querySelectorAll('iframe,frame'))}catch(_){frames=[]}for(const frame of frames){let child=null;try{child=frame.contentDocument}catch(_){child=null}if(child&&!seen.has(child)){seen.add(child);roots.push(child);next.push(child)}}}frontier=next}const all=[];for(const doc of roots){try{all.push(...doc.querySelectorAll('[contenteditable=\"true\"],[contenteditable=\"\"],[role=\"textbox\"],textarea'))}catch(_){}}const editable=all.filter(n=>{if(n.matches(':disabled,[aria-disabled=\"true\"],[aria-readonly=\"true\"]'))return false;const tag=String(n.tagName).toUpperCase(),rich=n.nodeType===1&&tag!=='INPUT'&&tag!=='TEXTAREA'&&(n.isContentEditable===true||(n.getAttribute('role')==='textbox'&&String(n.getAttribute('contenteditable')||'').toLowerCase()==='true'));return rich||tag==='TEXTAREA'});const labelOf=n=>(n.getAttribute('aria-label')||n.getAttribute('aria-placeholder')||n.getAttribute('data-placeholder')||'').trim();const named=editable.filter(n=>n.tagName===tag&&labelOf(n)===name);const isActive=n=>{try{const a=n.ownerDocument.activeElement;return a===n||(!!a&&n.contains(a))}catch(_){return false}};const painted=n=>{try{const r=n.getBoundingClientRect();return r.width>0||r.height>0}catch(_){return false}};let pick=named;if(named.length>1){const focused=named.filter(isActive);pick=focused.length===1&&!named.some(n=>!isActive(n)&&painted(n))?focused:named}return {count:pick.length,editable:editable.length}})()"#
+        .replace("__ROLE__", &json!(role).to_string())
+        .replace("__NAME__", &json!(name).to_string())
+        .replace("__TAG__", &json!(tag).to_string());
+    let counted = connection
+        .command(
+            registry,
+            handle,
+            tab_id,
+            "Runtime.evaluate",
+            json!({"expression":selector,"returnByValue":true}),
+        )
+        .await
+        .map_err(invalid)?;
+    let counted = super::super::shared_value(&counted).map_err(invalid)?;
+    let candidates = counted["count"].as_u64().unwrap_or(0);
+    let editable = counted["editable"].as_u64().unwrap_or(0);
+    if candidates != 1 {
+        return Ok(EditorRebind::Refused {
+            reason: if candidates == 0 {
+                "rebind_no_match"
+            } else {
+                "rebind_ambiguous"
+            },
+            candidates,
+            editable,
+        });
+    }
+    let element = connection
+        .command(
+            registry,
+            handle,
+            tab_id,
+            "Runtime.evaluate",
+            json!({
+                "expression":selector.replace("return {count:pick.length,editable:editable.length}", "return pick[0]"),
+                "returnByValue":false
+            }),
+        )
+        .await
+        .map_err(invalid)?;
+    let object_id = element["result"]["objectId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid("rebound editor did not resolve to a remote object"))?
+        .to_owned();
+    Ok(EditorRebind::Rebound { object_id })
+}
+
 async fn key_type(
     app: &AppV3,
     args: &V3ActArgs,
@@ -13697,6 +14509,7 @@ async fn key_type(
         .ok_or_else(|| invalid("type requires reference"))?;
     let expected = args.expected_value.as_deref().unwrap_or_default();
     let rich_editor = rich_editor_reference(app, args, reference).await;
+    let unreadable_surface = editor_value_unreadable(app, args, reference).await;
     let text = normalize_key_text(args.value.as_deref().unwrap_or_default());
     if text.is_empty() || expected.len().saturating_add(text.len()) > 16_384 {
         return Err(invalid(
@@ -13740,7 +14553,7 @@ async fn key_type(
     if !unrestricted && shared.handle.principal != app.core.legacy.principal.as_ref() {
         return Err(invalid("session is not owned by this server principal"));
     }
-    let snapshot = shared
+    let mut snapshot = shared
         .snapshots
         .get(&args.chrome_tab_id)
         .cloned()
@@ -13769,7 +14582,7 @@ async fn key_type(
     let timeout = Duration::from_millis(
         args.timeout_ms
             .unwrap_or(default_timeout)
-            .clamp(1_000, 600_000),
+            .clamp(1_000, 900_000),
     );
     let deadline = tokio::time::Instant::now() + timeout;
     let (before, interaction) = {
@@ -13804,6 +14617,12 @@ async fn key_type(
         .map_err(invalid)?;
         (before, interaction)
     };
+    let mode_label = match policy.mode {
+        crate::v3::TypingMode::FastKeys => "fast_keys",
+        _ => "human_keys",
+    };
+    let mut resolution = json!({"status":"snapshot_binding","epoch_changed":false});
+    let mut rebound_target = false;
     if !unrestricted
         && !super::super::shared_epoch_matches(
             &snapshot,
@@ -13813,38 +14632,160 @@ async fn key_type(
             crate::v3::EpochUse::TextMutation,
         )
     {
-        return Err(invalid(
-            "document changed since snapshot; take a fresh browser_snapshot",
-        ));
-    }
-    let guard_function = EDITOR_GUARD;
-    let progress = expected.to_owned();
-    let preflight = {
-        let connection = shared.connection.as_ref().unwrap();
-        let response = crate::v3_runtime::await_key_batch(
-            deadline,
-            connection.command(
+        // The revision moved between the snapshot and now. For a virtualized
+        // editor that is the normal state, not a reason to abandon the task:
+        // resolve the same control again by stable identity, in the live
+        // document, immediately before dispatch. Refuse unless exactly one
+        // editable candidate matches, so a rebind can never reach a different
+        // control than the one that was observed.
+        let identity = app
+            .core
+            .semantic
+            .lock()
+            .await
+            .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
+            .and_then(|state| state.items.get(reference).cloned());
+        let role = identity
+            .as_ref()
+            .and_then(|item| item["role"].as_str())
+            .unwrap_or_default();
+        let name = identity
+            .as_ref()
+            .and_then(|item| item["name"].as_str())
+            .unwrap_or_default();
+        let tag = identity
+            .as_ref()
+            .and_then(|item| item["tag"].as_str())
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_default();
+        if role.is_empty() || name.is_empty() || tag.is_empty() {
+            let mut receipt = pre_dispatch_stale_receipt("type", Some(mode_label));
+            receipt["resolution"] = json!({
+                "status":"not_rebound",
+                "reason":"target identity lacks an exact role, accessible name, or tag",
+                "epoch_changed":true
+            });
+            return Ok(receipt);
+        }
+        let rebound = {
+            let connection = shared
+                .connection
+                .as_ref()
+                .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+            rebind_editor_object(
+                connection,
                 shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId":snapshot.object_id,"functionDeclaration":guard_function,
-                    "arguments":[{"value":index},{"value":progress},{"value":true},{"value":true}],"returnByValue":true
-                }),
-            ),
-        )
-        .await
-        .map_err(|_| invalid("type preflight timed out; no key dispatched"))?
-        .map_err(|error| invalid(error.to_string()))?;
-        super::super::shared_value(&response).map_err(invalid)?
-    };
-    if preflight["ok"] != true {
-        return Ok(
-            json!({"status":"not_dispatched","action":"type","reason":preflight["reason"],"readback":preflight}),
-        );
+                role,
+                name,
+                &tag,
+            )
+            .await?
+        };
+        match rebound {
+            EditorRebind::Rebound { object_id } => {
+                snapshot.object_id = object_id;
+                rebound_target = true;
+                resolution = json!({
+                    "status":"rebound",
+                    "by":"role_and_accessible_name",
+                    "role":role,
+                    "name":name,
+                    "tag":tag,
+                    "attempts":1,
+                    "epoch_changed":true
+                });
+            }
+            EditorRebind::Refused {
+                reason,
+                candidates,
+                editable,
+            } => {
+                let mut receipt = pre_dispatch_stale_receipt("type", Some(mode_label));
+                receipt["reason_code"] = json!(reason);
+                receipt["resolution"] = json!({
+                    "status":"not_rebound",
+                    "reason":reason,
+                    "candidates":candidates,
+                    "editable_surfaces":editable,
+                    "epoch_changed":true
+                });
+                return Ok(receipt);
+            }
+        }
     }
-    let mut progress = preflight["value"].as_str().unwrap_or(&progress).to_owned();
+    let guard_function = EDITOR_GUARD;
+    let mut progress = expected.to_owned();
+    // A dispatch-time rebind already focused the resolved editor; a virtualized
+    // document may hand focus to its own event target immediately afterwards,
+    // so focus is not a precondition there. An unreadable surface also cannot
+    // satisfy a value precondition: demanding one refuses an empty document
+    // whose raw value is two zero-width marks, which blocked Google Docs typing.
+    let (preflight, executed) = complete_editor_guard(
+        shared
+            .connection
+            .as_ref()
+            .ok_or_else(|| invalid("shared extension session has not been accepted"))?,
+        shared.registry()?,
+        &shared.handle,
+        &args.chrome_tab_id,
+        &snapshot.object_id,
+        index,
+        &progress,
+        true,
+        rich_editor,
+        !rebound_target && !unreadable_surface,
+        !unreadable_surface,
+        deadline,
+    )
+    .await?;
+    if preflight["ok"] != true {
+        let mut receipt =
+            json!({"status":"not_dispatched","action":"type","reason":preflight["reason"],"readback":preflight});
+        // Answer "why" in the same receipt. Without it the caller only learns
+        // that the control was refused, which is exactly the loop that made a
+        // canvas editor look untypeable.
+        if matches!(
+            preflight["reason"].as_str(),
+            Some("not_editable" | "blocked" | "target_replaced")
+        ) && let Some(connection) = shared.connection.as_ref()
+        {
+            let probe = connection
+                .command(
+                    shared.registry()?,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId":snapshot.object_id,
+                        "functionDeclaration":EDITOR_TARGET_STATE,
+                        "arguments":[{"value":index}],
+                        "returnByValue":true
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|value| super::super::shared_value(&value).ok());
+            if let Some(probe) = probe {
+                receipt["target_state"] = probe;
+            }
+        }
+        executed.attach(&mut receipt);
+        receipt["recovery_stage"] = json!("internal_ladder_exhausted");
+        return Ok(receipt);
+    }
+    if executed.ran_any() {
+        resolution["recovery_executed"] = json!(executed.steps());
+        resolution["recovered"] = json!(true);
+    }
+    progress = if unreadable_surface {
+        // The DOM value of a canvas editor is meaningless (often invisible
+        // marks); never feed it back as the expected text of this transaction.
+        String::new()
+    } else {
+        preflight["value"].as_str().unwrap_or(&progress).to_owned()
+    };
     if !unrestricted {
         shared
             .snapshots
@@ -13863,7 +14804,7 @@ async fn key_type(
             shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.fastType",
             json!({"object_id":snapshot.object_id,"index":index,"expected":progress,"text":text,
                 "normalize_paragraphs":rich_editor,
-                "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1, 60_000) as u64}),
+                "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1, 600_000) as u64}),
         )).await;
         let result = match result {
             Ok(Ok(value)) => shared_extension_value(&value).map_err(invalid)?,
@@ -13961,7 +14902,50 @@ async fn key_type(
         };
         dispatch_count = receipt["input_commands"].as_u64().unwrap_or_default();
         let _ = dispatch_count;
-        return Ok(compact_transaction_receipt(&receipt, mode));
+        let mut compacted = compact_transaction_receipt(&receipt, mode);
+        compacted["resolution"] = resolution;
+        // A canvas editor cannot read its own value. The transaction proves
+        // what it can — the document text delta — and the caller must see how
+        // the result was verified, not just that it was.
+        if receipt["verification"].is_string() {
+            compacted["verification"] = receipt["verification"].clone();
+            compacted["surface"] = receipt["surface"].clone();
+            compacted["next_action"] = receipt["next_action"].clone();
+            if !receipt["document_text"].is_null() {
+                compacted["document_text"] = receipt["document_text"].clone();
+            }
+        }
+        // A dispatch-only result is not an unknown mutation. The page text does
+        // not contain canvas-editor content, so prove the insertion against the
+        // document's own copy path instead of leaving the caller to guess.
+        if compacted["status"] == "dispatched_unverified" {
+            let verification = verify_canvas_document_text(
+                shared.connection.as_ref().unwrap(),
+                shared.registry()?,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                &text,
+                deadline,
+            )
+            .await;
+            compacted["verification"] = verification["verification"].clone();
+            compacted["document_text"] = verification["document_text"].clone();
+            compacted["status"] = verification["status"].clone();
+            if let Some(reason) = verification["reason"].as_str() {
+                compacted["reason"] = json!(reason);
+            }
+            if compacted["status"] == "verified" {
+                compacted["next_action"] = Value::Null;
+            } else if let Some(next) = verification["next_action"].as_str() {
+                compacted["next_action"] = json!(next);
+            }
+        }
+        // Callers read `verified`, not only `status`. A canvas insertion that
+        // the document's own copy proved is verified evidence and must say so;
+        // anything less stays explicitly unverified.
+        compacted["verified"] = json!(compacted["status"] == "verified");
+        return Ok(compacted);
     } else {
         for character in text.chars() {
             let mut attempts = 0;
@@ -14179,11 +15163,12 @@ async fn key_type(
         );
     }
     super::super::authorize_internal_workflow_snapshot(&snapshot.token);
-    let result = json!({"status":"verified","action":"type","dispatch_acknowledged":true,
+    let mut result = json!({"status":"verified","action":"type","dispatch_acknowledged":true,
         "typing_mode":match policy.mode { crate::v3::TypingMode::FastKeys=>"fast_keys", _=>"human_keys" },
         "readback":progress.clone(),"cdp_key_events":dispatch_count,"intentional_delay_ms":policy.delay_ms,
         "intentional_delay_total_ms":(text.chars().count() as u64).saturating_mul(policy.delay_ms),
         "delta":{"reference":reference,"before":expected,"after":progress,"document_changed":false,"verified":true}});
+    executed.attach(&mut result);
     Ok(result)
 }
 
@@ -16631,8 +17616,13 @@ impl AppV3 {
 
     async fn browser_inner(&self, mut args: V3BrowserArgs) -> Result<Json<Value>, rmcp::ErrorData> {
         if args.tab_operation.is_some() && args.action != "tabs" { return Err(invalid("tab_operation requires action=tabs")); }
-        if (args.steps.is_some() || args.program.is_some()) && args.action != "open" {
-            return Err(invalid("steps and program are supported only by browser action=open"));
+        if (args.steps.is_some() || args.program.is_some())
+            && args.action != "open"
+            && args.action != "task"
+        {
+            return Err(invalid(
+                "steps and program are supported only by browser action=open, or by action=task on an existing session",
+            ));
         }
         if args.steps.is_some() && args.program.is_some() {
             return Err(invalid("provide only one of steps or program"));
@@ -16776,6 +17766,52 @@ impl AppV3 {
             return self.transition_presentation(session_id, tab_id, mode).await;
         }
         if args.action == "task" {
+            // The dominant shape for work on a document the user already has open:
+            // observe, resolve, type, verify in one guarded call. It uses the same
+            // workflow VM, lease, and cancellation fences as action=open.
+            if args.steps.is_some() || args.program.is_some() {
+                if args.task.is_some() || args.task_program.is_some() {
+                    return Err(invalid(
+                        "provide steps/program or task/task_program, not both",
+                    ));
+                }
+                let session_id = args
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| invalid("steps on action=task require an existing session_id"))?;
+                let chrome_tab_id = args.chrome_tab_id.clone().ok_or_else(|| {
+                    invalid("steps on action=task require the exact chrome_tab_id to act on")
+                })?;
+                let started = std::time::Instant::now();
+                let workflow = match self
+                    .workflow(Parameters(V3WorkflowArgs {
+                        session_id,
+                        chrome_tab_id,
+                        operation_id: None,
+                        cancel: false,
+                        steps: args.steps.take().unwrap_or_default(),
+                        program: args.program.take(),
+                        client_id: args.client_id.clone(),
+                        dag: None,
+                        max_bytes: args.max_bytes,
+                        max_bytes_reason: args.max_bytes_reason.clone(),
+                        retain_text_evidence: false,
+                    }))
+                    .await
+                {
+                    Ok(value) => value.structured_content.unwrap_or(Value::Null),
+                    Err(error) => json!({"status":"failed","stage":"workflow","reason":error.to_string()}),
+                };
+                let status = workflow["status"].clone();
+                return Ok(Json(json!({
+                    "status": status,
+                    "action": "task",
+                    "session_id": args.session_id,
+                    "chrome_tab_id": args.chrome_tab_id,
+                    "workflow": workflow,
+                    "elapsed_ms": started.elapsed().as_millis() as u64
+                })));
+            }
             if let Some(program) = args.task_program.take() {
                 if args.task.is_some() {
                     return Err(invalid("provide only one of task or task_program"));
@@ -17037,7 +18073,7 @@ impl AppV3 {
                         for guard in guards { ActionLeaseGuard::release(guard, false).await; }
                         return Ok(Json(json!({"status":"not_dispatched","reason_code":"tab_target_busy","dispatch_may_have_occurred":false})));
                     }
-                    guards.push(ActionLeaseGuard { leases:self.leases.clone(),target,owner:owner.clone(),owns_process:true,active:true });
+                    guards.push(ActionLeaseGuard { leases:self.leases.clone(),target,owner:owner.clone(),owns_process:true,active:true,takeover:None });
                 }
             }
             let result = async {
@@ -18148,7 +19184,41 @@ impl AppV3 {
                 return Ok(Json(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"invalid_pinch_arguments","dispatch_may_have_occurred":false,"reason":reason})));
             }
         } else if args.center_x.is_some()||args.center_y.is_some()||args.start_distance.is_some()||args.end_distance.is_some() {
-            return Ok(Json(json!({"status":"not_dispatched","action":args.action,"reason_code":"pinch_action_mismatch","dispatch_may_have_occurred":false})));
+            // A click may name a point instead of a reference. It is admitted here
+            // and bound to a fresh visual revision inside the action route, which
+            // hit-tests the live document before dispatch. Nothing is replayed
+            // from a caller-held coordinate.
+            let coordinate_click = args.action == "click"
+                && args.reference.is_none()
+                && args.center_x.is_some()
+                && args.center_y.is_some()
+                && args.start_distance.is_none()
+                && args.end_distance.is_none();
+            if coordinate_click {
+                if args.outcome.is_some() {
+                    return Ok(Json(json!({"status":"not_dispatched","action":"click",
+                        "reason_code":"coordinate_click_outcome_unsupported","dispatch_may_have_occurred":false,
+                        "reason":"A coordinate click returns requires_verify:true; verify its postcondition explicitly instead of declaring an outcome."})));
+                }
+            } else {
+                let coordinate_args = args.center_x.is_some() || args.center_y.is_some();
+                return Ok(Json(json!({
+                    "status":"not_dispatched",
+                    "action":args.action,
+                    "reason_code": if coordinate_args { "coordinate_click_requires_visual_probe" } else { "pinch_action_mismatch" },
+                    "dispatch_may_have_occurred":false,
+                    "reason": if coordinate_args {
+                        "A point is only accepted for action=click without a reference, or for action=multi_touch. Capture a workflow visual_click step when the point must be proven by a caller-held probe."
+                    } else {
+                        "center_x/center_y and pinch distances are only valid for action=multi_touch and coordinate click. Remove them for this action."
+                    },
+                    "next_action": if coordinate_args {
+                        "Use act action=click with center_x and center_y but no reference, or submit a workflow visual_click step."
+                    } else {
+                        "Remove the coordinate or pinch arguments for this action."
+                    }
+                })));
+            }
         }
         if args.action == "secure_fill"
             && args
@@ -18259,7 +19329,7 @@ impl AppV3 {
                     args.value.as_deref().unwrap_or_default().chars().count(),
                     delay_ms,
                 );
-                Duration::from_millis(args.timeout_ms.unwrap_or(default).clamp(1_000, 600_000))
+                Duration::from_millis(args.timeout_ms.unwrap_or(default).clamp(1_000, 900_000))
             } else if let Some(policy) = background_policy {
                 Duration::from_millis(policy.deadline_ms)
             } else {
@@ -18412,6 +19482,12 @@ impl AppV3 {
                     semantic_widget_pointer(self, &args, &item, None, true, None, None).await
                 }
                 "click" | "double_click" | "context_click" | "touch" => {
+                    if args.reference.is_none() {
+                        let (Some(x), Some(y)) = (args.center_x, args.center_y) else {
+                            return Err(invalid("click requires either a fresh reference or center_x and center_y"));
+                        };
+                        return guarded_coordinate_click(self, &args, x, y).await;
+                    }
                     if background_mutation && matches!(args.action.as_str(), "click" | "double_click" | "context_click") {
                         let reference = args.reference.as_deref().ok_or_else(|| invalid("click requires reference"))?;
                         let item = self.core.semantic.lock().await
@@ -18706,6 +19782,15 @@ impl AppV3 {
         let retain_process_lock = result
             .as_ref()
             .is_ok_and(|value| should_retain_process_lock(&args.action, value));
+        if let Some(takeover) = lease.takeover.clone()
+            && let Ok(receipt) = &mut result
+        {
+            receipt["lease_takeover"] = json!({
+                "kind":"dead_owner_generation",
+                "reason":takeover,
+                "previous_effect_completed":false
+            });
+        }
         lease.release(retain_process_lock).await;
         result.map(|value| Json(compact_workflow_receipt(value, false, true)))
     }
@@ -19143,7 +20228,7 @@ impl AppV3 {
                     .visual_refs
                     .get(&resolved)
                     .ok_or_else(|| invalid("unknown or stale visual coordinate reference"))?;
-                visual_click_impl(self, args, registered).await?
+                visual_click_impl(self, &args.session_id, &args.chrome_tab_id, registered, None).await?
             }
             V3WorkflowStep::Widget {
                 reference,
@@ -25332,6 +26417,41 @@ mod v3_batch_delivery_tests {
             {"op":"try_fallback","primary":[{"op":"step","step":{"kind":"snapshot"}}],"fallback":[{"op":"step","step":{"kind":"click","reference":"@c1","outcome":null}}]}
         ])).unwrap();
         assert!(!super::open_program_is_read_only(&fallback));
+    }
+
+    #[tokio::test]
+    async fn task_accepts_steps_before_requiring_an_existing_session() {
+        let app = AppV3::new(super::super::AppV2::new(super::super::App::default()));
+        let args: V3BrowserArgs = serde_json::from_value(json!({
+            "action":"task",
+            "steps":[{"kind":"snapshot"}]
+        })).unwrap();
+        let error = match app.browser_inner(args).await {
+            Err(error) => error,
+            Ok(_) => panic!("task without a session must not run"),
+        };
+        let message = error.to_string();
+        // The route gate must admit steps on task; the remaining refusal is the
+        // ordinary existing-session requirement, not a shape rejection.
+        assert!(message.contains("existing session_id"), "{message}");
+        assert!(!message.contains("supported only by browser action=open"), "{message}");
+    }
+
+    #[test]
+    fn coordinate_click_is_the_one_act_shape_that_accepts_a_bare_point() {
+        let click: V3ActArgs = serde_json::from_value(json!({
+            "session_id":"s","chrome_tab_id":"1","action":"click",
+            "center_x":120.0,"center_y":240.0
+        })).unwrap();
+        assert_eq!(click.center_x, Some(120.0));
+        assert!(click.reference.is_none());
+        // A point with a reference is not a coordinate route; the runtime
+        // rejects it rather than silently preferring one binding over the other.
+        let both: V3ActArgs = serde_json::from_value(json!({
+            "session_id":"s","chrome_tab_id":"1","action":"click",
+            "reference":"@c1","center_x":120.0,"center_y":240.0
+        })).unwrap();
+        assert!(both.reference.is_some());
     }
 
     #[tokio::test]

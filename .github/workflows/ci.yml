@@ -61,6 +61,9 @@ jobs:
       - run: npm run check:webmcp-browser
         env:
           CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+      - run: npm run check:editor-ladder
+        env:
+          CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}
       - run: cargo test -p controlla-browser --test headless_stress --locked -- --ignored --nocapture
         env:
           CONTROLLA_CHROME: ${{ steps.chrome.outputs.chrome-path }}

@@ -122,10 +122,16 @@ impl TypingPolicy {
 }
 
 pub fn human_typing_timeout_ms(char_count: usize, delay_ms: u64) -> u64 {
+    // A human-paced character is not just its pacing delay: each one costs a
+    // key-down and a key-up round trip through the native bridge, measured at
+    // roughly 45 ms each on a local socket. Budgeting only ~50 ms per character
+    // undercounted a long transaction by more than half, so it was cut off
+    // mid-text with the remaining characters undelivered.
+    const COMMAND_ROUND_TRIP_MS: u64 = 90;
     (char_count as u64)
-        .saturating_mul(delay_ms.saturating_add(50))
-        .saturating_add(10_000)
-        .clamp(30_000, 600_000)
+        .saturating_mul(delay_ms.saturating_add(COMMAND_ROUND_TRIP_MS))
+        .saturating_add(15_000)
+        .clamp(30_000, 900_000)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

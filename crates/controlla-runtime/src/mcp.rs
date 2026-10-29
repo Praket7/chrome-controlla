@@ -1090,6 +1090,100 @@ fn shared_value(response: &Value) -> Result<Value, String> {
     })
 }
 
+/// Finish a refused read-only guard by executing its internal ladder.
+///
+/// The scroll and swipe preflights are non-mutating: when they fail, a bounded
+/// sequence of settle, rebind, and revalidation steps can still make the same
+/// target dispatchable. The returned ledger records what ran so the caller sees
+/// evidence rather than a proposal.
+#[allow(clippy::too_many_arguments)]
+async fn complete_readonly_guard(
+    initial: Value,
+    connection: &PageSessionTransport,
+    registry: &SessionRegistry,
+    handle: &controlla_browser::sessions::SessionHandle,
+    tab_id: &str,
+    object_id: &str,
+    guard: &str,
+    index: usize,
+    extra_args: &[Value],
+    deadline: tokio::time::Instant,
+) -> (Value, crate::recovery_exec::Executed) {
+    let mut checked = initial;
+    let mut executed = crate::recovery_exec::Executed::default();
+    let mut ledger: Option<crate::action_recovery::RecoveryLedger> = None;
+    let mut active_reason: Option<crate::guard_reason::GuardReason> = None;
+    for _ in 0..=crate::recovery_exec::MAX_LADDER_STEPS {
+        if checked["ok"] == true {
+            executed.mark_resolved();
+            break;
+        }
+        let Some(reason) = crate::recovery_exec::reason_of(&checked) else {
+            break;
+        };
+        if active_reason != Some(reason) {
+            active_reason = Some(reason);
+            ledger = Some(crate::action_recovery::RecoveryLedger::new(reason));
+        }
+        let Some(rung) = ledger.as_mut().and_then(|ledger| ledger.next_rung()) else {
+            break;
+        };
+        let operation = crate::recovery_exec::operation_for(rung);
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if !operation.is_executable() {
+            continue;
+        }
+        match operation {
+            crate::recovery_exec::RungOperation::Settle { delay_ms } => {
+                executed.record(operation);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            crate::recovery_exec::RungOperation::WaitForEnable => {
+                executed.record(operation);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            crate::recovery_exec::RungOperation::Reacquire => {
+                executed.record(operation);
+                let rebound = connection
+                    .command(
+                        registry,
+                        handle,
+                        tab_id,
+                        "Runtime.callFunctionOn",
+                        json!({"objectId":object_id,"functionDeclaration":crate::recovery_exec::REACQUIRE_SCRIPT,"arguments":[{"value":index}],"returnByValue":true}),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|response| shared_value(&response).ok());
+                if rebound.as_ref().is_none_or(|rebound| rebound["ok"] != true) {
+                    continue;
+                }
+            }
+            crate::recovery_exec::RungOperation::Revalidate
+            | crate::recovery_exec::RungOperation::ValueRecheck => executed.record(operation),
+            _ => continue,
+        }
+        let mut arguments = Vec::with_capacity(extra_args.len() + 1);
+        arguments.push(json!({"value": index}));
+        arguments.extend(extra_args.iter().cloned());
+        let retry = connection
+            .command(
+                registry,
+                handle,
+                tab_id,
+                "Runtime.callFunctionOn",
+                json!({"objectId":object_id,"functionDeclaration":guard,"arguments":arguments,"returnByValue":true}),
+            )
+            .await
+            .ok()
+            .and_then(|response| shared_value(&response).ok());
+        checked = retry.unwrap_or(Value::Null);
+    }
+    (checked, executed)
+}
+
 fn shared_command_value(response: &Value) -> Value {
     if response["status"].is_string() {
         response.clone()
@@ -1157,19 +1251,10 @@ async fn capture_shared_snapshot(
         .as_ref()
         .ok_or("shared session is not accepted")?;
     let registry = shared.registry().map_err(|e| e.to_string())?;
-    let before =
-        shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id).await?;
-    if let Some(old) = shared.snapshots.get(&args.chrome_tab_id) {
-        let _ = connection
-            .command(
-                registry,
-                &shared.handle,
-                &args.chrome_tab_id,
-                "Runtime.releaseObject",
-                json!({"objectId":old.object_id}),
-            )
-            .await;
-    }
+    let old_object = shared
+        .snapshots
+        .get(&args.chrome_tab_id)
+        .map(|snapshot| snapshot.object_id.clone());
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|e| e.to_string())?;
     let token = random
@@ -1208,16 +1293,83 @@ async fn capture_shared_snapshot(
     }
     let config = json!({"selector":args.selector,"max_items":args.max_items,"max_text_chars":args.max_text_chars,"max_bytes":args.max_bytes,"token":token,"href_hint":args.href_hint,"goal":args.goal,"max_scan_nodes":args.max_scan_nodes});
     let expression = format!("({})({})", include_str!("shared_page/snapshot.js"), config);
-    let evaluation = connection
-        .command(
-            registry,
-            &shared.handle,
-            &args.chrome_tab_id,
-            "Runtime.evaluate",
-            json!({"expression":expression,"returnByValue":false}),
+    // One extension round trip for the pre-dispatch identity read and the page
+    // evaluation. The batch executes in order, so the identity still describes
+    // the document that produced this snapshot, and the post-read frame tree
+    // below remains the independent check that it did not change mid-scan.
+    let batch_prelude = matches!(
+        connection,
+        PageSessionTransport::Shared(shared) if shared.supports_batch_execution()
+    );
+    let (before, evaluation) = if batch_prelude {
+        let batch = connection
+            .command_batch(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                vec![
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Page.getFrameTree".into(),
+                        params: Value::Null,
+                        stop_on_not_ok: false,
+                    },
+                    controlla_browser::providers::SharedBatchAction {
+                        method: "Runtime.evaluate".into(),
+                        params: json!({"expression":expression,"returnByValue":false}),
+                        stop_on_not_ok: false,
+                    },
+                ],
+                Duration::from_secs(10),
+            )
+            .await?;
+        let receipts = batch["receipts"]
+            .as_array()
+            .filter(|receipts| receipts.len() == 2)
+            .ok_or("snapshot prelude batch omitted receipts")?;
+        if batch["completed"].as_u64() != Some(2)
+            || batch.get("batch_error").is_some()
+            || receipts[0]["method"] != "Page.getFrameTree"
+            || receipts[1]["method"] != "Runtime.evaluate"
+            || receipts
+                .iter()
+                .any(|receipt| receipt.get("error").is_some())
+        {
+            return Err(format!(
+                "snapshot prelude batch returned unexpected or failed commands: {}",
+                batch["batch_error"]
+            ));
+        }
+        (
+            frame_identity_from_tree(&receipts[0]["result"])?,
+            receipts[1]["result"].clone(),
         )
-        .await
-        .map_err(|e| e.to_string())?;
+    } else {
+        (
+            shared_frame_identity(connection, registry, &shared.handle, &args.chrome_tab_id)
+                .await?,
+            connection
+                .command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.evaluate",
+                    json!({"expression":expression,"returnByValue":false}),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    if let Some(old) = old_object.as_deref() {
+        let _ = connection
+            .command(
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                "Runtime.releaseObject",
+                json!({"objectId":old}),
+            )
+            .await;
+    }
     let object_id = evaluation
         .pointer("/result/objectId")
         .and_then(Value::as_str)
@@ -3271,6 +3423,10 @@ impl App {
                 if shared.handle.principal != self.principal.as_ref() {
                     return Err(invalid("session is not owned by this server principal"));
                 }
+                // A connection established by this call completed the extension
+                // handshake just now; only a recorded connection can be silently
+                // detached and needs proof before it is promised again.
+                let fresh_connection = shared.connection.is_none();
                 if shared.connection.is_none() {
                     let task = shared.pairing.as_mut().ok_or_else(|| {
                         invalid("pairing ended; create a fresh pair_shared session")
@@ -3318,9 +3474,52 @@ impl App {
                     shared.registry = Some(registry);
                     shared.connection = Some(PageSessionTransport::Shared(connection));
                 }
+                // A recorded connection is bookkeeping; it says nothing about
+                // whether the debugger is still attached. Probe before promising
+                // a session, or the next call fails with `Target is not attached`
+                // and no way to tell "paired but detached" from "not paired".
+                let targets = shared.connection.as_ref().unwrap().selected_targets();
+                let mut detached = Vec::new();
+                if !fresh_connection {
+                    let connection = shared.connection.as_ref().unwrap();
+                    let registry = shared.registry()?;
+                    for target_id in &targets {
+                        if let Err(error) = connection
+                            .command(
+                                registry,
+                                &shared.handle,
+                                target_id,
+                                "Page.getFrameTree",
+                                Value::Null,
+                            )
+                            .await
+                        {
+                            // Only a definitive detach is a failed acceptance. An
+                            // unsupported or timed-out probe proves nothing about
+                            // attachment and must not revoke a working session.
+                            let message = error.to_string().to_ascii_lowercase();
+                            if message.contains("not attached")
+                                || message.contains("detached")
+                                || message.contains("target closed")
+                                || message.contains("no target with given id")
+                            {
+                                detached.push(target_id.clone());
+                            }
+                        }
+                    }
+                }
+                if !detached.is_empty() {
+                    shared.connection = None;
+                    return Ok(rmcp::handler::server::wrapper::Json(json!({
+                        "session_id":id, "accepted":false, "attached":false,
+                        "reason_code":"target_not_attached",
+                        "detached_targets":detached,
+                        "next":"The debugger is no longer attached to these targets. Call pair_shared for the tab again, then accept_shared. Nothing was dispatched."
+                    })));
+                }
                 Ok(rmcp::handler::server::wrapper::Json(json!({
-                    "session_id":id, "accepted":true,
-                    "target_ids":shared.connection.as_ref().unwrap().selected_targets(),
+                    "session_id":id, "accepted":true, "attached":true,
+                    "target_ids":targets,
                     "next":"Use list_shared_targets and the guarded V3 snapshot/action surface. App save/persistence is not established by browser control."
                 })))
             }
@@ -3923,10 +4122,27 @@ impl App {
                 ));
             }
         };
+        let mut checked = checked;
         if checked["ok"] != true {
-            let mut refusal = crate::guard_reason::refusal(&checked);
-            refusal["action"] = json!("scroll");
-            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            let (retried, executed) = complete_readonly_guard(
+                checked,
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                guard,
+                index,
+                &[json!(args.delta_x), json!(args.delta_y), Value::Null],
+                deadline,
+            )
+            .await;
+            checked = retried;
+            if checked["ok"] != true {
+                let mut refusal = crate::recovery_exec::exhausted_refusal(&checked, &executed);
+                refusal["action"] = json!("scroll");
+                return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            }
         }
         let Some(viewport) = checked["viewport"].as_str() else {
             return Ok(rmcp::handler::server::wrapper::Json(
@@ -4092,10 +4308,34 @@ impl App {
                 ));
             }
         };
+        let mut checked = checked;
         if checked["ok"] != true {
-            let mut refusal = crate::guard_reason::refusal(&checked);
-            refusal["action"] = json!("swipe");
-            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            let (retried, executed) = complete_readonly_guard(
+                checked,
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                guard,
+                index,
+                &[
+                    json!(args.start_x),
+                    json!(args.start_y),
+                    json!(args.end_x),
+                    json!(args.end_y),
+                    Value::Null,
+                    json!("before"),
+                ],
+                deadline,
+            )
+            .await;
+            checked = retried;
+            if checked["ok"] != true {
+                let mut refusal = crate::recovery_exec::exhausted_refusal(&checked, &executed);
+                refusal["action"] = json!("swipe");
+                return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            }
         }
         let Some(viewport) = checked["viewport"].as_str() else {
             return Ok(rmcp::handler::server::wrapper::Json(
@@ -4249,10 +4489,33 @@ impl App {
                 ));
             }
         };
+        let mut checked = checked;
         if checked["ok"] != true {
-            let mut refusal = crate::guard_reason::refusal(&checked);
-            refusal["action"] = json!("multi_touch");
-            return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            let (retried, executed) = complete_readonly_guard(
+                checked,
+                connection,
+                registry,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &snapshot.object_id,
+                guard,
+                index,
+                &[
+                    json!(args.center_x),
+                    json!(args.center_y),
+                    json!(args.start_distance),
+                    json!(args.end_distance),
+                    Value::Null,
+                ],
+                deadline,
+            )
+            .await;
+            checked = retried;
+            if checked["ok"] != true {
+                let mut refusal = crate::recovery_exec::exhausted_refusal(&checked, &executed);
+                refusal["action"] = json!("multi_touch");
+                return Ok(rmcp::handler::server::wrapper::Json(refusal));
+            }
         }
         let Some(viewport) = checked["viewport"].as_str() else {
             return Ok(rmcp::handler::server::wrapper::Json(
@@ -4465,10 +4728,102 @@ impl App {
                 )));
             }
             let guard = crate::guard_reason::click_guard_script(SHARED_CLICK_UNSAFE_PREDICATE);
-            let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
-            let value = shared_value(&response)?;
+            // Execute the recovery ladder instead of returning its plan. Each
+            // rung is non-mutating: re-scroll, settle, wait for enablement,
+            // rebind, or resolve a different pointer anchor for the same
+            // control. A rung that cannot resolve the target is consumed, so a
+            // stuck page cannot loop, and the final refusal names what ran.
+            let mut executed = crate::recovery_exec::Executed::default();
+            let mut recovered_via: Option<&'static str> = None;
+            let mut ledger: Option<crate::action_recovery::RecoveryLedger> = None;
+            let mut active_reason: Option<crate::guard_reason::GuardReason> = None;
+            let mut guard_opts = Value::Null;
+            let mut value = Value::Null;
+            for _ in 0..=crate::recovery_exec::MAX_LADDER_STEPS {
+                let response=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome},{"value":guard_opts}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
+                value = shared_value(&response)?;
+                if value["ok"] == true {
+                    executed.mark_resolved();
+                    break;
+                }
+                let Some(reason) = crate::recovery_exec::reason_of(&value) else {
+                    break;
+                };
+                if active_reason != Some(reason) {
+                    active_reason = Some(reason);
+                    ledger = Some(crate::action_recovery::RecoveryLedger::new(reason));
+                }
+                let Some(rung) = ledger.as_mut().and_then(|ledger| ledger.next_rung()) else {
+                    break;
+                };
+                let operation = crate::recovery_exec::operation_for(rung);
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                if !operation.is_executable() {
+                    // This site does not own the route (frame, dialog, secure
+                    // input). Skip the rung and try the next one; the ladder is
+                    // bounded so this cannot loop.
+                    continue;
+                }
+                executed.record(operation);
+                match operation {
+                    crate::recovery_exec::RungOperation::Rescroll { block } => {
+                        guard_opts = json!({"scroll": block});
+                    }
+                    crate::recovery_exec::RungOperation::Settle { delay_ms } => {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    crate::recovery_exec::RungOperation::WaitForEnable => {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
+                    crate::recovery_exec::RungOperation::Revalidate
+                    | crate::recovery_exec::RungOperation::ValueRecheck => {}
+                    crate::recovery_exec::RungOperation::Reacquire => {
+                        let rebound=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":crate::recovery_exec::REACQUIRE_SCRIPT,"arguments":[{"value":index}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
+                        let rebound = shared_value(&rebound)?;
+                        if rebound["ok"] != true {
+                            continue;
+                        }
+                    }
+                    crate::recovery_exec::RungOperation::AncestorPointer
+                    | crate::recovery_exec::RungOperation::TrustedPointer => {
+                        let mode = if matches!(
+                            operation,
+                            crate::recovery_exec::RungOperation::AncestorPointer
+                        ) {
+                            "ancestor"
+                        } else {
+                            "self"
+                        };
+                        let anchor=connection.command(registry,&shared.handle,&args.chrome_tab_id,"Runtime.callFunctionOn",json!({"objectId":snapshot.object_id,"functionDeclaration":crate::recovery_exec::ANCHOR_SCRIPT,"arguments":[{"value":index},{"value":mode}],"returnByValue":true})).await.map_err(|e|e.to_string())?;
+                        let anchor = shared_value(&anchor)?;
+                        if anchor["ok"] != true {
+                            continue;
+                        }
+                        recovered_via = Some(if mode == "ancestor" {
+                            "ancestor_pointer_target"
+                        } else {
+                            "trusted_pointer"
+                        });
+                        executed.resolve(recovered_via.unwrap_or("trusted_pointer"));
+                        value = json!({
+                            "ok": true,
+                            "x": anchor["x"],
+                            "y": anchor["y"],
+                            "viewport": anchor["viewport"],
+                            "recovered_via": recovered_via
+                        });
+                        break;
+                    }
+                    crate::recovery_exec::RungOperation::EditableDescendant
+                    | crate::recovery_exec::RungOperation::Unsupported => break,
+                }
+            }
             if value["ok"] != true {
-                return Err(ClickRefusal::Guard(crate::guard_reason::refusal(&value)));
+                let mut refusal = crate::recovery_exec::exhausted_refusal(&value, &executed);
+                refusal["phase"] = json!("pre_dispatch_recovery");
+                return Err(ClickRefusal::Guard(refusal));
             }
             if !unrestricted
                 && !matches!(&args.outcome, SharedClickOutcome::NewTab { .. })
@@ -4485,7 +4840,7 @@ impl App {
             {
                 return Err("outcome already satisfied; no click needed".into());
             }
-            Ok((guard, value))
+            Ok((guard, value, recovered_via, executed))
         };
         let guard = match tokio::time::timeout_at(deadline, prepare).await {
             Ok(Ok(guard_and_check)) => guard_and_check,
@@ -4502,7 +4857,7 @@ impl App {
                 return Ok(rmcp::handler::server::wrapper::Json(refusal));
             }
         };
-        let (guard, initial_checked) = guard;
+        let (guard, initial_checked, recovered_via, executed) = guard;
         // Consume before dispatch: even a lost reply must not permit a duplicate click with this reference.
         if !unrestricted {
             shared
@@ -4549,20 +4904,54 @@ impl App {
         }
         // Revalidate the exact target and hit point after the last document/epoch
         // read. The browser-side guard is the final CDP read before pointer dispatch.
-        let final_recheck = tokio::time::timeout_at(
-            deadline,
-            connection.command(
-                registry,
-                &shared.handle,
-                &args.chrome_tab_id,
-                "Runtime.callFunctionOn",
-                json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true}),
-            ),
-        )
-        .await;
-        let final_checked = match final_recheck {
-            Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
-            _ => Value::Null,
+        // A recovered route is validated by the route that will dispatch it.
+        // Re-running the element guard here would re-assert the predicate the
+        // ladder just resolved around and turn a working recovery into a
+        // refusal at the last step.
+        let final_checked = if let Some(via) = recovered_via {
+            let mode = if via == "ancestor_pointer_target" {
+                "ancestor"
+            } else {
+                "self"
+            };
+            let recheck = tokio::time::timeout_at(
+                deadline,
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.callFunctionOn",
+                    json!({"objectId":snapshot.object_id,"functionDeclaration":crate::recovery_exec::ANCHOR_SCRIPT,"arguments":[{"value":index},{"value":mode}],"returnByValue":true}),
+                ),
+            )
+            .await;
+            match recheck {
+                Ok(Ok(response)) => {
+                    let anchor = shared_value(&response).unwrap_or(Value::Null);
+                    if anchor["ok"] == true {
+                        json!({"ok":true,"x":anchor["x"],"y":anchor["y"],"viewport":anchor["viewport"],"recovered_via":via})
+                    } else {
+                        anchor
+                    }
+                }
+                _ => Value::Null,
+            }
+        } else {
+            let final_recheck = tokio::time::timeout_at(
+                deadline,
+                connection.command(
+                    registry,
+                    &shared.handle,
+                    &args.chrome_tab_id,
+                    "Runtime.callFunctionOn",
+                    json!({"objectId":snapshot.object_id,"functionDeclaration":guard,"arguments":[{"value":index},{"value":outcome}],"returnByValue":true}),
+                ),
+            )
+            .await;
+            match final_recheck {
+                Ok(Ok(response)) => shared_value(&response).unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
         };
         if !final_click_guard_matches_viewport(
             &final_checked,
@@ -4577,6 +4966,10 @@ impl App {
             } else {
                 json!({"status":"not_dispatched","reason":"target or viewport changed during final revalidation","reason_code":"changed_target","retry_class":"refresh_snapshot","dispatch_acknowledged":false})
             };
+            // The ladder may have run and still failed to hold by final
+            // revalidation. Report what ran so the refusal distinguishes
+            // "recovery attempted" from "nothing was tried".
+            executed.attach(&mut refusal);
             refusal["phase"] = json!("final_revalidation");
             return Ok(rmcp::handler::server::wrapper::Json(refusal));
         }
@@ -4595,7 +4988,11 @@ impl App {
             .min(u64::MAX as u128) as u64;
         let mut pointer_activation = Value::Null;
         let mut pointer_terminal = None::<Value>;
-        let (acknowledged, dispatch_failed) = if input_mode == "mouse"
+        // A recovered pointer route resolved its own anchor and must dispatch
+        // through trusted CDP at those coordinates; the element-anchored
+        // extension click would re-run the guard that just refused it.
+        let (acknowledged, dispatch_failed) = if recovered_via.is_none()
+            && input_mode == "mouse"
             && shared.handle.mode == controlla_browser::sessions::SessionMode::Shared
         {
             let dispatch = tokio::time::timeout_at(
@@ -4848,6 +5245,10 @@ impl App {
             Err(_) => {
                 result["snapshot_error"] = json!("snapshot timed out; outcome remains as reported")
             }
+        }
+        executed.attach(&mut result);
+        if let Some(via) = recovered_via {
+            result["recovered_via"] = json!(via);
         }
         Ok(rmcp::handler::server::wrapper::Json(result))
     }

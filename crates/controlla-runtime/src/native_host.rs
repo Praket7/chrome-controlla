@@ -862,8 +862,13 @@ fn validate_extension_compatibility(
     if extension_build_id != Some(expected_build_id.as_str())
         && extension_build_id != Some(runtime_fallback.as_str())
     {
+        // Name both identities: "reload the extension" is unactionable if the
+        // installed build cannot be compared with the one this host expects.
+        let received = extension_build_id
+            .map(|value| value.chars().take(96).collect::<String>())
+            .unwrap_or_else(|| "none".to_owned());
         return Err(format!(
-            "extension build identity mismatch: expected {expected_build_id}; reload the matching Controlla extension"
+            "extension build identity mismatch: expected {expected_build_id}, received {received}; reload the matching Controlla extension in chrome://extensions"
         ));
     }
     Ok(expected_build_id)

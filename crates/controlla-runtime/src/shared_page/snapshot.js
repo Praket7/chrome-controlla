@@ -43,15 +43,19 @@ function(q) {
   }
   const nodes = [], items = [];
   const protectedSelector = '[data-masked],[data-requires-trusted],input[type="password"],input[type="file"],input[type="hidden"]';
-  const isCredentialInput = e => e instanceof HTMLInputElement && e.type === 'password';
+  // Realm-independent DOM checks: a page can hand an element from another
+  // document or execution world (embed editors do), where `instanceof` against
+  // this world's constructors is false even though the node is a real input.
+  const tagOf = e => e && typeof e.tagName === 'string' ? e.tagName.toUpperCase() : '';
+  const isCredentialInput = e => tagOf(e) === 'INPUT' && e.type === 'password';
   const composedClosest = (e, selector) => {
     for (let n=e, depth=0; n && depth<16; n=n.parentElement || n.getRootNode()?.host, depth++) {
       if (n.matches?.(selector)) return n;
     }
     return null;
   };
-  const trustedText = e => e?.hasAttribute('data-requires-trusted') && (e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(e.type));
-  const richEditor = e => e instanceof HTMLElement && !(e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement) && e.getAttribute('aria-readonly') !== 'true' && e.getAttribute('contenteditable')?.toLowerCase() !== 'false' && (e.isContentEditable || e.getAttribute('role') === 'textbox');
+  const trustedText = e => e?.hasAttribute('data-requires-trusted') && (tagOf(e) === 'TEXTAREA' || tagOf(e) === 'INPUT' && ['text','search','email','url','tel'].includes(e.type));
+  const richEditor = e => !!e && e.nodeType === 1 && typeof e.getAttribute === 'function' && tagOf(e) !== 'INPUT' && tagOf(e) !== 'TEXTAREA' && e.getAttribute('aria-readonly') !== 'true' && e.getAttribute('contenteditable')?.toLowerCase() !== 'false' && (e.isContentEditable === true || e.getAttribute('role') === 'textbox');
   const editableText = e => { const text=e.innerText ?? e.textContent ?? ''; return e.textContent === '' && /^\s*$/.test(text) ? '' : text.replace(/\r\n/g,'\n').replace(/\u00a0/g,' '); };
   const readable = e => {
     if (!e || composedClosest(e, '[data-masked],input[type="file"],input[type="hidden"]') || e.querySelector(protectedSelector)) return false;
@@ -192,8 +196,15 @@ function(q) {
       const freshnessUpperBound = dateOnly ? Date.UTC(Number(dateOnly[1]), Number(dateOnly[2])-1, Number(dateOnly[3])+1, 12)-1 : null;
       const exactInstant = typeof datetime === 'string' && /T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/.test(datetime);
       const rich = richEditor(e), editable = rich || e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement && ['text','search','email','url','tel'].includes(e.type);
+      // Canvas-backed editors (Google Docs and similar) paint their text, so the
+      // editable element's DOM text does not track what the user types. Say so on
+      // the item: the runtime must not demand a value precondition it cannot
+      // observe, and the type path must verify against the document text instead.
+      const paintsCanvas = node => { try { return !!node.querySelector && !!node.querySelector('canvas,[class*="canvas-tile"],[data-canvas-content]'); } catch (_) { return false; } };
+      const canvasHost = rich && (() => { if (paintsCanvas(e)) return true; for (let p = e.parentElement, depth = 0; p && depth < 3; p = p.parentElement, depth += 1) if (paintsCanvas(p)) return true; return false; })();
+      const valueReadable = !rich || !(scope.kind === 'same_origin_blank_frame' || canvasHost);
       const feedbackRegion = e.closest('[role="alert"],[role="status"],[role="log"],[aria-live]') !== null;
-      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),id:e.id || null,size:fileSizeOf(e),role,name:label,text:label,raw_value:value,...state,feedback_region:feedbackRegion,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',control_type:typeof e.type==='string'?e.type:null,multiple:'multiple'in e?e.multiple===true:null,min:e.getAttribute('min'),max:e.getAttribute('max'),step:e.getAttribute('step'),hover_reveals:e.getAttribute('data-hover-reveals')==='true'||e.hasAttribute('data-hover-reveals'),draggable:e.draggable===true||e.getAttribute('data-draggable')==='true',drop_target:e.getAttribute('data-drop-target')==='true'||e.getAttribute('aria-dropeffect')==='move',widget_kind:e.getAttribute('data-widget-kind'),href:e.tagName === 'A' ? e.href : null,target:e.tagName === 'A' ? e.getAttribute('target') : null,rel:e.tagName === 'A' ? e.getAttribute('rel') : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,test_id:e.getAttribute('data-testid') || e.getAttribute('data-test') || e.getAttribute('data-qa') || null,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),bounds:scope.frame==='main'?{x:b.left+e.ownerDocument.defaultView.scrollX,y:b.top+e.ownerDocument.defaultView.scrollY,width:b.width,height:b.height}:null,source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind};
+      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),id:e.id || null,size:fileSizeOf(e),role,name:label,text:label,raw_value:value,...state,feedback_region:feedbackRegion,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',control_type:typeof e.type==='string'?e.type:null,multiple:'multiple'in e?e.multiple===true:null,min:e.getAttribute('min'),max:e.getAttribute('max'),step:e.getAttribute('step'),hover_reveals:e.getAttribute('data-hover-reveals')==='true'||e.hasAttribute('data-hover-reveals'),draggable:e.draggable===true||e.getAttribute('data-draggable')==='true',drop_target:e.getAttribute('data-drop-target')==='true'||e.getAttribute('aria-dropeffect')==='move',widget_kind:e.getAttribute('data-widget-kind'),href:e.tagName === 'A' ? e.href : null,target:e.tagName === 'A' ? e.getAttribute('target') : null,rel:e.tagName === 'A' ? e.getAttribute('rel') : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,test_id:e.getAttribute('data-testid') || e.getAttribute('data-test') || e.getAttribute('data-qa') || null,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),bounds:scope.frame==='main'?{x:b.left+e.ownerDocument.defaultView.scrollX,y:b.top+e.ownerDocument.defaultView.scrollY,width:b.width,height:b.height}:null,source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind,value_readable:valueReadable};
       let queryScore = 0;
       if (q.goal) {
         const normalize = text => text.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ').trim();
@@ -271,7 +282,10 @@ function(q) {
     }
     if (early_stopped || truncation_reason === 'scanned_nodes_exceeded' || truncation_reason === 'max_bytes' && !q.goal) break;
   }
-  if (q.goal && items.length > 1) {
+  if (q.goal && items.length > 0) {
+    // Ranked collection can evict every candidate except one; references must
+    // always index the retained `nodes` array, including the single-item case,
+    // or the runtime rejects the fresh reference as stale (index >= count).
     // Equal relevance is common for sibling story links. Prefer the fresher
     // bounded <time> signal before falling back to DOM order so a "latest"
     // goal does not rank an older article first merely because it appears first.
@@ -353,8 +367,15 @@ function(q) {
   // unread embed invalidate a fully enumerated first-party link scope.
   const firstPartyHint = q.href_hint || q.goal?.href_hint;
   const first_party_complete = !!firstPartyHint && !truncated && !same_origin_frames_pending && items.every(item => { try { return new URL(item.href).origin === location.origin; } catch (_) { return false; } });
-  const scope_complete = firstPartyHint ? first_party_complete : q.goal ? !truncated && !early_stopped && frames_complete : complete;
+  // A goal-bearing scope covers the reachable DOM this runtime can act in.
+  // Unread cross-origin frames are outside that scope: nothing can be resolved
+  // or dispatched inside them, so an unrelated embed must not make every match
+  // look ambiguous. They are reported as skipped, and remain a partial
+  // coverage fact rather than a scope-completeness one.
+  const scope_frames_complete = same_origin_frames_pending === 0;
+  const cross_origin_frames_skipped = cross_origin_frames_unread;
+  const scope_complete = firstPartyHint ? first_party_complete : q.goal ? !truncated && !early_stopped && scope_frames_complete : complete;
   const target_uniqueness = scope_complete ? 'scope_complete' : 'unverified';
   for (const item of items) item.target_uniqueness = target_uniqueness;
-  return {nodes,items,raw,name,presentation,visible:e=>presentation(e).rendered,public:{interaction_epoch:interactionEpoch(),url:location.href,title:document.title,ready_state:document.readyState,items,text:text.slice(0,q.max_text_chars),text_requested,text_truncated,truncated:!complete,complete,global_complete:complete,completeness:{controls:controls_complete?'complete':'partial',text:text_complete?'complete':'partial',frames:frames_complete?'complete':'partial'},incomplete_reasons,goal_satisfied,goal_score:goal_satisfied?goal_score:null,scope_complete,coverage,coverage_scope:q.goal?'ranked_target':q.href_hint ? 'matching_first_party_links' : 'all_reachable_controls',first_party_complete,scanned_nodes:Math.min(scanned,maxScanNodes),scanned_text_nodes:textScanned,search_budget_exhausted:truncation_reason==='scanned_nodes_exceeded',omitted_by_limit,omitted_oversized,shadow_roots_seen,iframes_seen,same_origin_frames_read,same_origin_frames_pending,blank_frames_seen,cross_origin_frames_unread,truncation_reason:truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : same_origin_frames_pending ? 'same_origin_frames_pending' : null),total_candidates:items.length+omitted_by_limit}};
+  return {nodes,items,raw,name,presentation,visible:e=>presentation(e).rendered,public:{interaction_epoch:interactionEpoch(),url:location.href,title:document.title,ready_state:document.readyState,items,text:text.slice(0,q.max_text_chars),text_requested,text_truncated,truncated:!complete,complete,global_complete:complete,completeness:{controls:controls_complete?'complete':'partial',text:text_complete?'complete':'partial',frames:frames_complete?'complete':'partial'},incomplete_reasons,goal_satisfied,goal_score:goal_satisfied?goal_score:null,scope_complete,coverage,coverage_scope:q.goal?'ranked_target':q.href_hint ? 'matching_first_party_links' : 'all_reachable_controls',first_party_complete,scanned_nodes:Math.min(scanned,maxScanNodes),scanned_text_nodes:textScanned,search_budget_exhausted:truncation_reason==='scanned_nodes_exceeded',omitted_by_limit,omitted_oversized,shadow_roots_seen,iframes_seen,same_origin_frames_read,same_origin_frames_pending,blank_frames_seen,cross_origin_frames_unread,cross_origin_frames_skipped,truncation_reason:truncation_reason || (text_truncated ? 'text_truncated' : cross_origin_frames_unread ? 'cross_origin_frames_unread' : same_origin_frames_pending ? 'same_origin_frames_pending' : null),total_candidates:items.length+omitted_by_limit}};
 }

@@ -35,6 +35,18 @@ impl SemanticDocumentKey {
             document_revision: revision_at(snapshot, "/document/document_revision"),
         }
     }
+
+    /// Chrome's document identity is the frame plus loader pair. A URL change
+    /// from `history.pushState` keeps the same document and must keep existing
+    /// references valid; the URL is route metadata, not an identity boundary.
+    pub fn same_document(&self, other: &Self) -> bool {
+        self.frame_id == other.frame_id && self.loader_id == other.loader_id
+    }
+
+    /// True when both keys describe the same document but a different route.
+    pub fn same_document_new_url(&self, other: &Self) -> bool {
+        self.same_document(other) && self.url != other.url
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -107,18 +119,20 @@ impl SemanticMemory {
         items: Vec<Value>,
     ) -> Result<SemanticSnapshotUpdate, SemanticStateError> {
         let had_document = self.document.is_some();
+        // A same-document route change (history.pushState) keeps frame and
+        // loader identity, so it must not discard live references.
         let document_changed = self
             .document
             .as_ref()
-            .is_some_and(|current| current != &document);
-        if self.document.as_ref() != Some(&document) {
-            self.document = Some(document);
+            .is_some_and(|current| !current.same_document(&document));
+        if document_changed || !had_document {
             self.next_ref = 1;
             self.stable_to_short.clear();
             self.short_to_legacy.clear();
             self.items.clear();
             self.snapshot_revision.clear();
         }
+        self.document = Some(document);
         if self.next_ref == 0 {
             self.next_ref = 1;
         }
@@ -443,6 +457,30 @@ mod tests {
         assert_eq!(update.items[0]["reference"], "@c1");
         assert_eq!(memory.resolve("@c1").unwrap(), "new:0");
         assert!(memory.resolve("@c2").is_err());
+    }
+
+    #[test]
+    fn spa_route_change_preserves_references_and_document_identity() {
+        let mut memory = SemanticMemory::default();
+        let key = document("https://example.test/app");
+        let items =
+            vec![json!({"reference":"legacy:0","role":"textbox","name":"Email","raw_value":""})];
+        memory.ingest(key.clone(), "s1", items.clone()).unwrap();
+        let mut pushed = key;
+        pushed.url = "https://example.test/app/settings".into();
+        let update = memory.ingest(pushed, "s2", items).unwrap();
+        assert!(
+            !update.delta.document_changed,
+            "history.pushState keeps the loader and must not replace the document"
+        );
+        assert!(!update.delta.full);
+        assert_eq!(update.items[0]["reference"], "@c1");
+        assert_eq!(memory.resolve("@c1").unwrap(), "legacy:0");
+        assert_eq!(
+            memory.document().unwrap().url,
+            "https://example.test/app/settings",
+            "the stored route is refreshed without resetting identity"
+        );
     }
 
     #[test]

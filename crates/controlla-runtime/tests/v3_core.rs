@@ -49,9 +49,15 @@ fn fast_keys_have_zero_intentional_delay_and_human_keys_are_bounded() {
             .delay_ms,
         180
     );
+    // 90 ms of bridge round trip per character plus a 15 s setup reserve, so a
+    // long human-paced transaction is not cut off mid-text.
     assert_eq!(
         controlla_runtime::v3::human_typing_timeout_ms(280, 180),
-        74_400
+        90_600
+    );
+    assert_eq!(
+        controlla_runtime::v3::human_typing_timeout_ms(10_000, 250),
+        900_000
     );
     assert!(TypingPolicy::new(TypingMode::HumanKeys, Some(251)).is_err());
     assert_eq!(

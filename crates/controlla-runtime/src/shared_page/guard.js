@@ -1,7 +1,11 @@
 function(index, outcome, opts) {
   // Ordered, named predicates. Each failure names exactly one cause; never a generic "blocked".
   // `detail` is bounded safe metadata only: no text, values, passwords, or file paths.
-  const RETRY = {outside_viewport:'safe_internal',obscured:'safe_internal',stale_reference:'refresh_snapshot',changed_target:'refresh_snapshot',detached:'refresh_snapshot',document_changed:'refresh_snapshot',hidden:'refresh_snapshot',no_hit_target:'refresh_snapshot',pointer_events_none:'refresh_snapshot',disabled:'refresh_snapshot',aria_disabled:'refresh_snapshot',stale_value:'refresh_snapshot',masked_boundary:'requires_user',trusted_boundary:'requires_user',read_only:'requires_user',unsupported_control:'do_not_retry',unsupported_renderer_surface:'do_not_retry',frame_local_route_required:'safe_internal',cross_origin_frame_unresolved:'safe_internal',protected_browser_surface:'requires_user',native_dialog_route_required:'do_not_retry'};
+  // Mirrors the Rust execution-first table: a route/backend mismatch is
+  // internal, only a real boundary (secret entry, a Chrome-owned surface, or a
+  // fresh document) needs the caller. Keep this advisory table in sync with
+  // `GuardReason::retry_class`.
+  const RETRY = {outside_viewport:'safe_internal',obscured:'safe_internal',stale_reference:'safe_internal',changed_target:'safe_internal',detached:'safe_internal',document_changed:'refresh_snapshot',hidden:'refresh_snapshot',no_hit_target:'safe_internal',pointer_events_none:'safe_internal',disabled:'safe_internal',aria_disabled:'safe_internal',stale_value:'safe_internal',masked_boundary:'requires_user',trusted_boundary:'safe_internal',read_only:'safe_internal',unsupported_control:'safe_internal',unsupported_renderer_surface:'safe_internal',frame_local_route_required:'safe_internal',cross_origin_frame_unresolved:'safe_internal',protected_browser_surface:'do_not_retry',native_dialog_route_required:'safe_internal'};
   const fail = (reason, detail) => ({ok:false, reason, retry_class:RETRY[reason] || 'do_not_retry', detail:detail || {}});
   const round = n => Math.round(n);
   const rectOf = b => ({l:round(b.left), t:round(b.top), r:round(b.right), b:round(b.bottom)});

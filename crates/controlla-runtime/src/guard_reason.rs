@@ -4,6 +4,17 @@
 //! failed. This module is the single Rust-side contract for those codes, their
 //! retry classification, and the structured refusal that MCP routes return.
 //! A generic `blocked` result is never produced.
+//!
+//! ## Backend mismatch is not a boundary
+//!
+//! Most guard codes describe a *routing* problem: the requested element needs a
+//! trusted CDP backend, a frame-local session, an editor adapter, a dialog
+//! route, or one rebind. Under the default [`ExecutionPolicy::ExecutionFirst`]
+//! those reasons are internal recoveries and never become a model-visible
+//! refusal. Only genuinely external conditions — a Chrome-owned surface, an
+//! unauthorized secret entry, or a policy that forbids the route — stay
+//! terminal. [`ExecutionPolicy::Strict`] restores the older conservative
+//! classification for callers that ask for it.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -41,6 +52,58 @@ pub enum GuardReason {
     ReadOnly,
     /// Typed-value or caret precondition no longer holds.
     StaleValue,
+}
+
+/// How much the caller has authorized the runtime to resolve internally.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPolicy {
+    /// Resolve every route, backend, frame, and rebind problem inside the
+    /// runtime. A refusal is returned only for a real boundary.
+    #[default]
+    ExecutionFirst,
+    /// Surface route and backend problems to the caller instead of resolving
+    /// them. Retained for callers that want the pre-execution-first contract.
+    Strict,
+}
+
+impl ExecutionPolicy {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ExecutionFirst => "execution_first",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// Per-action authorization context. It never widens what the user asked for;
+/// it only decides whether a route the caller already authorized may be used.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardContext {
+    pub policy: ExecutionPolicy,
+    /// The caller explicitly authorized secret entry for this action.
+    pub secret_authorized: bool,
+}
+
+impl GuardContext {
+    pub const fn execution_first() -> Self {
+        Self {
+            policy: ExecutionPolicy::ExecutionFirst,
+            secret_authorized: false,
+        }
+    }
+
+    pub const fn strict() -> Self {
+        Self {
+            policy: ExecutionPolicy::Strict,
+            secret_authorized: false,
+        }
+    }
+
+    pub const fn with_secret_authorization(mut self, authorized: bool) -> Self {
+        self.secret_authorized = authorized;
+        self
+    }
 }
 
 /// What a caller (or the runtime) may do after a refusal.
@@ -117,8 +180,52 @@ impl GuardReason {
         Self::ALL.into_iter().find(|reason| reason.code() == code)
     }
 
-    /// Canonical classification. Rust is authoritative; the JS table is advisory.
+    /// Canonical classification under the default (execution-first) context.
+    /// Rust is authoritative; the JS table is advisory.
     pub fn retry_class(self) -> RetryClass {
+        self.retry_class_with(&GuardContext::execution_first())
+    }
+
+    /// Classification for a specific authorization context.
+    pub fn retry_class_with(self, context: &GuardContext) -> RetryClass {
+        match context.policy {
+            ExecutionPolicy::Strict => self.strict_retry_class(context),
+            ExecutionPolicy::ExecutionFirst => self.execution_first_retry_class(context),
+        }
+    }
+
+    fn execution_first_retry_class(self, context: &GuardContext) -> RetryClass {
+        match self {
+            // The route exists but is not the one already tried. The runtime
+            // switches backend/frame/dialog/editor routes itself.
+            GuardReason::FrameLocalRouteRequired
+            | GuardReason::CrossOriginFrameUnresolved
+            | GuardReason::UnsupportedRendererSurface
+            | GuardReason::NativeDialogRouteRequired
+            | GuardReason::UnsupportedControl
+            | GuardReason::ReadOnly
+            | GuardReason::TrustedBoundary
+            | GuardReason::PointerEventsNone
+            | GuardReason::OutsideViewport
+            | GuardReason::NoHitTarget
+            | GuardReason::Obscured
+            | GuardReason::StaleReference
+            | GuardReason::ChangedTarget
+            | GuardReason::Detached
+            | GuardReason::StaleValue => RetryClass::SafeInternal,
+            // A disabled control often becomes enabled after an async settle;
+            // one bounded wait is internal, and a still-disabled control is
+            // then reported as an application state, not a capability limit.
+            GuardReason::Disabled | GuardReason::AriaDisabled => RetryClass::SafeInternal,
+            GuardReason::Hidden | GuardReason::DocumentChanged => RetryClass::RefreshSnapshot,
+            // Genuine boundaries: a person must authorize or change state.
+            GuardReason::MaskedBoundary if !context.secret_authorized => RetryClass::RequiresUser,
+            GuardReason::MaskedBoundary => RetryClass::SafeInternal,
+            GuardReason::ProtectedBrowserSurface => RetryClass::DoNotRetry,
+        }
+    }
+
+    fn strict_retry_class(self, _context: &GuardContext) -> RetryClass {
         match self {
             GuardReason::OutsideViewport | GuardReason::Obscured => RetryClass::SafeInternal,
             GuardReason::StaleReference
@@ -146,17 +253,17 @@ impl GuardReason {
 
     /// Reasons Controlla must never bypass or "repair" around.
     pub fn is_boundary(self) -> bool {
-        matches!(
-            self,
-            GuardReason::UnsupportedRendererSurface
-                | GuardReason::ProtectedBrowserSurface
-                | GuardReason::NativeDialogRouteRequired
-                | GuardReason::MaskedBoundary
-                | GuardReason::TrustedBoundary
-                | GuardReason::Hidden
-                | GuardReason::Disabled
-                | GuardReason::AriaDisabled
-        )
+        self.is_boundary_with(&GuardContext::execution_first())
+    }
+
+    /// Boundary test for a specific authorization context. A masked boundary
+    /// stops being a boundary once the caller authorized that secret entry.
+    pub fn is_boundary_with(self, context: &GuardContext) -> bool {
+        match self {
+            GuardReason::ProtectedBrowserSurface => true,
+            GuardReason::MaskedBoundary => !context.secret_authorized,
+            _ => false,
+        }
     }
 }
 
@@ -168,6 +275,12 @@ impl RetryClass {
             RetryClass::RequiresUser => "requires_user",
             RetryClass::DoNotRetry => "do_not_retry",
         }
+    }
+
+    /// Whether the model must do something before this action can proceed.
+    /// A fresh snapshot is still a caller-visible step.
+    pub fn needs_caller_action(self) -> bool {
+        !matches!(self, RetryClass::SafeInternal)
     }
 }
 
@@ -181,9 +294,14 @@ const MAX_DETAIL_BYTES: usize = 1024;
 /// reported verbatim under `reason_code = "unclassified"` (never `blocked`) and
 /// fail closed (`do_not_retry`).
 pub fn refusal(guard_result: &Value) -> Value {
+    refusal_with(guard_result, &GuardContext::execution_first())
+}
+
+/// Build a refusal for a specific authorization context.
+pub fn refusal_with(guard_result: &Value, context: &GuardContext) -> Value {
     let raw = guard_result["reason"].as_str().unwrap_or("unclassified");
     let (code, class) = match GuardReason::from_code(raw) {
-        Some(reason) => (reason.code(), reason.retry_class()),
+        Some(reason) => (reason.code(), reason.retry_class_with(context)),
         None => ("unclassified", RetryClass::DoNotRetry),
     };
     let mut detail = guard_result.get("detail").cloned().unwrap_or(Value::Null);
@@ -193,9 +311,14 @@ pub fn refusal(guard_result: &Value) -> Value {
     let mut out = json!({
         "status": "not_dispatched",
         "dispatch_acknowledged": false,
+        // A refused pre-dispatch guard never reached the page: the side effect
+        // is known not to have happened.
+        "dispatch_may_have_occurred": false,
         "reason": code,
         "reason_code": code,
         "retry_class": class.code(),
+        "policy": context.policy.code(),
+        "model_action_required": class.needs_caller_action(),
         "detail": detail,
     });
     if code == "obscured"
@@ -204,7 +327,7 @@ pub fn refusal(guard_result: &Value) -> Value {
         out["blocker"] = blocker.clone();
     }
     if let Some(reason) = GuardReason::from_code(raw) {
-        crate::action_recovery::attach_to_refusal(&mut out, reason);
+        crate::action_recovery::attach_to_refusal_with(&mut out, reason, context);
     }
     out
 }
@@ -239,22 +362,76 @@ mod tests {
     }
 
     #[test]
-    fn only_repairable_guards_are_safe_internal_and_boundaries_never_are() {
-        for reason in GuardReason::ALL {
-            let safe = reason.retry_class() == RetryClass::SafeInternal;
+    fn backend_and_route_mismatch_resolve_inside_the_runtime() {
+        // Every reason whose only problem is "this route cannot dispatch here"
+        // must be repairable without a model turn.
+        for reason in [
+            GuardReason::TrustedBoundary,
+            GuardReason::ReadOnly,
+            GuardReason::UnsupportedControl,
+            GuardReason::UnsupportedRendererSurface,
+            GuardReason::NativeDialogRouteRequired,
+            GuardReason::FrameLocalRouteRequired,
+            GuardReason::CrossOriginFrameUnresolved,
+            GuardReason::StaleReference,
+            GuardReason::Detached,
+            GuardReason::OutsideViewport,
+            GuardReason::Obscured,
+            GuardReason::Disabled,
+        ] {
             assert_eq!(
-                safe,
-                matches!(
-                    reason,
-                    GuardReason::OutsideViewport
-                        | GuardReason::Obscured
-                        | GuardReason::FrameLocalRouteRequired
-                        | GuardReason::CrossOriginFrameUnresolved
-                ),
-                "{reason:?}"
+                reason.retry_class(),
+                RetryClass::SafeInternal,
+                "{reason:?} must resolve internally under execution_first"
             );
+            assert!(
+                !reason.is_boundary(),
+                "{reason:?} must not be reported as a boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_boundaries_stay_terminal() {
+        let strict = GuardContext::strict();
+        // A Chrome-owned surface is terminal in both policies.
+        assert_eq!(
+            GuardReason::ProtectedBrowserSurface.retry_class(),
+            RetryClass::DoNotRetry
+        );
+        assert!(GuardReason::ProtectedBrowserSurface.is_boundary());
+        // Secret entry without authorization is a person's decision.
+        let masked = GuardReason::MaskedBoundary;
+        assert_eq!(masked.retry_class(), RetryClass::RequiresUser);
+        assert!(masked.is_boundary());
+        assert_eq!(
+            masked
+                .retry_class_with(&GuardContext::execution_first().with_secret_authorization(true)),
+            RetryClass::SafeInternal
+        );
+        assert!(
+            !masked
+                .is_boundary_with(&GuardContext::execution_first().with_secret_authorization(true))
+        );
+        // The strict policy restores the conservative classification.
+        assert_eq!(
+            GuardReason::TrustedBoundary.retry_class_with(&strict),
+            RetryClass::RequiresUser
+        );
+        assert_eq!(
+            GuardReason::UnsupportedRendererSurface.retry_class_with(&strict),
+            RetryClass::DoNotRetry
+        );
+    }
+
+    #[test]
+    fn every_boundary_requires_a_caller_action() {
+        for reason in GuardReason::ALL {
             if reason.is_boundary() {
-                assert_ne!(reason.retry_class(), RetryClass::SafeInternal);
+                assert!(
+                    reason.retry_class().needs_caller_action(),
+                    "{reason:?} is a boundary but claims no caller action"
+                );
             }
         }
     }
@@ -276,11 +453,11 @@ mod tests {
         );
         assert_eq!(
             GuardReason::UnsupportedControl.retry_class(),
-            RetryClass::DoNotRetry
+            RetryClass::SafeInternal
         );
         assert_eq!(
             GuardReason::ReadOnly.retry_class(),
-            RetryClass::RequiresUser
+            RetryClass::SafeInternal
         );
     }
 
@@ -291,11 +468,25 @@ mod tests {
         assert_eq!(value["status"], "not_dispatched");
         assert_eq!(value["reason_code"], "obscured");
         assert_eq!(value["retry_class"], "safe_internal");
+        assert_eq!(value["model_action_required"], false);
+        assert_eq!(value["policy"], "execution_first");
         assert_eq!(value["blocker"]["tag"], "div");
         let unknown = refusal(&json!({"ok":false,"reason":"blocked"}));
         assert_eq!(unknown["reason_code"], "unclassified");
         assert_eq!(unknown["retry_class"], "do_not_retry");
+        assert_eq!(unknown["model_action_required"], true);
         let huge = refusal(&json!({"ok":false,"reason":"hidden","detail":{"x":"y".repeat(4000)}}));
         assert_eq!(huge["detail"]["truncated"], true);
+    }
+
+    #[test]
+    fn strict_policy_receipt_reports_the_policy_it_used() {
+        let value = refusal_with(
+            &json!({"ok":false,"reason":"trusted_boundary"}),
+            &GuardContext::strict(),
+        );
+        assert_eq!(value["policy"], "strict");
+        assert_eq!(value["retry_class"], "requires_user");
+        assert_eq!(value["model_action_required"], true);
     }
 }

@@ -1,0 +1,8 @@
+# The isolated shared-bridge Chrome fixtures are single async test functions
+# with very large state machines. At the default 2 MiB test-thread stack they
+# abort with a stack overflow on macOS, which is why the verification matrix
+# already documents `RUST_MIN_STACK=8388608 cargo test --workspace`. Setting it
+# here makes a plain `cargo test` equivalent, locally and in CI. A value set in
+# the environment still wins, so a deeper host can raise it.
+[env]
+RUST_MIN_STACK = "8388608"

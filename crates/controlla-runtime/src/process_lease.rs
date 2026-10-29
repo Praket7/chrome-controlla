@@ -6,7 +6,23 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long past its recorded TTL a lease stays authoritative. A holder
+/// refreshes the record while it acts, so only an abandoned lease passes this.
+const LEASE_EXPIRY_GRACE_SECONDS: u64 = 5;
+
+/// Published ownership for a held lock, on disk so another process can judge
+/// whether the recorded owner generation is still live before waiting on it.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct OwnerRecord {
+    schema_version: u32,
+    pid: u32,
+    process_generation: String,
+    state_dir: String,
+    owner: String,
+    expires_unix_seconds: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeaseKey {
@@ -37,8 +53,10 @@ struct HeldLease {
 pub struct LeaseCoordinator {
     inner: Arc<Mutex<HashMap<LeaseKey, HeldLease>>>,
     lock_dir: Arc<PathBuf>,
+    state_dir: Arc<PathBuf>,
     next_generation: Arc<std::sync::atomic::AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
+    takeovers: Arc<Mutex<HashMap<LeaseKey, String>>>,
 }
 
 impl Default for LeaseCoordinator {
@@ -59,12 +77,27 @@ impl LeaseCoordinator {
     }
 
     pub fn with_lock_dir(lock_dir: impl Into<PathBuf>) -> Self {
+        Self::with_lock_and_state_dir(lock_dir, state_directory())
+    }
+
+    pub fn with_lock_and_state_dir(
+        lock_dir: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             lock_dir: Arc::new(lock_dir.into()),
+            state_dir: Arc::new(state_dir.into()),
             next_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             changed: Arc::new(tokio::sync::Notify::new()),
+            takeovers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// A takeover that this process performed for `key`, if any. Reading it
+    /// clears the note so one admission is reported by one receipt.
+    pub fn take_takeover(&self, key: &LeaseKey) -> Option<String> {
+        self.takeovers.lock().unwrap().remove(key)
     }
 
     /// Register before attempting acquisition, then keep a bounded polling
@@ -83,6 +116,18 @@ impl LeaseCoordinator {
         is_read: bool,
     ) -> Result<Lease, String> {
         let mut map = self.inner.lock().unwrap();
+        // A lease whose TTL has passed cannot still have an effect in flight, so
+        // it must not keep blocking. Without this, a client that dies while
+        // holding the target leaves every later call waiting on a lease that no
+        // live process owns until someone restarts the whole server.
+        if map
+            .get(&key)
+            .is_some_and(|held| Instant::now() >= held.lease.expires_at)
+        {
+            // Dropping the entry closes its lock file, which releases the OS
+            // lock this process held for it.
+            map.remove(&key);
+        }
         if map.contains_key(&key) {
             if is_read
                 && let Some(readers) = map.get_mut(&key).and_then(|held| held.readers.as_mut())
@@ -108,22 +153,50 @@ impl LeaseCoordinator {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
+            .open(&path)
             .map_err(|error| format!("unable to open target lock file: {error}"))?;
         let lock_result = if is_read {
             file.try_lock_shared()
         } else {
             file.try_lock()
         };
+        let mut file = file;
         match lock_result {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("lease held by another MCP process".to_owned());
+                // A lock whose recorded owner generation is absent from the live
+                // runtime records belongs to a process that can no longer finish
+                // the effect. Take it over immediately instead of blocking behind
+                // it until the lease expiry, and remember why.
+                let Some(reason) = self.stale_owner(&key) else {
+                    return Err("lease held by another MCP process".to_owned());
+                };
+                let _ = std::fs::remove_file(&path);
+                let refreshed = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+                    .map_err(|error| format!("unable to open target lock file: {error}"))?;
+                let retry = if is_read {
+                    refreshed.try_lock_shared()
+                } else {
+                    refreshed.try_lock()
+                };
+                match retry {
+                    Ok(()) => {
+                        file = refreshed;
+                        self.takeovers.lock().unwrap().insert(key.clone(), reason);
+                    }
+                    Err(_) => return Err("lease held by another MCP process".to_owned()),
+                }
             }
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(format!("unable to acquire target lock: {error}"));
             }
         }
+        write_owner_record(&path, &self.state_dir, &key, owner, ttl);
 
         let lease = Lease {
             key: key.clone(),
@@ -149,6 +222,69 @@ impl LeaseCoordinator {
             },
         );
         Ok(lease)
+    }
+
+    /// Return a human-readable reason when the recorded owner of `key` is no
+    /// longer a live runtime generation, otherwise `None`.
+    ///
+    /// The record is written by the holder when it acquires the lock. A live
+    /// generation keeps `stdio-runtime.json` fresh; a crashed or replaced
+    /// process does not. The heartbeat grace is longer than the publish
+    /// interval, so a normal write pause is not mistaken for death.
+    fn stale_owner(&self, key: &LeaseKey) -> Option<String> {
+        let path = self
+            .lock_dir
+            .join(format!("{}.lock.owner.json", lease_key_digest(key)));
+        let bytes = std::fs::read(&path).ok()?;
+        let record: OwnerRecord = serde_json::from_slice(&bytes).ok()?;
+        if record.pid == std::process::id() {
+            return None;
+        }
+        // A lease's own TTL bounds how long its holder may act on the target.
+        // Once that TTL has passed (with a small grace for clock skew), the
+        // record is stale even when the process is still running: a live but
+        // idle holder that retained an unknown write must not block every other
+        // MCP process until someone restarts it.
+        let now = unix_now();
+        let expired = now
+            > record
+                .expires_unix_seconds
+                .saturating_add(LEASE_EXPIRY_GRACE_SECONDS);
+        let expiry_reason = || {
+            format!(
+                "recorded owner {} (pid {}) lease expired {}s ago in {}",
+                record.owner,
+                record.pid,
+                now.saturating_sub(record.expires_unix_seconds),
+                record.state_dir
+            )
+        };
+        let alive = process_alive(record.pid);
+        if alive {
+            // No runtime record is not proof of death: a live process that never
+            // publishes one (library use, tests) must keep its lease.
+            let runtime = runtime_record(&record.state_dir)?;
+            let service_pid = runtime
+                .get("service_pid")
+                .and_then(|pid| pid.as_u64())
+                .and_then(|pid| u32::try_from(pid).ok());
+            let generation = runtime
+                .get("process_generation")
+                .and_then(|value| value.as_str());
+            // Only the process that published the record can be judged by it. A
+            // record owned by a different pid says nothing about this live
+            // holder, so the lease stays with it.
+            if service_pid != Some(record.pid) {
+                return None;
+            }
+            if generation == Some(record.process_generation.as_str()) {
+                return expired.then(expiry_reason);
+            }
+        }
+        Some(format!(
+            "recorded owner generation {} (pid {}) is absent from the live runtime records in {}",
+            record.process_generation, record.pid, record.state_dir
+        ))
     }
 
     pub fn release(&self, key: &LeaseKey, owner: &str) -> bool {
@@ -181,9 +317,17 @@ impl LeaseCoordinator {
 
     /// Release a retained lock only after the caller explicitly reconciles the
     /// uncertain mutation with fresh read-only evidence.
+    ///
+    /// A lease whose TTL has already passed is released too: the retention
+    /// window is what makes reconciliation necessary in the first place, so a
+    /// lease that outlived it must not keep the target unusable forever.
     pub fn release_unknown(&self, key: &LeaseKey) -> bool {
         let mut map = self.inner.lock().unwrap();
-        if map.get(key).is_some_and(|held| held.unknown) {
+        let now = Instant::now();
+        if map
+            .get(key)
+            .is_some_and(|held| held.unknown || now >= held.lease.expires_at)
+        {
             map.remove(key);
             self.changed.notify_waiters();
             true
@@ -221,9 +365,15 @@ impl LeaseCoordinator {
 
     fn release_generation(&self, key: &LeaseKey, owner: &str, generation: u64) -> bool {
         let mut map = self.inner.lock().unwrap();
-        if map.get(key).is_some_and(|held| {
-            held.lease.owner == owner && held.generation == generation && held.unknown
-        }) {
+        // The generation identifies the exact hold. Do not also require the
+        // owner string to match: a nested reacquire can rewrite the visible
+        // owner while the same hold owns the OS lock, and a failed match would
+        // leave that lock held with no owner able to release it.
+        let _ = owner;
+        if map
+            .get(key)
+            .is_some_and(|held| held.generation == generation)
+        {
             map.remove(key);
             self.changed.notify_waiters();
             true
@@ -231,6 +381,67 @@ impl LeaseCoordinator {
             false
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn state_directory() -> PathBuf {
+    std::env::var_os("CONTROLLA_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".chrome-controlla"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".chrome-controlla"))
+}
+
+fn write_owner_record(
+    lock_path: &Path,
+    state_dir: &Path,
+    key: &LeaseKey,
+    owner: &str,
+    ttl: Duration,
+) {
+    let now = unix_now();
+    let record = OwnerRecord {
+        schema_version: 1,
+        pid: std::process::id(),
+        process_generation: crate::doctor::process_generation().to_owned(),
+        state_dir: state_dir.display().to_string(),
+        owner: owner.to_owned(),
+        expires_unix_seconds: now.saturating_add(ttl.as_secs()),
+    };
+    let path = lock_path.with_extension("lock.owner.json");
+    if let Ok(bytes) = serde_json::to_vec(&record) {
+        let _ = std::fs::write(path, bytes);
+    }
+    let _ = key;
+}
+
+fn runtime_record(state_dir: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(Path::new(state_dir).join("stdio-runtime.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // Signal 0 tests existence without delivering a signal. EPERM still means
+    // the process exists; it just belongs to another user.
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    // Without a cheap existence probe, rely on the published heartbeat alone.
+    true
 }
 
 fn lease_key_digest(key: &LeaseKey) -> String {
@@ -319,6 +530,175 @@ mod tests {
                 .is_ok()
         );
         let _ = m1;
+    }
+
+    #[test]
+    fn dead_owner_generation_is_taken_over_immediately() {
+        let dir = test_dir();
+        let state = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let coord = LeaseCoordinator::with_lock_and_state_dir(&dir, &state);
+        let key = key();
+        let path = dir.join(format!("{}.lock", lease_key_digest(&key)));
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        held.try_lock().unwrap();
+        // No runtime record exists for this state directory, so the recorded
+        // generation is absent from the live records and the lease is dead.
+        let record = OwnerRecord {
+            schema_version: 1,
+            pid: 4_000_000,
+            process_generation: "dead-generation".into(),
+            state_dir: state.display().to_string(),
+            owner: "crashed-client".into(),
+            expires_unix_seconds: 0,
+        };
+        std::fs::write(
+            path.with_extension("lock.owner.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let lease = coord
+            .try_acquire(
+                key.clone(),
+                "recovering-owner",
+                Duration::from_secs(10),
+                false,
+            )
+            .expect("a dead owner generation must not block acquisition");
+        let takeover = coord
+            .take_takeover(&key)
+            .expect("takeover must be reported");
+        assert!(
+            takeover.contains("absent from the live runtime records"),
+            "{takeover}"
+        );
+        assert_eq!(lease.owner, "recovering-owner");
+    }
+
+    #[test]
+    fn live_owner_generation_is_not_taken_over() {
+        let dir = test_dir();
+        let state = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // A live runtime record owned by the recorded pid and generation.
+        std::fs::write(
+            state.join("stdio-runtime.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "service_pid": 1,
+                "process_generation": crate::doctor::process_generation()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let coord = LeaseCoordinator::with_lock_and_state_dir(&dir, &state);
+        let key = key();
+        let path = dir.join(format!("{}.lock", lease_key_digest(&key)));
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        held.try_lock().unwrap();
+        let record = OwnerRecord {
+            schema_version: 1,
+            // A different, live pid: the published generation is what proves it.
+            pid: 1,
+            process_generation: crate::doctor::process_generation().into(),
+            state_dir: state.display().to_string(),
+            owner: "live-owner".into(),
+            expires_unix_seconds: unix_now() + 120,
+        };
+        std::fs::write(
+            path.with_extension("lock.owner.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            coord
+                .try_acquire(key.clone(), "waiting-owner", Duration::from_secs(10), false)
+                .is_err(),
+            "a live owner generation must keep its lease"
+        );
+        assert!(coord.take_takeover(&key).is_none());
+    }
+
+    #[test]
+    fn expired_lease_of_a_live_process_is_taken_over() {
+        // A live process that retained an unknown write and never reconciled it
+        // must not block every other MCP process forever. Its own record says
+        // when its lease stops being authoritative.
+        let dir = test_dir();
+        let state = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // The holder is alive and its published generation still matches, so
+        // only the lease expiry can free the target.
+        std::fs::write(
+            state.join("stdio-runtime.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "service_pid": 1,
+                "process_generation": "expired-generation"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let coord = LeaseCoordinator::with_lock_and_state_dir(&dir, &state);
+        let key = key();
+        let path = dir.join(format!("{}.lock", lease_key_digest(&key)));
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        held.try_lock().unwrap();
+        let record = OwnerRecord {
+            schema_version: 1,
+            pid: 1,
+            process_generation: "expired-generation".into(),
+            state_dir: state.display().to_string(),
+            owner: "retained-unknown".into(),
+            expires_unix_seconds: unix_now().saturating_sub(60),
+        };
+        std::fs::write(
+            path.with_extension("lock.owner.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        coord
+            .try_acquire(key.clone(), "waiting-owner", Duration::from_secs(10), false)
+            .expect("an expired lease must be taken over even while its process lives");
+        let takeover = coord
+            .take_takeover(&key)
+            .expect("takeover must be reported as admission evidence");
+        assert!(takeover.contains("expired"), "{takeover}");
+    }
+
+    #[tokio::test]
+    async fn reconciliation_releases_an_expired_retained_lease() {
+        let coord = LeaseCoordinator::with_lock_dir(test_dir());
+        let key = key();
+        coord
+            .try_acquire(key.clone(), "p1", Duration::from_millis(1), false)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(coord.release_unknown(&key));
+        assert!(
+            coord
+                .try_acquire(key, "p2", Duration::from_secs(10), false)
+                .is_ok()
+        );
     }
 
     #[test]

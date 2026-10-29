@@ -55,6 +55,8 @@ Use the [browser-control skill](../packages/chrome-controlla/plugin/skills/brows
 ## Troubleshooting
 
 - **“Native tab inventory is stale”:** check that the extension is enabled, the host manifest's `allowed_origins` exactly matches the ID Chrome displays, and its executable path exists. Reload the extension after correcting registration. A successful MCP startup alone does not prove the Chrome bridge is connected.
+- **“extension build identity mismatch: expected …, received …”:** the bridge hashes the installed extension assets and refuses sessions when Chrome is serving a different build. Reload the unpacked extension in `chrome://extensions` after any extension-source change; a rebuilt binary alone does not update the loaded extension. The receipt names both digests, so a repeated mismatch after reload means Chrome is still serving cached asset bytes, not that the host is stale.
+- **Native host hangs or never publishes a heartbeat after a rebuild:** on macOS a host binary that lives under a protected folder such as `~/Documents` can block when Chrome launches it. Copy `controlla` to an unprotected path (for example `~/.chrome-controlla/bin/controlla`) and re-run `install-bridge` from that copy; the manifest records the invoking binary's absolute path.
 - **No tools or the wrong tool names:** confirm Codex launches this checkout's `target/release/controlla-v2 mcp`, then restart Codex and inspect the live tool list.
 - **A second MCP process cannot start:** give it a different absolute `CONTROLLA_STATE_DIR`.
 - **Pairing rejects a tab:** rediscover and pass the fresh snapshot's `host_id` and only the exact selected tab IDs. Do not retry with an older snapshot.

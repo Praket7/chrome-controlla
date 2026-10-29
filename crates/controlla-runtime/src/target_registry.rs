@@ -38,20 +38,16 @@ impl HardBoundary {
 }
 
 /// Classify a stale reference against the current document identity. A missing
-/// document means the tab or session is gone. URL changes count as document
-/// replacement even when Chrome reuses the loader id.
+/// document means the tab or session is gone. Identity is the frame plus loader
+/// pair: a same-document route change (`history.pushState`, an in-page fragment)
+/// keeps both, so it must not invalidate a live reference. The URL is route
+/// metadata and is never an identity boundary on its own.
 pub fn classify_invalidation(
     expected: &SemanticDocumentKey,
     current: Option<&SemanticDocumentKey>,
 ) -> Invalidation {
     match current {
-        Some(current)
-            if current.frame_id == expected.frame_id
-                && current.loader_id == expected.loader_id
-                && current.url == expected.url =>
-        {
-            Invalidation::None
-        }
+        Some(current) if current.same_document(expected) => Invalidation::None,
         _ => Invalidation::Hard,
     }
 }
@@ -63,7 +59,7 @@ pub fn hard_boundary(
     let current = current?;
     if current.frame_id != expected.frame_id {
         Some(HardBoundary::FrameReplaced)
-    } else if current.url != expected.url || current.loader_id != expected.loader_id {
+    } else if current.loader_id != expected.loader_id {
         Some(HardBoundary::DocumentReplaced)
     } else {
         None
@@ -188,6 +184,35 @@ mod tests {
             rebind_in_document(&identity(document("loader-1")), Some(&current), &[]).as_receipt()["boundary"],
             "document_replaced"
         );
+    }
+
+    #[test]
+    fn spa_route_change_keeps_the_same_document_and_references() {
+        let expected = identity(document("loader-1"));
+        let mut pushed = document("loader-1");
+        pushed.url = "https://example.test/app/settings".into();
+        assert!(pushed.same_document(&expected.document));
+        assert!(pushed.same_document_new_url(&expected.document));
+        assert_eq!(
+            classify_invalidation(&expected.document, Some(&pushed)),
+            Invalidation::None
+        );
+        assert_eq!(hard_boundary(&expected.document, Some(&pushed)), None);
+        let items = [json!({
+            "reference": "@c9",
+            "retained_reference": "session:9",
+            "source_frame": "frame",
+            "backend_node_id": 77,
+            "role": "button",
+            "name": "Save",
+            "dom_path_fingerprint": "form:0:button:0",
+            "rect_bucket": "10,10,20,20",
+            "semantic_ancestor": {"id": "dialog-editor"}
+        })];
+        assert!(matches!(
+            rebind_in_document(&expected, Some(&pushed), &items),
+            RebindOutcome::Rebound(_)
+        ));
     }
 
     #[test]

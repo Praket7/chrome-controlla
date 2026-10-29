@@ -1,5 +1,20 @@
 # Verification matrix
 
+### 2026-10-28 execution-first guard routing and SPA identity
+
+| Check | Result | Evidence and boundary |
+|---|---|---|
+| Guard taxonomy reclassification | pass | `GuardReason::retry_class_with` + `action_recovery::plan_for`; 358 runtime lib tests. Backend, frame, editor, dialog, viewport, and rebind mismatches classify `safe_internal` under `execution_first`; only an unauthorized secret entry and a Chrome-owned surface stay terminal. |
+| Chrome-backed guard predicates | pass | `cargo test -p controlla-runtime --test guard_diagnostics -- --ignored`: 7 cases, including exact reason codes, detail redaction, and route reclassification. `aria-disabled` is asserted as a non-blocking annotation for pointer dispatch, matching the guard's documented split from fill/select. |
+| Live MCP click receipts | pass | Release `controlla-v2` against a local page in dedicated headless Chrome: ordinary click `verified`; a `pointer-events:none` control with no plausible ancestor returned `not_dispatched` with `reason_code: pointer_events_none`, `retry_class: safe_internal`, `automatic_recovery: true`, `recovery.backend: ancestor_pointer_target`, `recovery.executed: ["ancestor_pointer"]`, `recovery.exhausted: true`, `recovery.stage: internal_ladder_exhausted`, no `next_action`, and the page stayed `idle`; verify passed and a `pushState` route click stayed `verified`. |
+| Executed editor ladder, live | pass | Release `controlla-v2`, dedicated headless Chrome, a `div[role=textbox]` shell wrapping one `contenteditable`: `act type` returned `status: verified`, `typing_mode: block`, `recovery.executed: ["editable_descendant"]`, `recovery.resolved: true`, `automatic_recovery: true`, `model_action_required: false`; an independent `verify text_present` passed. `npm run check:editor-ladder` pins the shell-refusal, array-rebind, element-`this`, no-descendant, and post-rung guard cases against the production literals. |
+| SPA identity | pass | Live probe: a `history.pushState` route change kept `@c1/@c2` valid and updated the document URL, with the same frame and loader identity. Unit tests cover `same_document`, `classify_invalidation`, `hard_boundary`, `document_key`, and `reacquire_reference`. |
+| Observation delta identity and retention | pass | `npm run check:observation` (6 tests): duplicate role/name controls stay distinct, occurrence fallback prevents collisions, document replacement is scoped, and pruning reports measured `required_retention_rate` instead of a constant floor. Helper-level only. |
+| Normal skill size | pass | `SKILL.md` is 4,094 bytes and `source_structure::normal_agent_instructions_stay_short` enforces the 4,096-byte bound; capability and recovery detail moved to `references/advanced.md`. |
+| Structure ratchet | pass | `cargo test -p controlla-runtime --test source_structure`: pins `v3_full.rs` at 31,671 lines (31,647 now) and `background.js` at 3,322 lines, and rejects a second declaration of the guard, recovery, or task-step contracts. The executed guard ladders live in `mcp/v3_recovery.rs`, outside the pinned facade. This is a ratchet, not decomposition. |
+| Full local suite, strict Clippy, docs | pass | `cargo test --workspace --quiet`, `cargo clippy --workspace --all-targets --quiet -- -D warnings`, `npm run check:docs` (95 files), and `node --test scripts/test-editor-rebind.mjs` (19 tests). |
+| Docs/Word/Monaco qualification, monolith decomposition, unified task IR, pointer parity, Phase 12 execution harness | unqualified | See `docs/plan-status-2026-10-28.md` for the staged list. No staffing or speed claim follows from the checks above. |
+
 ## Performance implementation evidence — 2026-10-23
 
 See [the implementation ledger](performance-implementation-2026-10-23.md) for commands, review findings, retained failures, final suite outcomes and limits. Real disposable Chromium checks cover DOM actions, snapshot geometry/budget behavior, guarded preflight and native WebMCP schema/input compatibility. The fixture oracle proves basic form/upload server state independent of browser events; unsupported scenarios remain unqualified. These checks do not qualify external clients, arbitrary app persistence, or a speed superiority claim.
@@ -1077,3 +1092,13 @@ The isolated simulated-extension shared-download fixture passed with identity/ep
 - One-call read-only browser open program: nested branches and conditions are bounded/preflighted; 12 focused Rust tests pass. Programmed writes, scrolling, and artifact operations fail closed before pairing.
 - Structured extraction task: run-specific nonce and privileged fixture acceptance implemented. First Controlla/Playwright smoke failed at Codex host exit on both clients; live mixed-task qualification not established.
 - Installed extension bridge, direct client on latest build, and Classroom, Slides, Canva, CapCut qualification: pending observed reload/pairing and live postconditions.
+
+### 2026-10-28 Google Docs typing and document-text verification
+
+| Check | Result | Evidence and boundary |
+|---|---|---|
+| Docs editor typing through `HumanKeys` | pass, live installed Chrome | Fresh `docs.google.com/document/create` tab in a foreground session: `act(type, reference @c1, typing_mode human_keys)` returned `status: verified`, `verified: true`, `verification: clipboard_document_text`, `document_text.characters: 81`, `matched_windows: 3/3`, `clipboard_restored: true`. A second foreground pass verified through `verification: document_copy_event` with `exact_contains: true`. |
+| Dispatch-time rebind on a moving document | pass, live | The same receipts reported `resolution.status: rebound`, `by: role_and_accessible_name`, one attempt, after the semantic revision moved between snapshot and dispatch. |
+| Hidden-tab honesty | pass, live | Background session: `status: dispatched_unverified`, `verification: tab_hidden`, explicit reason, no key or clipboard commands after dispatch, and a next action to foreground the tab. The user clipboard was neither read nor written. |
+| Saved Drive persistence | unqualified | The receipts prove the live editor's own copy output, not that Drive persisted the document server-side. |
+| Local unit and integration suite | pass | `cargo test -p controlla-runtime --lib` (349 passed) and the full `cargo test -p controlla-runtime` integration set. New `document_text` unit tests cover normalization, window sampling, autocorrect tolerance, and absent text. |

@@ -55,6 +55,29 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 // Setup/pairing keeps the shorter startup timeout, while command replies use
 // the explicit operation deadline (or this 30 second single-command default).
 const SHARED_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the host waits for one extension command's reply.
+///
+/// Human-paced typing is a single browser-side transaction whose duration is
+/// proportional to the text length: 600 characters at a 45 ms pace already
+/// exceed 30 s, and the generic timeout used to cut the reply off while the
+/// editor was still typing, turning a clean verification into `unknown`.
+/// Typing commands therefore wait for the transaction budget they were given,
+/// plus delivery slack; every other command keeps the 30 s bound.
+fn shared_command_timeout(method: &str, params: &Value) -> Duration {
+    match method {
+        "Controlla.typeTextTransaction" | "Controlla.fastType" => {
+            let requested_ms = params
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(600_000);
+            SHARED_COMMAND_TIMEOUT
+                .max(Duration::from_millis(requested_ms).saturating_add(Duration::from_secs(5)))
+        }
+        _ => SHARED_COMMAND_TIMEOUT,
+    }
+}
 /// Per-peer WS handshake + hello bound: one silent local connection must not
 /// consume the whole pairing window and starve the legitimate extension.
 const PER_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1050,6 +1073,7 @@ impl SharedExtensionSession {
         params: Value,
     ) -> Result<Value, ProviderError> {
         let started = Instant::now();
+        let response_timeout = shared_command_timeout(method, &params);
         let cdp_budget_charge = if method == "Controlla.fastType" {
             fast_type_cdp_bound(&params)
         } else if method == "Controlla.humanTypeCharacter" {
@@ -1104,7 +1128,7 @@ impl SharedExtensionSession {
         crate::scheduler::telemetry::record_browser_operation_dispatch().await;
         crate::scheduler::telemetry::record_native_host_message(false).await;
         crate::scheduler::telemetry::record_command_purpose(method, 1).await;
-        let result = match tokio::time::timeout(SHARED_COMMAND_TIMEOUT, &mut receiver).await {
+        let result = match tokio::time::timeout(response_timeout, &mut receiver).await {
             Ok(Ok(Ok(value))) => {
                 crate::scheduler::telemetry::record_native_host_message(true).await;
                 value
@@ -1427,6 +1451,31 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_commands_wait_for_their_own_transaction_budget() {
+        // Human-paced typing is one long browser-side transaction. A 600 s
+        // budget must not be cut off by the 30 s generic command timeout, while
+        // an unrelated command keeps the short bound.
+        let long = json!({"deadline_ms": 600_000});
+        assert_eq!(
+            shared_command_timeout("Controlla.typeTextTransaction", &long),
+            Duration::from_secs(605)
+        );
+        let short = json!({"deadline_ms": 45_000});
+        assert_eq!(
+            shared_command_timeout("Controlla.fastType", &short),
+            Duration::from_secs(50)
+        );
+        assert_eq!(
+            shared_command_timeout("Runtime.evaluate", &long),
+            SHARED_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            shared_command_timeout("Controlla.typeTextTransaction", &json!({})),
+            SHARED_COMMAND_TIMEOUT
+        );
+    }
 
     #[test]
     fn screenshot_integrity_requires_matching_document_target_and_pixels() {

@@ -65,6 +65,19 @@ pub(super) async fn acquire_queued_lease(
     owner: &str,
     nested: bool,
 ) -> Result<crate::v3::TargetLease, crate::v3::TargetLease> {
+    acquire_queued_lease_with_admission(leases, target, owner, nested)
+        .await
+        .map(|(lease, _)| lease)
+}
+
+/// Acquire the exclusive target lease, returning any dead-owner takeover this
+/// process performed so the action receipt can report it.
+pub(super) async fn acquire_queued_lease_with_admission(
+    leases: &Mutex<crate::v3::LeaseTable>,
+    target: &crate::v3::TargetKey,
+    owner: &str,
+    nested: bool,
+) -> Result<(crate::v3::TargetLease, Option<String>), crate::v3::TargetLease> {
     let deadline = tokio::time::Instant::now() + TARGET_LEASE_QUEUE_TIMEOUT;
     loop {
         let changed = process_lease_coordinator().changed();
@@ -74,8 +87,9 @@ pub(super) async fn acquire_queued_lease(
         // in-memory lease: cancellation there would orphan the process lock.
         let mut table = leases.lock().await;
         let process_key = process_lease_key(target);
-        if !nested
-            && process_lease_coordinator()
+        let mut takeover = None;
+        if !nested {
+            if process_lease_coordinator()
                 .try_acquire(
                     process_key.clone(),
                     owner,
@@ -83,21 +97,25 @@ pub(super) async fn acquire_queued_lease(
                     false,
                 )
                 .is_err()
-        {
-            if tokio::time::Instant::now() >= deadline {
-                let now = now_ms();
-                return Err(crate::v3::TargetLease {
-                    owner: "another MCP process".into(),
-                    acquired_at_ms: now,
-                    expires_at_ms: now.saturating_add(120_000),
-                });
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    let now = now_ms();
+                    return Err(crate::v3::TargetLease {
+                        owner: "another MCP process".into(),
+                        acquired_at_ms: now,
+                        expires_at_ms: now.saturating_add(120_000),
+                    });
+                }
+                drop(table);
+                tokio::select! {
+                    _ = changed.as_mut() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                }
+                continue;
             }
-            drop(table);
-            tokio::select! {
-                _ = changed.as_mut() => {},
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {},
-            }
-            continue;
+            // A dead-owner takeover is admission evidence: the previous holder
+            // could not have completed its effect, so the receipt must say so.
+            takeover = process_lease_coordinator().take_takeover(&process_key);
         }
         let result = if nested {
             table.acquire_nested(target.clone(), owner, now_ms(), 120_000)
@@ -106,7 +124,7 @@ pub(super) async fn acquire_queued_lease(
         };
         drop(table);
         match result {
-            Ok(lease) => return Ok(lease),
+            Ok(lease) => return Ok((lease, takeover)),
             Err(existing) if tokio::time::Instant::now() >= deadline => {
                 if !nested {
                     process_lease_coordinator().release(&process_key, owner);
@@ -118,9 +136,9 @@ pub(super) async fn acquire_queued_lease(
                     process_lease_coordinator().release(&process_key, owner);
                 }
                 tokio::select! {
-                _ = changed.as_mut() => {},
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {},
-            }
+                    _ = changed.as_mut() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                }
             }
         }
     }

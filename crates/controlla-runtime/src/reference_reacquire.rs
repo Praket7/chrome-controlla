@@ -100,7 +100,9 @@ pub fn reacquire_reference(
     current_document: &SemanticDocumentKey,
     current_items: &[Value],
 ) -> Result<ReacquiredReference, ReacquireError> {
-    if &expected.document != current_document {
+    // Frame plus loader identify the document. A same-document route change
+    // (history.pushState) keeps both and must still allow a rebind.
+    if !expected.document.same_document(current_document) {
         return Err(ReacquireError::DocumentChanged);
     }
     let mut high_matches = Vec::new();

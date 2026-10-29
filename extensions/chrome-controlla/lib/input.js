@@ -21,17 +21,52 @@ const SUPPORTED_STRATEGIES = new Set([
   "clipboard_paste",
 ]);
 
-export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAnchor,operation,prepare,normalize){
-  const e=this;
+// Rich editors that draw their text on a canvas (Google Docs, some design tools)
+// expose an editable element whose DOM text does not track what the user types.
+// Readback cannot confirm those surfaces, so the transaction must say so instead
+// of claiming an unknown delivery after the first character.
+export const SURFACE_PROBE = `function(index){
+  const e=this.nodes?this.nodes[index]:this;
+  // Duck-typed node checks: an embed editor can hand back an element from
+  // another realm, where instanceof against this world's constructors is false.
+  const tagOf=n=>n&&typeof n.tagName==='string'?n.tagName.toUpperCase():'';
+  const rich=!!e&&e.nodeType===1&&typeof e.getAttribute==='function'&&tagOf(e)!=='INPUT'&&tagOf(e)!=='TEXTAREA'&&(e.isContentEditable===true||e.getAttribute('role')==='textbox');
+  const plain=tagOf(e)==='TEXTAREA'||tagOf(e)==='INPUT'&&['text','search','email','url','tel'].includes(e.type);
+  const text=rich?(e.innerText??e.textContent??''):'';
+  // Canvas editors often paint the text beside or above the editable element,
+  // not inside it. Search the nearby container chain, but never the whole page:
+  // an unrelated canvas elsewhere must not disable readback for a normal form.
+  const paints=n=>!!n.querySelector&&!!n.querySelector('canvas,[class*="canvas-tile"],[data-canvas-content]');
+  let canvas=rich&&paints(e);
+  for(let p=e.parentElement,depth=0;!canvas&&p&&depth<3;p=p.parentElement,depth+=1)canvas=paints(p);
+  // Some editors host the editing surface in a blank same-origin frame and keep
+  // the text in their own model; that element never reports what was typed.
+  // Only a document that belongs to a subframe counts: a top-level about:blank
+  // page (a fresh tab, or a test harness) is its own document and does report
+  // its text, so flagging it would refuse readback for no reason.
+  const blankFrame=rich&&(()=>{try{
+    const doc=e.ownerDocument;
+    const win=doc.defaultView;
+    const framed=!!win&&win!==win.top;
+    return framed&&doc.location.href==='about:blank';
+  }catch(_){return false}})();
+  return {rich,plain,canvas,event_target_frame:blankFrame,text_length:text.length,readable:!rich||!(canvas||blankFrame)};
+}`;
+
+export const CONNECTED_PROBE = `function(index){const e=this.nodes?this.nodes[index]:this;return {ok:!!e&&e.isConnected===true}}`;
+
+export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAnchor,operation,prepare,normalize,lenientFocus,index){
+  const e=this.nodes?this.nodes[index]:this;
   if(!e||!e.isConnected)return {ok:false,reason:'target_stale'};
-  const rich=e instanceof HTMLElement&&!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement)&&(e.isContentEditable||e.getAttribute('role')==='textbox');
-  const plain=e instanceof HTMLTextAreaElement||e instanceof HTMLInputElement&&['text','search','email','url','tel'].includes(e.type);
+  const tagOf=n=>n&&typeof n.tagName==='string'?n.tagName.toUpperCase():'';
+  const rich=!!e&&e.nodeType===1&&typeof e.getAttribute==='function'&&tagOf(e)!=='INPUT'&&tagOf(e)!=='TEXTAREA'&&(e.isContentEditable===true||e.getAttribute('role')==='textbox');
+  const plain=tagOf(e)==='TEXTAREA'||tagOf(e)==='INPUT'&&['text','search','email','url','tel'].includes(e.type);
   const trusted=e.closest('[data-requires-trusted]');
   if(!rich&&!plain)return {ok:false,reason:'not_editable'};
   if(e.matches(':disabled,[aria-disabled="true"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||(trusted&&trusted!==e))return {ok:false,reason:'blocked'};
-  const read=()=>{const raw=rich?(e.innerText??e.textContent??'').replace(/\\r\\n/g,'\\n').replace(/\\u00a0/g,' '):e.value;return rich?(raw==='\\n'?'':normalize?raw.replace(/\\n{2,}/g,b=>'\\n'.repeat(Math.ceil(b.length/2))):raw):raw};
+  const read=()=>{const raw=rich?(e.innerText??e.textContent??'').replace(/\\r\\n/g,'\\n').replace(/\\u00a0/g,' '):e.value;return rich?(/^\\s*$/.test(raw)?'':normalize?raw.replace(/\\n{2,}/g,b=>'\\n'.repeat(Math.ceil(b.length/2))):raw):raw};
   let value=read();
-  const expectedOk=expectedKind==='unchecked'||expectedKind==='contains'?expectedKind==='contains'?value.includes(expectedValue):true:expectedKind==='suffix'?value.endsWith(expectedValue):value===expectedValue;
+  const expectedOk=expectedKind==='unchecked'||expectedKind==='contains'?expectedKind==='contains'?value.includes(expectedValue):true:expectedKind==='suffix'?value.endsWith(expectedValue):value===(rich&&/^\\s*$/.test(expectedValue)?'':expectedValue);
   if(!expectedOk)return {ok:false,reason:'stale_value',value,length:value.length,rich};
   if(prepare){
     e.focus();
@@ -55,7 +90,7 @@ export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAn
     if(operation==='append')atBoundary=selectionStart===selectionEnd&&selectionEnd===e.value.length;
     if(operation==='replace')atBoundary=selectionStart===0&&selectionEnd===e.value.length;
   }
-  if(operation==='insert_at_caret'?false:!focused||!atBoundary)return {ok:false,reason:'focus_or_selection_changed',value,length:value.length,focused,atBoundary,rich};
+  if(operation==='insert_at_caret'?false:(!focused&&lenientFocus!==true)||!atBoundary)return {ok:false,reason:'focus_or_selection_changed',value,length:value.length,focused,atBoundary,rich};
   value=read();
   return {ok:true,value,length:value.length,rich,focused,selectionStart,selectionEnd,expectedAnchor:expectedAnchor??null};
 }`;
@@ -119,6 +154,7 @@ export function validateTypeTextTransaction(params = {}) {
   return {
     tabId: Number.isSafeInteger(params.tabId) ? params.tabId : null,
     objectId: params.object_id ?? null,
+    index: Number.isSafeInteger(params.index) ? params.index : null,
     backendNodeId: Number.isSafeInteger(params.backend_node_id) ? params.backend_node_id : null,
     frameId: params.frame_id ?? null,
     loaderId: params.loader_id ?? null,
@@ -166,7 +202,7 @@ async function verifyFrameLoader(tabId, transaction, ctx) {
   return cached === transaction.loaderId;
 }
 
-async function guard(ctx, target, objectId, transaction, values, prepare) {
+async function guard(ctx, target, objectId, transaction, values, prepare, lenientFocus = false) {
   const response = await ctx.send(target, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: TRANSACTION_GUARD,
@@ -177,10 +213,65 @@ async function guard(ctx, target, objectId, transaction, values, prepare) {
       { value: transaction.operation },
       { value: prepare },
       { value: transaction.normalize },
+      { value: lenientFocus },
+      { value: transaction.index },
     ],
     returnByValue: true,
   });
   return response?.result?.value ?? { ok: false, reason: "guard_response_missing" };
+}
+
+async function probeSurface(ctx, target, objectId, index) {
+  try {
+    const response = await ctx.send(target, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: SURFACE_PROBE,
+      arguments: [{ value: index }],
+      returnByValue: true,
+    });
+    return response?.result?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Canvas editors keep their text outside the editable element, but the page
+// still renders it. A before/after read of the document text is the only
+// verification these surfaces can honestly offer.
+async function pageText(ctx, target) {
+  try {
+    const response = await ctx.send(target, "Runtime.evaluate", {
+      // Same-origin frames are part of the visible page: an editor may render
+      // its text in a child document (Google Docs) rather than the top one.
+      expression: "(()=>{const parts=[],seen=new Set();const walk=doc=>{if(!doc||seen.has(doc))return;seen.add(doc);try{parts.push(doc.body?(doc.body.innerText||''):'')}catch(_){}let frames=[];try{frames=Array.from(doc.querySelectorAll('iframe,frame'))}catch(_){frames=[]}for(const f of frames){try{if(f.contentDocument)walk(f.contentDocument)}catch(_){}}};walk(document);return parts.join('\\n').slice(0,200000)})()",
+      returnByValue: true,
+    });
+    const value = response?.result?.value;
+    return typeof value === "string" ? value.replace(/\u00a0/g, " ") : null;
+  } catch {
+    return null;
+  }
+}
+
+function verificationNeedle(text) {
+  const normalized = String(text).replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
+  const line = normalized.split("\n").map(part => part.trim()).find(part => part.length >= 8);
+  const needle = line ?? normalized.trim();
+  return needle.length >= 8 && needle.length <= 400 ? needle : null;
+}
+
+async function stillConnected(ctx, target, objectId, index) {
+  try {
+    const response = await ctx.send(target, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: CONNECTED_PROBE,
+      arguments: [{ value: index }],
+      returnByValue: true,
+    });
+    return response?.result?.value?.ok === true;
+  } catch {
+    return false;
+  }
 }
 
 function expectedProgress(transaction, dispatched, baseValue = "") {
@@ -236,15 +327,26 @@ export async function typeTextTransaction(tabId, params, ctx) {
       return finish({ status: "not_dispatched", reason: "frame_identity_stale" });
     }
     resolved = await resolveObjectId(tabId, transaction, ctx);
-    const firstValue = transaction.expected.kind === "unchecked"
+    // A canvas-backed rich editor cannot report what was typed into it. Detect
+    // that before the first guard so the transaction never claims a readback it
+    // cannot perform, and never reports the first character as an unknown write.
+    const surface = await probeSurface(ctx, resolved.target, resolved.objectId, transaction.index);
+    // A canvas editor paints beside its editable element, and some editors
+    // (Google Docs) host the editable element in a blank document whose DOM
+    // never receives the typed text. Both are unreadable surfaces: dispatch
+    // and report, never invent a readback.
+    const unverifiable = surface?.plain !== true
+      && (surface?.canvas === true || surface?.event_target_frame === true);
+    const firstValue = unverifiable || transaction.expected.kind === "unchecked"
       ? { kind: "unchecked", value: "" }
       : { kind: transaction.expected.kind, value: transaction.expected.value ?? "", anchor: transaction.expected.anchor ?? null };
-    let before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true);
+    const textBefore = unverifiable ? await pageText(ctx, resolved.target) : null;
+    let before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true, unverifiable);
     let interferenceRebased = false;
     if (before.ok !== true && before.reason === "focus_or_selection_changed" && !dispatchMayHaveOccurred) {
       // Benign focus drift before any input: re-prepare the same target once.
       // A changed value or replaced target is never overwritten.
-      before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true);
+      before = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, true, unverifiable);
       interferenceRebased = before.ok === true;
     }
     cdpCommands = ctx.commandCount() - commandStart;
@@ -320,16 +422,16 @@ export async function typeTextTransaction(tabId, params, ctx) {
         for (const character of Array.from(chunk)) {
           const enter = character === "\n";
           const key = enter ? "Enter" : character;
+          // A keyDown that carries `text` already inserts the character (Chrome
+          // synthesizes the matching keypress/input). Sending a separate `char`
+          // event repeated the insertion path and cost one native round trip,
+          // roughly 45 ms, for every character typed.
           const down = enter
             ? { type: "keyDown", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36, text: "\r", unmodifiedText: "\r" }
-            : { type: "keyDown", key };
+            : { type: "keyDown", key, text: character, unmodifiedText: character };
           await ctx.send(resolved.target, "Input.dispatchKeyEvent", down);
           dispatchMayHaveOccurred = true;
           inputCommands += 1;
-          if (!enter) {
-            await ctx.send(resolved.target, "Input.dispatchKeyEvent", { type: "char", key, text: character, unmodifiedText: character });
-            inputCommands += 1;
-          }
           await ctx.send(resolved.target, "Input.dispatchKeyEvent", enter
             ? { type: "keyUp", key, code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36 }
             : { type: "keyUp", key });
@@ -359,7 +461,19 @@ export async function typeTextTransaction(tabId, params, ctx) {
       const shouldVerify = transaction.verifyEvery === 0
         ? index === chunks.length - 1
         : (index + 1) % transaction.verifyEvery === 0 || index === chunks.length - 1;
-      if (shouldVerify) {
+      if (shouldVerify && unverifiable) {
+        // Only liveness is observable on this surface. Anything stronger would
+        // be a fabricated readback.
+        if (!(await stillConnected(ctx, resolved.target, resolved.objectId, transaction.index))) {
+          return finish({
+            status: "unknown",
+            backend,
+            chunks: index + 1,
+            reason: "editor detached during typing; the remaining text was not dispatched",
+            interruption: { reason: "target_detached", phase: "readback", chunk: index },
+          });
+        }
+      } else if (shouldVerify) {
         const expected = expectedProgress(transaction, dispatched, initialValue);
         const after = await guard(ctx, resolved.target, resolved.objectId, transaction, expected, false);
         if (after.ok !== true) {
@@ -376,6 +490,53 @@ export async function typeTextTransaction(tabId, params, ctx) {
       }
     }
 
+    if (unverifiable) {
+      if (!(await stillConnected(ctx, resolved.target, resolved.objectId, transaction.index))) {
+        return finish({
+          status: dispatchMayHaveOccurred ? "unknown" : "not_dispatched",
+          backend,
+          chunks: chunks.length,
+          reason: "editor detached before the final liveness check",
+          interruption: { reason: "target_detached", phase: "final_readback" },
+        });
+      }
+      // The text was dispatched at the requested pace and the editor survived.
+      // The element cannot report what it now contains, so verify against the
+      // document text itself: the typed line must be absent before and present
+      // after. Anything weaker is reported as dispatch-only.
+      const needle = textBefore === null ? null : verificationNeedle(transaction.text);
+      let proven = false;
+      if (needle) {
+        for (let attempt = 0; attempt < 8 && !proven; attempt += 1) {
+          const afterText = await pageText(ctx, resolved.target);
+          proven = afterText !== null && afterText.includes(needle) && !textBefore.includes(needle);
+          if (!proven) await delay(150);
+        }
+      }
+      return {
+        ...finish({
+          status: proven ? "verified" : "dispatched_unverified",
+          backend,
+          chunks: chunks.length,
+          interference_rebased: interferenceRebased,
+        }),
+        verification: proven ? "document_text" : "dispatch_only",
+        surface: {
+          canvas: surface?.canvas === true,
+          event_target_frame: surface?.event_target_frame === true,
+          text_readable: false,
+        },
+        document_text: proven
+          ? { needle_chars: needle.length, before_chars: textBefore.length }
+          : undefined,
+        adapter: adapter.id,
+        adapter_qualified: adapter.qualified === true,
+        completed_chars: codePointLength(transaction.text),
+        next_action: proven
+          ? null
+          : "Read the document text to confirm the insertion; do not replay this transaction.",
+      };
+    }
     const finalExpected = transaction.operation === "insert_at_caret"
       ? { kind: "contains", value: transaction.text }
       : expectedProgress(transaction, dispatched, initialValue);

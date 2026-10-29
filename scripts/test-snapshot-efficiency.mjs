@@ -19,7 +19,7 @@ async function collect(html, config = {}) {
       const original = Element.prototype.getBoundingClientRect;
       Element.prototype.getBoundingClientRect = function () { geometryReads++; return original.call(this); };
       const snapshot = new Function(`return (${source})`)()({selector:'body',token:'test',max_items:20,max_text_chars:0,max_bytes:8192,max_scan_nodes:1000,...config});
-      return { items: snapshot.items, geometryReads, result: snapshot.public };
+      return { items: snapshot.items, nodeCount: snapshot.nodes.length, geometryReads, result: snapshot.public };
     }, { source, config });
   } finally { await page.close(); }
 }
@@ -45,6 +45,22 @@ test('role-targeted search avoids layout reads for excluded controls', async () 
   assert.deepEqual(result.items.map(item => item.name), ['Target']);
   assert.equal(result.geometryReads, 1);
   assert.equal(result.result.scope_complete, true);
+});
+
+test('ranked eviction leaves one candidate whose reference indexes the retained nodes', async () => {
+  // The exact match is discovered last and evicts the lower-ranked earlier
+  // candidates under a one-item goal budget. Its reference must be renumbered
+  // with the retained nodes; otherwise a fresh reference is rejected as stale
+  // because its raw index is no longer smaller than the returned count.
+  const result = await collect(
+    '<button>Target low priority</button><button>Unrelated control</button><button>Target</button>',
+    { goal: { query: 'Target' }, max_items: 1, max_bytes: 20000 },
+  );
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].name, 'Target');
+  assert.equal(result.items[0].reference, 'test:0');
+  assert.equal(result.result.items.length, 1);
+  assert.equal(result.nodeCount, 1);
 });
 
 test('goal href filtering retains matching links and reports an incomplete bounded scan', async () => {

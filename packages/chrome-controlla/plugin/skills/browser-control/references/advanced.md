@@ -40,3 +40,52 @@ Use `ready_when: {"kind":"visual_stable","quiet_ms":300,"timeout_ms":3000}` on `
 `Controlla.frameHumanTypeCharacter` remains registered for one compatibility cycle so already-packaged clients do not break. No V3 task, workflow, or `act` typing path calls it: they use `Controlla.typeTextTransaction`, and the extension tests assert a 1,000-character frame type sends exactly one such request and no per-character frame typing. Remove the shim only after two green package-compatibility cycles; do not route new work through it.
 
 Use native fallback only when the live capability report advertises it and the task needs foreground pointer movement/scrolling or a non-submitting key. It refuses coordinate clicks, drags, all text entry, and navigation because native visual evidence cannot establish safe intent. Use fresh semantic extension actions for page controls and navigation; keep order confirmation, credential entry, challenge hand-off, and background actions on their guarded extension routes. See `docs/desktop-fallback.md` for exact platform status.
+
+## Execution policy and recovery
+
+`execution_policy: "execution_first"` is the default. It lets the runtime
+resolve a backend mismatch, frame route, viewport problem, stale reference,
+scroll container, focus drift, or dialog route without a model turn. The receipt
+reports `automatic_recovery: true` and a `recovery.plan` naming each internal
+rung (`trusted_cdp`, `frame_local_cdp`, `oopif_child_session`,
+`editable_descendant`, `semantic_reacquire`, `dialog_route`, ...).
+`execution_policy: "strict"` restores the older conservative classification in
+which those conditions are surfaced to the caller.
+
+Recovery is bounded and non-mutating. It never re-dispatches an effect whose
+delivery is uncertain; `unknown` still requires one read-only verification and
+never a replay.
+
+## Capability boundaries moved out of the fast path
+
+- Screenshot evidence: `verified` means the PNG decoded and its
+document/lifecycle/revision still matched. `unavailable` means Chrome exposed no
+valid compositor surface. `stale` means navigation or topology changed and the
+pixels were discarded. An empty or malformed PNG is never evidence.
+- `act(action="click", center_x, center_y)` without a reference clicks one page
+coordinate after a bounded visual revision and exact hit test. It returns
+`requires_verify: true` and is never replayed.
+- A stale document revision is a precondition, not a failed write: `act` returns
+`not_dispatched` with `dispatch_may_have_occurred: false`. For typing, the
+runtime repairs once by resolving the same editor in the live document and its
+same-origin frames by role plus accessible name.
+- Canvas editors (Google Docs is the reference case) cannot report typed text
+from the editable element. A visible tab verifies through `document_copy_event`
+or `clipboard_document_text` with `document_text.hash`; a hidden tab returns
+`dispatched_unverified` and `verification: "tab_hidden"`. A verified editor
+readback proves the live document content, not server-side persistence.
+- Cross-origin frames: `find` and targeted snapshots report unread frames under
+`cross_origin_frames_skipped` and set `coverage: partial`. Use
+`include_frames=true` for a bounded accessibility aggregation over up to eight
+child frames, or the explicit `frame_id` path for one frame.
+- Password entry requires `secure_fill` with `allow_password=true`, the exact
+credential-free `expected_origin`, and an `account_marker`. If the user supplied
+the password in chat, pass it only in that action's `value`; otherwise omit it
+and Controlla opens its one-use local prompt. The receipt is a redacted boolean.
+- Headless is an isolated lifecycle mode, not an `open` mode. A one-call private
+`Research` task launches, navigates, verifies, and releases internally. Form
+drafts, mutations, uploads, downloads, and repeat actions need an existing
+session because they depend on an observed page, reference, or artifact.
+- `browser action=release` detaches Controlla and keeps the user's tab open.
+- Upload receipts separate file selection, application acceptance, and
+persistence; report only the level observed.

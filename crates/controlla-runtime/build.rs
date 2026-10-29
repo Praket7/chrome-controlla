@@ -30,6 +30,7 @@ fn main() {
     let allowed_non_runtime_files = [
         "README.md",
         "test-background.cjs",
+        "test-observation.mjs",
         "test-v3-batch.cjs",
         "lib",
     ]

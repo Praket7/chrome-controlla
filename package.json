@@ -24,6 +24,9 @@
     "prepare:release-candidate": "node scripts/prepare-release-candidate.mjs",
     "bench:phase11:configured": "node scripts/run-phase11-suite.mjs",
     "check:topology": "node --test scripts/tab-management.test.cjs scripts/native-authorization.test.cjs",
+    "check:editor-rebind": "node --test scripts/test-editor-rebind.mjs",
+    "check:editor-ladder": "node --test scripts/test-editor-ladder.mjs",
+    "check:observation": "node --test extensions/chrome-controlla/test-observation.mjs",
     "check:background-dom": "node --test scripts/test-background-actions.mjs",
     "check:snapshot-efficiency": "node --test scripts/test-snapshot-efficiency.mjs",
     "check:webmcp-browser": "node --test scripts/test-webmcp-browser.mjs"
