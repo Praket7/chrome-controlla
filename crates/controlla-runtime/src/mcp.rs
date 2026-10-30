@@ -7198,6 +7198,28 @@ impl App {
             "app_acceptance":"not_established"
         })))
     }
+
+    /// Open a tab, re-pairing a bounded number of times while a real site is
+    /// still redirecting. The open is keyed by the caller's idempotency key and
+    /// targets the tab this session already created, so a re-pair cannot reach
+    /// a different tab; every other error surfaces unchanged.
+    #[allow(dead_code)] // Used by V3 open in the CLI binary.
+    async fn shared_tab_open(
+        &self,
+        args: SharedTabArgs,
+    ) -> Result<rmcp::handler::server::wrapper::Json<Value>, rmcp::ErrorData> {
+        let mut attempt = 0u32;
+        loop {
+            match self.shared_tab(Parameters(args.clone())).await {
+                Err(error) if attempt < 3 && error.message.contains("during pairing") => {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(500 * u64::from(attempt));
+                    tokio::time::sleep(delay).await;
+                }
+                other => return other,
+            }
+        }
+    }
 }
 
 #[tool_handler]

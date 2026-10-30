@@ -11,13 +11,12 @@ recovery-only.
 
 ## Default shape
 
-1. `browser(action="task")` for a bounded goal; pass `task_program` when known so
-   it runs in one call.
+1. `browser(action="task")` for a bounded goal; pass `task_program`.
 2. One `snapshot` only when a fresh reference is required.
 3. `act` for one known mutation; `workflow` for a caller-supplied program.
 4. One read-only `verify` only when no receipt proves the outcome.
 
-No duplicate snapshots, homepage detours, or round-trips.
+No duplicate snapshots or detours.
 
 ## Execution contract
 
@@ -27,15 +26,13 @@ root, scroll container, and rebind itself. `execution_policy` defaults to
 the runtime, not as refusals; `strict` surfaces them. Background is the default;
 semantic click, fill, select, type, press, scroll, snapshots, and trusted keys
 work while the tab is inactive or Chrome is unfocused; `foreground` asks to show
-Chrome. Reuse the opaque `context` instead of copying IDs. `open` reuses a tab the
-session already holds, including another view of the same document. Success is
-compact: `status`, `context`, `result`, `verified`, `trace_id`.
+Chrome. Reuse the opaque `context` instead of copying IDs. Success is compact:
+`status`, `context`, `result`, `verified`, `trace_id`.
 
 - `not_dispatched` + `automatic_recovery`: the internal route is chosen; do not
   re-derive one.
-- `unknown`: Never blind retry `unknown`; verify read-only once, then never replay.
-- `verification: "tab_hidden"`: a canvas editor could not answer copy proof;
-  bring the tab forward once, never replay.
+- `unknown`: never blind retry; verify read-only once, then never replay.
+- `verification: "tab_hidden"`: canvas copy proof was unreachable; never replay.
 - Refusals are only for indistinguishable targets, Chrome policy, OS-owned
   surfaces, missing authorization, or an unproven outcome.
 
@@ -65,11 +62,10 @@ attach control. Pass a typed `outcome`; an acknowledgement is not success.
 ## Typing
 
 Omit `typing_mode`; Controlla selects block insertion, fast keys, IME, or an
-editor adapter from observed characteristics. Entry is one
-`typeTextTransaction`; use `human_keys` only for human-paced input. A canvas
-editor (Google Docs, Sheets) paints text only while its tab is visible, so it
-needs a visible tab in an unfocused background window, never a hidden tab; a
-hidden tab reports `dispatched_unverified`, not `verified`.
+editor adapter. Use `human_keys` only for human-paced input. A canvas editor
+such as Google Docs paints text only while its tab is visible: give it a visible
+tab in an unfocused background window, never a hidden tab, which reports
+`dispatched_unverified`.
 
 ## Safety
 
@@ -83,7 +79,7 @@ and return to guarded mode after.
 
 ## Disclosure
 
-`references/advanced.md` (typing, modes, boundaries, raw arguments),
+`references/advanced.md` (typing, modes, boundaries),
 `references/uploads-and-frames.md`,
 `references/common-recipes.md`; `references/recovery.md` only after a real
 failure.

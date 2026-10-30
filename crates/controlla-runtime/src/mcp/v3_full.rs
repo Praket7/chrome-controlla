@@ -18798,32 +18798,7 @@ impl AppV3 {
                     account_marker_selector: None,
                     account_marker_text: None,
                 };
-                // A real site can still be redirecting when its freshly created
-                // tab is first paired, and the identity check then fails on the
-                // race instead of on a real mismatch. This open is idempotent
-                // (same key, same URL, same owned tab), so a bounded re-pair is
-                // safe; every other error surfaces unchanged.
-                let mut attempt = 0u32;
-                loop {
-                    match self
-                        .core
-                        .legacy
-                        .shared_tab(Parameters(open_args.clone()))
-                        .await
-                    {
-                        Ok(result) => break Ok(result),
-                        Err(error) => {
-                            if attempt >= 3 || !error.message.contains("during pairing") {
-                                break Err(error);
-                            }
-                            attempt += 1;
-                            tokio::time::sleep(Duration::from_millis(
-                                500 * u64::from(attempt),
-                            ))
-                            .await;
-                        }
-                    }
-                }
+                self.core.legacy.shared_tab_open(open_args).await
             };
             let Json(mut result) = match opened {
                 Ok(result) => result,
