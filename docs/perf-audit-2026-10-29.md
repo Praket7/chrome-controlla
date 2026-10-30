@@ -63,20 +63,20 @@ hand back a new remote object. Both are fixed and covered by
 
 ## Long-form typing, live
 
-A 3,974-character Google Docs essay was typed into a freshly created document
-with human-paced key events. Reopening the document in its read-only mobile view
-returns 3,985 normalized characters and contains both the opening sentence and
-the final sentence of the source, and the type receipt reported
-`status: verified`, `verification: clipboard_document_text`. That path selects
-all, lets the document answer the copy itself, and matches sampled windows
-across the whole typed text, so it is a whole-document comparison rather than a
-first-line probe. The document is
-https://docs.google.com/document/d/1VaeeJytbu5sFlrCLMGp0e5llBWp98ZxnuyrqcTBa9Fs/edit.
-A 788-character paragraph measured 51 s (65 ms per character at a 45 ms pace),
-which fits the two-command-per-character path. The document's name still reads
-"Untitled document": Docs commits a title rename only from trusted keyboard
-input, and its controlled input reverts a programmatic fill before the commit,
-which is a known gap rather than a silent success.
+A 3,973-character Google Docs essay was typed into a freshly created document
+with human-paced key events by the release binary. The type receipt reported
+`status: verified`, `verification: document_copy_event`, and took 261.9 s at a
+55 ms pace, which is 65.9 ms per character for the two-command-per-character
+path. Reopening the document in its read-only mobile view returns 3,985
+normalized characters and contains both the opening sentence and the final
+sentence of the source, so this is an independent whole-document check rather
+than a first-line probe. The document is
+https://docs.google.com/document/d/16kmvt8_sLc77qch62Vv6Zy9wADo9h-uZ6mlqBT7Kmbk/edit.
+Docs named it from the essay heading; a rename attempt through the title field
+refused with `stale_value` because the auto-rename had already changed the
+field, which is the guard reporting a real precondition rather than a failure.
+A 788-character paragraph previously measured 51 s (65 ms per character at a
+45 ms pace), consistent with the same path.
 
 ## Boundary
 
