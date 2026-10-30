@@ -7211,9 +7211,15 @@ impl App {
         let mut attempt = 0u32;
         loop {
             match self.shared_tab(Parameters(args.clone())).await {
-                Err(error) if attempt < 3 && error.message.contains("during pairing") => {
+                Err(error) if attempt < 8 && error.message.contains("during pairing") => {
                     attempt += 1;
-                    let delay = std::time::Duration::from_millis(500 * u64::from(attempt));
+                    // A real site can redirect for several seconds after its first
+                    // paint (ESPN boots through a consent hop and a canonical
+                    // redirect). Re-discovery is cheap and every attempt is keyed
+                    // to the owned tab, so wait long enough for the URL to settle
+                    // instead of surfacing a pairing race as the open's failure.
+                    let delay =
+                        std::time::Duration::from_millis((400 * u64::from(attempt)).min(2_000));
                     tokio::time::sleep(delay).await;
                 }
                 other => return other,
