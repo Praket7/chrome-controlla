@@ -35,6 +35,26 @@ export function findReusableTab(tabs, { url, documentId, requestedTabId } = {}) 
   }) ?? null;
 }
 
+// A background automation window is durable state, not a per-open resource.
+// Minting a window for every open strands one window per tab and buries the
+// user's real windows, so an open reuses the live unfocused window Controlla
+// already owns. A focused or missing window is never reused: the caller asked
+// for an unfocused presentation and user windows stay untouched.
+export async function reusableOwnedBackgroundWindow(windowsApi, receipts) {
+  const candidates = Object.values(receipts || {})
+    .filter(receipt => receipt?.status === "complete" && receipt.create_background_window === true
+      && Number.isSafeInteger(receipt.window_id) && typeof receipt.document_id === "string")
+    .sort((left, right) => (right.created_ms || 0) - (left.created_ms || 0))
+    .slice(0, 8);
+  for (const receipt of candidates) {
+    const window = await windowsApi.get(receipt.window_id, { populate: true }).catch(() => undefined);
+    if (!window || window.focused !== false || (window.type !== undefined && window.type !== "normal")) continue;
+    if (Array.isArray(window.tabs) && window.tabs.some(tab => tab.incognito)) continue;
+    return window.id;
+  }
+  return undefined;
+}
+
 export function tabIdentity(tab) {
   return {
     tab_id: tab?.id ?? null,

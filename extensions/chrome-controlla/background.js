@@ -4,6 +4,7 @@ import { DebuggerSessionManager } from "./lib/debugger-sessions.js";
 import { typeTextTransaction } from "./lib/input.js";
 import { PointerEngine } from "./lib/pointer.js";
 import { semanticDelta, pruneSemanticItems } from "./lib/observation.js";
+import { reusableOwnedBackgroundWindow } from "./lib/tab-control.js";
 
 let socket;
 const NATIVE_HOST = "chrome_controlla_bridge";
@@ -2920,7 +2921,7 @@ async function returnExistingOpen(receipt, url, native, generation) {
     pairedTabUrls.set(tabId, after.url); pairedTabDocumentIds.set(tabId, after.document_id); bindPairedTabTopology(tabId); attached.add(tabId);
   }
   const tab = await chrome.tabs.get(tabId), window = await chrome.windows.get(tab.windowId);
-  return { tab_id: receipt.tab_id, window_id: receipt.window_id ?? tab.windowId, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true, created_background_window: receipt.create_background_window === true, placement: receipt.placement || {}, tab_active: !!tab.active, window_focused: !!window.focused };
+  return { tab_id: receipt.tab_id, window_id: receipt.window_id ?? tab.windowId, url: receipt.url, document_id: receipt.document_id, idempotent_reuse: true, created_by_controlla: true, created_background_window: receipt.create_background_window === true, reused_background_window: receipt.reused_background_window === true, placement: receipt.placement || {}, tab_active: !!tab.active, window_focused: !!window.focused };
 }
 async function assertOwnedAutomationWindow(windowId) {
   const window = await chrome.windows.get(windowId, { populate: true }).catch(() => undefined);
@@ -2973,9 +2974,11 @@ async function createOwnedTabFromNative(request) {
     if (tab && tab.url !== markerUrl && tab.url !== url) throw new Error("Owned recovery tab changed before completion; no duplicate was opened.");
     if (targetWindowPolicy === "existing_automation_window") await assertOwnedAutomationWindow(targetWindowId);
     else if (targetWindowId !== undefined) await chrome.windows.get(targetWindowId);
+    let reusedWindowId;
     if (!tab && backgroundWindow) {
-      const window = await chrome.windows.create({url:markerUrl,focused:false,type:"normal"});
-      tab = window?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
+      reusedWindowId = await reusableOwnedBackgroundWindow(chrome.windows, receipts);
+      if (reusedWindowId !== undefined) tab = await chrome.tabs.create({windowId:reusedWindowId,url:markerUrl,active:false});
+      else tab = (await chrome.windows.create({url:markerUrl,focused:false,type:"normal"}))?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
     } else if (!tab && targetWindowId !== undefined) {
       tab = await chrome.tabs.create({windowId:targetWindowId,url:markerUrl,active});
     } else if (!tab) {
@@ -2983,7 +2986,8 @@ async function createOwnedTabFromNative(request) {
     }
     if (!tab || !Number.isSafeInteger(tab.id)) throw new Error("Chrome did not return a new owned tab.");
     receipts[key] = {status:"creating",tab_id:String(tab.id),window_id:tab.windowId,target_window_id:targetWindowId,target_window_policy:targetWindowPolicy,
-      url,requested_url:url,marker_url:markerUrl,active,create_background_window:backgroundWindow,created_ms:receipt?.created_ms || Date.now()};
+      url,requested_url:url,marker_url:markerUrl,active,create_background_window:backgroundWindow,
+      reused_background_window:reusedWindowId !== undefined,created_ms:receipt?.created_ms || Date.now()};
     await chrome.storage.local.set({[OPEN_RECEIPTS_KEY]:receipts});
     try {
       // Chrome does not reliably expose webNavigation frame/document identity
@@ -3021,6 +3025,7 @@ async function createOwnedTabFromNative(request) {
       return {tab_id:String(tab.id),window_id:current.windowId,url:identity.url,document_id:identity.document_id,
         redirected_from:redirectedFrom ?? null,
         idempotent_reuse:false,created_by_controlla:true,created_background_window:backgroundWindow,
+        reused_background_window:reusedWindowId !== undefined,
         tab_active:!!current.active,window_focused:!!window.focused};
     } catch (error) {
       const latest = (await chrome.storage.local.get(OPEN_RECEIPTS_KEY))[OPEN_RECEIPTS_KEY] || {};
@@ -3096,18 +3101,24 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     if (receipt && ((receipt.create_background_window === true) !== createBackgroundWindow || JSON.stringify(receipt.placement || {}) !== JSON.stringify(placement))) throw new Error("Idempotency key is already bound to a different target/window policy.");
     if (receipt && receipt.target_window_id !== targetWindowId) throw new Error("Idempotency key is already bound to a different automation window.");
     if (Number.isSafeInteger(targetWindowId)) await assertOwnedAutomationWindow(targetWindowId);
-    let createdWindow;
+    let createdWindow, reusedWindowId;
     if (!tab && createBackgroundWindow) {
-      createdWindow = await chrome.windows.create({ url: markerUrl, focused: false, type: "normal", ...placement });
-      tab = createdWindow?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
-      if (!tab || !Number.isSafeInteger(createdWindow?.id)) throw new Error("Chrome did not return the new unfocused Controlla window and tab.");
+      // Explicit window placement needs a window of its own; an unplaced open
+      // reuses the unfocused automation window that is already open.
+      if (!Object.keys(placement).length) reusedWindowId = await reusableOwnedBackgroundWindow(chrome.windows, receipts);
+      if (reusedWindowId !== undefined) tab = await chrome.tabs.create({ windowId: reusedWindowId, url: markerUrl, active });
+      else {
+        createdWindow = await chrome.windows.create({ url: markerUrl, focused: false, type: "normal", ...placement });
+        tab = createdWindow?.tabs?.find(candidate => Number.isSafeInteger(candidate.id));
+        if (!tab || !Number.isSafeInteger(createdWindow?.id)) throw new Error("Chrome did not return the new unfocused Controlla window and tab.");
+      }
     } else if (!tab && Number.isSafeInteger(targetWindowId)) tab = await chrome.tabs.create({ windowId: targetWindowId, url: markerUrl, active });
     else if (!tab) tab = await chrome.tabs.create({ url: markerUrl, active });
-    receipt = { status: "creating", tab_id: String(tab.id), window_id: createdWindow?.id ?? tab.windowId, target_window_id: targetWindowId, url, requested_url: url, marker_url: markerUrl, active, create_background_window: createBackgroundWindow, placement, created_ms: receipt?.created_ms || Date.now() };
+    receipt = { status: "creating", tab_id: String(tab.id), window_id: createdWindow?.id ?? tab.windowId, target_window_id: targetWindowId, url, requested_url: url, marker_url: markerUrl, active, create_background_window: createBackgroundWindow, placement, reused_background_window: reusedWindowId !== undefined, created_ms: receipt?.created_ms || Date.now() };
     receipts[clientKey] = receipt;
     pruneOpenReceipts(receipts);
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
-    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, placement };
+    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, reused_background_window: reusedWindowId !== undefined, placement };
     });
     if (reservation.existing) return returnExistingOpen(reservation.existing, url, native, generation);
     let result;
@@ -3128,12 +3139,13 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
       const selectedWindow = await assertOwnedAutomationWindow(targetWindowId);
       if (result.window_id !== targetWindowId || selectedWindow.focused) throw new Error("Created tab moved or the selected automation window was focused; inspect its topology before retrying.");
     }
+    if (reservation.reused_background_window === true) result.reused_background_window = true;
     await withReceiptLock(async () => {
       const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
       const receipts = saved[OPEN_RECEIPTS_KEY] || {};
       const current = receipts[clientKey];
       if (current?.tab_id !== result.tab_id) throw new Error("Open receipt changed before completion; no second tab was opened.");
-      receipts[clientKey] = { status: "complete", tab_id: result.tab_id, window_id: result.window_id ?? reservation.window_id, target_window_id: targetWindowId, url: result.url, requested_url: url, document_id: result.document_id, active, create_background_window: createBackgroundWindow, placement, created_ms: reservation.created_ms };
+      receipts[clientKey] = { status: "complete", tab_id: result.tab_id, window_id: result.window_id ?? reservation.window_id, target_window_id: targetWindowId, url: result.url, requested_url: url, document_id: result.document_id, active, create_background_window: createBackgroundWindow, reused_background_window: reservation.reused_background_window === true, placement, created_ms: reservation.created_ms };
       pruneOpenReceipts(receipts);
       await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
     });

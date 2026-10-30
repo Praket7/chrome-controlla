@@ -3301,6 +3301,22 @@ async function waitFor(predicate, description) {
   assert.equal(tabList.find(tab => tab.id === Number(ownedWindowResult.tab_id)).windowId, ownedWindowResult.window_id);
   assert.equal(focusedWindowFocused, false, "creating the owned window does not focus Chrome");
 
+  // Repeated background opens share the automation window. Creating one window
+  // per tab buries the user's real windows, so the live unfocused window is
+  // reused and the unfocused presentation is re-verified on the new tab.
+  const windowsBeforeReuse = createdWindows.length;
+  restartPort.hostMessage({ ...openRequest, id: "open-owned-background-window-reuse", params: {
+    url: "https://example.test/owned-window-reuse", idempotency_key: "client-fixture:owned-window-reuse-123",
+    active: false, create_background_window: true
+  } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const reusedWindowResult = restartPort.sent.at(-1).result;
+  assert.equal(createdWindows.length, windowsBeforeReuse, "a second background open reuses the open automation window instead of creating another");
+  assert.equal(reusedWindowResult.reused_background_window, true);
+  assert.equal(reusedWindowResult.window_id, ownedWindowResult.window_id, "the reused tab lands in the already-owned automation window");
+  assert.equal(reusedWindowResult.window_focused, false, "the reused automation window stays unfocused");
+  assert.equal(focusedWindowFocused, false, "reusing the automation window does not focus Chrome");
+
   restartPort.hostMessage({ ...openRequest, id: "open-tab-before-move", params: {
     url: "https://example.test/move-owned", idempotency_key: "client-fixture:move-owned-1234", active: false
   } });

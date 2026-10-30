@@ -8,7 +8,8 @@
 //!
 //! The presentation that works is an unfocused window: the tab is visible to
 //! Chrome, the window never takes focus, and trusted keys and document copy
-//! readback both work.
+//! readback both work. Opens reuse the live unfocused automation window, so
+//! following this advice costs a tab rather than another window.
 
 use serde_json::{Value, json};
 
@@ -26,7 +27,7 @@ fn receipt() -> Value {
         "reason_code": "hidden_canvas_editor_requires_visible_tab",
         "dispatch_may_have_occurred": false,
         "reason": "this editor paints its own text, and Chrome defers trusted key input for a hidden tab; scripted insertion is ignored, so the document would stay empty",
-        "next_action": "open the same URL with mode=background and target_policy=create_background_window (or move the owned tab into that unfocused window), then type again; the tab stays visible to Chrome without taking focus"
+        "next_action": "reopen the same URL with mode=background and target_policy=create_background_window (the live unfocused automation window is reused, so this does not add a window), then type again; the tab stays visible to Chrome without taking focus"
     })
 }
 
