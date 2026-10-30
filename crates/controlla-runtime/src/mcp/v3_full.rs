@@ -4,6 +4,7 @@ use super::{
     resolve_reference, retained_mutation, snapshot_impl, verify_impl,
 };
 use super::recovery::{complete_download_guard, complete_editor_guard};
+use crate::v3_execution::shared::{value_has_unknown, value_may_have_dispatched};
 use base64::Engine as _;
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -2805,43 +2806,8 @@ impl HasUnknownOutcome for (bool, Vec<Value>) {
     }
 }
 
-fn value_has_unknown(value: &Value) -> bool {
-    // `dispatched_unverified` is a finished transaction with acknowledged
-    // dispatch, not an ambiguous delivery: the mutation is complete and the
-    // receipt tells the caller to inspect before retrying. Retaining the target
-    // lock for two minutes after it made a typed document unusable.
-    let resolved = matches!(
-        value["status"].as_str(),
-        Some(
-            "verified"
-                | "complete"
-                | "completed"
-                | "passed"
-                | "not_dispatched"
-                | "dispatched_unverified"
-        )
-    );
-    value["status"] == "unknown"
-        || (!resolved && (value["dispatch_may_have_occurred"] == true
-            || value["dispatch_may_have_occurred"] == "unknown"))
-        || value.as_object().is_some_and(|object| object.values().any(value_has_unknown))
-        || value.as_array().is_some_and(|items| items.iter().any(value_has_unknown))
-}
-
 fn should_retain_process_lock(action: &str, value: &Value) -> bool {
     value_has_unknown(value) && !matches!(action, "scroll" | "scroll_to" | "hover")
-}
-
-fn value_may_have_dispatched(value: &Value) -> bool {
-    value["dispatch_may_have_occurred"] == true
-        || value["dispatch_may_have_occurred"] == "unknown"
-        || value["status"] == "unknown"
-        || value
-            .as_object()
-            .is_some_and(|object| object.values().any(value_may_have_dispatched))
-        || value
-            .as_array()
-            .is_some_and(|items| items.iter().any(value_may_have_dispatched))
 }
 
 async fn with_lease_release<T: HasUnknownOutcome>(
@@ -13745,6 +13711,18 @@ async fn editor_value_unreadable(app: &AppV3, args: &V3ActArgs, reference: &str)
         })
 }
 
+/// Probe for the hidden-canvas refusal; the policy itself lives in
+/// `v3_execution::canvas` so the facade only reads the two inputs it needs.
+async fn hidden_canvas_editor_refusal(app: &AppV3, args: &V3ActArgs) -> Option<Value> {
+    let reference = args.reference.as_deref()?;
+    let unreadable = editor_value_unreadable(app, args, reference).await;
+    let state = presentation_state(app, &args.session_id, &args.chrome_tab_id).await?;
+    crate::v3_execution::canvas::hidden_canvas_editor_refusal(
+        unreadable,
+        state["visibility_state"].as_str(),
+    )
+}
+
 /// Dispatch one trusted key chord through the shared extension. Used only for
 /// the document-text readback copy: select all, copy, and collapse the
 /// resulting selection.
@@ -19921,6 +19899,9 @@ impl AppV3 {
                     .await
                 }
                 "type" => {
+                    if let Some(refusal) = hidden_canvas_editor_refusal(self, &args).await {
+                        return Ok(refusal);
+                    }
                     if args.reference.as_deref().is_some_and(|reference| reference.starts_with("@f:")) {
                         let text = args.value.as_deref().unwrap_or_default();
                         let policy = typing_policy(

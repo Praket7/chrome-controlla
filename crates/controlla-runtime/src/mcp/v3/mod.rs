@@ -9,6 +9,8 @@ pub mod act;
 #[allow(dead_code)]
 pub mod browser;
 #[allow(dead_code)]
+pub mod canvas;
+#[allow(dead_code)]
 pub mod extract;
 #[allow(dead_code)]
 pub mod pointer;
