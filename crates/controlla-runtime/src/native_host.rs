@@ -1284,6 +1284,10 @@ mod tests {
                 include_bytes!("../../../extensions/chrome-controlla/lib/debugger-sessions.js"),
             ),
             (
+                "lib/presentation-input.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/presentation-input.js"),
+            ),
+            (
                 "lib/input.js",
                 include_bytes!("../../../extensions/chrome-controlla/lib/input.js"),
             ),
@@ -1300,8 +1304,24 @@ mod tests {
                 include_bytes!("../../../extensions/chrome-controlla/lib/pointer.js"),
             ),
             (
+                "lib/resource-keys.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/resource-keys.js"),
+            ),
+            (
+                "lib/owned-resources.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/owned-resources.js"),
+            ),
+            (
+                "lib/presentation-slots.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/presentation-slots.js"),
+            ),
+            (
                 "lib/tab-control.js",
                 include_bytes!("../../../extensions/chrome-controlla/lib/tab-control.js"),
+            ),
+            (
+                "lib/owned-open.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/owned-open.js"),
             ),
         ];
         let extension_source = include_str!("../../../extensions/chrome-controlla/background.js");

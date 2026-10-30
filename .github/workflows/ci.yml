@@ -18,6 +18,7 @@ jobs:
           node-version-file: .nvmrc
       - run: npm ci --ignore-scripts
       - run: npm run check:agent-ux
+      - run: npm run check:presentation
       - run: npm run check:docs
       - run: npm run check:provenance
       - run: npm run check:apps

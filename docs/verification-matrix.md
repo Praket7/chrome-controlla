@@ -1,5 +1,20 @@
 # Verification matrix
 
+### 2026-10-30 presentation slots and owned-resource reuse
+
+| Check | Result | Evidence and boundary |
+|---|---|---|
+| Window presentation slots | pass | `lib/presentation-slots.js` unit tests (11 in `npm run check:presentation`): one VISIBLE owner, busy refusal with the real owner, epoch advance on takeover, stale reclaim, token fencing after release, `FOREGROUND` focus requirement, per-window independence. |
+| Read-only reuse discovery | pass | `test-background.cjs` calls the discovery hook against a completed owned open and asserts the window's active tab and the activation counter are unchanged. |
+| Concurrent visible tasks | pass | Harness: reserving window W for task A, task B's open creates a second window and A's tab stays active; sequential work then reuses an existing window with no third window. |
+| Minimized-window eligibility | pass | Harness: a minimized owned window is never selected; the open moves to an eligible window. |
+| Logical-resource reuse | pass | Harness: a second Google Docs view reuses the first tab, navigates it to the requested view, and writes a completed receipt with no new tab. Unit tests pin the per-app rules, the GitHub issue/PR number space, and that deep repository paths do not collapse to the repo. |
+| Idle recycling and alias persistence | pass | Harness: `recycle_idle_tabs` repurposes the oldest idle ephemeral tab without adding one, the default still creates a tab, and a brand-new key that resolves to an existing tab persists its alias for an idempotent retry. |
+| Independently overlapped opens | pass | Harness blocks one open's document read and proves a second open completes while the first is still waiting, i.e. navigation no longer runs under the owned-state lock. |
+| Canvas visibility loss | pass | Harness: a hidden canvas editor returns `not_dispatched` / `canvas_presentation_unavailable` with zero key, insert, or IME commands. Real Chrome (`npm run check:transaction-background`, 9 tests): a canvas editor hidden mid-transaction returns `unknown` / `canvas_presentation_lost`, never switches to `dom_typing`, and leaves an exact prefix instead of a DOM tail; with presentation reacquired it resumes and verifies. The old test that asserted this case "verified" through DOM insertion was replaced, because that success was fabricated on surfaces whose DOM holds no text. |
+| Typecheck, Clippy, full suite | pass | `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`; `test-background.cjs`, `test-v3-batch.cjs`, `check:presentation`, `check:agent-ux`, `check:topology`, `check:release`, `check:docs`, `check:provenance`, `check:apps`, `check:v3`, `check:bench`. |
+| Installed-Chrome qualification of the new paths | partial | Playwright-driven real Chrome passed `check:background-dom` (9 tests) and `check:transaction-background` (9 tests, including canvas stop/resume). The user's installed extension was not reloaded and no signed-in live site was driven. Docs bulk insertion (§15) and the Unicode/composition split (§16) are not implemented. See [plan status](plan-status-2026-10-30.md). |
+
 ### 2026-10-28 execution-first guard routing and SPA identity
 
 | Check | Result | Evidence and boundary |

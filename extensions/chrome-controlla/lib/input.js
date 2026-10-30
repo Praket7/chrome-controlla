@@ -9,6 +9,7 @@ import {
   hashText,
   selectEditorAdapter,
 } from "./editor-adapters.js";
+import { createPresentationLease } from "./presentation-input.js";
 
 export const MAX_TRANSACTION_TEXT = 16384;
 const SUPPORTED_OPERATIONS = new Set(["replace", "append", "insert_at_caret"]);
@@ -396,6 +397,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
   let dispatchMayHaveOccurred = false;
   let resolved = null;
   let prepared = false;
+  const presentation = createPresentationLease(ctx);
   let dispatched = "";
   let lastReadback = typeof transaction.expected.value === "string" ? transaction.expected.value : null;
   const finish = extra => {
@@ -474,10 +476,25 @@ export async function typeTextTransaction(tabId, params, ctx) {
     const { adapter } = selectEditorAdapter(probe);
     const choice = chooseInputBackend({ strategy: transaction.strategy, text: transaction.text, probe });
     let backend = choice.backend;
-    // A hidden tab does not receive trusted key input until the user brings it
-    // forward, so the transaction would spend its whole budget on keys Chrome
-    // is only queuing. Insert through the document instead.
-    if (backend === "key_events" && before.hidden === true) backend = "dom_typing";
+    // A hidden tab queues trusted keys, so insert through the document instead
+    // — but only when the element's own value is the document. A canvas editor's
+    // DOM holds nothing, so inserting there would type nothing and claim
+    // success. Reacquire presentation instead; stop before dispatching if that
+    // fails.
+    if (backend === "key_events" && before.hidden === true) {
+      if (unverifiable) {
+        if (!(await presentation.usable())) {
+          return finish({ status: "not_dispatched", backend, reason: "canvas_presentation_unavailable" });
+        }
+        const rechecked = await guard(ctx, resolved.target, resolved.objectId, transaction, firstValue, false, true, true, true);
+        if (rechecked.ok !== true || rechecked.hidden === true) {
+          return finish({ status: "not_dispatched", backend, reason: "canvas_presentation_unavailable" });
+        }
+        before = rechecked;
+      } else {
+        backend = "dom_typing";
+      }
+    }
     if (backend === "clipboard_paste" && ctx.sensitive === true) {
       return finish({ status: "not_dispatched", backend, reason: "clipboard_paste_refused_for_sensitive_text" });
     }
@@ -629,7 +646,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
           ) {
             resyncs += 1;
             hiddenSeen = regained.hidden === true;
-            if (regained.hidden === true && backend !== "dom_typing") {
+            if (regained.hidden === true && backend !== "dom_typing" && !unverifiable) {
               backend = "dom_typing";
               rebuildChunks("dom_typing", typedSoFar.length);
             }
@@ -655,7 +672,20 @@ export async function typeTextTransaction(tabId, params, ctx) {
       // would be queued by Chrome and applied only when the tab is focused
       // again, so switch to document insertion while the tab is in the
       // background and keep the remaining characters flowing.
-      if (hiddenSeen && backend === "key_events") switchToDomTyping();
+      if (hiddenSeen && backend === "key_events") {
+        if (unverifiable) {
+          // Queued keys never land in a hidden canvas and the DOM cannot stand
+          // in for it: reacquire the window or report an explicit unknown.
+          if (!(await presentation.usable())) {
+            return finish({
+              status: "unknown", backend, chunks: nextChunk,
+              reason: "canvas_presentation_lost",
+              interruption: { reason: "canvas_presentation_lost", phase: "before_chunk", chunk: nextChunk },
+            });
+          }
+          hiddenSeen = false;
+        } else switchToDomTyping();
+      }
       const chunk = transaction.text.slice(cursor, chunkStarts[nextChunk] + chunks[nextChunk].length);
       if (backend === "key_events") {
         for (const character of Array.from(chunk)) {
@@ -763,7 +793,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
           ) {
             resyncs += 1;
             hiddenSeen = after.hidden === true;
-            if (after.hidden === true && backend !== "dom_typing") {
+            if (after.hidden === true && backend !== "dom_typing" && !unverifiable) {
               backend = "dom_typing";
               rebuildChunks("dom_typing", typedSoFar.length);
             }
@@ -860,5 +890,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
       reason: dispatchMayHaveOccurred ? "transaction_delivery_uncertain" : "transaction_preflight_failed",
       interruption: { reason: String(error?.message ?? error).slice(0, 200), phase: prepared ? "dispatch" : "preflight" },
     });
+  } finally {
+    await presentation.release();
   }
 }

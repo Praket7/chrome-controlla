@@ -37,8 +37,10 @@ fn production_monoliths_do_not_regrow() {
         line_count("crates/controlla-runtime/src/mcp/v3_full.rs") <= 32_000,
         "v3_full.rs regrew; move implementation into a subsystem module instead of adding lines"
     );
+    // Lowered from 3,360 when the native cold-open lifecycle moved to
+    // lib/owned-open.js. Keep ratcheting down as more subsystems move out.
     assert!(
-        line_count("extensions/chrome-controlla/background.js") <= 3_360,
+        line_count("extensions/chrome-controlla/background.js") <= 3_350,
         "background.js regrew; move the subsystem into extensions/chrome-controlla/lib"
     );
     assert!(

@@ -60,6 +60,11 @@ let mockNativeError;
 let nativeErrorReads = 0;
 const tabUrlOverrides = new Map();
 const tabDocumentOverrides = new Map();
+const windowStateOverrides = new Map();
+const windowTypeOverrides = new Map();
+let activeTabUpdates = 0;
+let transactionSurface = { rich: true, plain: false, canvas: false, event_target_frame: false, text_length: 4, readable: true };
+let transactionHidden = false;
 const frameReadCounts = new Map();
 const unavailableIdentityReads = new Map();
 const transientIdentityAfterAttach = new Set();
@@ -83,6 +88,7 @@ const emitDownloadChanged = delta => { for (const callback of downloadChangedLis
 const emitTabsActivated = event => { for (const callback of tabsActivatedListeners) callback(event); };
 let emitActivationEvents = false;
 let afterNextTabActivation;
+let afterNextTabCreate;
 let onNextActiveWindowQuery;
 let tabsCreated;
 let windowFocusChanged;
@@ -210,7 +216,7 @@ const chrome = {
       return tabList;
     },
     async ungroup(ids) { for (const id of Array.isArray(ids) ? ids : [ids]) { const tab=tabList.find(tab=>tab.id===id); if (!tab) throw Error("missing tab"); tab.groupId=-1; } },
-    async create({ url, active = true, windowId }) { const id = nextCreatedTab++; const tab = { id, windowId: windowId ?? 1, title: "New tab", url, status: "complete", frozen: false, active }; if (active) createdTabPreviousActive.set(id, focusedWindowActiveTabId); tabList.push(tab); if (active) { for (const sibling of tabList) if (sibling.windowId === tab.windowId && sibling.id !== tab.id) sibling.active = false; tab.active = true; focusedWindowActiveTabId = tab.id; if (emitActivationEvents) emitTabsActivated({ tabId: tab.id, windowId: tab.windowId }); } if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } return tab; },
+    async create({ url, active = true, windowId }) { const id = nextCreatedTab++; const tab = { id, windowId: windowId ?? 1, title: "New tab", url, status: "complete", frozen: false, active }; if (active) createdTabPreviousActive.set(id, focusedWindowActiveTabId); tabList.push(tab); if (active) { for (const sibling of tabList) if (sibling.windowId === tab.windowId && sibling.id !== tab.id) sibling.active = false; tab.active = true; focusedWindowActiveTabId = tab.id; if (emitActivationEvents) emitTabsActivated({ tabId: tab.id, windowId: tab.windowId }); } if (loseNextCreatedTabReply) { loseNextCreatedTabReply = false; throw new Error("simulated lost tabs.create reply"); } if (afterNextTabCreate) { const callback = afterNextTabCreate; afterNextTabCreate = undefined; callback(tab); } return tab; },
     async remove(tabId) { const index = tabList.findIndex(tab => tab.id === tabId); if (index >= 0) { const [removed] = tabList.splice(index, 1); if (removed.active && focusedWindowActiveTabId === tabId) { const previous = tabList.find(tab => tab.id === createdTabPreviousActive.get(tabId) && tab.windowId === removed.windowId); if (previous) { for (const sibling of tabList) if (sibling.windowId === removed.windowId) sibling.active = false; previous.active = true; focusedWindowActiveTabId = previous.id; if (emitActivationEvents) emitTabsActivated({ tabId: previous.id, windowId: previous.windowId }); } } } createdTabPreviousActive.delete(tabId); },
     async move(tabId, { windowId }) {
       const tab = tabList.find(item => item.id === tabId);
@@ -221,6 +227,7 @@ const chrome = {
     async update(tabId, { url, active }) {
       const tab = tabList.find(tab => tab.id === tabId);
       if (!tab) throw new Error("missing tab");
+      if (active === true) activeTabUpdates += 1;
       if (active !== undefined) { tab.active = active; if (active) { focusedWindowActiveTabId = tabId; if (emitActivationEvents) { for (const sibling of tabList) if (sibling.windowId === tab.windowId) sibling.active = false; tab.active = true; emitTabsActivated({ tabId, windowId: tab.windowId }); } if (afterNextTabActivation) { const callback = afterNextTabActivation; afterNextTabActivation = undefined; callback(tabId); } } }
       if (url === undefined) return tab;
       const delayedCommit = delayedNextCommitMs;
@@ -287,7 +294,14 @@ const chrome = {
     onCreated: { addListener(callback) { const prior = tabsCreated; tabsCreated = (...args) => { prior?.(...args); callback(...args); }; } },
   },
   windows: {
-    async get(windowId) { return { id:windowId??1, focused:focusedWindowFocused }; },
+    async get(windowId, options = {}) {
+      const id = windowId ?? 1;
+      return { id, focused: focusedWindowFocused,
+        state: windowStateOverrides.get(id) ?? "normal",
+        type: windowTypeOverrides.get(id) ?? "normal",
+        incognito: false,
+        ...(options?.populate === true ? { tabs: tabList.filter(tab => tab.windowId === id) } : {}) };
+    },
     async getAll() { return [{ id:1, focused:focusedWindowFocused, state:"normal", type:"normal", incognito:false }, { id:2, focused:false, state:"normal", type:"normal", incognito:false }]; },
     async update(windowId, { focused }) { if (focused !== undefined) focusedWindowFocused = focused; return { id: windowId, focused: !!focused }; },
     async create(options) {
@@ -596,6 +610,9 @@ const chrome = {
       if (method === "DOM.getBoxModel" && params?.backendNodeId === 777) return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
       if (method === "DOM.resolveNode") return { object: { objectId: params?.backendNodeId === 990 ? "fixture-password-object" : params?.backendNodeId === 92 ? "fixture-frame-textbox" : params?.backendNodeId === 999 ? "fixture-frame-owner" : params?.backendNodeId === 998 ? "fixture-parent-owner" : params?.backendNodeId === 997 ? "fixture-nested-owner" : "fixture-file-object" } };
       if (method === "Runtime.callFunctionOn" && params?.objectId === "fixture-frame-textbox" && params?.functionDeclaration?.startsWith("function(expected,prepare,normalize)")) return { result: { value: frameHumanTypeGuardResults.shift() || { ok: true } } };
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.includes("event_target_frame")) {
+        return { result: { value: { ...transactionSurface } } };
+      }
       if (method === "Runtime.callFunctionOn" && ["fixture-frame-textbox", "fixture-root-textbox"].includes(params?.objectId) && params?.functionDeclaration?.startsWith("function(expectedKind")) {
         if (transactionFocusStealOnce) {
           transactionFocusStealOnce = false;
@@ -605,11 +622,16 @@ const chrome = {
         const expected = params.arguments?.[1]?.value;
         const operation = params.arguments?.[3]?.value;
         const prepare = params.arguments?.[4]?.value === true;
-        if (kind === "exact_value" && expected !== transactionFixtureValue) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
-        if (kind === "suffix" && !transactionFixtureValue.endsWith(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
-        if (kind === "contains" && !transactionFixtureValue.includes(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue } } };
+        // A canvas editor's element holds no document text, so its value is not
+        // evidence. The real guard skips value checks when `unreadable` is set.
+        const unreadable = params.arguments?.[9]?.value === true;
+        if (!unreadable) {
+          if (kind === "exact_value" && expected !== transactionFixtureValue) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue, hidden: transactionHidden } } };
+          if (kind === "suffix" && !transactionFixtureValue.endsWith(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue, hidden: transactionHidden } } };
+          if (kind === "contains" && !transactionFixtureValue.includes(expected)) return { result: { value: { ok: false, reason: "stale_value", value: transactionFixtureValue, hidden: transactionHidden } } };
+        }
         if (prepare && operation === "replace") transactionFixtureReplacePending = true;
-        return { result: { value: { ok: true, value: transactionFixtureValue, length: transactionFixtureValue.length, rich: true, focused: true, selectionStart: transactionFixtureValue.length, selectionEnd: transactionFixtureValue.length } } };
+        return { result: { value: { ok: true, value: transactionFixtureValue, length: transactionFixtureValue.length, rich: true, focused: true, hidden: transactionHidden, selectionStart: transactionFixtureValue.length, selectionEnd: transactionFixtureValue.length } } };
       }
       if (method === "Input.imeSetComposition") return { accepted: true };
       if (method === "Input.insertText" && target.sessionId === "fixture-oopif-session") {
@@ -661,8 +683,9 @@ const chrome = {
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
 const extensionLibraryAssets = [
-  "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/input.js",
-  "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/tab-control.js",
+  "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input.js",
+  "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/resource-keys.js",
+  "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js", "lib/owned-open.js",
 ];
 function stripModuleSyntax(source) {
   return source.replace(/^import[^;]*;[ \t]*$/gm, "").replace(/^export default /gm, "").replace(/^export /gm, "");
@@ -714,7 +737,7 @@ function runBackground() {
     },
     clearTimeout,
   };
-  vm.runInNewContext(`${backgroundExecutable}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted, executionCounters: executionCounterReceipt, resetExecutionCounters };`, backgroundContext);
+  vm.runInNewContext(`${backgroundExecutable}\nglobalThis.__testHooks = { sendCdpCommand, pendingNavigationMatchesDocument, pendingMainFrameNavigations, uploadInputPolicyFunction, frameActionableGuardFunction, fileInputsInFrames, createWatcherStateMirror, applyWatcherStateEvent, watcherStateMatches, watcherRevisionReceipt, createOwnedTabFromNative, presentationSlots, previewReusableOwnedBackgroundTab: async url => { const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY); return findReusableOwnedBackgroundCandidate(chrome, saved[OPEN_RECEIPTS_KEY] || {}, url, nativePageIdentity, { isLeased: tabId => nativeTabLeases.has(tabId) }); }, setWatcherStateForTest: value => { watcherState = value; }, extensionBuildId: CONTROLLA_EXTENSION_BUILD_ID_PROMISE, reconnectStateReady, reconnectExhausted: () => reconnectExhausted, executionCounters: executionCounterReceipt, resetExecutionCounters };`, backgroundContext);
 }
 runBackground();
 
@@ -3579,6 +3602,160 @@ async function waitFor(predicate, description) {
   await assert.rejects(backgroundContext.__testHooks.sendCdpCommand({ tabId: 1 }, "Test.never", {}, 10), error =>
     error.reason_code === "cdp_command_timeout" && error.dispatch_may_have_occurred === true);
   assert.ok(Date.now() - cdpStarted < 250, "a stuck CDP promise must be bounded");
+
+  // -------------------------------------------------------------------------
+  // P0 presentation correctness and owned-resource reuse.
+  // -------------------------------------------------------------------------
+  const hooks = backgroundContext.__testHooks;
+  const nativeOpen = (key, url, extra = {}) => hooks.createOwnedTabFromNative({
+    url, idempotency_key: key, active: false, create_background_window: true,
+    expires_at_unix: Math.floor(mockNow / 1000) + 10, ...extra,
+  });
+
+  // Candidate discovery is side-effect free: it must prove identity without
+  // changing which tab the window presents.
+  const discoveryUrl = "https://example.test/p0-discovery";
+  const discovered = await nativeOpen("p0-discovery-key", discoveryUrl);
+  const discoveredTabId = Number(discovered.tab_id);
+  const discoveredWindowId = discovered.window_id;
+  const activeBeforePreview = tabList.find(tab => tab.windowId === discoveredWindowId && tab.active)?.id;
+  const updatesBeforePreview = activeTabUpdates;
+  const preview = await hooks.previewReusableOwnedBackgroundTab(discoveryUrl);
+  assert.ok(preview, "the completed open is discoverable as a reuse candidate");
+  assert.equal(preview.tab.id, discoveredTabId);
+  assert.equal(preview.kind, "exact_document");
+  assert.equal(activeTabUpdates, updatesBeforePreview, "discovery never activates a tab");
+  assert.equal(tabList.find(tab => tab.windowId === discoveredWindowId && tab.active)?.id, activeBeforePreview,
+    "discovery leaves the window's presented tab unchanged");
+
+  // A window can present one tab for one task. A second visible task must land
+  // in another window instead of hiding the first task's canvas.
+  const firstTaskTab = Number(discovered.tab_id);
+  const firstTaskSlot = await hooks.presentationSlots.reserve({
+    windowId: discoveredWindowId, tabId: firstTaskTab, requirement: "visible", deadlineMs: 0,
+  });
+  assert.equal(firstTaskSlot.granted, true);
+  const windowsBeforeRace = createdWindows.length;
+  const secondTask = await nativeOpen("p0-second-task", "https://example.test/p0-second-task");
+  assert.notEqual(secondTask.window_id, discoveredWindowId,
+    "a second visible task never steals the first task's window");
+  assert.equal(createdWindows.length, windowsBeforeRace + 1, "the second task gets a window of its own");
+  assert.equal(tabList.find(tab => tab.id === firstTaskTab).active, true,
+    "the first task's tab stays presented in its own window");
+  await hooks.presentationSlots.release(firstTaskSlot.token);
+  const windowsBeforeSequential = createdWindows.length;
+  const sequential = await nativeOpen("p0-sequential-task", "https://example.test/p0-sequential-task");
+  assert.ok(sequential.window_id !== undefined);
+  assert.equal(createdWindows.length, windowsBeforeSequential,
+    "sequential visible work reuses an automation window instead of adding one");
+
+  // A minimized window cannot paint a canvas editor, so it is never chosen.
+  windowStateOverrides.set(discoveredWindowId, "minimized");
+  const windowsBeforeMinimized = createdWindows.length;
+  const minimizedSkip = await nativeOpen("p0-minimized-window", "https://example.test/p0-minimized-window");
+  assert.notEqual(minimizedSkip.window_id, discoveredWindowId, "a minimized window never hosts visible work");
+  assert.ok(createdWindows.length <= windowsBeforeMinimized + 1, "the open moves to an eligible window instead of minimizing itself");
+  assert.equal(tabList.find(tab => String(tab.id) === minimizedSkip.tab_id).windowId, minimizedSkip.window_id);
+  windowStateOverrides.delete(discoveredWindowId);
+
+  // A brand-new idempotency key that resolves to an existing tab persists the
+  // alias, so retrying that key later resolves to the same tab.
+  const aliasUrl = "https://example.test/p0-alias";
+  const aliasOrigin = await nativeOpen("p0-alias-origin", aliasUrl);
+  const aliasTabsBefore = tabList.length;
+  const aliasReuse = await nativeOpen("p0-alias-second", aliasUrl);
+  assert.equal(aliasReuse.tab_id, aliasOrigin.tab_id, "a new key reuses the tab that already holds the URL");
+  assert.equal(aliasReuse.reuse_kind, "exact_document");
+  assert.equal(aliasReuse.tab_created_this_call, false);
+  assert.equal(aliasReuse.tab_reused_this_call, true);
+  assert.equal(tabList.length, aliasTabsBefore, "the aliased open creates no tab");
+  const aliasReceipts = localStorage.openReceipts;
+  assert.equal(aliasReceipts["ownerless:p0-alias-second"]?.tab_id, aliasOrigin.tab_id,
+    "the new key is persisted against the existing tab before returning");
+  assert.equal(aliasReceipts["ownerless:p0-alias-second"]?.document_id, aliasReuse.document_id);
+  const aliasRetry = await nativeOpen("p0-alias-second", aliasUrl);
+  assert.equal(aliasRetry.tab_id, aliasOrigin.tab_id, "retrying the aliased key is idempotent");
+
+  // Independent opens must overlap: one slow page load cannot serialize the
+  // next reservation behind it. The first open's document read is blocked, so
+  // it is provably still in navigation while the second open completes.
+  let slowTabId;
+  let slowBlocked = false;
+  afterNextTabCreate = tab => {
+    slowTabId = tab.id;
+    blockedFrame = { tabId: tab.id, started: () => { slowBlocked = true; } };
+  };
+  let slowSettled = false;
+  const slowOpen = nativeOpen("p0-parallel-slow", "https://example.test/p0-parallel-slow")
+    .finally(() => { slowSettled = true; });
+  await waitFor(() => slowBlocked, "the slow open reached its document read");
+  assert.equal(slowSettled, false, "the slow open is still waiting for its document");
+  const fastOpen = await Promise.race([
+    nativeOpen("p0-parallel-fast", "https://example.test/p0-parallel-fast"),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("independent opens were serialized behind a page load")), 2000)),
+  ]);
+  assert.ok(fastOpen.tab_id);
+  assert.equal(slowSettled, false, "a second open completes while the first is still waiting for its document");
+  releaseBlockedFrame?.();
+  assert.equal(typeof (await slowOpen).tab_id, "string");
+  assert.equal(tabList.find(tab => tab.id === slowTabId)?.id, slowTabId);
+
+  // Two views of the same Google Doc are one resource. Opening the second view
+  // navigates the tab that already holds the document instead of adding one.
+  const docsBase = "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?tab=t.0";
+  const docsView = "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit?tab=t.5";
+  const docsOrigin = await nativeOpen("p0-docs-origin", docsBase);
+  const docsTabsBefore = tabList.length;
+  const docsReuse = await nativeOpen("p0-docs-view", docsView);
+  assert.equal(docsReuse.tab_id, docsOrigin.tab_id, "a different view of the same document reuses its tab");
+  assert.equal(docsReuse.reuse_kind, "same_resource_navigation");
+  assert.equal(docsReuse.url, docsView, "the reused tab is navigated to the requested view");
+  assert.equal(tabList.length, docsTabsBefore, "logical-resource reuse creates no tab");
+  assert.equal(tabList.find(tab => String(tab.id) === docsOrigin.tab_id).url, docsView);
+  assert.equal(localStorage.openReceipts["ownerless:p0-docs-view"]?.document_id, docsReuse.document_id,
+    "the navigated view is recorded as a completed receipt for the new key");
+
+  // Idle ephemeral tabs are recycled when a caller explicitly allows it, so tab
+  // count tracks concurrency rather than the number of URLs visited.
+  const recycleOrigin = await nativeOpen("p0-recycle-origin", "https://example.test/p0-recycle-origin");
+  mockNow += 61_000;
+  const idsBeforeRecycle = new Set(tabList.map(tab => String(tab.id)));
+  const tabsBeforeRecycle = tabList.length;
+  const recycled = await nativeOpen("p0-recycle-target", "https://example.test/p0-recycle-target", { recycle_idle_tabs: true });
+  assert.equal(recycled.reuse_kind, "recycled_owned_tab");
+  assert.equal(recycled.tab_created_this_call, false);
+  assert.equal(tabList.length, tabsBeforeRecycle, "recycling repurposes an idle owned tab instead of opening one");
+  assert.ok(idsBeforeRecycle.has(recycled.tab_id), "the recycled target already existed as an owned tab");
+  assert.notEqual(recycled.tab_id, recycleOrigin.tab_id, "the oldest idle tab is recycled first, not the newest");
+  const noRecycle = await nativeOpen("p0-recycle-refused", "https://example.test/p0-recycle-refused");
+  assert.equal(noRecycle.reuse_kind, "new_tab_existing_window", "recycling stays opt-in");
+  assert.equal(noRecycle.tab_created_this_call, true);
+
+  // A hidden canvas editor must never receive a DOM-insert tail. Reacquiring
+  // presentation fails here (the tab is in the user's focused window), so the
+  // transaction stops before dispatching instead of typing into nothing.
+  const activeBeforeCanvas = focusedWindowActiveTabId;
+  const canvasTab = tabList.find(tab => tab.id === 41);
+  const previousCanvasActive = canvasTab.active === true;
+  transactionSurface = { rich: true, plain: false, canvas: true, event_target_frame: false, text_length: 0, readable: false };
+  transactionHidden = true;
+  const inputCallsBeforeCanvas = debuggerCalls.filter(call => ["Input.dispatchKeyEvent", "Input.insertText", "Input.imeSetComposition"].includes(call.method)).length;
+  restartPort.hostMessage({ type: "command", id: "canvas-hidden-transaction", target_id: "41", method: "Controlla.typeTextTransaction", params: {
+    object_id: "fixture-root-textbox",
+    expected: { kind: "unchecked" }, operation: "append", text: "canvas text",
+    strategy: "key_events", chunk_chars: 4, verify_every_chunks: 1, pacing_ms: 0, deadline_ms: 5000,
+  } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const canvasReceipt = restartPort.sent.findLast(message => message.id === "canvas-hidden-transaction")?.result;
+  assert.equal(canvasReceipt?.status, "not_dispatched", JSON.stringify(canvasReceipt));
+  assert.equal(canvasReceipt?.backend, "key_events", "the canvas transaction never switches to DOM insertion");
+  assert.equal(canvasReceipt?.reason, "canvas_presentation_unavailable");
+  assert.equal(debuggerCalls.filter(call => ["Input.dispatchKeyEvent", "Input.insertText", "Input.imeSetComposition"].includes(call.method)).length,
+    inputCallsBeforeCanvas, "no input reaches a hidden canvas editor");
+  transactionSurface = { rich: true, plain: false, canvas: false, event_target_frame: false, text_length: 4, readable: true };
+  transactionHidden = false;
+  canvasTab.active = previousCanvasActive;
+  focusedWindowActiveTabId = activeBeforeCanvas;
 
   console.log("Extension version handshake, pairing cleanup, chooser/download event routing, and command allowlist tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

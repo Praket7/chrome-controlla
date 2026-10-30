@@ -13,11 +13,16 @@ const EXTENSION_RUNTIME_ASSETS: &[&str] = &[
     "lib/transport.js",
     "lib/frame-tree.js",
     "lib/debugger-sessions.js",
+    "lib/presentation-input.js",
     "lib/input.js",
     "lib/editor-adapters.js",
     "lib/observation.js",
     "lib/pointer.js",
+    "lib/resource-keys.js",
+    "lib/owned-resources.js",
+    "lib/presentation-slots.js",
     "lib/tab-control.js",
+    "lib/owned-open.js",
 ];
 
 fn main() {
@@ -31,6 +36,7 @@ fn main() {
         "README.md",
         "test-background.cjs",
         "test-observation.mjs",
+        "test-p0-resources.mjs",
         "test-v3-batch.cjs",
         "lib",
     ]

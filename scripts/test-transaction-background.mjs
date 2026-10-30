@@ -40,7 +40,7 @@ document.addEventListener("keydown", event => {
 }, true);
 </script></body></html>`;
 
-async function run({ text, strategy = "key_events", pacing = 0, rich = false, canvas = false, hideAt = null, deferKeys = true, editAt = null, clickEmptyAt = null, replaceAt = null, restorePrefix = false }) {
+async function run({ text, strategy = "key_events", pacing = 0, rich = false, canvas = false, hideAt = null, deferKeys = true, editAt = null, clickEmptyAt = null, replaceAt = null, restorePrefix = false, recoverPresentation = false }) {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   try {
     await page.setContent(FIXTURE(rich, canvas));
@@ -59,6 +59,16 @@ async function run({ text, strategy = "key_events", pacing = 0, rich = false, ca
       ensureAutoAttach: async () => {},
       waitForFrameSession: async () => null,
       sensitive: false,
+      // A real session hands these to the extension's presentation slot. The
+      // fixture only flips the emulated visibility flag: regaining the slot
+      // means the window presents the tab again.
+      acquirePresentation: async () => {
+        if (!recoverPresentation) return null;
+        await page.evaluate(() => { window.__hide = false; window.__defer = false; });
+        return "fixture-presentation-token";
+      },
+      revalidatePresentation: async () => true,
+      releasePresentation: async () => {},
       async send(_target, method, params) { commands += 1; return cdp.send(method, params); },
     };
     const hide = () => page.evaluate(defer => { window.__defer = defer; window.__hide = true; }, deferKeys);
@@ -140,10 +150,25 @@ test("a contenteditable keeps receiving text after the tab goes away", async () 
   assert.equal(value, TEXT);
 });
 
-test("a canvas editor that goes hidden mid-way still finishes and verifies", async () => {
+// A canvas editor's DOM holds nothing. Inserting the remaining text there used
+// to look like success because the fixture reports its innerText, while a real
+// canvas editor (Google Docs) would never receive it. The safe contract is: stop
+// trusted input, report an explicit unknown, and never append a DOM tail.
+test("a hidden canvas editor stops instead of faking success through DOM insertion", async () => {
   const { receipt, value } = await run({ text: TEXT, hideAt: 200, pacing: 25, canvas: true });
-  assert.equal(receipt.status, "verified");
-  assert.equal(receipt.verification, "document_text");
+  assert.equal(receipt.status, "unknown", JSON.stringify(receipt));
+  assert.equal(receipt.backend, "key_events", "the canvas transaction never switches to DOM insertion");
+  assert.equal(receipt.reason, "canvas_presentation_lost");
+  assert.ok(value.length > 0, "characters typed before the tab went hidden were delivered");
+  assert.ok(value.length < TEXT.length, "the remaining text was not appended through the DOM");
+  assert.ok(TEXT.startsWith(value), "what did land is an exact prefix of the requested text");
+  assert.equal(receipt.completed_chars, value.length);
+});
+
+test("a canvas editor resumes after presentation is reacquired", async () => {
+  const { receipt, value } = await run({ text: TEXT, hideAt: 200, pacing: 25, canvas: true, recoverPresentation: true });
+  assert.equal(receipt.status, "verified", JSON.stringify(receipt));
+  assert.equal(receipt.backend, "key_events");
   assert.equal(value, TEXT);
 });
 
