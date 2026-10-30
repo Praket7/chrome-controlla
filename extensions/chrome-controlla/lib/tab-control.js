@@ -55,6 +55,44 @@ export async function reusableOwnedBackgroundWindow(windowsApi, receipts) {
   return undefined;
 }
 
+// A repeated background open must not mint another tab for a URL the owned
+// window already holds. Only a tab in an unfocused window is eligible, and it
+// is reselected inside that window (never focusing the browser) so Chrome
+// paints it and trusted typing has a visible target.
+export async function reusableOwnedBackgroundTab(chromeApi, receipts, url, identityOf) {
+  const candidates = Object.values(receipts || {})
+    .filter(receipt => receipt?.status === "complete" && receipt.create_background_window === true
+      && receipt.url === url && Number.isSafeInteger(Number(receipt.tab_id)) && typeof receipt.document_id === "string")
+    .sort((left, right) => (right.created_ms || 0) - (left.created_ms || 0))
+    .slice(0, 8);
+  for (const receipt of candidates) {
+    const tabId = Number(receipt.tab_id);
+    const tab = await chromeApi.tabs.get(tabId).catch(() => undefined);
+    if (!tab || tab.url !== url) continue;
+    const window = await chromeApi.windows.get(tab.windowId).catch(() => undefined);
+    if (!window || window.focused !== false || window.state === "minimized") continue;
+    const identity = await identityOf(tabId).catch(() => undefined);
+    if (!identity || identity.url !== receipt.url || identity.document_id !== receipt.document_id) continue;
+    if (!tab.active) await chromeApi.tabs.update(tabId, { active: true });
+    const active = await chromeApi.tabs.get(tabId).catch(() => undefined);
+    const after = active && await chromeApi.windows.get(active.windowId).catch(() => undefined);
+    if (!active?.active || after?.focused !== false) continue;
+    return { tab: active, receipt };
+  }
+  return null;
+}
+
+// Bounded receipt retention. The extension keeps one record per open so a
+// retry can find the tab it created instead of opening a second one.
+export function pruneOpenReceipts(receipts, maxAgeMs, maxCount, now = Date.now()) {
+  for (const [key, receipt] of Object.entries(receipts)) {
+    if (["complete", "closed"].includes(receipt?.status) && Number.isSafeInteger(receipt.created_ms) && now - receipt.created_ms > maxAgeMs) delete receipts[key];
+  }
+  const completed = Object.entries(receipts).filter(([, receipt]) => ["complete", "closed"].includes(receipt?.status))
+    .sort((a, b) => (a[1].created_ms || 0) - (b[1].created_ms || 0));
+  while (Object.keys(receipts).length > maxCount && completed.length) delete receipts[completed.shift()[0]];
+}
+
 export function tabIdentity(tab) {
   return {
     tab_id: tab?.id ?? null,

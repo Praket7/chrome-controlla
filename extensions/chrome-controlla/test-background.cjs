@@ -3317,6 +3317,39 @@ async function waitFor(predicate, description) {
   assert.equal(reusedWindowResult.window_focused, false, "the reused automation window stays unfocused");
   assert.equal(focusedWindowFocused, false, "reusing the automation window does not focus Chrome");
 
+  // Repeating the same URL must reuse the tab the owned window already holds.
+  // The client that created it has ended, so this is the cold-open path a
+  // fresh probe takes; it must not add a tab or a window.
+  const tabsBeforeColdReuse = tabList.length;
+  const windowsBeforeColdReuse = createdWindows.length;
+  restartPort.disconnect("simulate a finished client process");
+  runBackground();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const coldPort = nativePorts.at(-1);
+  coldPort.hostMessage({ type: "ready" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const coldReuseUrl = "https://example.test/owned-window-reuse";
+  const coldRequest = { type: "create_tab", request_id: "b".repeat(32), url: coldReuseUrl,
+    idempotency_key: "client-fixture:cold-reuse-1234", active: false, create_background_window: true,
+    expires_at_unix: Math.floor(mockNow / 1000) + 10 };
+  coldPort.hostMessage(coldRequest);
+  await waitFor(() => coldPort.sent.some(message => message.type === "created_tab" && message.request_id === coldRequest.request_id), "cold reuse result");
+  const coldReuse = coldPort.sent.find(message => message.type === "created_tab" && message.request_id === coldRequest.request_id);
+  assert.ok(coldReuse?.result, JSON.stringify(coldReuse));
+  assert.equal(coldReuse.result.tab_id, reusedWindowResult.tab_id, "a repeated open reuses the owned tab instead of creating another");
+  assert.equal(coldReuse.result.reused_open_tab, true, "the reuse is reported in the creation receipt");
+  assert.equal(coldReuse.result.window_focused, false, "reuse never focuses the automation window");
+  assert.equal(coldReuse.result.tab_active, true, "the reused tab is selected inside its own unfocused window so Chrome paints it");
+  assert.equal(tabList.length, tabsBeforeColdReuse, "a repeated open of the same URL adds no tab");
+  assert.equal(createdWindows.length, windowsBeforeColdReuse, "a repeated open of the same URL adds no window");
+  const coldReuseTab = tabList.find(tab => String(tab.id) === coldReuse.result.tab_id);
+  assert.equal(coldReuseTab.windowId, reusedWindowResult.window_id, "the reused tab stays in the owned automation window");
+  // Continue the suite on the fresh worker's port.
+  restartPort = coldPort;
+  restartPort.hostMessage({ type: "pair", request_id: "pair-after-cold-reuse", tab_ids: [41],
+    expected_urls: expectedUrls([41]), expected_document_ids: expectedDocuments([41]) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+
   restartPort.hostMessage({ ...openRequest, id: "open-tab-before-move", params: {
     url: "https://example.test/move-owned", idempotency_key: "client-fixture:move-owned-1234", active: false
   } });
