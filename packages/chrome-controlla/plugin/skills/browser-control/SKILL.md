@@ -31,7 +31,7 @@ Chrome. Reuse the opaque `context` instead of copying IDs. Success is compact:
 
 - `not_dispatched` + `automatic_recovery`: the internal route is chosen; do not
   re-derive one.
-- `unknown`: never blind retry; verify read-only once, then never replay.
+- `unknown`: Never blind retry `unknown`; verify read-only once, never replay.
 - `verification: "tab_hidden"`: canvas copy proof was unreachable; never replay.
 - Refusals are only for indistinguishable targets, Chrome policy, OS-owned
   surfaces, missing authorization, or an unproven outcome.
