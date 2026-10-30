@@ -3109,7 +3109,7 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     receipts[clientKey] = receipt;
     pruneOpenReceipts(receipts, OPEN_RECEIPT_MAX_AGE_MS, OPEN_RECEIPT_MAX_COUNT);
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
-    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, reused_background_window: reusedWindowId !== undefined, placement, slotToken };
+    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, reused_background_window: reusedWindowId !== undefined, placement, slotToken, created_window: createdWindow !== undefined };
     });
     if (reservation.existing) {
       try { return await returnExistingOpen(reservation.existing, url, native, generation); }
@@ -3135,8 +3135,8 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
       if (result.window_id !== targetWindowId || selectedWindow.focused) throw new Error("Created tab moved or the selected automation window was focused; inspect its topology before retrying.");
     }
     if (reservation.reused_background_window === true) result.reused_background_window = true;
-    result = { ...result, ...openTelemetry({ created: result.idempotent_reuse !== true, windowCreated: false,
-      reuseKind: result.idempotent_reuse ? ReuseKind.EXACT_DOCUMENT : reservation.reused_background_window ? ReuseKind.NEW_TAB_EXISTING_WINDOW : ReuseKind.NEW_TAB_NEW_WINDOW }) };
+    result = { ...result, ...openTelemetry({ created: result.idempotent_reuse !== true, windowCreated: reservation.created_window === true,
+      reuseKind: result.idempotent_reuse ? ReuseKind.EXACT_DOCUMENT : reservation.created_window === true ? ReuseKind.NEW_TAB_NEW_WINDOW : ReuseKind.NEW_TAB_EXISTING_WINDOW }) };
     await withReceiptLock(async () => {
       const saved = await chrome.storage.local.get(OPEN_RECEIPTS_KEY);
       const receipts = saved[OPEN_RECEIPTS_KEY] || {};

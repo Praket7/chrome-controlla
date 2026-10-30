@@ -3639,6 +3639,8 @@ async function waitFor(predicate, description) {
   const secondTask = await nativeOpen("p0-second-task", "https://example.test/p0-second-task");
   assert.notEqual(secondTask.window_id, discoveredWindowId,
     "a second visible task never steals the first task's window");
+  assert.equal(secondTask.window_created_this_call, true, "telemetry names the window this call created");
+  assert.equal(secondTask.window_reused_this_call, false);
   assert.equal(createdWindows.length, windowsBeforeRace + 1, "the second task gets a window of its own");
   assert.equal(tabList.find(tab => tab.id === firstTaskTab).active, true,
     "the first task's tab stays presented in its own window");
@@ -3646,6 +3648,8 @@ async function waitFor(predicate, description) {
   const windowsBeforeSequential = createdWindows.length;
   const sequential = await nativeOpen("p0-sequential-task", "https://example.test/p0-sequential-task");
   assert.ok(sequential.window_id !== undefined);
+  assert.equal(sequential.window_created_this_call, false);
+  assert.equal(sequential.window_reused_this_call, true);
   assert.equal(createdWindows.length, windowsBeforeSequential,
     "sequential visible work reuses an automation window instead of adding one");
 
