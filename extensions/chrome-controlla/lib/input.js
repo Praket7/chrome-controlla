@@ -19,6 +19,7 @@ const SUPPORTED_STRATEGIES = new Set([
   "key_events",
   "ime",
   "clipboard_paste",
+  "dom_typing",
 ]);
 
 // Rich editors that draw their text on a canvas (Google Docs, some design tools)
@@ -55,7 +56,7 @@ export const SURFACE_PROBE = `function(index){
 
 export const CONNECTED_PROBE = `function(index){const e=this.nodes?this.nodes[index]:this;return {ok:!!e&&e.isConnected===true}}`;
 
-export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAnchor,operation,prepare,normalize,lenientFocus,index){
+export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAnchor,operation,prepare,normalize,lenientFocus,index,valueOnly,unreadable){
   const e=this.nodes?this.nodes[index]:this;
   if(!e||!e.isConnected)return {ok:false,reason:'target_stale'};
   const tagOf=n=>n&&typeof n.tagName==='string'?n.tagName.toUpperCase():'';
@@ -66,8 +67,15 @@ export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAn
   if(e.matches(':disabled,[aria-disabled="true"]')||e.readOnly||e.getAttribute('aria-readonly')==='true'||e.getAttribute('contenteditable')?.toLowerCase()==='false'||e.closest('[data-masked]')||(trusted&&trusted!==e))return {ok:false,reason:'blocked'};
   const read=()=>{const raw=rich?(e.innerText??e.textContent??'').replace(/\\r\\n/g,'\\n').replace(/\\u00a0/g,' '):e.value;return rich?(/^\\s*$/.test(raw)?'':normalize?raw.replace(/\\n{2,}/g,b=>'\\n'.repeat(Math.ceil(b.length/2))):raw):raw};
   let value=read();
-  const expectedOk=expectedKind==='unchecked'||expectedKind==='contains'?expectedKind==='contains'?value.includes(expectedValue):true:expectedKind==='suffix'?value.endsWith(expectedValue):value===(rich&&/^\\s*$/.test(expectedValue)?'':expectedValue);
-  if(!expectedOk)return {ok:false,reason:'stale_value',value,length:value.length,rich};
+  // Visibility travels with every rejection: a chunk dispatched to a tab that
+  // just went to the background is queued by Chrome rather than applied, and
+  // the caller needs that fact to switch transports instead of giving up.
+  const hiddenNow=e.ownerDocument.visibilityState!=='visible';
+  // A canvas editor's editable element does not hold the document text, so its
+  // value is not evidence of anything. Only visibility, focus, and liveness are
+  // read from it.
+  const expectedOk=unreadable===true||expectedKind==='unchecked'||expectedKind==='contains'?expectedKind==='contains'?value.includes(expectedValue):true:expectedKind==='suffix'?value.endsWith(expectedValue):value===(rich&&/^\\s*$/.test(expectedValue)?'':expectedValue);
+  if(!expectedOk)return {ok:false,reason:'stale_value',value,length:value.length,rich,hidden:hiddenNow,focused:e.ownerDocument.activeElement===e};
   if(prepare){
     e.focus();
     if(rich){
@@ -90,10 +98,86 @@ export const TRANSACTION_GUARD = `function(expectedKind,expectedValue,expectedAn
     if(operation==='append')atBoundary=selectionStart===selectionEnd&&selectionEnd===e.value.length;
     if(operation==='replace')atBoundary=selectionStart===0&&selectionEnd===e.value.length;
   }
-  if(operation==='insert_at_caret'?false:(!focused&&lenientFocus!==true)||!atBoundary)return {ok:false,reason:'focus_or_selection_changed',value,length:value.length,focused,atBoundary,rich};
+  if(!valueOnly&&(operation==='insert_at_caret'?false:(!focused&&lenientFocus!==true)||!atBoundary))return {ok:false,reason:'focus_or_selection_changed',value,length:value.length,focused,atBoundary,rich,hidden:hiddenNow};
   value=read();
-  return {ok:true,value,length:value.length,rich,focused,selectionStart,selectionEnd,expectedAnchor:expectedAnchor??null};
+  return {ok:true,value,length:value.length,rich,focused,selectionStart,selectionEnd,expectedAnchor:expectedAnchor??null,hidden:hiddenNow,
+    // The identity a detached editor can be looked up by again.
+    identity:{tag:String(e.tagName||'').toUpperCase(),role:e.getAttribute('role')||'',label:String(e.getAttribute('aria-label')||'').trim(),placeholder:String(e.getAttribute('aria-placeholder')||e.getAttribute('data-placeholder')||'').trim(),id:e.id||''}};
 }`;
+
+// Chrome defers trusted key input to a tab it does not consider visible: the
+// characters queue up and only appear once the user brings the tab forward.
+// A background transaction therefore inserts through the document instead of
+// the input pipeline. The events are the same ones a paste or an editor
+// command produces, and the readback is the same DOM value the guard checks.
+const DOM_INSERT = `function(chunk){
+  const e=this;if(!e||!e.isConnected)return {ok:false,reason:'target_stale'};
+  const tag=String(e.tagName||'').toUpperCase();
+  const rich=e.nodeType===1&&tag!=='INPUT'&&tag!=='TEXTAREA'&&(e.isContentEditable===true||(e.getAttribute&&e.getAttribute('role')==='textbox'));
+  // Focus is per-document, so it can be restored while the tab itself sits in
+  // the background. preventScroll keeps a background insert from moving the
+  // page the user is looking at in another tab.
+  try{e.focus({preventScroll:true})}catch(_){try{e.focus()}catch(_){}}
+  if(tag==='TEXTAREA'||tag==='INPUT'){
+    if(typeof e.setRangeText==='function'){try{e.setRangeText(chunk,e.value.length,e.value.length,'end')}catch(_){e.value=(e.value||'')+chunk}}
+    else e.value=(e.value||'')+chunk;
+    e.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:chunk}));
+    e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:chunk}));
+    return {ok:String(e.value||'').endsWith(chunk),value:e.value,length:String(e.value||'').length};
+  }
+  if(!rich)return {ok:false,reason:'not_editable'};
+  // Append semantics: an editor that lost focus may have left its caret in a
+  // paragraph the user clicked, and execCommand would insert there. Collapse
+  // the caret to the end of the editing surface first.
+  const doc=e.ownerDocument;
+  const caretToEnd=()=>{try{const sel=doc.getSelection(),range=doc.createRange();range.selectNodeContents(e);range.collapse(false);sel.removeAllRanges();sel.addRange(range)}catch(_){}};
+  caretToEnd();
+  let inserted=false;
+  try{inserted=doc.execCommand('insertText',false,chunk)}catch(_){inserted=false}
+  if(!inserted){
+    try{
+      const sel=doc.getSelection(),range=doc.createRange();
+      range.selectNodeContents(e);range.collapse(false);
+      const text=doc.createTextNode(chunk);range.insertNode(text);
+      range.setStartAfter(text);range.collapse(true);
+      sel.removeAllRanges();sel.addRange(range);
+      e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:chunk}));
+      inserted=true;
+    }catch(_){inserted=false}
+  }
+  const value=e.innerText??e.textContent??'';
+  return {ok:inserted,value,length:value.length};
+}`;
+
+// A tab that is moved to the background can lose its renderer: Chrome swaps
+// the document out and restores the form afterwards, which detaches every node
+// the transaction was holding. Re-acquiring the editor by the identity the
+// caller already proved is the only way to continue. The lookup refuses
+// ambiguity, so a look-alike field is never typed into.
+const REBIND_EDITOR = identity => `(()=>{
+  const tag=${JSON.stringify(identity?.tag ?? "")},role=${JSON.stringify(identity?.role ?? "")},label=${JSON.stringify(identity?.label ?? "")},placeholder=${JSON.stringify(identity?.placeholder ?? "")},id=${JSON.stringify(identity?.id ?? "")};
+  if(!tag)return null;
+  const matches=n=>{
+    if(!n||n.nodeType!==1)return false;
+    if(String(n.tagName||'').toUpperCase()!==tag)return false;
+    if(String(n.getAttribute('role')||'')!==role)return false;
+    if(String(n.getAttribute('aria-label')||'').trim()!==label)return false;
+    if(String(n.getAttribute('aria-placeholder')||n.getAttribute('data-placeholder')||'').trim()!==placeholder)return false;
+    if(id&&n.id!==id)return false;
+    return !n.matches(':disabled,[aria-disabled="true"],[aria-readonly="true"]');
+  };
+  const roots=[document],seen=new Set([document]);
+  for(let depth=0,frontier=[document];depth<3&&frontier.length;depth+=1){
+    const next=[];
+    for(const doc of frontier){let frames=[];try{frames=Array.from(doc.querySelectorAll('iframe,frame'))}catch(_){frames=[]}
+      for(const frame of frames){let child=null;try{child=frame.contentDocument}catch(_){child=null}
+        if(child&&!seen.has(child)){seen.add(child);roots.push(child);next.push(child)}}}
+    frontier=next;
+  }
+  const found=[];
+  for(const doc of roots){try{for(const n of doc.querySelectorAll('textarea,input,[contenteditable="true"],[contenteditable=""],[role="textbox"]'))if(matches(n))found.push(n)}catch(_){}}
+  return found.length===1?found[0]:null;
+})()`;
 
 const NATIVE_SETTER = `function(expected,value){
   const e=this;
@@ -149,8 +233,8 @@ export function validateTypeTextTransaction(params = {}) {
   const normalize = params.normalize_paragraphs !== false;
   const chunkChars = boundedInteger(params.chunk_chars, 256, 1, 1024);
   const verifyEvery = boundedInteger(params.verify_every_chunks, 1, 0, 64);
-  const pacingMs = boundedInteger(params.pacing_ms, 0, 0, 250);
-  const deadlineMs = boundedInteger(params.deadline_ms, 30000, 1000, 600000);
+  const pacingMs = boundedInteger(params.pacing_ms, 0, 0, 600);
+  const deadlineMs = boundedInteger(params.deadline_ms, 30000, 1000, 900000);
   return {
     tabId: Number.isSafeInteger(params.tabId) ? params.tabId : null,
     objectId: params.object_id ?? null,
@@ -202,7 +286,7 @@ async function verifyFrameLoader(tabId, transaction, ctx) {
   return cached === transaction.loaderId;
 }
 
-async function guard(ctx, target, objectId, transaction, values, prepare, lenientFocus = false) {
+async function guard(ctx, target, objectId, transaction, values, prepare, lenientFocus = false, valueOnly = false, unreadable = false) {
   const response = await ctx.send(target, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: TRANSACTION_GUARD,
@@ -215,6 +299,8 @@ async function guard(ctx, target, objectId, transaction, values, prepare, lenien
       { value: transaction.normalize },
       { value: lenientFocus },
       { value: transaction.index },
+      { value: valueOnly },
+      { value: unreadable },
     ],
     returnByValue: true,
   });
@@ -284,6 +370,22 @@ async function delay(ms) {
   if (ms > 0) await new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// A human types, on average, about 40 words per minute, which is roughly 200
+// characters per minute or 300 ms per character. Real typing is not metronomic:
+// letter-to-letter intervals vary by more than half again, and the pauses grow
+// at word boundaries and after sentence punctuation. `pacingMs` is the mean
+// interval; this maps it to one plausible pause for the character just typed.
+function humanPacingMs(meanMs, character) {
+  if (!(meanMs > 0)) return 0;
+  const jitter = 0.55 + Math.random() * 1.1; // 0.55x .. 1.65x
+  let factor = jitter / 1.1; // keep the long-run mean at 1x
+  if (character === " ") factor *= 1.2;
+  else if (character === "," || character === ";" || character === ":") factor *= 1.7;
+  else if (character === "." || character === "!" || character === "?") factor *= 2.3;
+  else if (character === "\n") factor *= 2.1;
+  return Math.min(1500, Math.max(18, Math.round(meanMs * factor)));
+}
+
 export async function typeTextTransaction(tabId, params, ctx) {
   const transaction = validateTypeTextTransaction({ ...params, tabId });
   const startedAt = ctx.now();
@@ -335,7 +437,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
     // (Google Docs) host the editable element in a blank document whose DOM
     // never receives the typed text. Both are unreadable surfaces: dispatch
     // and report, never invent a readback.
-    const unverifiable = surface?.plain !== true
+    let unverifiable = surface?.plain !== true
       && (surface?.canvas === true || surface?.event_target_frame === true);
     const firstValue = unverifiable || transaction.expected.kind === "unchecked"
       ? { kind: "unchecked", value: "" }
@@ -371,7 +473,11 @@ export async function typeTextTransaction(tabId, params, ctx) {
     };
     const { adapter } = selectEditorAdapter(probe);
     const choice = chooseInputBackend({ strategy: transaction.strategy, text: transaction.text, probe });
-    const backend = choice.backend;
+    let backend = choice.backend;
+    // A hidden tab does not receive trusted key input until the user brings it
+    // forward, so the transaction would spend its whole budget on keys Chrome
+    // is only queuing. Insert through the document instead.
+    if (backend === "key_events" && before.hidden === true) backend = "dom_typing";
     if (backend === "clipboard_paste" && ctx.sensitive === true) {
       return finish({ status: "not_dispatched", backend, reason: "clipboard_paste_refused_for_sensitive_text" });
     }
@@ -397,27 +503,160 @@ export async function typeTextTransaction(tabId, params, ctx) {
       return finish({ status: "verified", backend, completed_chars: codePointLength(transaction.text), chunks: 1 });
     }
 
-    const chunkSize = backend === "key_events"
-      ? Math.max(1, Math.min(transaction.chunkChars, 32))
-      : transaction.chunkChars;
-    const chunks = backend === "ime_composition"
-      ? graphemeChunks(transaction.text, chunkSize)
-      : backend === "key_events"
-        ? graphemeChunks(transaction.text, chunkSize)
-        : graphemeChunks(transaction.text, chunkSize);
+    // A paced transaction runs for a long time and the user may switch tabs
+    // part way through. One character per chunk costs a guard read per
+    // character (a few milliseconds against a human pause of hundreds) and in
+    // return makes every character boundary a decision point about which
+    // transport can still deliver.
+    const chunkSizeFor = mode => mode === "dom_typing"
+      ? 1
+      : mode === "key_events"
+        ? Math.max(1, Math.min(transaction.pacingMs > 0 ? 1 : transaction.chunkChars, 32))
+        : transaction.chunkChars;
+    let chunkSize = chunkSizeFor(backend);
+    let chunks = graphemeChunks(transaction.text, chunkSize);
     if (!chunks.length) return finish({ status: "not_dispatched", backend, reason: "empty_text" });
 
-    for (let index = 0; index < chunks.length; index += 1) {
+    // Dispatch is cursor-based rather than chunk-indexed: focus theft can drop
+    // the tail of a chunk that was already sent, and the transaction resumes
+    // from what actually landed in the field.
+    let chunkStarts = [];
+    const rebuildChunks = (mode, from) => {
+      chunkSize = chunkSizeFor(mode);
+      chunks = graphemeChunks(transaction.text.slice(from), chunkSize);
+      chunkStarts = [];
+      let offset = from;
+      for (const chunk of chunks) {
+        chunkStarts.push(offset);
+        offset += chunk.length;
+      }
+    };
+    rebuildChunks(backend, 0);
+    let cursor = 0;
+    let nextChunk = 0;
+    let resyncs = 0;
+    // The last visibility the document reported. Trusted key input is queued,
+    // not applied, once the tab stops being visible, so the transport must
+    // change at the first character boundary that sees it.
+    let hiddenSeen = before.hidden === true;
+    let rebinds = 0;
+    const switchToDomTyping = () => {
+      backend = "dom_typing";
+      rebuildChunks("dom_typing", cursor);
+      nextChunk = 0;
+      interferenceRebased = true;
+    };
+    // The document under the transaction can be replaced while the user works
+    // in another tab. Look the editor up again by the identity the preflight
+    // already proved, then resume from whatever the new document actually
+    // holds: nothing typed yet, or the restored prefix. Anything else is a
+    // different field and stops the transaction.
+    const identity = before.identity ?? null;
+    const recoverDetached = async () => {
+      if (!identity || transaction.operation !== "append" || rebinds >= 4) return false;
+      rebinds += 1;
+      try {
+        const response = await ctx.send(resolved.target, "Runtime.evaluate", {
+          expression: REBIND_EDITOR(identity),
+          returnByValue: false,
+        });
+        const objectId = response?.result?.objectId;
+        if (!objectId) return false;
+        resolved = { ...resolved, objectId };
+        const fresh = await probeSurface(ctx, resolved.target, objectId, transaction.index);
+        if (fresh) unverifiable = fresh.plain !== true && (fresh.canvas === true || fresh.event_target_frame === true);
+        // The replacement document has its own focus and caret, so the editor
+        // has to be prepared again before the next character is dispatched.
+        const state = await guard(ctx, resolved.target, objectId, transaction, { kind: "unchecked", value: "" }, true, true, true, unverifiable);
+        if (state.ok !== true) return false;
+        const actual = typeof state.value === "string" ? state.value : "";
+        let typed = null;
+        if (actual === initialValue) typed = "";
+        else if (actual.startsWith(initialValue)) typed = actual.slice(initialValue.length);
+        if (typed === null || !transaction.text.startsWith(typed)) return false;
+        cursor = typed.length;
+        dispatched = typed;
+        nextChunk = 0;
+        lastReadback = actual;
+        rebuildChunks(backend, cursor);
+        interferenceRebased = true;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    while (cursor < transaction.text.length) {
+      while (nextChunk < chunks.length && chunkStarts[nextChunk] + chunks[nextChunk].length <= cursor) nextChunk += 1;
+      if (nextChunk >= chunks.length) break;
       if (!ctx.isAuthorized(tabId) || ctx.now() >= deadline) {
         return finish({
           status: dispatchMayHaveOccurred ? "unknown" : "not_dispatched",
           backend,
-          chunks: index,
+          chunks: nextChunk,
           reason: dispatchMayHaveOccurred ? "transaction_deadline_or_session_change" : "deadline_or_session_change",
           interruption: { reason: "deadline_or_session_change", phase: "before_chunk" },
         });
       }
-      const chunk = chunks[index];
+      // A paced transaction can outlive the user's attention. Clicking empty
+      // page area moves focus and the caret away from the editor without
+      // changing its value; that is drift, not a conflicting edit. Restore the
+      // target and keep typing instead of abandoning the remaining characters.
+      // A changed value still stops the transaction, so a real human edit is
+      // never overwritten.
+      if (cursor > 0 && transaction.operation !== "replace") {
+        const expectedBefore = expectedProgress(transaction, dispatched, initialValue);
+        // A canvas editor paints beside its editable element, so the element's
+        // own text proves nothing. Read visibility and focus from it without
+        // pretending its value is the document.
+        const regained = await guard(ctx, resolved.target, resolved.objectId, transaction, expectedBefore, true, unverifiable || backend === "dom_typing", unverifiable, unverifiable);
+        if (regained.ok !== true) {
+          lastReadback = regained.value ?? lastReadback;
+          if (regained.reason === "target_stale" && (await recoverDetached())) continue;
+          // A background tab can drop the last key of a chunk that was already
+          // sent. If the field holds exactly the prefix this transaction typed,
+          // resume from what landed instead of abandoning the rest of the text.
+          const actual = !unverifiable && typeof regained.value === "string" ? regained.value : null;
+          const typedSoFar = actual !== null
+            && transaction.operation === "append"
+            && actual.startsWith(initialValue)
+            ? actual.slice(initialValue.length)
+            : null;
+          if (
+            typedSoFar !== null
+            && typedSoFar.length < cursor
+            && transaction.text.startsWith(typedSoFar)
+            && resyncs < 64
+          ) {
+            resyncs += 1;
+            hiddenSeen = regained.hidden === true;
+            if (regained.hidden === true && backend !== "dom_typing") {
+              backend = "dom_typing";
+              rebuildChunks("dom_typing", typedSoFar.length);
+            }
+            cursor = typedSoFar.length;
+            dispatched = typedSoFar;
+            nextChunk = 0;
+            interferenceRebased = true;
+            continue;
+          }
+          return finish({
+            status: dispatchMayHaveOccurred ? "unknown" : "not_dispatched",
+            backend,
+            chunks: nextChunk,
+            reason: regained.reason ?? "interference_not_recovered",
+            interruption: { reason: regained.reason ?? "interference_not_recovered", phase: "before_chunk", chunk: nextChunk },
+          });
+        }
+        lastReadback = regained.value;
+        hiddenSeen = regained.hidden === true;
+        interferenceRebased = true;
+      }
+      // The user switched tabs after the guard above. Trusted keys sent now
+      // would be queued by Chrome and applied only when the tab is focused
+      // again, so switch to document insertion while the tab is in the
+      // background and keep the remaining characters flowing.
+      if (hiddenSeen && backend === "key_events") switchToDomTyping();
+      const chunk = transaction.text.slice(cursor, chunkStarts[nextChunk] + chunks[nextChunk].length);
       if (backend === "key_events") {
         for (const character of Array.from(chunk)) {
           const enter = character === "\n";
@@ -437,8 +676,31 @@ export async function typeTextTransaction(tabId, params, ctx) {
             : { type: "keyUp", key });
           inputCommands += 1;
           dispatched += character;
-          if (transaction.pacingMs > 0) await delay(transaction.pacingMs);
+          if (transaction.pacingMs > 0) await delay(humanPacingMs(transaction.pacingMs, character));
         }
+      } else if (backend === "dom_typing") {
+        const response = await ctx.send(resolved.target, "Runtime.callFunctionOn", {
+          objectId: resolved.objectId,
+          functionDeclaration: DOM_INSERT,
+          arguments: [{ value: chunk }],
+          returnByValue: true,
+        });
+        const inserted = response?.result?.value;
+        dispatchMayHaveOccurred = true;
+        inputCommands += 1;
+        if (inserted?.ok !== true && inserted?.reason === "target_stale" && (await recoverDetached())) continue;
+        if (inserted?.ok !== true) {
+          return finish({
+            status: "unknown",
+            backend,
+            chunks: nextChunk,
+            reason: inserted?.reason ?? "dom_insert_failed",
+            interruption: { reason: inserted?.reason ?? "dom_insert_failed", phase: "dispatch", chunk: nextChunk },
+          });
+        }
+        dispatched += chunk;
+        lastReadback = typeof inserted.value === "string" ? inserted.value : lastReadback;
+        if (transaction.pacingMs > 0) await delay(humanPacingMs(transaction.pacingMs, Array.from(chunk).slice(-1)[0] ?? ""));
       } else if (backend === "ime_composition") {
         const codePoints = Array.from(chunk).length;
         await ctx.send(resolved.target, "Input.imeSetComposition", {
@@ -457,10 +719,13 @@ export async function typeTextTransaction(tabId, params, ctx) {
         inputCommands += 1;
         dispatched += chunk;
       }
+      cursor += chunk.length;
+      nextChunk += 1;
+      dispatched = transaction.text.slice(0, cursor);
 
       const shouldVerify = transaction.verifyEvery === 0
-        ? index === chunks.length - 1
-        : (index + 1) % transaction.verifyEvery === 0 || index === chunks.length - 1;
+        ? cursor >= transaction.text.length
+        : (nextChunk % transaction.verifyEvery === 0) || cursor >= transaction.text.length;
       if (shouldVerify && unverifiable) {
         // Only liveness is observable on this surface. Anything stronger would
         // be a fabricated readback.
@@ -468,25 +733,56 @@ export async function typeTextTransaction(tabId, params, ctx) {
           return finish({
             status: "unknown",
             backend,
-            chunks: index + 1,
+            chunks: nextChunk,
             reason: "editor detached during typing; the remaining text was not dispatched",
-            interruption: { reason: "target_detached", phase: "readback", chunk: index },
+            interruption: { reason: "target_detached", phase: "readback", chunk: nextChunk },
           });
         }
       } else if (shouldVerify) {
         const expected = expectedProgress(transaction, dispatched, initialValue);
-        const after = await guard(ctx, resolved.target, resolved.objectId, transaction, expected, false);
+        const after = await guard(ctx, resolved.target, resolved.objectId, transaction, expected, false, unverifiable || backend === "dom_typing", true);
         if (after.ok !== true) {
           lastReadback = after.value ?? lastReadback;
+          if (after.reason === "target_stale" && (await recoverDetached())) continue;
+          // Focus theft drops the tail of a chunk without changing what the
+          // field already holds. When the field contains exactly the prefix
+          // this transaction typed, resume from what landed instead of
+          // abandoning the remaining text. Extra or replaced text is a real
+          // human edit and still stops the transaction.
+          const actual = typeof after.value === "string" ? after.value : null;
+          const typedSoFar = actual !== null
+            && transaction.operation === "append"
+            && actual.startsWith(initialValue)
+            ? actual.slice(initialValue.length)
+            : null;
+          if (
+            typedSoFar !== null
+            && typedSoFar.length < cursor
+            && transaction.text.startsWith(typedSoFar)
+            && resyncs < 64
+          ) {
+            resyncs += 1;
+            hiddenSeen = after.hidden === true;
+            if (after.hidden === true && backend !== "dom_typing") {
+              backend = "dom_typing";
+              rebuildChunks("dom_typing", typedSoFar.length);
+            }
+            cursor = typedSoFar.length;
+            dispatched = typedSoFar;
+            nextChunk = 0;
+            interferenceRebased = true;
+            continue;
+          }
           return finish({
             status: "unknown",
             backend,
-            chunks: index + 1,
+            chunks: nextChunk,
             reason: after.reason ?? "chunk_readback_failed",
-            interruption: { reason: after.reason ?? "chunk_readback_failed", phase: "readback", chunk: index },
+            interruption: { reason: after.reason ?? "chunk_readback_failed", phase: "readback", chunk: nextChunk },
           });
         }
         lastReadback = after.value;
+        hiddenSeen = after.hidden === true;
       }
     }
 
@@ -540,7 +836,7 @@ export async function typeTextTransaction(tabId, params, ctx) {
     const finalExpected = transaction.operation === "insert_at_caret"
       ? { kind: "contains", value: transaction.text }
       : expectedProgress(transaction, dispatched, initialValue);
-    const final = await guard(ctx, resolved.target, resolved.objectId, transaction, finalExpected, false);
+    const final = await guard(ctx, resolved.target, resolved.objectId, transaction, finalExpected, false, unverifiable || backend === "dom_typing", true);
     if (final.ok !== true) {
       lastReadback = final.value ?? lastReadback;
       return finish({

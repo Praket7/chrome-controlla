@@ -46,7 +46,7 @@ pub fn backend_for_mode(mode: PublicTypingMode) -> InputBackend {
 pub fn pace_for_mode(mode: PublicTypingMode, delay_ms: u16) -> InputPace {
     match mode {
         PublicTypingMode::HumanKeys => InputPace::Human {
-            delay_ms: delay_ms.min(250),
+            delay_ms: delay_ms.min(600),
         },
         PublicTypingMode::FastKeys => InputPace::Adaptive {
             min_ms: 0,
@@ -172,7 +172,7 @@ pub fn extension_transaction_payload(
         "verify_every_chunks": if mode == PublicTypingMode::HumanKeys { 1 } else { 4 },
         "pacing_ms": if mode == PublicTypingMode::HumanKeys { delay_ms } else { 0 },
         "normalize_paragraphs": true,
-        "deadline_ms": deadline_ms.clamp(1, 600_000),
+        "deadline_ms": deadline_ms.clamp(1, 900_000),
     });
     if let Some(object) = payload.as_object_mut() {
         match target {
@@ -261,7 +261,7 @@ mod tests {
         );
         assert_eq!(
             pace_for_mode(PublicTypingMode::HumanKeys, 999),
-            InputPace::Human { delay_ms: 250 }
+            InputPace::Human { delay_ms: 600 }
         );
     }
 

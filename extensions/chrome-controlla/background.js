@@ -11,6 +11,8 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_ALARM = "controlla-native-reconnect";
+const HEARTBEAT_ALARM = "controlla-native-heartbeat";
+const HANDSHAKE_TIMEOUT_MS = 3000;
 const RECONNECT_STORAGE_KEY = "nativeReconnectAttempts";
 const NATIVE_LEASE_JOURNAL_KEY = "controllaNativeLeaseJournalV1";
 const OPEN_RECEIPTS_KEY = "openReceipts";
@@ -1080,6 +1082,11 @@ async function frameHumanTypeCharacter(tabId, params, isAuthorized) {
     /* auto-attach stays warm for the bound tab */
   }
 }
+function armHeartbeatAlarm() {
+  // Idempotent: the worker arms this on every start (including a reload),
+  // because Chrome clears alarms when the extension is updated or reloaded.
+  chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 0.5 });
+}
 async function scheduleNativeReconnect() {
   if (reconnectTimer || nativePort) return;
   const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
@@ -1093,6 +1100,24 @@ async function scheduleNativeReconnect() {
   reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connectNative(); }, delay);
 }
 chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === HEARTBEAT_ALARM) {
+    // MV3 can suspend this worker between native messages, and a host can be
+    // wedged from an earlier launch (a wrong binary on the registered path
+    // never sends `ready`). Either way the port stays open and every command
+    // afterwards fails on a stale inventory. This alarm is the recovery path:
+    // re-dial a missing port, and replace one that never completed its
+    // handshake. Chrome clamps the period to 30 seconds, so this is the
+    // tightest bounded self-heal available without a user reload.
+    if (!nativePort) {
+      reconnectExhausted = false;
+      connectNative();
+    } else if (!nativeReady && nativeConnectStartedAt && Date.now() - nativeConnectStartedAt > HANDSHAKE_TIMEOUT_MS) {
+      try { nativePort.disconnect(); } catch {}
+      nativePort = undefined; nativeConnectStartedAt = 0; nativePortGeneration++;
+      connectNative();
+    }
+    return;
+  }
   if (alarm.name !== RECONNECT_ALARM) return;
   // An alarm can be the only callback delivered after an MV3 worker is
   // suspended. Reconnect immediately, then reconcile persisted state before
@@ -3319,4 +3344,5 @@ chrome.tabs.onRemoved.addListener(tabId => {
   fileChooserEvents.delete(tabId); fileChooserOperations.delete(tabId); navigationDebuggerAttaches.delete(tabId);
   pairedTabUrls.delete(tabId); pairedTabDocumentIds.delete(tabId); clearPairedTabTopology(tabId); navigatingTabs.delete(tabId); debuggerDetachedDuringNavigation.delete(tabId); committedNavigationTabs.delete(tabId);
 });
+armHeartbeatAlarm();
 void reconnectStateReady.then(() => { if (!reconnectExhausted) connectNative(); });

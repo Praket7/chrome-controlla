@@ -1532,6 +1532,64 @@ mod route_telemetry_tests {
     }
 
     #[test]
+    fn document_views_of_one_resource_reuse_a_single_tab() {
+        let id = "16kmvt8_sLc77qch62Vv6Zy9wADo9h-uZ6mlqBT7Kmbk";
+        let tabs = vec![
+            json!({"id": 30, "url": format!("https://docs.google.com/document/d/{id}/edit?tab=t.0"), "document_id": "doc-30", "active_for_open": false, "last_accessed": 500.0, "window_id": 1}),
+            json!({"id": 31, "url": "https://docs.google.com/document/d/other-doc/edit", "document_id": "doc-31", "active_for_open": true, "last_accessed": 900.0, "window_id": 1}),
+        ];
+        // A read-only view and the editor are the same document, so the editor
+        // tab is reused instead of opening a second tab for the same doc.
+        assert_eq!(
+            super::reusable_tab_for_url(&tabs, &format!("https://docs.google.com/document/d/{id}/mobilebasic"), None).map(|item| item.0),
+            Some("30".into())
+        );
+        // Another document never matches, even when it is the focused tab.
+        assert!(
+            super::reusable_tab_for_url(&tabs, "https://docs.google.com/document/d/missing/mobilebasic", None).is_none()
+        );
+        // A different host with the same path is not the same resource.
+        assert!(!super::same_document_resource(
+            &format!("https://docs.google.com/document/d/{id}/edit"),
+            &format!("https://not-docs.example/document/d/{id}/edit")
+        ));
+        // Exact URL still wins when both forms are open.
+        let both = vec![
+            json!({"id": 40, "url": format!("https://docs.google.com/document/d/{id}/edit"), "document_id": "doc-40", "active_for_open": true, "last_accessed": 10.0, "window_id": 1}),
+            json!({"id": 41, "url": format!("https://docs.google.com/document/d/{id}/mobilebasic"), "document_id": "doc-41", "active_for_open": false, "last_accessed": 99.0, "window_id": 1}),
+        ];
+        assert_eq!(
+            super::reusable_tab_for_url(&both, &format!("https://docs.google.com/document/d/{id}/mobilebasic"), None).map(|item| item.0),
+            Some("41".into())
+        );
+    }
+
+    #[test]
+    fn bound_session_open_reuses_the_bound_tab_for_the_same_document() {
+        let id = "16kmvt8_sLc77qch62Vv6Zy9wADo9h-uZ6mlqBT7Kmbk";
+        let edit = format!("https://docs.google.com/document/d/{id}/edit?tab=t.0");
+        let other_view = format!("https://docs.google.com/document/d/{id}/edit");
+        let bound = vec!["30".to_owned()];
+        assert!(super::bound_tab_matches_open(&bound, "30", None, &edit, &edit));
+        assert!(super::bound_tab_matches_open(&bound, "30", None, &edit, &other_view));
+        assert!(!super::bound_tab_matches_open(
+            &bound,
+            "30",
+            None,
+            &edit,
+            "https://docs.google.com/document/d/another-doc/edit"
+        ));
+        assert!(!super::bound_tab_matches_open(&bound, "30", None, &edit, "https://example.test/"));
+        assert!(!super::bound_tab_matches_open(&bound, "31", Some("31"), &edit, &other_view));
+        // Several bound tabs need an explicit, bound tab ID; guessing would
+        // navigate the wrong document.
+        let several = vec!["30".to_owned(), "31".to_owned()];
+        assert!(!super::bound_tab_matches_open(&several, "30", None, &edit, &other_view));
+        assert!(super::bound_tab_matches_open(&several, "31", Some("31"), &edit, &other_view));
+        assert!(!super::bound_tab_matches_open(&several, "30", Some("31"), &edit, &other_view));
+    }
+
+    #[test]
     fn explicit_open_anchor_uses_the_requested_stable_tab() {
         let tabs = vec![
             json!({"id": 10, "url": "https://example.test/", "document_id": "doc-10", "active_for_open": true, "window_id": 1}),
@@ -1613,18 +1671,65 @@ fn selected_open_anchor_tab_id(
         .ok_or("requested source tab is not a stable web tab in the fresh inventory")
 }
 
+/// The app identity of a single-page document (Google Docs, Sheets, Slides).
+///
+/// These apps move between `/edit`, `/mobilebasic`, `/view` and `?tab=`
+/// variants of one resource. Comparing full URLs treats every view as a new
+/// page, so each call opened (and abandoned) another tab for the same document.
+fn document_app_identity(url: &url::Url) -> Option<(&'static str, &str)> {
+    let host = url.host_str()?;
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    let (app, rest): (&'static str, &[&str]) = match host {
+        "docs.google.com" => match segments.first().copied()? {
+            "document" => ("document", &segments[1..]),
+            "spreadsheets" | "spreadsheet" => ("spreadsheets", &segments[1..]),
+            "presentation" => ("presentation", &segments[1..]),
+            _ => return None,
+        },
+        "sheets.google.com" => ("spreadsheets", segments.as_slice()),
+        "slides.google.com" => ("presentation", segments.as_slice()),
+        _ => return None,
+    };
+    if rest.len() < 2 || rest[0] != "d" || rest[1].is_empty() {
+        return None;
+    }
+    Some((app, rest[1]))
+}
+
+fn same_document_resource(candidate: &str, expected: &str) -> bool {
+    let (Ok(candidate), Ok(expected)) = (url::Url::parse(candidate), url::Url::parse(expected))
+    else {
+        return false;
+    };
+    if candidate.origin() != expected.origin() {
+        return false;
+    }
+    if let (Some((app, id)), Some((expected_app, expected_id))) =
+        (document_app_identity(&candidate), document_app_identity(&expected))
+    {
+        return app == expected_app && id == expected_id;
+    }
+    false
+}
+
 fn reusable_tab_for_url(tabs: &[Value], url: &str, requested: Option<&str>) -> Option<(String, Option<String>)> {
     tabs.iter()
         .filter(|tab| {
             tab["id"].as_u64().is_some()
                 && tab["document_id"].as_str().is_some_and(|id| !id.is_empty())
                 && requested.is_none_or(|id| tab["id"].as_u64().map(|value| value.to_string()).as_deref() == Some(id))
-                && tab["url"]
-                    .as_str()
-                    .is_some_and(|candidate| same_navigation_resource_url(candidate, url))
+                && tab["url"].as_str().is_some_and(|candidate| {
+                    same_navigation_resource_url(candidate, url)
+                        || same_document_resource(candidate, url)
+                })
         })
         .max_by_key(|tab| {
             (
+                // An exact URL match wins over another view of the same
+                // document, then the focused/most recently used tab.
+                tab["url"]
+                    .as_str()
+                    .is_some_and(|candidate| same_navigation_resource_url(candidate, url)),
                 tab["active_for_open"] == true,
                 tab["last_accessed"].as_f64().unwrap_or_default() as u64,
             )
@@ -1635,6 +1740,35 @@ fn reusable_tab_for_url(tabs: &[Value], url: &str, requested: Option<&str>) -> O
                 tab["window_id"].as_u64().map(|id| id.to_string()),
             )
         })
+}
+
+/// A bound-session open must never create a second tab for a document the
+/// session already holds. The candidate tab must already be bound, and an
+/// exact URL returns that tab while another view of the same document
+/// navigates it in place. Several bound tabs need an explicit tab ID; guessing
+/// would navigate the wrong document.
+fn bound_tab_matches_open(
+    bound: &[String],
+    tab_id: &str,
+    requested: Option<&str>,
+    current_url: &str,
+    requested_url: &str,
+) -> bool {
+    let selected = match requested {
+        Some(id) => id == tab_id && bound.iter().any(|bound| bound == tab_id),
+        None => bound.len() == 1 && bound[0] == tab_id,
+    };
+    selected
+        && (same_navigation_resource_url(current_url, requested_url)
+            || same_document_resource(current_url, requested_url))
+}
+
+fn browser_mode_label(mode: crate::v3::BrowserMode) -> &'static str {
+    match mode {
+        crate::v3::BrowserMode::Foreground => "foreground",
+        crate::v3::BrowserMode::Background => "background",
+        crate::v3::BrowserMode::Headless => "headless",
+    }
 }
 
 #[derive(Clone)]
@@ -2381,7 +2515,7 @@ impl AppV3 {
                 ids
             },
             None if crate::guard_reason::unrestricted_mode() => {
-                let snapshot = crate::native_setup::read_tabs().map_err(invalid)?;
+                let snapshot = crate::native_setup::read_tabs().map_err(bridge_failure)?;
                 let tabs = snapshot["tabs"]
                     .as_array()
                     .ok_or_else(|| invalid("native tab inventory omitted tabs"))?;
@@ -2531,6 +2665,31 @@ impl AppV3 {
         let Some((candidate, _candidate_window)) = reusable_tab_for_url(tabs, url, args.chrome_tab_id.as_deref()) else {
             return Ok(None);
         };
+        // A repeat open of a URL this server already attached must connect to
+        // the session that owns the tab. Pairing the same tab into a fresh
+        // session is refused by Chrome ("already leased"), which made the second
+        // open of the same page fail and pushed callers into opening new tabs.
+        if let Some(existing) = self
+            .core
+            .legacy
+            .owned_shared_session_for_target(&candidate)
+            .await
+        {
+            let existing_mode = self.browser_modes.lock().await.get(&existing).copied();
+            return match existing_mode {
+                Some(existing_mode) if existing_mode == mode => {
+                    Ok(Some((existing, candidate, None)))
+                }
+                Some(existing_mode) => Err(invalid(format!(
+                    "the requested URL is already attached in {} mode as session {existing}; pass that session_id, or close it before opening the same URL in {} mode",
+                    browser_mode_label(existing_mode),
+                    browser_mode_label(mode)
+                ))),
+                None => Err(invalid(format!(
+                    "the requested URL is already attached as session {existing}; pass that session_id instead of opening it again"
+                ))),
+            };
+        }
         let anchor = open_anchor_tab_id(
             tabs,
             discovery["snapshot"]["last_focused_window_id"].as_u64(),
@@ -2795,7 +2954,7 @@ struct V3BrowserArgs {
     task: Option<crate::v3_tasks::TaskPrimitive>,
     #[serde(default)]
     #[schemars(
-        description = "Bounded task program run through the workflow VM; exclusive with task."
+        description = "Bounded task program via the workflow VM; exclusive with task."
     )]
     task_program: Option<crate::task_program::TaskProgram>,
     #[serde(default)]
@@ -2807,7 +2966,7 @@ struct V3BrowserArgs {
     #[schemars(description = "register")]
     skill_action: Option<String>,
     skill_id: Option<String>,
-    #[schemars(with = "Option<serde_json::Value>", description = "Skill definition.")]
+    #[schemars(with = "Option<serde_json::Value>", description = "Skill JSON.")]
     skill_definition: Option<crate::skills::SkillDefinition>,
     expires_at_ms: Option<u64>,
     skill_predicate: Option<BrowserPredicate>,
@@ -2816,7 +2975,7 @@ struct V3BrowserArgs {
     bytes: Option<Vec<u8>>,
     bytes_base64: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Explicitly approve reading the user-supplied local file_path for upload staging. Required for guarded foreground/shared sessions; never inferred from the path.")]
+    #[schemars(description = "Explicitly approve reading file_path for upload staging; required for guarded foreground/shared sessions, never inferred.")]
     allow_local_file_path: Option<bool>,
     file_path: Option<String>,
     artifact_handle: Option<String>,
@@ -2829,7 +2988,7 @@ struct V3BrowserArgs {
     idempotency_key: Option<String>,
     #[schemars(description = "one call")]
     steps: Option<Vec<V3WorkflowStep>>,
-    #[schemars(description = "bounded workflow program for one-call open")]
+    #[schemars(description = "bounded workflow program")]
     program: Option<Vec<V3WorkflowOp>>,
 }
 
@@ -2933,7 +3092,7 @@ struct V3ActArgs {
     chrome_tab_id: String,
     #[schemars(
         extend("enum" = ["click", "double_click", "context_click", "hover", "scroll", "scroll_to", "fill", "type", "press", "select", "secure_fill", "touch", "swipe", "multi_touch", "page_tools", "page_tool"]),
-        description = "Choose a background or foreground action; secure_fill is password-only. Page actions use the Chrome extension."
+        description = "Choose a background or foreground action; secure_fill is password-only. Page actions use the extension."
     )]
     action: String,
     #[serde(default)]
@@ -2972,7 +3131,7 @@ struct V3ActArgs {
     timeout_ms: Option<u64>,
     typing_mode: Option<String>,
     #[schemars(
-        description = "human_keys delay per character in ms (0–250; default 180)."
+        description = "human_keys mean delay per character in ms (0-600; default 280, about 40 WPM). Real per-key pauses vary around it and lengthen after punctuation."
     )]
     delay_ms: Option<u64>,
     client_id: Option<String>,
@@ -3676,6 +3835,15 @@ fn invalid(message: impl Into<String>) -> rmcp::ErrorData {
     rmcp::ErrorData::invalid_params(message.into(), None)
 }
 
+/// A failure that came from the native Chrome bridge rather than from the
+/// caller's arguments. Carrying the kind lets `tool_validation_result` return
+/// the recovery action that actually applies.
+fn bridge_failure(message: impl Into<String>) -> rmcp::ErrorData {
+    let message = message.into();
+    let kind = crate::native_setup::inventory_error_kind(&message);
+    rmcp::ErrorData::invalid_params(message, Some(serde_json::json!({"kind": kind})))
+}
+
 /// A freshness guard rejected the action before any command reached the page.
 ///
 /// These are preconditions, not deliveries: nothing was dispatched, so the caller
@@ -3701,13 +3869,33 @@ fn pre_dispatch_stale_receipt(action: &str, typing_mode: Option<&str>) -> Value 
 
 fn tool_validation_result(error: rmcp::ErrorData) -> rmcp::model::CallToolResult {
     let reason = error.message.to_string();
-    let next_action = "Correct the named argument or refresh the selected tab and document identity; inspect any uncertain mutation before retrying.";
+    let bridge_kind = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .filter(|kind| kind.starts_with("native_bridge_"));
+    // A dead bridge is not an argument error. Telling the caller to "correct
+    // the named argument" for an inventory the browser never published sends
+    // it chasing a request that was already valid, so report the bridge and
+    // the one repair that works.
+    let (reason_code, next_action) = match bridge_kind {
+        Some(_) => (
+            "native_bridge_unavailable",
+            "reload the Controlla extension on chrome://extensions so its service worker reconnects to the native host, then retry; nothing was dispatched",
+        ),
+        None => (
+            "invalid_tool_request",
+            "Correct the named argument or refresh the selected tab and document identity; inspect any uncertain mutation before retrying.",
+        ),
+    };
     let payload = json!({
         "status":"error",
-        "reason_code":"invalid_tool_request",
+        "reason_code":reason_code,
         "reason":reason,
         "dispatch_may_have_occurred":false,
         "next_action":next_action,
+        "bridge_kind":bridge_kind,
     });
     let mut result = rmcp::model::CallToolResult::error(vec![
         rmcp::model::ContentBlock::text(format!("{reason} Next action: {next_action}")),
@@ -4068,7 +4256,7 @@ async fn type_frame_reference(
     let transaction_deadline = deadline
         .saturating_duration_since(tokio::time::Instant::now())
         .as_millis()
-        .clamp(1, 600_000) as u64;
+        .clamp(1, 900_000) as u64;
     let payload = extension_transaction_payload(
         &TransactionTarget::Frame {
             frame_id: parts.0.to_owned(),
@@ -4078,7 +4266,7 @@ async fn type_frame_reference(
         expected,
         &text,
         mode,
-        policy.delay_ms.min(250) as u16,
+        policy.delay_ms.min(600) as u16,
         transaction_deadline,
     );
     let result = tokio::time::timeout_at(
@@ -10606,32 +10794,25 @@ fn presentation_transition_stable(before: &Value, after: &Value) -> bool {
     .all(|key| before.get(*key) == after.get(*key))
 }
 
-fn inactive_background_click_receipt(presentation: &Value) -> Option<Value> {
-    (presentation["tab_active"] == false).then(|| json!({
+/// Whether background pointer input is impossible rather than merely
+/// unfocused. Tab activity and window focus are the user's to change at any
+/// moment, so neither is a reason to refuse: CDP input and DOM input both reach
+/// an inactive tab. Only a discarded document cannot accept input.
+fn background_pointer_refusal(presentation: Option<&Value>) -> Option<Value> {
+    let discarded = presentation.is_some_and(|value| {
+        value["lifecycle"] == "discarded" || value["discarded"] == true
+    });
+    if !discarded {
+        return None;
+    }
+    let mut refusal = json!({
         "status":"not_dispatched",
-        "reason_code":"inactive_background_tab",
-        "reason":"The tested Chrome configuration does not deliver CDP mouse input to an inactive tab; activate the tab or navigate to the observed destination instead",
+        "reason_code":"background_target_discarded",
+        "reason":"Chrome discarded this tab's document, so pointer input cannot reach it",
         "dispatch_acknowledged":false,
         "dispatch_may_have_occurred":false,
-        "next_action":"use the observed link URL for background navigation, or retry in foreground mode"
-    }))
-}
-
-fn background_pointer_refusal(presentation: Option<&Value>) -> Option<Value> {
-    let mut refusal = match presentation {
-        Some(value) if value["tab_active"].as_bool() == Some(true) => return None,
-        Some(value) if value["tab_active"].as_bool() == Some(false) => {
-            inactive_background_click_receipt(value)?
-        }
-        _ => json!({
-            "status":"not_dispatched",
-            "reason_code":"background_activity_unavailable",
-            "reason":"Tab activity could not be verified, so background pointer input was not dispatched",
-            "dispatch_acknowledged":false,
-            "dispatch_may_have_occurred":false,
-            "next_action":"retry after activity telemetry recovers, or use foreground mode"
-        }),
-    };
+        "next_action":"activate the tab so Chrome reloads the document, then take a fresh snapshot"
+    });
     refusal["mode"] = json!("background");
     if let Some(presentation) = presentation {
         refusal["presentation_before"] = presentation.clone();
@@ -13909,7 +14090,7 @@ fn direct_action_budget(args: &V3ActArgs) -> crate::v3::CommandBudget {
         let pacing = crate::v3::human_typing_timeout_ms(
             count,
             if human_paced {
-                args.delay_ms.unwrap_or(180).min(250)
+                args.delay_ms.unwrap_or(280).min(600)
             } else {
                 0
             },
@@ -14448,7 +14629,7 @@ async fn rebind_editor_object(
     name: &str,
     tag: &str,
 ) -> Result<EditorRebind, rmcp::ErrorData> {
-    let selector = r#"(()=>{const role=__ROLE__,name=__NAME__,tag=__TAG__;const roots=[document],seen=new Set([document]);for(let depth=0,frontier=[document];depth<4&&frontier.length;depth+=1){const next=[];for(const doc of frontier){let frames=[];try{frames=Array.from(doc.querySelectorAll('iframe,frame'))}catch(_){frames=[]}for(const frame of frames){let child=null;try{child=frame.contentDocument}catch(_){child=null}if(child&&!seen.has(child)){seen.add(child);roots.push(child);next.push(child)}}}frontier=next}const all=[];for(const doc of roots){try{all.push(...doc.querySelectorAll('[contenteditable=\"true\"],[contenteditable=\"\"],[role=\"textbox\"],textarea'))}catch(_){}}const editable=all.filter(n=>{if(n.matches(':disabled,[aria-disabled=\"true\"],[aria-readonly=\"true\"]'))return false;const tag=String(n.tagName).toUpperCase(),rich=n.nodeType===1&&tag!=='INPUT'&&tag!=='TEXTAREA'&&(n.isContentEditable===true||(n.getAttribute('role')==='textbox'&&String(n.getAttribute('contenteditable')||'').toLowerCase()==='true'));return rich||tag==='TEXTAREA'});const labelOf=n=>(n.getAttribute('aria-label')||n.getAttribute('aria-placeholder')||n.getAttribute('data-placeholder')||'').trim();const named=editable.filter(n=>n.tagName===tag&&labelOf(n)===name);const isActive=n=>{try{const a=n.ownerDocument.activeElement;return a===n||(!!a&&n.contains(a))}catch(_){return false}};const painted=n=>{try{const r=n.getBoundingClientRect();return r.width>0||r.height>0}catch(_){return false}};let pick=named;if(named.length>1){const focused=named.filter(isActive);pick=focused.length===1&&!named.some(n=>!isActive(n)&&painted(n))?focused:named}return {count:pick.length,editable:editable.length}})()"#
+    let selector = r#"(()=>{const role=__ROLE__,name=__NAME__,tag=__TAG__;const roots=[document],seen=new Set([document]);for(let depth=0,frontier=[document];depth<4&&frontier.length;depth+=1){const next=[];for(const doc of frontier){let frames=[];try{frames=Array.from(doc.querySelectorAll('iframe,frame'))}catch(_){frames=[]}for(const frame of frames){let child=null;try{child=frame.contentDocument}catch(_){child=null}if(child&&!seen.has(child)){seen.add(child);roots.push(child);next.push(child)}}}frontier=next}const all=[];for(const doc of roots){try{all.push(...doc.querySelectorAll('[contenteditable=\"true\"],[contenteditable=\"\"],[role=\"textbox\"],textarea'))}catch(_){}}const editable=all.filter(n=>{if(n.matches(':disabled,[aria-disabled=\"true\"],[aria-readonly=\"true\"]'))return false;const tag=String(n.tagName).toUpperCase(),rich=n.nodeType===1&&tag!=='INPUT'&&tag!=='TEXTAREA'&&String(n.getAttribute('contenteditable')||'').toLowerCase()!=='false'&&(n.isContentEditable===true||n.getAttribute('role')==='textbox');return rich||tag==='TEXTAREA'});const labelOf=n=>(n.getAttribute('aria-label')||n.getAttribute('aria-placeholder')||n.getAttribute('data-placeholder')||'').trim();const named=editable.filter(n=>n.tagName===tag&&labelOf(n)===name);const isActive=n=>{try{const a=n.ownerDocument.activeElement;return a===n||(!!a&&n.contains(a))}catch(_){return false}};const painted=n=>{try{const r=n.getBoundingClientRect();return r.width>0||r.height>0}catch(_){return false}};let pick=named;if(named.length>1){const focused=named.filter(isActive);pick=focused.length===1&&!named.some(n=>!isActive(n)&&painted(n))?focused:named}return {count:pick.length,editable:editable.length}})()"#
         .replace("__ROLE__", &json!(role).to_string())
         .replace("__NAME__", &json!(name).to_string())
         .replace("__TAG__", &json!(tag).to_string());
@@ -14804,7 +14985,7 @@ async fn key_type(
             shared.registry()?, &shared.handle, &args.chrome_tab_id, "Controlla.fastType",
             json!({"object_id":snapshot.object_id,"index":index,"expected":progress,"text":text,
                 "normalize_paragraphs":rich_editor,
-                "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1, 600_000) as u64}),
+                "deadline_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis().clamp(1, 900_000) as u64}),
         )).await;
         let result = match result {
             Ok(Ok(value)) => shared_extension_value(&value).map_err(invalid)?,
@@ -14862,11 +15043,11 @@ async fn key_type(
             &progress,
             &text,
             mode,
-            policy.delay_ms.min(250) as u16,
+            policy.delay_ms.min(600) as u16,
             deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .as_millis()
-                .clamp(1, 600_000) as u64,
+                .clamp(1, 900_000) as u64,
         );
         let result = tokio::time::timeout_at(
             deadline,
@@ -14915,10 +15096,18 @@ async fn key_type(
                 compacted["document_text"] = receipt["document_text"].clone();
             }
         }
+        // Google Docs and similar canvas editors keep an offscreen keystroke
+        // relay in a child frame. Text that never reached the document still
+        // appears in that relay's DOM text, so a page-text match from an
+        // event-target frame is not evidence of an insertion. Prove it against
+        // the document's own copy path instead.
+        let relay_text_is_not_document_text = receipt["surface"]["event_target_frame"] == true
+            && receipt["verification"] == "document_text"
+            && compacted["status"] == "verified";
         // A dispatch-only result is not an unknown mutation. The page text does
         // not contain canvas-editor content, so prove the insertion against the
         // document's own copy path instead of leaving the caller to guess.
-        if compacted["status"] == "dispatched_unverified" {
+        if compacted["status"] == "dispatched_unverified" || relay_text_is_not_document_text {
             let verification = verify_canvas_document_text(
                 shared.connection.as_ref().unwrap(),
                 shared.registry()?,
@@ -15217,15 +15406,22 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
         .connection
         .as_ref()
         .ok_or_else(|| invalid("shared extension session has not been accepted"))?;
+    // Keyboard input goes to whatever holds focus, so the reference only has to
+    // anchor a live element and offer it focus. Requiring `activeElement === e`
+    // refused every canvas editor whose caret lives in an iframe or a sibling
+    // canvas (Google Docs is the reference case), which made select-all and undo
+    // impossible on exactly the documents that need them most.
     let preflight = connection.command(shared.registry()?, &shared.handle, &args.chrome_tab_id, "Runtime.callFunctionOn", json!({
-        "objectId":snapshot.object_id,"functionDeclaration":if unrestricted {"function(index){const e=this.nodes[index];if(e)e.focus();return {ok:!!e};}"} else {"function(index){const e=this.nodes[index];return {ok:!!e&&e.isConnected&&document.activeElement===e};}"},
+        "objectId":snapshot.object_id,"functionDeclaration":"function(index){const e=this.nodes[index];if(!e||!e.isConnected)return {ok:false,focused:false};try{e.focus()}catch(_){}return {ok:true,focused:document.activeElement===e};}",
         "arguments":[{"value":index}],"returnByValue":true
     })).await.map_err(|error| invalid(error.to_string()))?;
-    if super::super::shared_value(&preflight).map_err(invalid)?["ok"] != true {
+    let preflight_value = super::super::shared_value(&preflight).map_err(invalid)?;
+    if preflight_value["ok"] != true {
         return Ok(
-            json!({"status":"not_dispatched","action":"press","reason":"referenced element is not connected and focused"}),
+            json!({"status":"not_dispatched","action":"press","reason":"referenced element is not connected"}),
         );
     }
+    let referenced_focus = preflight_value["focused"] == true;
     if !unrestricted {
         shared
             .snapshots
@@ -15284,7 +15480,8 @@ async fn press(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> 
         }
     }
     Ok(
-        json!({"status":"dispatched","action":"press","dispatch_acknowledged":true,"requires_verify":true}),
+        json!({"status":"dispatched","action":"press","dispatch_acknowledged":true,"requires_verify":true,
+            "referenced_element_focused":referenced_focus,"key_target":"focused_element"}),
     )
 }
 
@@ -18014,7 +18211,7 @@ impl AppV3 {
                 "desktop_capabilities":desktop_capabilities,
                 "activate":{"mode":"foreground only; requires a session-created Controlla-owned tab and idempotency_key; verifies the same document, active tab, and focused window"},
                 "workflow_cancellation":{"use":"repeat a concurrent workflow call with the same session_id and operation_id, cancel=true, and steps omitted","boundary":"later workflow steps are fenced; an in-flight step may have taken effect and needs readback"},
-                "open":{"session_id":"omit to create a new Controlla-owned tab without borrowing a user tab","mode":"background (default) keeps the new tab inactive; foreground requests an active tab and warns if Chrome is not focused","target_policy":"omit to create an inactive tab in Chrome's selected window; existing_window requires an exact window_id and keeps the tab inactive in background mode; create_background_window creates an unfocused owned window; existing_automation_window requires window_id from a prior Controlla-created background window","idempotency_key":"required; retries must preserve URL, mode, target policy, window ID, and placement","steps":"optional bounded workflow executed in the new target; result is returned in workflow",
+                "open":{"session_id":"omit to create a new Controlla-owned tab without borrowing a user tab; with a session_id, a URL the session already holds returns or navigates that bound tab instead of opening a second one","mode":"background (default) keeps the new tab inactive; foreground requests an active tab and warns if Chrome is not focused","target_policy":"omit to create an inactive tab in Chrome's selected window; existing_window requires an exact window_id and keeps the tab inactive in background mode; create_background_window creates an unfocused owned window; existing_automation_window requires window_id from a prior Controlla-created background window","idempotency_key":"required; retries must preserve URL, mode, target policy, window ID, and placement","steps":"optional bounded workflow executed in the new target; result is returned in workflow",
                 "ready_when":r#"Tagged JSON objects: {"kind":"document_committed"}, {"kind":"dom_content_loaded"}, {"kind":"url_prefix","prefix":"https://example.com/"}, {"kind":"selector","selector":"main"}, {"kind":"semantic_match","query":"results","role":"heading"}, or {"kind":"visual_stable","quiet_ms":300,"timeout_ms":3000,"region":{"x":0,"y":0,"width":640,"height":480}}. visual_stable hashes normalized bounded pixels and requires a same-document active renderer; timeout returns incomplete and skips workflow steps"#,"guarded_cold_open":"ordinary open omits host_id and target_ids; Controlla performs one fresh internal discovery and pairs a stable target. Explicit discovery is only for intentionally selecting a particular existing tab","local_unrestricted_cold_open":"chooses a stable web tab from the native inventory"},
                 "act_actions":["click","double_click","context_click","hover","scroll","scroll_to","fill","type","press","select","secure_fill","touch","swipe","multi_touch","page_tools","page_tool"],
                 "artifact_scopes":{"guarded":["private_headless_session","guarded_shared_session"],"local_unrestricted":["private_headless_session","local_unrestricted_shared_session"]},
@@ -18349,6 +18546,142 @@ impl AppV3 {
                     "browser action=open requires idempotency_key so retries reuse the same tab",
                 ));
             }
+            if let Some(session_id) = args.session_id.clone() {
+                let simple_readiness = args.ready_when.as_ref().is_none_or(|condition| {
+                    matches!(
+                        condition,
+                        V3ReadyWhen::DocumentCommitted | V3ReadyWhen::DomContentLoaded
+                    )
+                });
+                if args.target_policy.is_none()
+                    && args.window_id.is_none()
+                    && args.steps.is_none()
+                    && args.program.is_none()
+                    && simple_readiness
+                {
+                    if self.browser_modes.lock().await.get(&session_id) != Some(&mode) {
+                        return Err(invalid(
+                            "session was not created in the requested browser mode",
+                        ));
+                    }
+                    // Re-using a bound session for a URL it already holds must
+                    // not cost a second tab: an exact URL returns the bound tab
+                    // and another view of the same document navigates it in
+                    // place. Chrome keeps the tab in the background either way.
+                    let bound = {
+                        let shared = self
+                            .core
+                            .legacy
+                            .shared_sessions
+                            .lock()
+                            .await
+                            .get(&session_id)
+                            .cloned()
+                            .ok_or_else(|| invalid("unknown shared session_id"))?;
+                        let shared = shared.lock().await;
+                        if shared.handle.principal != self.core.legacy.principal.as_ref() {
+                            return Err(invalid("session principal mismatch"));
+                        }
+                        shared
+                            .connection
+                            .as_ref()
+                            .ok_or_else(|| invalid("shared extension session has not been accepted"))?
+                            .selected_targets()
+                            .to_vec()
+                    };
+                    let inventory = crate::native_setup::read_tabs().map_err(invalid)?;
+                    let current = inventory["tabs"].as_array().and_then(|tabs| {
+                        tabs.iter()
+                            .find(|tab| {
+                                let Some(tab_id) = tab["id"].as_u64().map(|id| id.to_string())
+                                else {
+                                    return false;
+                                };
+                                bound_tab_matches_open(
+                                    &bound,
+                                    &tab_id,
+                                    args.chrome_tab_id.as_deref(),
+                                    tab["url"].as_str().unwrap_or_default(),
+                                    url,
+                                )
+                            })
+                            .cloned()
+                    });
+                    if let Some(tab) = current {
+                        let tab_id = tab["id"].as_u64().unwrap().to_string();
+                        let current_url = tab["url"].as_str().unwrap_or_default();
+                        let window_focused = tab["window_id"].as_u64().is_some_and(|window| {
+                            inventory["windows"].as_array().is_some_and(|windows| {
+                                windows.iter().any(|entry| {
+                                    entry["id"].as_u64() == Some(window)
+                                        && entry["focused"] == true
+                                })
+                            })
+                        });
+                        if same_navigation_resource_url(current_url, url) {
+                            return Ok(Json(json!({
+                                "status":"reused",
+                                "verified":true,
+                                "created":false,
+                                "created_by_controlla":false,
+                                "idempotent_reuse":true,
+                                "reused_existing_target":true,
+                                "same_document_navigation":false,
+                                "tab_id":tab_id,
+                                "url":current_url,
+                                "document_id":tab["document_id"].clone(),
+                                "tab_active":tab["active_for_open"] == true || tab["active"] == true,
+                                "window_focused":window_focused,
+                                "navigation":Value::Null
+                            })));
+                        }
+                        let Json(navigation) = self
+                            .core
+                            .legacy
+                            .shared_tab(Parameters(super::SharedTabArgs {
+                                session_id: session_id.clone(),
+                                action: "navigate".into(),
+                                chrome_tab_id: Some(tab_id.clone()),
+                                url: url.to_owned(),
+                                idempotency_key: None,
+                                active: None,
+                                wait_until: None,
+                                create_background_window: None,
+                                target_window_id: None,
+                                candidate_tab_id: None,
+                                created_at_ms: None,
+                                since_ms: None,
+                                account_marker_selector: None,
+                                account_marker_text: None,
+                            }))
+                            .await?;
+                        if let Some(state) = self
+                            .core
+                            .semantic
+                            .lock()
+                            .await
+                            .get_mut(&super::tab_key(&session_id, &tab_id))
+                        {
+                            super::invalidate_semantic_tab(state);
+                        }
+                        return Ok(Json(json!({
+                            "status":"reused",
+                            "verified":navigation["verified"] == true,
+                            "created":false,
+                            "created_by_controlla":false,
+                            "idempotent_reuse":true,
+                            "reused_existing_target":true,
+                            "same_document_navigation":true,
+                            "tab_id":tab_id,
+                            "url":navigation["url"],
+                            "document_id":navigation["document_id"],
+                            "tab_active":tab["active_for_open"] == true || tab["active"] == true,
+                            "window_focused":window_focused,
+                            "navigation":navigation
+                        })));
+                    }
+                }
+            }
             let cold = args.session_id.is_none();
             let mut reused_target: Option<(String, String, Option<String>)> = None;
             let mut independently_created: Option<Value> = None;
@@ -18408,6 +18741,14 @@ impl AppV3 {
                 let tab = inventory["tabs"].as_array().and_then(|tabs| tabs.iter().find(|tab| tab["id"].as_u64().map(|id| id.to_string()).as_deref() == Some(reused_tab.as_str()))).cloned().unwrap_or(Value::Null);
                 let window_id = tab["window_id"].as_u64();
                 let window_focused = window_id.and_then(|id| inventory["windows"].as_array().and_then(|windows| windows.iter().find(|window| window["id"].as_u64() == Some(id)))).is_some_and(|window| window["focused"] == true);
+                let tab_active = tab["active_for_open"] == true || tab["active"] == true;
+                if mode == crate::v3::BrowserMode::Foreground && source_tab.is_none() {
+                    // The tab already belongs to a live session, and that session
+                    // has no second tab to route an activation command through.
+                    // Report the measured presentation instead of claiming an
+                    // activation that never happened.
+                    activation_verified = window_focused && tab_active;
+                }
                 Ok(Json(json!({
                     "status": if activation_verified { "reused" } else { "incomplete" },
                     "verified": activation_verified,
@@ -18416,16 +18757,15 @@ impl AppV3 {
                     "tab_id": reused_tab,
                     "url": tab["url"].as_str().unwrap_or(url),
                     "document_id": tab["document_id"],
-                    "tab_active": tab["active_for_open"] == true || tab["active"] == true,
+                    "tab_active": tab_active,
                     "window_focused": window_focused,
                     "window_id": window_id,
                     "reused_existing_target": true,
+                    "already_attached": source_tab.is_none(),
                     "reason_code": if activation_verified { Value::Null } else { json!("existing_target_presentation_not_verified") }
                 })))
-            } else { self
-                .core
-                .legacy
-                .shared_tab(Parameters(super::SharedTabArgs {
+            } else {
+                let open_args = super::SharedTabArgs {
                     session_id: session_id.clone(),
                     action: "open".into(),
                     chrome_tab_id: args.chrome_tab_id.clone(),
@@ -18457,8 +18797,34 @@ impl AppV3 {
                     since_ms: None,
                     account_marker_selector: None,
                     account_marker_text: None,
-                }))
-                .await };
+                };
+                // A real site can still be redirecting when its freshly created
+                // tab is first paired, and the identity check then fails on the
+                // race instead of on a real mismatch. This open is idempotent
+                // (same key, same URL, same owned tab), so a bounded re-pair is
+                // safe; every other error surfaces unchanged.
+                let mut attempt = 0u32;
+                loop {
+                    match self
+                        .core
+                        .legacy
+                        .shared_tab(Parameters(open_args.clone()))
+                        .await
+                    {
+                        Ok(result) => break Ok(result),
+                        Err(error) => {
+                            if attempt >= 3 || !error.message.contains("during pairing") {
+                                break Err(error);
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(
+                                500 * u64::from(attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            };
             let Json(mut result) = match opened {
                 Ok(result) => result,
                 Err(error) => {
@@ -19324,7 +19690,7 @@ impl AppV3 {
         let dispatch_started = std::time::Instant::now();
         let operation_timeout =
             if args.action == "type" && args.typing_mode.as_deref() == Some("human_keys") {
-                let delay_ms = args.delay_ms.unwrap_or(180);
+                let delay_ms = args.delay_ms.unwrap_or(280).min(600);
                 let default = crate::v3::human_typing_timeout_ms(
                     args.value.as_deref().unwrap_or_default().chars().count(),
                     delay_ms,
@@ -19345,7 +19711,10 @@ impl AppV3 {
                         if let Some(refusal)=background_pointer_refusal(presentation.as_ref()){return Ok(refusal);}
                         let before=presentation_before.as_ref().unwrap();
                         let Some(current)=presentation.as_ref() else {return Ok(json!({"status":"not_dispatched","action":"swipe","reason_code":"presentation_state_unavailable","dispatch_may_have_occurred":false}));};
-                        if before["activation_epoch"]!=current["activation_epoch"]||before["focus_epoch"]!=current["focus_epoch"]||before["tab_active"]!=current["tab_active"]||before["window_focused"]!=current["window_focused"] {return Ok(json!({"status":"not_dispatched","action":"swipe","reason_code":"presentation_changed_before_dispatch","dispatch_may_have_occurred":false}));}
+                        // A window focus change or tab switch is the user's to make at
+                        // any time and does not move the target inside the viewport.
+                        // Only a resized viewport invalidates grounded coordinates.
+                        if before["viewport"]!=current["viewport"] {return Ok(json!({"status":"not_dispatched","action":"swipe","reason_code":"presentation_changed_before_dispatch","dispatch_may_have_occurred":false}));}
                     }
                     if reference.starts_with("@f:") {
                         return swipe_frame_reference(self,&args).await;
@@ -19354,8 +19723,11 @@ impl AppV3 {
                     self.core.legacy.shared_swipe(super::super::SharedSwipeArgs {
                         session_id:args.session_id.clone(),chrome_tab_id:args.chrome_tab_id.clone(),reference:legacy_reference,
                         start_x:args.start_x.unwrap(),start_y:args.start_y.unwrap(),end_x:args.end_x.unwrap(),end_y:args.end_y.unwrap(),timeout_ms:args.timeout_ms,
-                        expected_activation_epoch:presentation_before.as_ref().and_then(|state|state["activation_epoch"].as_u64()),
-                        expected_focus_epoch:presentation_before.as_ref().and_then(|state|state["focus_epoch"].as_u64()),
+                        // Window focus and tab activation are transient user state:
+                        // a gesture that was grounded inside this document does not
+                        // become invalid because the user looked elsewhere.
+                        expected_activation_epoch: None,
+                        expected_focus_epoch: None,
                         expected_target_revision: None,
                     }).await.map(|Json(value)|value)
                 }
@@ -19368,15 +19740,15 @@ impl AppV3 {
                         if let Some(refusal)=background_pointer_refusal(presentation.as_ref()){return Ok(refusal);}
                         let before=presentation_before.as_ref().unwrap();
                         let Some(current)=presentation.as_ref() else {return Ok(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"presentation_state_unavailable","dispatch_may_have_occurred":false}));};
-                        if before["activation_epoch"]!=current["activation_epoch"]||before["focus_epoch"]!=current["focus_epoch"]||before["tab_active"]!=current["tab_active"]||before["window_focused"]!=current["window_focused"] {return Ok(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"presentation_changed_before_dispatch","dispatch_may_have_occurred":false}));}
+                        if before["viewport"]!=current["viewport"] {return Ok(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"presentation_changed_before_dispatch","dispatch_may_have_occurred":false}));}
                     }
                     let legacy_reference=super::resolve_reference(&self.core,&args.session_id,&args.chrome_tab_id,reference).await?;
                     self.core.legacy.shared_multi_touch(super::super::SharedPinchArgs {
                         session_id:args.session_id.clone(),chrome_tab_id:args.chrome_tab_id.clone(),reference:legacy_reference,
                         center_x:args.center_x.unwrap(),center_y:args.center_y.unwrap(),start_distance:args.start_distance.unwrap(),end_distance:args.end_distance.unwrap(),timeout_ms:args.timeout_ms,
                         outcome: serde_json::from_value(serde_json::to_value(args.outcome.clone().expect("validated multi_touch outcome")).map_err(|e| invalid(e.to_string()))?).map_err(|e| invalid(e.to_string()))?,
-                        expected_activation_epoch:presentation_before.as_ref().and_then(|state|state["activation_epoch"].as_u64()),
-                        expected_focus_epoch:presentation_before.as_ref().and_then(|state|state["focus_epoch"].as_u64()),
+                        expected_activation_epoch: None,
+                        expected_focus_epoch: None,
                         expected_target_revision: None,
                     }).await.map(|Json(value)|value)
                 }
@@ -24577,7 +24949,7 @@ mod v3_batch_delivery_tests {
         fill_form_known_pre_dispatch_failure, fill_form_same_field_conflict,
         find_all_coverage_complete, focus_changed_during_operation,
         guarded_shared_artifact_upload_allowed, has_presentation_epochs,
-        human_keys_control_character, identity_marker_matches, inactive_background_click_receipt,
+        human_keys_control_character, identity_marker_matches,
         lease_target_key, linked_date_frontier, mutation_skill_template,
         native_download_anchor_is_safe, native_download_lifecycle_receipt, next_visual_probe_limit,
         normalize_key_text, normalize_presentation_state, page_navigate_error,
@@ -28904,27 +29276,26 @@ mod v3_batch_delivery_tests {
     }
 
     #[test]
-    fn inactive_background_click_fails_fast_without_claiming_dispatch() {
-        let receipt =
-            inactive_background_click_receipt(&json!({"tab_active":false,"window_focused":false}))
-                .unwrap();
-        assert_eq!(receipt["status"], "not_dispatched");
-        assert_eq!(receipt["reason_code"], "inactive_background_tab");
-        assert_eq!(receipt["dispatch_acknowledged"], false);
+    fn background_pointer_input_ignores_tab_activity_and_window_focus() {
+        // Pointer input reaches an inactive tab and an unfocused window, so
+        // neither state may refuse the action any more.
+        assert!(background_pointer_refusal(None).is_none());
         assert!(
-            inactive_background_click_receipt(&json!({"tab_active":true,"window_focused":true}),)
+            background_pointer_refusal(Some(&json!({"tab_active":false,"window_focused":false})))
                 .is_none()
         );
-        assert!(inactive_background_click_receipt(&Value::Null).is_none());
-        assert_eq!(
-            background_pointer_refusal(None).unwrap()["reason_code"],
-            "background_activity_unavailable"
-        );
-        assert_eq!(
-            background_pointer_refusal(Some(&json!({"window_focused":true}))).unwrap()["reason_code"],
-            "background_activity_unavailable"
-        );
         assert!(background_pointer_refusal(Some(&json!({"tab_active":true}))).is_none());
+        assert!(
+            background_pointer_refusal(Some(&json!({"tab_active":false,"lifecycle":"active"})))
+                .is_none()
+        );
+        // A discarded document cannot accept input at all.
+        let discarded =
+            background_pointer_refusal(Some(&json!({"tab_active":false,"lifecycle":"discarded"})))
+                .unwrap();
+        assert_eq!(discarded["status"], "not_dispatched");
+        assert_eq!(discarded["reason_code"], "background_target_discarded");
+        assert_eq!(discarded["dispatch_acknowledged"], false);
     }
 
     #[test]
@@ -28938,9 +29309,9 @@ mod v3_batch_delivery_tests {
 
         let inactive_raw = json!({"result":{"value":{"tab_active":false,"window_focused":false,"visibility_state":"hidden","lifecycle":"unknown","viewport":{"width":1280,"height":720,"device_scale_factor":2},"activation_epoch":3,"focus_epoch":5}}});
         let inactive = normalize_presentation_state(&inactive_raw).unwrap();
-        assert_eq!(
-            background_pointer_refusal(Some(&inactive)).unwrap()["reason_code"],
-            "inactive_background_tab"
+        assert!(
+            background_pointer_refusal(Some(&inactive)).is_none(),
+            "an inactive tab is still dispatchable background input"
         );
     }
 
@@ -28984,7 +29355,7 @@ mod v3_batch_delivery_tests {
             .expect("the full extension result envelope must normalize too");
         assert_eq!(
             background_pointer_refusal(Some(&normalized)).unwrap()["reason_code"],
-            "inactive_background_tab"
+            "background_target_discarded"
         );
     }
 
@@ -31083,10 +31454,12 @@ mod v3_batch_delivery_tests {
             assert_eq!(typed["status"], "verified", "{mode}: {typed}");
             assert_eq!(typed["readback"], expected, "{mode}: {typed}");
             if mode == "human_keys" {
-                assert_eq!(typed["intentional_delay_ms"], 180, "{typed}");
+                // No explicit delay was requested, so the measured pace is the
+                // default human rate: about 40 WPM, 280 ms per character.
+                assert_eq!(typed["intentional_delay_ms"], 280, "{typed}");
                 assert_eq!(
                     typed["intentional_delay_total_ms"],
-                    text.chars().count() as u64 * 180,
+                    text.chars().count() as u64 * 280,
                     "{typed}"
                 );
             }

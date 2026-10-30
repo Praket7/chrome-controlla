@@ -221,7 +221,7 @@ pub fn select_backend(
 pub fn pace_for(mode: PublicTypingMode, delay_ms: u16) -> InputPace {
     match mode {
         PublicTypingMode::HumanKeys => InputPace::Human {
-            delay_ms: delay_ms.min(250),
+            delay_ms: delay_ms.min(600),
         },
         PublicTypingMode::FastKeys => InputPace::Adaptive {
             min_ms: 0,

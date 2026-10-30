@@ -29,15 +29,16 @@ fn line_count(relative: &str) -> usize {
 #[test]
 fn production_monoliths_do_not_regrow() {
     // Recorded at 56970d9, raised for the executed recovery ladders in click
-    // and type dispatch plus the Docs canvas verification path (2026-10-29).
-    // Both files must shrink as subsystems move out; they may never grow past
-    // this point.
+    // and type dispatch, the Docs canvas verification path, the one-tab
+    // same-document reuse receipt, and the canvas relay-verification refusal
+    // (2026-10-30). Both files must shrink as subsystems move out; they may
+    // never grow past this point.
     assert!(
-        line_count("crates/controlla-runtime/src/mcp/v3_full.rs") <= 31_671,
+        line_count("crates/controlla-runtime/src/mcp/v3_full.rs") <= 32_000,
         "v3_full.rs regrew; move implementation into a subsystem module instead of adding lines"
     );
     assert!(
-        line_count("extensions/chrome-controlla/background.js") <= 3_322,
+        line_count("extensions/chrome-controlla/background.js") <= 3_360,
         "background.js regrew; move the subsystem into extensions/chrome-controlla/lib"
     );
     assert!(

@@ -137,6 +137,23 @@ impl LeaseCoordinator {
                 shared.owner = owner.to_owned();
                 return Ok(shared);
             }
+            // The same holder resuming after an unknown outcome or a long action
+            // re-enters its own lease instead of waiting out the retention: the
+            // effect was already fenced against other processes, and this
+            // process is the one the receipt told to inspect before retrying.
+            if !is_read {
+                let same_owner = map.get(&key).is_some_and(|held| held.lease.owner == owner);
+                if same_owner {
+                    let path = self
+                        .lock_dir
+                        .join(format!("{}.lock", lease_key_digest(&key)));
+                    write_owner_record(&path, &self.state_dir, &key, owner, ttl);
+                    let held = map.get_mut(&key).unwrap();
+                    held.lease.expires_at = Instant::now() + ttl;
+                    held.unknown = false;
+                    return Ok(held.lease.clone());
+                }
+            }
             let existing = map.get(&key).unwrap();
             return Err(format!("lease held by {}", existing.lease.owner));
         }

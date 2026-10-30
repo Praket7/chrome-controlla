@@ -204,6 +204,20 @@ pub fn remove_pairing_request(host_id: &str, request_id: &str) -> Result<(), Str
     }
 }
 
+/// Classify an inventory failure so callers can return a recovery action
+/// instead of blaming the caller's arguments for a bridge that is down.
+///
+/// A stale snapshot means the native host stopped refreshing (a suspended MV3
+/// worker or a wedged host); every other case means the bridge was never
+/// installed or its records are unusable.
+pub fn inventory_error_kind(message: &str) -> &'static str {
+    if message.contains("is stale") {
+        "native_bridge_stale"
+    } else {
+        "native_bridge_unavailable"
+    }
+}
+
 pub fn read_tabs() -> Result<serde_json::Value, String> {
     let path = home()?.join(".chrome-controlla/native-tabs.json");
     let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;

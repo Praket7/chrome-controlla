@@ -81,10 +81,12 @@ impl TypingPolicy {
     pub fn new(mode: TypingMode, delay_ms: Option<u64>) -> Result<Self, &'static str> {
         let delay_ms = match mode {
             TypingMode::Block | TypingMode::FastKeys | TypingMode::Ime => 0,
-            TypingMode::HumanKeys => delay_ms.unwrap_or(180),
+            // 280 ms per character is about 215 characters per minute, close
+            // to the ~40 WPM measured for ordinary adult typists (200 CPM).
+            TypingMode::HumanKeys => delay_ms.unwrap_or(280),
         };
-        if delay_ms > 250 {
-            return Err("typing delay must be <= 250ms");
+        if delay_ms > 600 {
+            return Err("typing delay must be <= 600ms");
         }
         Ok(Self {
             mode,
@@ -222,8 +224,14 @@ impl LeaseTable {
         ttl_ms: u64,
     ) -> Result<TargetLease, TargetLease> {
         self.expire(now_ms);
-        if let Some(existing) = self.leases.get(&target) {
-            return Err(existing.clone());
+        if let Some(existing) = self.leases.get(&target).cloned() {
+            // The same owner re-entering its own target resumes the lease: this
+            // is the recommended path after an unknown outcome, where the holder
+            // inspected state and continues instead of waiting out the TTL.
+            if existing.owner == owner {
+                return self.renew(&target, owner, now_ms, ttl_ms).ok_or(existing);
+            }
+            return Err(existing);
         }
         // A writer must wait for every shared reader to finish. Readers only
         // hold short, observation-scoped leases.

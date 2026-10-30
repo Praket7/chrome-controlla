@@ -43,6 +43,30 @@ mod legacy_mcp {
 
 #[tokio::main]
 async fn main() {
+    // Chrome launches the registered native host with the calling extension
+    // origin as its only argument. This binary is documented as the MCP
+    // endpoint, but a copy of it can end up registered as the native host
+    // (for example after a release swap). Serving the host role here keeps
+    // such a mismatch working instead of leaving Chrome with a process that
+    // never publishes `ready` and silently kills the whole bridge.
+    let mut args = std::env::args().skip(1);
+    if let Some(origin) = args.next()
+        && origin.starts_with("chrome-extension://")
+        && args.next().is_none()
+    {
+        let origin = origin.strip_suffix('/').unwrap_or(&origin);
+        let id = &origin["chrome-extension://".len()..];
+        if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
+            eprintln!("invalid native host origin");
+            std::process::exit(2);
+        }
+        // Already inside the tokio runtime this async main owns.
+        if let Err(error) = controlla_runtime::native_host::run().await {
+            eprintln!("Chrome native host failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = legacy_mcp::run_compact().await {
         eprintln!("Controlla v3 MCP server failed: {error}");
         std::process::exit(1);

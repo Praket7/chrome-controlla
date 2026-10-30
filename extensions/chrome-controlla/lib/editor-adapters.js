@@ -71,6 +71,7 @@ export function chooseInputBackend({ strategy, text, probe }) {
   if (strategy === "native_setter") return { backend: "native_setter", reason: "explicit" };
   if (strategy === "insert_text") return { backend: "insert_text", reason: "explicit" };
   if (strategy === "key_events") return { backend: "key_events", reason: "explicit" };
+  if (strategy === "dom_typing") return { backend: "dom_typing", reason: "explicit" };
   if (strategy === "ime") return { backend: "ime_composition", reason: "explicit" };
   if (strategy === "clipboard_paste") return { backend: "clipboard_paste", reason: "explicit" };
   if (described.masked || described.requiresTrustedEvents) {

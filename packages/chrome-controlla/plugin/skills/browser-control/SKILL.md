@@ -26,9 +26,10 @@ root, scroll container, and rebind itself. `execution_policy` defaults to
 `execution_first`: backend, frame, viewport, and rebind problems resolve inside
 the runtime, not as refusals; `strict` surfaces them. Background is the default;
 semantic click, fill, select, type, press, scroll, snapshots, and trusted keys
-work while the tab is inactive, Chrome is unfocused, or the tab is hidden;
-`foreground` asks to show Chrome. Reuse the opaque `context` instead of copying
-IDs. Success is compact: `status`, `context`, `result`, `verified`, `trace_id`.
+work while the tab is inactive or Chrome is unfocused; `foreground` asks to show
+Chrome. Reuse the opaque `context` instead of copying IDs. `open` reuses a tab the
+session already holds, including another view of the same document. Success is
+compact: `status`, `context`, `result`, `verified`, `trace_id`.
 
 - `not_dispatched` + `automatic_recovery`: the internal route is chosen; do not
   re-derive one.
@@ -65,7 +66,10 @@ attach control. Pass a typed `outcome`; an acknowledgement is not success.
 
 Omit `typing_mode`; Controlla selects block insertion, fast keys, IME, or an
 editor adapter from observed characteristics. Entry is one
-`typeTextTransaction`; use `human_keys` only for human-paced input.
+`typeTextTransaction`; use `human_keys` only for human-paced input. A canvas
+editor (Google Docs, Sheets) paints text only while its tab is visible, so it
+needs a visible tab in an unfocused background window, never a hidden tab; a
+hidden tab reports `dispatched_unverified`, not `verified`.
 
 ## Safety
 

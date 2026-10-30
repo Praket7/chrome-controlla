@@ -134,7 +134,7 @@ struct SharedInputArgs {
     postcondition: Option<String>,
     timeout_ms: Option<u64>,
 }
-#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("allOf" = [{"if":{"properties":{"action":{"const":"open"}},"required":["action"]},"then":{"required":["idempotency_key"]}}]))]
 struct SharedTabArgs {
@@ -1759,6 +1759,38 @@ impl App {
 
     pub(crate) fn principal(&self) -> &str {
         &self.principal
+    }
+
+    /// The live shared session, owned by this server, that already holds
+    /// `tab_id`. `browser action=open` consults this before pairing so a repeat
+    /// open of a URL connects to the session that owns the tab instead of asking
+    /// Chrome to lease the same tab into a second session, which Chrome refuses.
+    #[allow(dead_code)] // Used by V3 open reuse in the CLI binary.
+    pub(crate) async fn owned_shared_session_for_target(&self, tab_id: &str) -> Option<String> {
+        let sessions: Vec<(String, Arc<Mutex<SharedLiveSession>>)> = self
+            .shared_sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect();
+        for (id, session) in sessions {
+            let session = session.lock().await;
+            if session.handle.principal != self.principal.as_ref() {
+                continue;
+            }
+            let Some(connection) = session.connection.as_ref() else {
+                continue;
+            };
+            if connection
+                .selected_targets()
+                .iter()
+                .any(|target| target == tab_id)
+            {
+                return Some(id);
+            }
+        }
+        None
     }
 
     fn owns_session(&self, session: &LiveSession) -> bool {
@@ -6212,7 +6244,7 @@ impl App {
     }
     #[tool(
         name = "shared_tab",
-        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `open` uses a requested source tab, or the sole attached tab; several attached tabs require an explicit chrome_tab_id. The compact `route_selection` records the selected source and each rejected candidate before dispatch. If no candidate is usable, the error includes the same bounded report so recovery does not require an opaque retry. `adopt_popup` requires the click-start time and candidate creation time returned by the opener-bound tab evidence, plus a CSS scope and exact account-marker text. It reports visible UI evidence only and does not establish authentication."
+        description = "Open or navigate a tab in the shared extension session, or adopt a recent popup only when its exact Chrome opener, creation timestamp, candidate ID, URL, and a fresh visible account marker all match. `open` uses a requested source tab, or the sole attached tab; several attached tabs need an explicit chrome_tab_id. The compact `route_selection` records the selected source and each rejected candidate before dispatch; if none is usable, the error carries the same bounded report. `adopt_popup` also needs the click-start and candidate creation times from the opener-bound evidence. This is visible UI evidence only, not authentication."
     )]
     async fn shared_tab(
         &self,

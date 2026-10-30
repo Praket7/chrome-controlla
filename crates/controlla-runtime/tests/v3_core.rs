@@ -47,19 +47,19 @@ fn fast_keys_have_zero_intentional_delay_and_human_keys_are_bounded() {
         TypingPolicy::new(TypingMode::HumanKeys, None)
             .unwrap()
             .delay_ms,
-        180
+        280
     );
     // 90 ms of bridge round trip per character plus a 15 s setup reserve, so a
     // long human-paced transaction is not cut off mid-text.
     assert_eq!(
-        controlla_runtime::v3::human_typing_timeout_ms(280, 180),
-        90_600
+        controlla_runtime::v3::human_typing_timeout_ms(280, 280),
+        118_600
     );
     assert_eq!(
         controlla_runtime::v3::human_typing_timeout_ms(10_000, 250),
         900_000
     );
-    assert!(TypingPolicy::new(TypingMode::HumanKeys, Some(251)).is_err());
+    assert!(TypingPolicy::new(TypingMode::HumanKeys, Some(601)).is_err());
     assert_eq!(
         TypingPolicy::choose("hello", false, false).mode,
         TypingMode::Block
@@ -91,7 +91,7 @@ fn interaction_epoch_rejects_document_focus_selection_and_viewport_drift() {
 }
 
 #[test]
-fn target_leases_serialize_same_tab_without_blocking_other_tabs() {
+fn target_leases_admit_one_owner_per_tab_without_blocking_other_tabs() {
     let mut leases = LeaseTable::default();
     let tab_a = TargetKey {
         browser_id: "chrome".into(),
@@ -101,9 +101,19 @@ fn target_leases_serialize_same_tab_without_blocking_other_tabs() {
         browser_id: "chrome".into(),
         tab_id: "2".into(),
     };
-    assert!(leases.acquire(tab_a.clone(), "codex", 100, 1_000).is_ok());
-    assert!(leases.acquire(tab_a.clone(), "codex", 100, 1_000).is_err());
-    assert!(leases.acquire(tab_a.clone(), "claude", 101, 1_000).is_err());
+    let first = leases
+        .acquire(tab_a.clone(), "codex", 100, 1_000)
+        .expect("the first owner is admitted");
+    // Re-entering the target as the same owner resumes its own lease, which is
+    // how a holder continues after inspecting an unknown outcome. It must not
+    // age the lease out or hand the target to a second holder.
+    let resumed = leases
+        .acquire(tab_a.clone(), "codex", 150, 1_000)
+        .expect("the owning client resumes its own lease");
+    assert_eq!(resumed.owner, first.owner);
+    assert_eq!(resumed.acquired_at_ms, first.acquired_at_ms);
+    assert!(resumed.expires_at_ms > first.expires_at_ms);
+    assert!(leases.acquire(tab_a.clone(), "claude", 151, 1_000).is_err());
     assert!(leases.acquire(tab_b.clone(), "claude", 101, 1_000).is_ok());
     assert_eq!(leases.owner(&tab_a, 200).as_deref(), Some("codex"));
     assert!(leases.release(&tab_a, "codex"));
