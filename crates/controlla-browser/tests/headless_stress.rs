@@ -157,13 +157,17 @@ async fn repeated_headless_launch_evaluate_and_cleanup_never_reuses_profile_stat
                         if error.to_string().contains("FrameChanged")
                             || error
                                 .to_string()
-                                .contains("AX selector matched no DOM node") =>
+                                .contains("AX selector matched no DOM node")
+                            || error
+                                .to_string()
+                                .contains("Could not find node with given id") =>
                     {
                         readiness = error.to_string();
                         // Chrome can commit the root frame before its first
-                        // document nodes are queryable. This is a read-only
-                        // readiness miss, so reacquire and retry within the
-                        // enclosing five-second startup bound.
+                        // document nodes are queryable, and it can replace the
+                        // node between DOM.querySelector and the AX read. Both
+                        // are read-only readiness misses, so reacquire and
+                        // retry within the enclosing five-second startup bound.
                         tokio::task::yield_now().await;
                     }
                     Err(error) => panic!("headless run {run} observation failed: {error}"),
