@@ -4,12 +4,14 @@ pub mod v3_execution;
 pub use controlla_runtime::{
     action_recovery, apps, artifacts, browser_contract, browser_workflow, cache, canva, capability,
     capability_registry, capability_router, capcut_recipe, compact_catalog, desktop_fallback,
-    desktop_platform, doctor, document_text, evidence_store, execution_cost_router, guard_reason,
-    http_auth, http_server, jobs, metrics, native_host, native_setup, observation_router,
-    page_action_memory, process_lease, recovery_exec, reference_reacquire, relevance,
-    runtime_observer, semantic_state, site_profiles, skill_induction, skill_runtime, skill_store,
-    skills, slides_deck, target_registry, task_checkpoints, task_program, v3, v3_runtime, v3_tasks,
-    verifier, visual_probe, visual_stability, widget_adapters, workflow, workflow_dag, workflow_vm,
+    desktop_platform, doctor, document_text, evidence_store, execution_cost_router, execution_plan,
+    guard_reason, http_auth, http_server, jobs, metrics, native_host, native_setup,
+    observation_router, page_action_memory, process_lease, progressive_observation, recovery_exec,
+    reference_reacquire, reference_rebase, relevance, runtime_observer, semantic_state,
+    site_profiles, skill_induction, skill_runtime, skill_store, skills, slides_deck,
+    target_registry, task_checkpoints, task_observation, task_program, text_conflict, v3,
+    v3_runtime, v3_tasks, verifier, visual_probe, visual_stability, widget_adapters, workflow,
+    workflow_dag, workflow_vm,
 };
 
 #[allow(dead_code, clippy::unnecessary_sort_by)]

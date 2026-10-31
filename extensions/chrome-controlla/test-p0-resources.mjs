@@ -9,8 +9,10 @@ import {
   presentationProof, presentationSatisfies,
 } from "./lib/presentation-slots.js";
 import { logicalResourceKey, sameLogicalResource, isSameResourceView } from "./lib/resource-keys.js";
+import { commandNeedsPageFocus, createFocusEmulation } from "./lib/focus-emulation.js";
 import {
   indexOwnedResources, selectReuse, usableRecord, openTelemetry, aliasReceipt,
+  planPoolEviction, DEFAULT_OWNED_TAB_POOL_LIMIT,
   ReuseKind, TabDurability,
 } from "./lib/owned-resources.js";
 
@@ -178,6 +180,51 @@ test("reuse priority is exact document, then same resource, then an idle ephemer
   assert.equal(allLeased, null, "a leased tab is never selected even for an exact document");
 });
 
+test("the owned-tab pool evicts only safe, idle, ephemeral tabs", () => {
+  const receipts = Object.fromEntries(Array.from({ length: 3 }, (_, index) => [
+    `pool-${index}`,
+    receipt({
+      tab_id: String(30 + index), window_id: 900 + index,
+      url: `https://example.test/pool/${index}`, document_id: `doc-${index}`,
+      created_ms: 1_000 + index, last_used_ms: 1_000 + index,
+      durability: TabDurability.EPHEMERAL,
+    }),
+  ]));
+  const index = indexOwnedResources(receipts);
+  const within = planPoolEviction(index, { limit: 4, now: 500_000 });
+  assert.equal(within.within_limit, true);
+  assert.deepEqual(within.evict, []);
+
+  const evicted = planPoolEviction(index, { limit: 2, now: 500_000 });
+  assert.equal(evicted.blocked, false);
+  assert.equal(evicted.needed, 2);
+  assert.deepEqual(evicted.evict.map(record => record.tab_id), [30, 31],
+    "the oldest idle ephemeral tabs are evicted first");
+
+  const leased = planPoolEviction(index, { limit: 2, now: 500_000, isLeased: tabId => tabId === 30 });
+  assert.deepEqual(leased.evict.map(record => record.tab_id), [31, 32],
+    "a leased tab is never evicted");
+
+  const protectedTabs = planPoolEviction(index, { limit: 2, now: 500_000, isTabProtected: tabId => tabId <= 31 });
+  assert.equal(protectedTabs.blocked, true, "refuse the open when no safe victim exists");
+  assert.equal(protectedTabs.reason, "no_safe_eviction_candidate");
+
+  const fresh = planPoolEviction(index, { limit: 2, now: 500_000, minIdleMs: 600_000 });
+  assert.equal(fresh.blocked, true, "a recently used tab is not evicted during its grace window");
+
+  const durable = indexOwnedResources({
+    session: receipt({ tab_id: "40", window_id: 940, durability: TabDurability.SESSION, last_used_ms: 0 }),
+    "ephemeral-a": receipt({ tab_id: "41", window_id: 941, last_used_ms: 0 }),
+  });
+  const onlyEphemeral = planPoolEviction(durable, { limit: 1, now: 500_000 });
+  assert.deepEqual(onlyEphemeral.evict.map(record => record.tab_id), [41],
+    "session-durability tabs survive pool eviction");
+
+  const capped = planPoolEviction(index, { limit: 2, now: 500_000, keepTabIds: [30] });
+  assert.equal(capped.evict.some(record => record.tab_id === 30), false);
+  assert.equal(DEFAULT_OWNED_TAB_POOL_LIMIT >= 1, true);
+});
+
 test("current-call telemetry distinguishes a created tab from a reused one", () => {
   const created = openTelemetry({ created: true, windowCreated: true });
   assert.deepEqual(created, {
@@ -238,4 +285,34 @@ test("window presentations are per-window, not per-browser", async () => {
   assert.equal(a.granted && b.granted, true, "two windows can each present one tab");
   assert.equal(slots.owner(900).tab_id, 1);
   assert.equal(slots.owner(901).tab_id, 2);
+});
+
+test("focus emulation is lazy, page-only, and restored on detach", async () => {
+  assert.equal(commandNeedsPageFocus("DOM.getDocument"), false);
+  assert.equal(commandNeedsPageFocus("DOM.setFileInputFiles"), false);
+  assert.equal(commandNeedsPageFocus("Runtime.evaluate"), true);
+  assert.equal(commandNeedsPageFocus("Input.dispatchMouseEvent"), true);
+  assert.equal(commandNeedsPageFocus("Controlla.pointerClick"), true);
+  const commands = [];
+  const previous = globalThis.chrome;
+  globalThis.chrome = { debugger: { sendCommand: async (target, method, params) => {
+    commands.push({ target, method, params });
+  } } };
+  try {
+    const emulation = createFocusEmulation();
+    assert.equal(emulation.has(7), false);
+    assert.equal(await emulation.ensure(7), true);
+    assert.equal(emulation.has(7), true);
+    assert.equal(commands.length, 1);
+    assert.deepEqual(commands[0].params, { enabled: true });
+    await emulation.ensure(7);
+    assert.equal(commands.length, 1, "an already-emulated tab does not repeat the handshake");
+    await emulation.disable(7);
+    assert.equal(emulation.has(7), false);
+    assert.deepEqual(commands.at(-1).params, { enabled: false });
+    await emulation.disable(7);
+    assert.equal(commands.length, 2, "detach does not disable emulation twice");
+  } finally {
+    globalThis.chrome = previous;
+  }
 });

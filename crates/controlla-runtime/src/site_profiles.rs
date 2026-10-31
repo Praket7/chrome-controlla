@@ -7,6 +7,14 @@ use std::path::PathBuf;
 pub const MAX_PROFILES: usize = 256;
 pub const MAX_PROFILE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlPromotionSource {
+    #[default]
+    QueryParameter,
+    PathSegment,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteProfile {
@@ -16,6 +24,10 @@ pub struct SiteProfile {
     #[serde(default)]
     pub semantic_query: String,
     pub url_template: String,
+    #[serde(default)]
+    pub slot_name: String,
+    #[serde(default)]
+    pub promotion_source: UrlPromotionSource,
     pub result_schema: Value,
     pub structural_signature: String,
     pub qualified_at_ms: u64,
@@ -72,6 +84,9 @@ impl SiteProfileStore {
             || profile.intent.len() > 256
             || profile.semantic_query.trim().is_empty()
             || profile.semantic_query.len() > 512
+            || (!profile.slot_name.is_empty()
+                && (!valid_slot_name(&profile.slot_name)
+                    || !profile.url_template.contains("{query}")))
             || profile.url_template.len() > 2048
             || !profile.url_template.starts_with("https://")
             || url::Url::parse(&profile.origin).is_err()
@@ -161,13 +176,23 @@ impl SiteProfileStore {
         structural_signature: &str,
         now_ms: u64,
     ) -> Result<Option<SiteProfile>, &'static str> {
-        let query_key_is_operation: &[&str] = match intent {
-            "search" => &["q", "query", "search", "term"],
-            "filter" => &["filter", "category", "date"],
-            "sort" => &["sort", "order", "direction"],
-            "paginate" => &["page", "offset", "cursor"],
-            _ => return Ok(None),
-        };
+        if structural_signature.is_empty() || structural_signature.len() > 256 {
+            return Ok(None);
+        }
+        self.promote_verified_url(intent, url, structural_signature, now_ms)
+    }
+
+    /// WALT-style URL promotion: learn either a single operation query slot or
+    /// one operation path slot from distinct verified examples. The persisted
+    /// profile contains a `{query}` template and a slot name, never training
+    /// text. Ambiguous URLs stay unlearned.
+    pub fn promote_verified_url(
+        &mut self,
+        intent: &str,
+        url: &str,
+        structural_signature: &str,
+        now_ms: u64,
+    ) -> Result<Option<SiteProfile>, &'static str> {
         if structural_signature.is_empty() || structural_signature.len() > 256 {
             return Ok(None);
         }
@@ -179,27 +204,17 @@ impl SiteProfileStore {
         {
             return Ok(None);
         }
-        let pairs = parsed.query_pairs().collect::<Vec<_>>();
-        if pairs.len() != 1 {
+        let Some(promotion) = promotion_candidate(&parsed, intent) else {
             return Ok(None);
-        }
-        let (key, value) = (&pairs[0].0, &pairs[0].1);
-        if !query_key_is_operation.contains(&key.to_ascii_lowercase().as_str())
-            || value.trim().is_empty()
-            || value.len() > 512
-        {
-            return Ok(None);
-        }
+        };
         let origin = parsed.origin().ascii_serialization();
-        let path = parsed.path();
-        if path.len() > 512 {
-            return Ok(None);
-        }
-        let template = format!("{origin}{path}?{key}={{query}}");
-        if !self.training.contains_key(&format!(
-            "{origin}|{intent}|{structural_signature}|{template}"
-        )) && self.training.len() >= MAX_PROFILES
-        {
+        let template = promotion.template;
+        let value = promotion.sample;
+        let cohort_key = format!(
+            "{origin}|{intent}|{structural_signature}|{template}|{:?}|{}",
+            promotion.source, promotion.slot_name
+        );
+        if !self.training.contains_key(&cohort_key) && self.training.len() >= MAX_PROFILES {
             return Ok(None);
         }
         let mut signature = sha2::Sha256::new();
@@ -210,7 +225,6 @@ impl SiteProfileStore {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let cohort_key = format!("{origin}|{intent}|{structural_signature}|{template}");
         let samples = self.training.entry(cohort_key.clone()).or_default();
         if samples.len() < 3 {
             samples.insert(input_hash);
@@ -232,8 +246,10 @@ impl SiteProfileStore {
             id,
             origin,
             intent: intent.to_owned(),
-            semantic_query: "search".into(),
+            semantic_query: promotion.slot_name.clone(),
             url_template: template,
+            slot_name: promotion.slot_name.clone(),
+            promotion_source: promotion.source,
             result_schema: serde_json::json!({"type":"object"}),
             structural_signature: structural_signature.to_owned(),
             qualified_at_ms: now_ms,
@@ -251,10 +267,13 @@ impl SiteProfileStore {
             if query.trim().is_empty() || query.len() > 512 {
                 return None;
             }
-            profile.url_template.replace(
-                "{query}",
-                &url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>(),
-            )
+            let encoded = match profile.promotion_source {
+                UrlPromotionSource::PathSegment => encode_path_segment(query),
+                UrlPromotionSource::QueryParameter => {
+                    url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+                }
+            };
+            profile.url_template.replace("{query}", &encoded)
         } else {
             profile.url_template.clone()
         };
@@ -323,6 +342,96 @@ impl SiteProfileStore {
     }
 }
 
+struct PromotionCandidate {
+    template: String,
+    sample: String,
+    slot_name: String,
+    source: UrlPromotionSource,
+}
+
+fn promotion_candidate(parsed: &url::Url, intent: &str) -> Option<PromotionCandidate> {
+    let query_keys: &[&str] = match intent {
+        "search" => &["q", "query", "search", "term"],
+        "filter" => &["filter", "category", "date"],
+        "sort" => &["sort", "order", "direction"],
+        "paginate" => &["page", "offset", "cursor"],
+        _ => return None,
+    };
+    let path_parents: &[&str] = match intent {
+        "search" => &["search", "find", "query", "lookup"],
+        "filter" => &["filter", "filters", "category", "categories", "tag", "tags"],
+        "sort" => &["sort", "order", "sorted"],
+        "paginate" => &["page", "pages", "p"],
+        _ => return None,
+    };
+    let origin = parsed.origin().ascii_serialization();
+    let pairs = parsed.query_pairs().collect::<Vec<_>>();
+    if !pairs.is_empty() {
+        if pairs.len() != 1 {
+            return None;
+        }
+        let (key, value) = (&pairs[0].0, &pairs[0].1);
+        if !query_keys.contains(&key.to_ascii_lowercase().as_str())
+            || value.trim().is_empty()
+            || value.len() > 512
+        {
+            return None;
+        }
+        let path = parsed.path();
+        if path.len() > 512 {
+            return None;
+        }
+        return Some(PromotionCandidate {
+            template: format!("{origin}{path}?{key}={{query}}"),
+            sample: value.to_string(),
+            slot_name: key.to_ascii_lowercase(),
+            source: UrlPromotionSource::QueryParameter,
+        });
+    }
+    if parsed.query().is_some() {
+        return None;
+    }
+    let path = parsed.path();
+    if path.len() > 512 || path.ends_with('/') {
+        return None;
+    }
+    let (prefix, last) = path.rsplit_once('/')?;
+    if last.is_empty() || last.len() > 512 {
+        return None;
+    }
+    let parent = prefix.rsplit('/').next()?.to_ascii_lowercase();
+    if !path_parents.contains(&parent.as_str()) {
+        return None;
+    }
+    if last.bytes().all(|byte| byte.is_ascii_digit()) {
+        if intent != "paginate" || last.parse::<u32>().ok().is_none_or(|page| page == 0) {
+            return None;
+        }
+    } else if intent == "paginate" {
+        return None;
+    }
+    Some(PromotionCandidate {
+        template: format!("{origin}{prefix}/{{query}}"),
+        sample: last.to_owned(),
+        slot_name: "query".into(),
+        source: UrlPromotionSource::PathSegment,
+    })
+}
+
+fn encode_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
+}
+
+fn valid_slot_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 pub fn schema_matches(value: &Value, schema: &Value) -> bool {
     let type_ok = match schema["type"].as_str() {
         Some("object") => value.is_object(),
@@ -370,8 +479,10 @@ mod tests {
             id: "search".into(),
             origin: "https://example.test".into(),
             intent: "latest".into(),
-            semantic_query: "Bills story".into(),
+            semantic_query: "q".into(),
             url_template: "https://example.test/search?q={query}".into(),
+            slot_name: "q".into(),
+            promotion_source: UrlPromotionSource::QueryParameter,
             result_schema: json!({"type":"object"}),
             structural_signature: "s1".into(),
             qualified_at_ms: 100,
@@ -552,6 +663,87 @@ mod tests {
                 store
                     .candidate_for_intent("https://example.test", intent, 101)
                     .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn path_segment_operation_urls_are_promoted_without_training_text() {
+        let mut store = SiteProfileStore::default();
+        for query in ["alpha", "bravo", "charlie"] {
+            let url = format!("https://example.test/search/{query}");
+            let _ = store
+                .promote_verified_url("search", &url, "structure-v2", 100)
+                .unwrap();
+        }
+        let profile = store
+            .candidate_for_intent("https://example.test", "search", 101)
+            .unwrap();
+        assert_eq!(profile.promotion_source, UrlPromotionSource::PathSegment);
+        assert_eq!(profile.url_template, "https://example.test/search/{query}");
+        assert_eq!(profile.slot_name, "query");
+        assert!(!profile.url_template.contains("alpha"));
+        assert_eq!(
+            SiteProfileStore::instantiate(profile, "Bills & scores"),
+            Some("https://example.test/search/Bills%20%26%20scores".into())
+        );
+        assert_eq!(
+            SiteProfileStore::instantiate(profile, "a/b?c#d"),
+            Some("https://example.test/search/a%2Fb%3Fc%23d".into())
+        );
+    }
+
+    #[test]
+    fn path_promotion_rejects_entity_paths_and_non_paginated_numbers() {
+        let mut store = SiteProfileStore::default();
+        for query in ["alpha", "bravo", "charlie"] {
+            assert!(
+                store
+                    .promote_verified_url(
+                        "search",
+                        &format!("https://example.test/articles/{query}"),
+                        "s",
+                        100,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .candidate_for_intent("https://example.test", "search", 101)
+                .is_none()
+        );
+        let mut store = SiteProfileStore::default();
+        for page in ["2", "3", "4"] {
+            let _ = store
+                .promote_verified_url(
+                    "paginate",
+                    &format!("https://example.test/articles/page/{page}"),
+                    "s",
+                    100,
+                )
+                .unwrap();
+        }
+        let profile = store
+            .candidate_for_intent("https://example.test", "paginate", 101)
+            .unwrap();
+        assert_eq!(
+            profile.url_template,
+            "https://example.test/articles/page/{query}"
+        );
+        let mut store = SiteProfileStore::default();
+        for page in ["2", "3", "4"] {
+            assert!(
+                store
+                    .promote_verified_url(
+                        "search",
+                        &format!("https://example.test/articles/{page}"),
+                        "s",
+                        100,
+                    )
+                    .unwrap()
+                    .is_none()
             );
         }
     }

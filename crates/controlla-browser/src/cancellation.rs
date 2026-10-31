@@ -150,6 +150,7 @@ mod tests {
                 "Controlla.pointerMultiTouch",
                 "Controlla.frameScroll",
                 "Controlla.frameSwipe",
+                "Controlla.frameMultiTouch",
                 "Controlla.scrollToTarget",
                 "Controlla.futureMutation",
             ] {

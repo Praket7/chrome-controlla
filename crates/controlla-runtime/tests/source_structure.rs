@@ -47,6 +47,10 @@ fn production_monoliths_do_not_regrow() {
         line_count("crates/controlla-runtime/src/task_program.rs") <= 900,
         "the shared task program must stay a bounded representation, not a second runtime"
     );
+    assert!(
+        line_count("crates/controlla-runtime/src/execution_plan.rs") <= 1_400,
+        "the shared execution plan must stay an envelope, not a second executor"
+    );
 }
 
 #[test]
@@ -68,6 +72,14 @@ fn one_module_owns_each_cross_cutting_contract() {
             "crates/controlla-runtime/src/browser_contract.rs",
             "pub struct ExecutionPolicy",
         ),
+        (
+            "crates/controlla-runtime/src/execution_plan.rs",
+            "pub struct ExecutionPlan",
+        ),
+        (
+            "crates/controlla-runtime/src/execution_plan.rs",
+            "pub struct OperationContract",
+        ),
     ];
     for (owner, declaration) in owners {
         assert!(
@@ -86,6 +98,8 @@ fn one_module_owns_each_cross_cutting_contract() {
             "pub enum GuardReason",
             "pub enum RecoveryClass",
             "pub enum TaskStepKind",
+            "pub struct ExecutionPlan",
+            "pub struct OperationContract",
         ] {
             assert!(
                 !source.contains(declaration),

@@ -1328,6 +1328,26 @@ mod tests {
                 include_bytes!("../../../extensions/chrome-controlla/lib/tab-control.js"),
             ),
             (
+                "lib/focus-emulation.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/focus-emulation.js"),
+            ),
+            (
+                "lib/owned-pool.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/owned-pool.js"),
+            ),
+            (
+                "lib/execution-counters.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/execution-counters.js"),
+            ),
+            (
+                "lib/navigation-url.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/navigation-url.js"),
+            ),
+            (
+                "lib/frame-multitouch.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/frame-multitouch.js"),
+            ),
+            (
                 "lib/owned-open.js",
                 include_bytes!("../../../extensions/chrome-controlla/lib/owned-open.js"),
             ),

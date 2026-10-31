@@ -82,16 +82,23 @@ impl RebindOutcome {
             Self::Rebound(candidate) => serde_json::json!({
                 "status": "rebound",
                 "reference": candidate.reference,
+                "rebase_class": "rebound",
+                "safe_for_mutation": true,
+                "evidence": ["unique_high_confidence_identity"],
                 "confidence": "high",
                 "attempts": 1
             }),
             Self::Invalidated(boundary) => serde_json::json!({
                 "status": "invalidated",
+                "rebase_class": "document_replaced",
+                "safe_for_mutation": false,
                 "boundary": boundary.as_str(),
                 "attempts": 0
             }),
             Self::Ambiguous(error) => serde_json::json!({
                 "status": "ambiguous",
+                "rebase_class": "ambiguous",
+                "safe_for_mutation": false,
                 "reason": error.to_string(),
                 "attempts": 1
             }),

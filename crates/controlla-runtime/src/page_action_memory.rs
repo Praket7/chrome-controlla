@@ -7,6 +7,26 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub const MAX_ACTION_MEMORY_ENTRIES: usize = 512;
 pub const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const MAX_OPERATION_STEPS: usize = 24;
+pub const MIN_OPERATION_PROMOTIONS: u8 = 2;
+const OPERATION_ACTIONS: &[&str] = &[
+    "navigate",
+    "click",
+    "double_click",
+    "fill",
+    "type",
+    "press",
+    "select",
+    "scroll",
+    "scroll_to",
+    "hover",
+    "extract",
+    "verify_visible",
+    "upload",
+    "download",
+    "save_draft",
+    "wait_for",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayStatus {
@@ -45,6 +65,44 @@ pub enum VerifyPredicate {
     AppState { adapter: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationEffect {
+    #[default]
+    ReadOnly,
+    Mutating,
+}
+
+/// One verified state transition inside a learned operation. Target identity is
+/// structural only; user-entered values stay in their value slots and never in
+/// memory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationStep {
+    pub action: String,
+    #[serde(default)]
+    pub target: Option<TargetTemplate>,
+    #[serde(default)]
+    pub postcondition: Option<VerifyPredicate>,
+    #[serde(default)]
+    pub value_slot: Option<String>,
+}
+
+/// A bounded multi-step operation promoted only after repeated independent
+/// verification. It is an execution hint: callers must still re-resolve live
+/// targets and re-check every stored postcondition before dispatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationPlan {
+    pub steps: Vec<OperationStep>,
+    #[serde(default)]
+    pub effect: OperationEffect,
+    #[serde(default)]
+    pub successes: u8,
+    #[serde(default)]
+    pub promoted: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReplayPlan {
@@ -54,6 +112,19 @@ pub enum ReplayPlan {
     Click {
         target: TargetTemplate,
         outcome: VerifyPredicate,
+    },
+    /// A verified click whose outcome was only checked by the live action
+    /// receipt. It is a target hint, not an independently replayable outcome.
+    ClickHint {
+        target: TargetTemplate,
+    },
+    FillHint {
+        target: TargetTemplate,
+        value_slot: String,
+    },
+    SelectHint {
+        target: TargetTemplate,
+        value_slot: String,
     },
     Fill {
         target: TargetTemplate,
@@ -113,6 +184,7 @@ mod tests {
             replay: Some(ReplayPlan::Extract {
                 selector: selector.into(),
             }),
+            operation: None,
             preconditions: None,
             repair: None,
             last_verified_ms: 100,
@@ -144,6 +216,7 @@ mod tests {
                 action: "fill".into(),
                 expected_postcondition: json!({"kind":"filled","value":"super-secret"}),
                 replay: None,
+                operation: None,
                 preconditions: None,
                 repair: None,
                 last_verified_ms: 100,
@@ -187,6 +260,7 @@ mod tests {
             action: "fill".into(),
             expected_postcondition: json!({"kind":"text_present"}),
             replay: Some(plan.clone()),
+            operation: None,
             preconditions: Some(json!({"form":"signup","step":1})),
             repair: None,
             last_verified_ms: 100,
@@ -210,6 +284,7 @@ mod tests {
                     pattern: "https://example.test/".into(),
                 },
             }),
+            operation: None,
             preconditions: None,
             repair: None,
             last_verified_ms: 100,
@@ -243,6 +318,7 @@ mod tests {
                         text: "Saved".into(),
                     },
                 }),
+                operation: None,
                 preconditions: None,
                 repair: None,
                 last_verified_ms: 100,
@@ -283,6 +359,100 @@ mod tests {
         ));
     }
 
+    fn operation_plan() -> super::OperationPlan {
+        super::OperationPlan {
+            steps: vec![
+                super::OperationStep {
+                    action: "navigate".into(),
+                    target: None,
+                    postcondition: None,
+                    value_slot: None,
+                },
+                super::OperationStep {
+                    action: "fill".into(),
+                    target: Some(super::TargetTemplate {
+                        role: Some("textbox".into()),
+                        name: Some("Search".into()),
+                        href: None,
+                        ancestor: None,
+                        test_id: None,
+                    }),
+                    postcondition: None,
+                    value_slot: Some("value_1".into()),
+                },
+                super::OperationStep {
+                    action: "click".into(),
+                    target: Some(super::TargetTemplate {
+                        role: Some("button".into()),
+                        name: Some("Search".into()),
+                        href: None,
+                        ancestor: None,
+                        test_id: None,
+                    }),
+                    postcondition: Some(super::VerifyPredicate::TextPresent {
+                        text: "Results".into(),
+                    }),
+                    value_slot: None,
+                },
+            ],
+            effect: super::OperationEffect::ReadOnly,
+            successes: 1,
+            promoted: false,
+        }
+    }
+
+    #[test]
+    fn operation_memory_promotes_only_after_two_independent_verified_passes() {
+        let key = key();
+        let mut memory = ActionMemory::default();
+        assert!(memory.record_operation(key.clone(), operation_plan(), Verification::Passed));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(memory.lookup_operation(&key, now).is_none());
+        assert_eq!(
+            memory.replay_status(&key, now),
+            super::ReplayStatus::Disabled
+        );
+        assert!(memory.record_operation(key.clone(), operation_plan(), Verification::Passed));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let promoted = memory.lookup_operation(&key, now).unwrap();
+        let plan = promoted.operation.as_ref().unwrap();
+        assert!(plan.promoted);
+        assert_eq!(plan.successes, 2);
+        assert_eq!(memory.replay_status(&key, now), super::ReplayStatus::Hit);
+        assert!(memory.has_promoted_operation("https://example.test", "research:abc", now));
+        assert!(!memory.has_promoted_operation("https://other.test", "research:abc", now));
+        assert!(
+            memory
+                .lookup_operation(&key, now + super::MAX_AGE_MS + 1)
+                .is_none()
+        );
+        assert!(!memory.record_operation(key.clone(), operation_plan(), Verification::Failed));
+        assert!(memory.lookup(&key, now).is_none());
+    }
+
+    #[test]
+    fn operation_memory_rejects_raw_values_and_unbounded_step_shapes() {
+        let key = key();
+        let mut memory = ActionMemory::default();
+        let mut secret_slot = operation_plan();
+        secret_slot.steps[1].value_slot = Some("person@example.test".into());
+        assert!(!memory.record_operation(key.clone(), secret_slot, Verification::Passed));
+        let mut unknown_action = operation_plan();
+        unknown_action.steps[0].action = "password".into();
+        assert!(!memory.record_operation(key.clone(), unknown_action, Verification::Passed));
+        let mut oversized = operation_plan();
+        oversized.steps = (0..super::MAX_OPERATION_STEPS + 1)
+            .map(|_| oversized.steps[0].clone())
+            .collect();
+        assert!(!memory.record_operation(key, oversized, Verification::Passed));
+    }
+
     #[test]
     fn secret_bearing_preconditions_are_rejected() {
         let mut memory = ActionMemory::default();
@@ -294,6 +464,7 @@ mod tests {
                 action: "fill".into(),
                 expected_postcondition: json!({"kind":"filled"}),
                 replay: None,
+                operation: None,
                 preconditions: Some(json!({"password":"hunter2"})),
                 repair: None,
                 last_verified_ms: 100,
@@ -320,6 +491,9 @@ pub struct ActionMemoryEntry {
     /// A bounded, non-secret replay description. Older persisted entries omit it.
     #[serde(default)]
     pub replay: Option<ReplayPlan>,
+    /// Multi-step operation memory. Older persisted entries omit it.
+    #[serde(default)]
+    pub operation: Option<OperationPlan>,
     /// Required state observed immediately before the validated operation.
     #[serde(default)]
     pub preconditions: Option<Value>,
@@ -409,6 +583,94 @@ impl ActionMemory {
         self.persist().is_ok()
     }
 
+    /// Records one independently verified execution of a bounded operation.
+    /// The first pass is a candidate; the second distinct verification promotes
+    /// it. A failure or drift invalidates the exact operation instead of leaving
+    /// a partially trusted replay behind.
+    pub fn record_operation(
+        &mut self,
+        key: ActionMemoryKey,
+        mut operation: OperationPlan,
+        verification: Verification,
+    ) -> bool {
+        if verification != Verification::Passed {
+            self.entries.remove(&key);
+            let _ = self.persist();
+            return false;
+        }
+        if !valid_key(&key)
+            || operation.steps.is_empty()
+            || operation.steps.len() > MAX_OPERATION_STEPS
+            || !valid_operation(&operation)
+        {
+            return false;
+        }
+        operation.promoted = false;
+        operation.successes = operation.successes.clamp(1, u8::MAX - 1);
+        if let Some(previous) = self.entries.get(&key)
+            && let Some(previous_operation) = previous.operation.as_ref()
+            && operation_digest(previous_operation) == operation_digest(&operation)
+        {
+            operation.successes = previous_operation.successes.saturating_add(1);
+        }
+        operation.promoted = operation.successes >= MIN_OPERATION_PROMOTIONS;
+        let entry = ActionMemoryEntry {
+            semantic_target: serde_json::json!({
+                "kind": "operation",
+                "step_count": operation.steps.len(),
+                "effect": operation.effect,
+            }),
+            action: "operation".into(),
+            expected_postcondition: serde_json::json!({
+                "kind": "all_operation_steps_verified",
+                "successes": operation.successes,
+                "promoted": operation.promoted,
+            }),
+            replay: None,
+            operation: Some(operation),
+            preconditions: None,
+            repair: None,
+            last_verified_ms: now_unix_ms(),
+        };
+        if !valid_entry(&entry) {
+            return false;
+        }
+        if !self.entries.contains_key(&key)
+            && self.entries.len() >= MAX_ACTION_MEMORY_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_verified_ms)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, entry);
+        self.persist().is_ok()
+    }
+
+    /// Returns a promoted operation only when it is fresh. An unpromoted
+    /// candidate is deliberately unavailable to execution.
+    pub fn lookup_operation(
+        &self,
+        key: &ActionMemoryKey,
+        now_ms: u64,
+    ) -> Option<&ActionMemoryEntry> {
+        self.lookup(key, now_ms)
+            .filter(|entry| entry.operation.as_ref().is_some_and(|plan| plan.promoted))
+    }
+
+    /// Fast prefilter for the operation-memory path.
+    pub fn has_promoted_operation(&self, origin: &str, intent: &str, now_ms: u64) -> bool {
+        self.entries.iter().any(|(key, entry)| {
+            key.origin == origin
+                && key.intent == intent
+                && entry.operation.as_ref().is_some_and(|plan| plan.promoted)
+                && entry.last_verified_ms <= now_ms
+                && now_ms.saturating_sub(entry.last_verified_ms) <= MAX_AGE_MS
+        })
+    }
+
     /// Returns a bounded grounding hint only; callers must still revalidate the live target.
     pub fn lookup(&self, key: &ActionMemoryKey, now_ms: u64) -> Option<&ActionMemoryEntry> {
         self.entries.get(key).filter(|entry| {
@@ -421,7 +683,12 @@ impl ActionMemory {
         let Some(entry) = self.entries.get(key) else {
             return ReplayStatus::Miss;
         };
-        if entry.replay.is_none() {
+        if entry.replay.is_none()
+            && !entry
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.promoted)
+        {
             return ReplayStatus::Disabled;
         }
         if entry.last_verified_ms > now_ms
@@ -572,7 +839,36 @@ fn valid_entry(entry: &ActionMemoryEntry) -> bool {
         && preconditions_valid
         && repair_valid
         && entry.replay.as_ref().is_none_or(valid_replay_plan)
-        && serde_json::to_vec(entry).is_ok_and(|bytes| bytes.len() <= 4096)
+        && entry.operation.as_ref().is_none_or(valid_operation)
+        && serde_json::to_vec(entry).is_ok_and(|bytes| bytes.len() <= 8192)
+}
+
+fn valid_operation(operation: &OperationPlan) -> bool {
+    !operation.steps.is_empty()
+        && operation.steps.len() <= MAX_OPERATION_STEPS
+        && operation.steps.iter().all(|step| {
+            OPERATION_ACTIONS.contains(&step.action.as_str())
+                && step.target.as_ref().is_none_or(valid_target_template)
+                && step.postcondition.as_ref().is_none_or(valid_predicate)
+                && step
+                    .value_slot
+                    .as_ref()
+                    .is_none_or(|slot| valid_value_slot(slot))
+        })
+        && serde_json::to_vec(operation).is_ok_and(|bytes| bytes.len() <= 4096)
+}
+
+fn operation_digest(operation: &OperationPlan) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(serde_json::to_vec(operation).unwrap_or_default()).into()
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn valid_plan_string(value: &str, max: usize) -> bool {
@@ -620,6 +916,11 @@ fn valid_replay_plan(plan: &ReplayPlan) -> bool {
         ReplayPlan::Navigate { url_template } => valid_plan_string(url_template, 4096),
         ReplayPlan::Click { target, outcome } => {
             valid_target_template(target) && valid_predicate(outcome)
+        }
+        ReplayPlan::ClickHint { target } => valid_target_template(target),
+        ReplayPlan::FillHint { target, value_slot }
+        | ReplayPlan::SelectHint { target, value_slot } => {
+            valid_target_template(target) && valid_value_slot(value_slot)
         }
         ReplayPlan::Fill {
             target,

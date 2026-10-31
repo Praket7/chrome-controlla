@@ -169,6 +169,52 @@ export function selectReuse(index, {
   return null;
 }
 
+// A bounded pool needs an eviction policy that is safe to run unattended.
+// Only ephemeral, completed, unleased, unprotected tabs that have been idle for
+// the whole grace window are candidates. A missing candidate refuses the open
+// instead of silently exceeding the bound or closing user-visible work.
+export const DEFAULT_OWNED_TAB_POOL_LIMIT = 12;
+export const MIN_EVICTION_IDLE_MS = 120_000;
+
+export function planPoolEviction(index, {
+  limit = DEFAULT_OWNED_TAB_POOL_LIMIT,
+  isLeased = () => false,
+  isTabUnavailable = () => false,
+  isTabProtected = () => false,
+  keepTabIds = [],
+  now = index.now,
+  minIdleMs = MIN_EVICTION_IDLE_MS,
+} = {}) {
+  const keep = new Set(keepTabIds.map(Number).filter(Number.isSafeInteger));
+  const live = index.records.filter(record => record.window_id !== null || record.status === "complete");
+  const over = live.length - limit;
+  if (over < 0) return { within_limit: true, live_tabs: live.length, limit, evict: [], blocked: false };
+  const candidates = live
+    .filter(record => record.durability === TabDurability.EPHEMERAL)
+    .filter(record => record.status === "complete")
+    .filter(record => !keep.has(record.tab_id))
+    .filter(record => !isLeased(record.tab_id))
+    .filter(record => !isTabUnavailable(record.tab_id))
+    .filter(record => !isTabProtected(record.tab_id))
+    .filter(record => now - record.last_used_ms >= minIdleMs)
+    .sort((left, right) => left.last_used_ms - right.last_used_ms);
+  const needed = over + 1;
+  const evict = candidates.slice(0, needed);
+  if (evict.length < needed) {
+    return {
+      within_limit: false,
+      live_tabs: live.length,
+      limit,
+      evict,
+      blocked: true,
+      reason: "no_safe_eviction_candidate",
+      needed,
+      available: candidates.length,
+    };
+  }
+  return { within_limit: false, live_tabs: live.length, limit, evict, blocked: false, needed };
+}
+
 // Windows that currently hold a completed Controlla-owned tab. Eligibility is
 // re-proved live by the caller (unfocused, not minimized, no foreign tabs need
 // checking here; ownership is what this answers).

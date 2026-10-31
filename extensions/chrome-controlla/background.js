@@ -9,8 +9,16 @@ import {
   pruneOpenReceipts,
 } from "./lib/tab-control.js";
 import { PresentationSlotManager, PresentationRequirement, presentationProof } from "./lib/presentation-slots.js";
-import { ReuseKind, TabDurability, aliasReceipt, openTelemetry } from "./lib/owned-resources.js";
+import {
+  ReuseKind, TabDurability, aliasReceipt, openTelemetry,
+  indexOwnedResources, planPoolEviction, DEFAULT_OWNED_TAB_POOL_LIMIT,
+} from "./lib/owned-resources.js";
 import { configureOwnedTabOpener, reserveOwnedBackgroundSlot } from "./lib/owned-open.js";
+import { commandNeedsPageFocus, createFocusEmulation } from "./lib/focus-emulation.js";
+import { evictOwnedPoolTabs } from "./lib/owned-pool.js";
+import { executionCounterReceipt, executionCounters, noteCdpCommand, resetExecutionCounters } from "./lib/execution-counters.js";
+import { isSameDocumentUrl, validateNavigationUrl } from "./lib/navigation-url.js";
+import { dispatchFrameMultiTouch } from "./lib/frame-multitouch.js";
 
 let socket;
 const NATIVE_HOST = "chrome_controlla_bridge";
@@ -26,6 +34,11 @@ const OPEN_RECEIPTS_KEY = "openReceipts";
 const ACTIVATION_RECEIPTS_KEY = "activationReceipts";
 const OPEN_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const OPEN_RECEIPT_MAX_COUNT = 256;
+// Live automation tabs are a bounded resource. The receipt table can remember
+// more history than the pool may keep alive; eviction is what bounds Chrome.
+// 64 live automation tabs is generous for a desktop task, small enough to
+// bound Chrome's memory, and leaves room for concurrent shared sessions.
+const OWNED_TAB_POOL_LIMIT = 64;
 const WATCHER_STATE_KEY = "controllaWatcherStateV1";
 const WATCHER_MAX_TABS = 2048;
 const WATCHER_MAX_WINDOWS = 128;
@@ -51,7 +64,7 @@ const MAX_DOWNLOAD_OBSERVERS_PER_TAB = 4;
 const MAX_DOWNLOAD_OBSERVERS = 64;
 function uploadInputPolicyFunction() { return "function(names){const e=this;if(!e||e.nodeName!=='INPUT'||e.type!=='file')return {ok:false,reason:'target_not_file_input'};const accept=(e.getAttribute('accept')||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);const mime=n=>({txt:'text/plain',csv:'text/csv',json:'application/json',pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',svg:'image/svg+xml',mp3:'audio/mpeg',mp4:'video/mp4',html:'text/html',xml:'application/xml'})[String(n).split('.').pop().toLowerCase()];if(names.length>1&&!e.multiple)return {ok:false,reason:'multiple_files_not_allowed'};for(const name of names){const lower=String(name).toLowerCase(),ext='.'+lower.split('.').pop(),type=mime(name);if(accept.length&&!accept.some(a=>a.startsWith('.')?lower.endsWith(a):a.endsWith('/*')?!!type&&type.startsWith(a.slice(0,-1)):a.includes('/')?a===type:false))return {ok:false,reason:'accept_filter_mismatch',filename:name};}return {ok:true,accept,multiple:!!e.multiple}}"; }
 const DOWNLOAD_OBSERVER_TTL_MS = 60000;
-const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js", "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input-scripts.js", "lib/typing-support.js", "lib/input.js", "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/resource-keys.js", "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js", "lib/owned-open.js"];
+const CONTROLLA_EXTENSION_BUILD_ASSETS = ["background.js", "manifest.json", "open-recovery.html", "popup.html", "popup.js", "secure-input.css", "secure-input.html", "secure-input.js", "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input-scripts.js", "lib/typing-support.js", "lib/input.js", "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/resource-keys.js", "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js", "lib/focus-emulation.js", "lib/owned-pool.js", "lib/execution-counters.js", "lib/navigation-url.js", "lib/frame-multitouch.js", "lib/owned-open.js"];
 const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
   const runtimeFallback = `controlla-chrome-extension:${chrome.runtime.getManifest().version}:runtime`;
   const compute = (async () => {
@@ -78,41 +91,6 @@ const CONTROLLA_EXTENSION_BUILD_ID_PROMISE = (async () => {
 const SCREENSHOT_CHUNK_CHARS = 512 * 1024;
 const SHARED_COMMAND_METHODS = new Set(["Page.getFrameTree", "Page.getLayoutMetrics", "Page.captureScreenshot", "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
   "Input.dispatchMouseEvent", "Input.dispatchDragEvent", "Input.dispatchTouchEvent", "Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText", "DOM.getDocument", "DOM.querySelector", "DOM.enable", "DOM.describeNode", "DOM.resolveNode", "DOM.setFileInputFiles", "Page.enable", "Page.setInterceptFileChooserDialog", "Accessibility.getPartialAXTree", "Accessibility.getFullAXTree", "Controlla.waitForFileChooser", "Controlla.downloadLifecycle", "Controlla.scrollToTarget"]);
-// Bounded, structured telemetry for the execution-core regression gates.
-// These counters are never model-visible on ordinary success; they surface only
-// in diagnostics or explicit qualification receipts.
-const executionCounters = {
-  cdp_commands: 0,
-  browser_commands: 0,
-  native_host_commands: 0,
-  full_ax_reads: 0,
-  frame_tree_reads: 0,
-  target_rebinds: 0,
-  automatic_recoveries: 0,
-  user_visible_recoveries: 0,
-  auto_attach_calls: 0,
-  input_commands: 0,
-  verification_reads: 0,
-  by_method: Object.create(null),
-};
-function resetExecutionCounters() {
-  for (const key of Object.keys(executionCounters)) {
-    if (key === "by_method") executionCounters.by_method = Object.create(null);
-    else executionCounters[key] = 0;
-  }
-}
-function noteCdpCommand(method) {
-  executionCounters.cdp_commands += 1;
-  executionCounters.by_method[method] = (executionCounters.by_method[method] || 0) + 1;
-  if (method === "Accessibility.getFullAXTree") executionCounters.full_ax_reads += 1;
-  else if (method === "Page.getFrameTree") executionCounters.frame_tree_reads += 1;
-  else if (method === "Target.setAutoAttach") executionCounters.auto_attach_calls += 1;
-  else if (method === "Input.dispatchKeyEvent" || method === "Input.insertText" || method === "Input.imeSetComposition" || method === "Input.dispatchMouseEvent" || method === "Input.dispatchDragEvent" || method === "Input.dispatchTouchEvent") executionCounters.input_commands += 1;
-  else if (method === "Runtime.callFunctionOn" || method === "Runtime.evaluate") executionCounters.verification_reads += 1;
-}
-function executionCounterReceipt() {
-  return { ...executionCounters, by_method: { ...executionCounters.by_method } };
-}
 const cdpTransport = createBoundedTransport({
   sendCommand: (target, method, params) => chrome.debugger.sendCommand(target, method, params),
   onCommand: noteCdpCommand,
@@ -190,6 +168,7 @@ const tabNavigationGenerations = new Map();
 const pendingMainFrameNavigations = new Map();
 const navigatingTabs = new Set();
 const debuggerDetachedDuringNavigation = new Set();
+const focusEmulation = createFocusEmulation();
 const committedNavigationTabs = new Map();
 const navigationDebuggerAttaches = new Map();
 let manualGeneration = 0;
@@ -824,15 +803,20 @@ function trackTabDetach(tabId, current) {
   const cleanup = () => { if (pendingTabDetaches.get(tabId) === current) pendingTabDetaches.delete(tabId); };
   current.then(cleanup, cleanup);
 }
-async function performDebuggerDetach(tabId) { try { await chrome.debugger.detach({ tabId }); } catch {} }
+async function performDebuggerDetach(tabId) {
+  await focusEmulation.disable(tabId);
+  try { await chrome.debugger.detach({ tabId }); } catch {}
+}
 async function attachDebugger(tabId) {
   await (pendingTabDetaches.get(tabId) || Promise.resolve()).catch(() => {});
   const attached = await chrome.debugger.attach({ tabId }, "1.3");
   // Auto-attach is warmed by the first frame operation and then stays on for
-  // the life of this attachment; pairing itself stays command-free.
+  // the life of this attachment; pairing itself stays command-free. Focus
+  // emulation is likewise lazy: the first page read/input enables it.
   debuggerSessions.markAttached(tabId);
   return attached;
 }
+
 function queueNativeMutation(operation) { const result = nativeMutation.then(operation, operation); nativeMutation = result.catch(() => {}); return result; }
 function sendNative(port, generation, message) {
   if (nativePort !== port || nativePortGeneration !== generation) return false;
@@ -1562,6 +1546,9 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         reason: "Paired tab topology changed during preflight; retry after reconciling its window." } });
       return;
     }
+    // Enable focus emulation only after every identity and topology gate has
+    // passed. A fenced command must not pay for a page command it will not run.
+    if (commandNeedsPageFocus(request.method)) await focusEmulation.ensure(tabId);
     commandMayHaveDispatched = true;
     if (request.method === "Controlla.openTab") {
       const url = validateNavigationUrl(request.params?.url); const native = nativeRoute; const waitUntil = request.params?.wait_until ?? "dom_content_loaded";
@@ -1725,6 +1712,7 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
         window_state: ["normal", "minimized", "maximized", "fullscreen"].includes(win.state) ? win.state : "unknown",
         visibility_state: visibility, document_hidden: typeof renderer.document_hidden === "boolean" ? renderer.document_hidden : undefined,
         document_has_focus: typeof renderer.document_has_focus === "boolean" ? renderer.document_has_focus : undefined,
+        focus_emulated: focusEmulation.has(tabId),
         lifecycle, renderer_unavailable: !!rendererFailure, prerendering: renderer.prerendering === true, viewport,
         activation_epoch: activationEpoch, focus_epoch: focusEpoch,
         presentation_epoch: presentationSlots.epoch(tab.windowId),
@@ -2599,6 +2587,14 @@ async function dispatchCommand(request, isAuthorized, respond, nativeMessage = f
       respond({type:"result",id:request.id,result:receipt||{status:"unknown",reason_code:"frame_swipe_receipt_missing",dispatch_acknowledged:dispatchAcknowledged,dispatch_may_have_occurred:touchStartAttempted}});
       return;
     }
+    if (request.method === "Controlla.frameMultiTouch") {
+      await dispatchFrameMultiTouch(request, respond, {
+        tabId, isAuthorized, nativeRoute, resolveNativeLease, activationEpoch, focusEpoch,
+        pairedTabDocumentIds, routeGeneration, debuggerSessions, frameTreeRegistry,
+        pointerEngine, sendCdpCommand, rootPointForFrame, waitForFrameSession, safeNativeError,
+      });
+      return;
+    }
     if (request.method === "Controlla.frameFill") {
       const frameId = request.params?.frame_id, loaderId = request.params?.loader_id, backendNodeId = request.params?.backend_node_id;
       const expected = request.params?.expected_value, value = request.params?.value, timeoutMs = request.params?.timeout_ms;
@@ -2854,15 +2850,6 @@ function screenshotTargetLifecycle(tab) {
   if (tab.frozen === false) return "active";
   return "unknown";
 }
-function validateNavigationUrl(value) { if (typeof value !== "string" || value.length > 2048) throw new Error("URL must be a bounded HTTP(S) URL."); const url = new URL(value); if (!(url.protocol === "http:" || url.protocol === "https:") || !url.hostname || url.username || url.password) throw new Error("URL must be HTTP(S) and cannot contain credentials."); return url.href; }
-function isSameDocumentUrl(previous, next) {
-  try {
-    const before = new URL(previous), after = new URL(next);
-    return before.protocol === after.protocol && before.username === after.username && before.password === after.password
-      && before.host === after.host && before.pathname === after.pathname && before.search === after.search
-      && before.hash !== after.hash;
-  } catch (_) { return false; }
-}
 async function nativePageIdentity(tabId) {
   for (let attempt = 0; attempt < 26; attempt++) {
     const tab = await chrome.tabs.get(tabId);
@@ -3084,7 +3071,20 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
         await presentationSlots.release(slot.token);
       }
     }
-    let createdWindow, reusedWindowId, slotToken;
+    let createdWindow, reusedWindowId, slotToken, poolEvictions = [];
+    if (!tab) {
+      const pool = await evictOwnedPoolTabs({
+        receipts,
+        limit: OWNED_TAB_POOL_LIMIT,
+        presentedTabIds: presentationSlots.snapshot().map(slot => Number(slot.owner?.tab_id)).filter(Number.isSafeInteger),
+        liveTabs: await chrome.tabs.query({}).catch(() => []),
+        isLeased: tabId => nativeTabLeases.has(tabId),
+        isTabUnavailable: tabId => nativeAttachedTabs.has(tabId),
+        closeTab: tabId => chrome.tabs.remove(tabId),
+      });
+      poolEvictions = pool.evicted;
+      if (poolEvictions.length) await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
+    }
     if (!tab && createBackgroundWindow) {
       // Explicit window placement needs a window of its own; an unplaced open
       // reuses an unfocused automation window with a free presentation slot.
@@ -3109,7 +3109,7 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
     receipts[clientKey] = receipt;
     pruneOpenReceipts(receipts, OPEN_RECEIPT_MAX_AGE_MS, OPEN_RECEIPT_MAX_COUNT);
     await chrome.storage.local.set({ [OPEN_RECEIPTS_KEY]: receipts });
-    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, reused_background_window: reusedWindowId !== undefined, placement, slotToken, created_window: createdWindow !== undefined };
+    return { tab, markerUrl, reused, created_ms: receipt.created_ms, window_id: receipt.window_id, target_window_id: targetWindowId, create_background_window: createBackgroundWindow, reused_background_window: reusedWindowId !== undefined, placement, slotToken, created_window: createdWindow !== undefined, pool_evictions: poolEvictions };
     });
     if (reservation.existing) {
       try { return await returnExistingOpen(reservation.existing, url, native, generation); }
@@ -3135,6 +3135,7 @@ async function openControllaTab(url, clientKey, native, generation, waitUntil = 
       if (result.window_id !== targetWindowId || selectedWindow.focused) throw new Error("Created tab moved or the selected automation window was focused; inspect its topology before retrying.");
     }
     if (reservation.reused_background_window === true) result.reused_background_window = true;
+    if (reservation.pool_evictions?.length) result.pool_evictions = reservation.pool_evictions;
     result = { ...result, ...openTelemetry({ created: result.idempotent_reuse !== true, windowCreated: reservation.created_window === true,
       reuseKind: result.idempotent_reuse ? ReuseKind.EXACT_DOCUMENT : reservation.created_window === true ? ReuseKind.NEW_TAB_NEW_WINDOW : ReuseKind.NEW_TAB_EXISTING_WINDOW }) };
     await withReceiptLock(async () => {
@@ -3260,7 +3261,7 @@ async function pairManual(endpointUrl, token, tabs) {
   next.onerror = () => { if (generation !== manualGeneration) return; socket = undefined; void detachManual(generation); };
 }
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
-  if (!Number.isInteger(tabId)) return; const committed = committedNavigationTabs.get(tabId);
+  if (!Number.isInteger(tabId)) return; focusEmulation.forget(tabId); const committed = committedNavigationTabs.get(tabId);
   if (reason === "target_closed" && (navigatingTabs.has(tabId) || committed) && pairedTabDocumentIds.has(tabId)) {
     clearDownloadLifecycleState(tabId, "target_detached_during_navigation");
     debuggerDetachedDuringNavigation.add(tabId);

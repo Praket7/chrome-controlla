@@ -454,6 +454,9 @@ const chrome = {
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(index,cx,cy,startDistance,endDistance,expectedViewport)")) {
         return { result: { value: { ok: true, viewport: params.arguments[5].value, rect: { left: 0, top: 0, width: 100, height: 100 } } } };
       }
+      if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(cx,cy,expectedViewport)")) {
+        return { result: { value: { ok: true, viewport: JSON.stringify([100, 80, 1]), rect: { left: 0, top: 0, width: 100, height: 100 } } } };
+      }
       if (method === "Runtime.callFunctionOn" && params?.functionDeclaration?.startsWith("function(sx,sy,ex,ey,expectedViewport,phase)")) {
         const phase=params.arguments[5]?.value;
         return { result: { value: { ok: true, viewport: JSON.stringify([100,80,1]), rect: { left: 10, top: 10, width: 30, height: 30 }, scroll: { left: 0, top: phase === "after" && fixtureFrameSwipeMoves ? 20 : 0 } } } };
@@ -685,7 +688,13 @@ const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__
 const extensionLibraryAssets = [
   "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input-scripts.js", "lib/typing-support.js", "lib/input.js",
   "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/resource-keys.js",
-  "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js", "lib/owned-open.js",
+  "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js",
+  "lib/focus-emulation.js",
+  "lib/owned-pool.js",
+  "lib/execution-counters.js",
+  "lib/navigation-url.js",
+  "lib/frame-multitouch.js",
+  "lib/owned-open.js",
 ];
 function stripModuleSyntax(source) {
   return source.replace(/^import[^;]*;[ \t]*$/gm, "").replace(/^export default /gm, "").replace(/^export /gm, "");
@@ -1001,6 +1010,10 @@ async function waitFor(predicate, description) {
   assert.deepEqual(attached, [41, 43, 47], "native pairing attaches exactly the requested tabs");
   assert.deepEqual([...new Set(attached)], [41, 43, 47], "native pairing never attaches all tabs");
   assert.deepEqual(debuggerCalls, [], "pairing must not dispatch commands");
+  native.hostMessage({ type: "command", id: "focus-emulation-probe", target_id: "41", method: "Runtime.evaluate", params: { expression: "document.hasFocus()" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(debuggerCalls.some(call => call.method === "Emulation.setFocusEmulationEnabled" && call.target.tabId === 41 && call.params?.enabled === true),
+    "the first page read enables focus emulation lazily, after pairing");
 
   // Regression: a non-active same-site target must remain addressable by its
   // stable Chrome tab ID after Chrome reorders the surrounding tabs.
@@ -1425,6 +1438,28 @@ async function waitFor(predicate, description) {
   const frameSwipeEvents=debuggerCalls.slice(frameSwipeStart).filter(call=>!call.target.sessionId&&call.method==="Input.dispatchTouchEvent");
   assert.deepEqual(frameSwipeEvents.map(call=>call.params.type),["touchStart","touchMove","touchEnd"],"frame swipe dispatches trusted single-finger touch phases through the root input route");
   assert.deepEqual([frameSwipeEvents[0].params.touchPoints[0].x,frameSwipeEvents[0].params.touchPoints[0].y,frameSwipeEvents[1].params.touchPoints[0].x,frameSwipeEvents[1].params.touchPoints[0].y],[140,250,140,325],"child viewport coordinates are transformed through the OOPIF owner quad");
+  const framePinchStart=debuggerCalls.length;
+  native.hostMessage({type:"command",id:"oopif-guarded-pinch",target_id:"41",method:"Controlla.frameMultiTouch",params:{
+    frame_id:"frame-oopif",loader_id:"fixture-loader",backend_node_id:91,center_x:50,center_y:40,start_distance:80,end_distance:120,timeout_ms:1500
+  }});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const framePinchResult=native.sent.findLast(message=>message.id==="oopif-guarded-pinch")?.result;
+  assert.equal(framePinchResult?.status,"dispatched",JSON.stringify(framePinchResult));
+  assert.equal(framePinchResult?.gesture,"two_finger_pinch");
+  assert.equal(framePinchResult?.coordinate_space,"child_frame_css_viewport");
+  const framePinchEvents=debuggerCalls.slice(framePinchStart).filter(call=>!call.target.sessionId&&call.method==="Input.dispatchTouchEvent");
+  assert.deepEqual(framePinchEvents.map(call=>call.params.type),["touchStart","touchMove","touchEnd"],"frame pinch dispatches trusted two-finger touch phases through the root input route");
+  assert.equal(framePinchEvents[0].params.touchPoints.length,2,"frame pinch sends both contact points in one trusted event");
+  const firstDistance=Math.hypot(framePinchEvents[0].params.touchPoints[1].x-framePinchEvents[0].params.touchPoints[0].x,framePinchEvents[0].params.touchPoints[1].y-framePinchEvents[0].params.touchPoints[0].y);
+  const secondDistance=Math.hypot(framePinchEvents[1].params.touchPoints[1].x-framePinchEvents[1].params.touchPoints[0].x,framePinchEvents[1].params.touchPoints[1].y-framePinchEvents[1].params.touchPoints[0].y);
+  assert.ok(secondDistance>firstDistance*1.4,`the mapped frame pinch opens both contacts rather than replaying a single-finger path (${firstDistance} -> ${secondDistance})`);
+  const pinchTouchCountBeforeStale=debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length;
+  native.hostMessage({type:"command",id:"stale-frame-pinch-refused",target_id:"41",method:"Controlla.frameMultiTouch",params:{
+    frame_id:"frame-oopif",loader_id:"stale-loader",backend_node_id:91,center_x:50,center_y:40,start_distance:80,end_distance:120,timeout_ms:1500
+  }});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(native.sent.findLast(message=>message.id==="stale-frame-pinch-refused")?.result?.status,"not_dispatched");
+  assert.equal(debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length,pinchTouchCountBeforeStale,"a stale frame loader refuses before frame pinch input");
   const touchCountBeforeStaleLoader=debuggerCalls.filter(call=>call.method==="Input.dispatchTouchEvent").length;
   native.hostMessage({type:"command",id:"stale-frame-swipe-loader-refused",target_id:"41",method:"Controlla.frameSwipe",params:{frame_id:"frame-oopif",loader_id:"stale-loader",backend_node_id:91,start_x:20,start_y:20,end_x:20,end_y:50,timeout_ms:1500}});
   await new Promise(resolve=>setTimeout(resolve,0));
@@ -1816,6 +1851,9 @@ async function waitFor(predicate, description) {
   assert.equal(native.sent.at(-1).result.window_focused, false, "presentation telemetry reports the window without focusing it");
   assert.equal(native.sent.at(-1).result.visibility_state, "visible", "DOM visibility is reported independently from Chrome tab/window focus");
   assert.equal(native.sent.at(-1).result.document_has_focus, true, "page focus is reported as a distinct signal, not used as window focus");
+  assert.equal(typeof native.sent.at(-1).result.focus_emulated, "boolean", "presentation reports whether focus emulation is active");
+  assert.ok(debuggerCalls.some(call => call.method === "Emulation.setFocusEmulationEnabled" && call.target.tabId === 41 && call.params?.enabled === true),
+    "attaching a target enables Chrome focus emulation without activating the tab");
   assert.equal(JSON.stringify(native.sent.at(-1).result.viewport), JSON.stringify({ width: 1280, height: 720, device_scale_factor: 2 }), "presentation includes the page capture geometry");
   assert.equal(native.sent.at(-1).result.lifecycle, "active", "presentation reports the explicit unfrozen tab lifecycle separately from window and page focus");
   const activationEpoch = native.sent.at(-1).result.activation_epoch;
@@ -2390,6 +2428,13 @@ async function waitFor(predicate, description) {
   assert.equal(detached.length, detachCountBeforeOldClose, "an old pairing must not detach newer tabs");
 
   const activeSocket = sockets.at(-1);
+  // Consume the one-time focus-emulation handshake so the exact command
+  // counts below measure the observed command, not lazy tab setup.
+  await activeSocket.onmessage({ data: JSON.stringify({
+    type: "command", id: "focus-emulation-bootstrap", target_id: "18", method: "Runtime.evaluate", params: { expression: "document.hasFocus()" }
+  }) });
+  assert.ok(debuggerCalls.some(call => call.method === "Emulation.setFocusEmulationEnabled" && call.target.tabId === 18 && call.params?.enabled === true),
+    "a shared-tab target enables focus emulation before page input");
   const callsBeforeBlocked = debuggerCalls.length;
   await activeSocket.onmessage({ data: JSON.stringify({
     type: "command", id: "blocked", target_id: "18", method: "Browser.getVersion", params: {}

@@ -4,6 +4,7 @@ use super::{
     resolve_reference, retained_mutation, snapshot_impl, verify_impl,
 };
 use super::recovery::{complete_download_guard, complete_editor_guard};
+use crate::execution_plan::{route_candidates, task_needs_visual_evidence, task_route_signals};
 use crate::v3_execution::shared::{value_has_unknown, value_may_have_dispatched};
 use base64::Engine as _;
 use rmcp::{
@@ -12,6 +13,15 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
+#[path = "../mcp/v3_core.rs"]
+mod execution_core;
+use execution_core::{
+    action_memory_signature_from_items, editor_value_unreadable, finalize_visual_requirement,
+    hidden_canvas_editor_refusal, learned_action_replay,
+    page_tool_signature, promote_learned_url_operation, read_only_research_skill_steps,
+    record_task_operation, research_profile_input, stale_reference_receipt, task_snapshot_goal,
+    text_conflict_preflight, AutoBindOutcome,
+};
 #[path = "../mcp/v3_canvas_proof.rs"]
 mod canvas_proof;
 use canvas_proof::{verify_canvas_document_text, verify_canvas_text_present};
@@ -326,10 +336,11 @@ fn shape_incremental_snapshot(snapshot: &mut Value) -> bool {
 
 #[cfg(test)]
 mod route_telemetry_tests {
+    use super::execution_core::finalize_visual_requirement;
     use super::{
         AppV3, BrowserClickOutcome, BrowserPredicate, V3ReadyWhen, V3WorkflowStep, attach_execution_actuals, attach_observation_boundary,
         attach_operation_costs, background_window_focus_invariant, browser_tool_result,
-        contains_returned_page_evidence, finalize_visual_requirement, foreground_open_invariant,
+        contains_returned_page_evidence, foreground_open_invariant,
         navigation_ready_event_matches, observe_site_warmth, open_workflow_route_receipt,
         page_tool_route_receipt, readiness_wait_expression, selected_automation_window_invariant,
         shape_incremental_snapshot, task_cost_context, task_parallel_research_allowed,
@@ -4326,6 +4337,45 @@ async fn swipe_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, r
         Err(error)=>Ok(json!({"status":"unknown","action":"swipe","reference":reference,"source_frame_id":parts[0],"coordinate_space":"child_frame_css_viewport",
             "dispatch_acknowledged":null,"dispatch_may_have_occurred":true,"reason_code":"frame_swipe_delivery_unknown",
             "reason":format!("frame swipe delivery is uncertain; inspect the child frame before retrying: {error}")}))
+    }
+}
+
+async fn multi_touch_frame_reference(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
+    let reference=args.reference.as_deref().ok_or_else(||invalid("frame multi_touch requires a fresh frame reference"))?;
+    let parts=reference.strip_prefix("@f:").unwrap_or_default().splitn(3,':').collect::<Vec<_>>();
+    if parts.len()!=3||parts[0].is_empty()||parts[0].len()>256||parts[1].is_empty()||parts[1].len()>256 {
+        return Err(invalid("frame multi_touch requires @f:<frame>:<loader>:<backend-node>"));
+    }
+    let backend_node_id=parts[2].parse::<i64>().ok().filter(|id|*id>0).ok_or_else(||invalid("frame multi_touch reference has an invalid backend node identity"))?;
+    let (Some(center_x),Some(center_y),Some(start_distance),Some(end_distance))=(args.center_x,args.center_y,args.start_distance,args.end_distance) else {
+        return Err(invalid("frame multi_touch requires child-frame pinch geometry"));
+    };
+    let presentation=presentation_state(app,&args.session_id,&args.chrome_tab_id).await;
+    let expected_activation_epoch=presentation.as_ref().and_then(|state|state["activation_epoch"].as_u64());
+    let expected_focus_epoch=presentation.as_ref().and_then(|state|state["focus_epoch"].as_u64());
+    let shared=app.core.legacy.shared_sessions.lock().await.get(&args.session_id).cloned().ok_or_else(||invalid("unknown shared session"))?;
+    let shared=shared.lock().await;
+    if shared.handle.principal!=app.core.legacy.principal.as_ref(){return Err(invalid("session is not owned by this server principal"));}
+    let connection=shared.connection.as_ref().ok_or_else(||invalid("shared extension session has not been accepted"))?;
+    let response=connection.command(shared.registry()?,&shared.handle,&args.chrome_tab_id,"Controlla.frameMultiTouch",json!({
+        "frame_id":parts[0],"loader_id":parts[1],"backend_node_id":backend_node_id,
+        "center_x":center_x,"center_y":center_y,"start_distance":start_distance,"end_distance":end_distance,
+        "timeout_ms":args.timeout_ms.unwrap_or(3000).clamp(1000,10000),
+        "expected_activation_epoch":expected_activation_epoch,"expected_focus_epoch":expected_focus_epoch
+    })).await;
+    match response {
+        Ok(response)=>{
+            let evidence=super::super::shared_value(&response).map_err(invalid)?;
+            let status=evidence["status"].as_str().unwrap_or("unknown");
+            Ok(json!({"status":status,"action":"multi_touch","gesture":"two_finger_pinch","reference":reference,"source_frame_id":parts[0],
+                "coordinate_space":"child_frame_css_viewport",
+                "dispatch_acknowledged":evidence["dispatch_acknowledged"],"dispatch_may_have_occurred":evidence["dispatch_may_have_occurred"],
+                "reason_code":evidence["reason_code"],"reason":evidence["reason"],"dispatch":evidence}))
+        }
+        Err(error)=>Ok(json!({"status":"unknown","action":"multi_touch","gesture":"two_finger_pinch","reference":reference,"source_frame_id":parts[0],
+            "coordinate_space":"child_frame_css_viewport","dispatch_acknowledged":null,"dispatch_may_have_occurred":true,
+            "reason_code":"frame_multi_touch_delivery_unknown",
+            "reason":format!("frame multi_touch delivery is uncertain; inspect the child frame before retrying: {error}")}))
     }
 }
 
@@ -8330,80 +8380,6 @@ async fn action_memory_structural_signature(
         origin,
         &state.page_ordered_items(),
     ))
-}
-
-fn action_memory_signature_from_items(origin: &str, items: &[&Value]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(origin.as_bytes());
-    for item in items {
-        for field in ["role", "name", "href", "disabled"] {
-            if let Some(value) = item.get(field) {
-                hasher.update(field.as_bytes());
-                hasher.update([0]);
-                hasher.update(value.to_string().as_bytes());
-                hasher.update([0xff]);
-            }
-        }
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn read_only_research_skill_steps(
-    mut workflow: crate::browser_workflow::BrowserWorkflowDefinition,
-    url: &str,
-    selector: &str,
-) -> Option<Vec<crate::browser_workflow::BrowserWorkflowStep>> {
-    use crate::browser_workflow::{
-        BrowserWorkflowPredicate as Predicate, BrowserWorkflowStep as Step,
-    };
-    if !safe_persistable_skill_url(url) || workflow.steps.is_empty() || workflow.steps.len() > 40 {
-        return None;
-    }
-    let requested_scope = site_scope_from_url(url)?;
-    let mut saw_extract = false;
-    let mut final_url_verify = false;
-    for (index, step) in workflow.steps.iter_mut().enumerate() {
-        match step {
-            Step::Navigate { url: target }
-                if index == 0
-                    && safe_persistable_skill_url(target)
-                    && site_scope_from_url(target).as_deref() == Some(&requested_scope) =>
-            {
-                *target = url.to_owned();
-            }
-            Step::Extract {
-                selector: selected, ..
-            } if selected == selector => {
-                saw_extract = true;
-                final_url_verify = false;
-            }
-            Step::Assert {
-                predicate: Predicate::Url { equals },
-            }
-            | Step::Verify {
-                predicate: Predicate::Url { equals },
-            } if safe_persistable_skill_url(equals)
-                && site_scope_from_url(equals).as_deref() == Some(&requested_scope) =>
-            {
-                if !saw_extract {
-                    return None;
-                }
-                *equals = url.to_owned();
-                final_url_verify = true;
-            }
-            Step::Checkpoint => {}
-            other if other.effect() == crate::workflow::EffectClass::ReadOnly => return None,
-            _ => return None,
-        }
-    }
-    if !saw_extract || !final_url_verify {
-        return None;
-    }
-    Some(workflow.steps)
 }
 
 /// V3 task skills may replay only a bounded fill-only form template. Each
@@ -13231,6 +13207,22 @@ fn attach_execution_actuals(route: &mut Value, started: std::time::Instant, resu
     });
 }
 
+/// Keep the plan's selected route aligned with the route receipt after a
+/// qualified candidate falls back to semantic extraction.
+fn sync_plan_route(plan: &mut crate::execution_plan::ExecutionPlan, route: &mut Value) {
+    if let Ok(tier) =
+        serde_json::from_value::<crate::capability_router::ExecutionTier>(route["tier"].clone())
+        && tier != plan.route.tier
+    {
+        let predicted = route["predicted_model_calls"]
+            .as_u64()
+            .unwrap_or(0)
+            .min(u64::from(u8::MAX)) as u8;
+        plan.set_selected_tier(tier, "route receipt selected this tier", predicted);
+    }
+    route["execution_plan"] = plan.receipt();
+}
+
 fn internal_model_call_budget(tier: crate::capability_router::ExecutionTier) -> u32 {
     match tier {
         crate::capability_router::ExecutionTier::QualifiedSkill
@@ -13715,41 +13707,6 @@ async fn rich_editor_reference(app: &AppV3, args: &V3ActArgs, reference: &str) -
         .and_then(|state| state.items.get(reference))
         .is_some_and(|item| item["editable_kind"] == "rich_text")
 }
-
-/// True when the editable element's DOM value cannot represent what was typed.
-///
-/// Canvas-backed editors paint their text (Google Docs), and some host the
-/// editable element in a blank same-origin frame that only relays key events.
-/// The snapshot marks those items `value_readable: false`; the blank-frame
-/// `source_kind` is kept as a fallback for observations taken before that field
-/// existed. A value precondition is meaningless on these surfaces, so demanding
-/// one is how an empty Google Doc refused an empty `expected_value`.
-async fn editor_value_unreadable(app: &AppV3, args: &V3ActArgs, reference: &str) -> bool {
-    app.core
-        .semantic
-        .lock()
-        .await
-        .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
-        .and_then(|state| state.items.get(reference))
-        .is_some_and(|item| {
-            item["value_readable"] == false
-                || item["source_kind"] == "same_origin_blank_frame"
-        })
-}
-
-/// Probe for the hidden-canvas refusal; the policy itself lives in
-/// `v3_execution::canvas` so the facade only reads the two inputs it needs.
-async fn hidden_canvas_editor_refusal(app: &AppV3, args: &V3ActArgs) -> Option<Value> {
-    let reference = args.reference.as_deref()?;
-    let unreadable = editor_value_unreadable(app, args, reference).await;
-    let state = presentation_state(app, &args.session_id, &args.chrome_tab_id).await?;
-    crate::v3_execution::canvas::hidden_canvas_editor_refusal(
-        unreadable,
-        state["visibility_state"].as_str(),
-    )
-}
-
-
 
 /// Dispatch one trusted key chord through the shared extension. Used only for
 /// the document-text readback copy: select all, copy, and collapse the
@@ -15543,63 +15500,6 @@ fn research_goal(task: &crate::v3_tasks::TaskPrimitive, url: &str) -> Option<Str
     research_query(url)
 }
 
-fn task_route_signals(
-    task: &crate::v3_tasks::TaskPrimitive,
-    expanded_step_count: usize,
-    qualified_skill: bool,
-    site_tool: bool,
-    speculative_read: bool,
-) -> crate::capability_router::ExecutionCapabilities {
-    let visual_required = match task {
-        crate::v3_tasks::TaskPrimitive::Research { goal, .. } => {
-            goal.as_deref().is_some_and(task_needs_visual_evidence)
-        }
-        _ => false,
-    };
-    // TaskPrimitive::expand admits only bounded operations supported by the V3
-    // executor. A zero-step program has no semantic implementation and must
-    // fall through instead of claiming a deterministic route.
-    let semantic_program = expanded_step_count > 0 && !visual_required;
-    crate::capability_router::ExecutionCapabilities {
-        qualified_skill: qualified_skill && !visual_required,
-        site_tool: site_tool && !visual_required,
-        speculative_read: speculative_read && !visual_required,
-        semantic_program,
-        semantic_confidence: 0.0,
-        targeted_visual: visual_required,
-    }
-}
-
-fn route_candidates(
-    signals: crate::capability_router::ExecutionCapabilities,
-    read_only: bool,
-) -> Vec<crate::capability_router::ExecutionTier> {
-    use crate::capability_router::ExecutionTier as Tier;
-    let mut tiers = Vec::new();
-    if read_only && signals.qualified_skill {
-        tiers.push(Tier::QualifiedSkill);
-    }
-    if signals.site_tool {
-        tiers.push(Tier::WebMcpOrSiteTool);
-    }
-    if read_only && signals.speculative_read {
-        tiers.push(Tier::SpeculativeRead);
-    }
-    if signals.semantic_program {
-        tiers.push(Tier::SemanticProgram);
-    }
-    if signals.semantic_confidence >= 0.8 {
-        tiers.push(Tier::SemanticPlanner);
-    }
-    if signals.targeted_visual {
-        tiers.push(Tier::TargetedVisual);
-    }
-    if tiers.is_empty() {
-        tiers.push(Tier::FullVisionFallback);
-    }
-    tiers
-}
-
 fn speculative_route_allowed(active_task_count_before_this_task: usize) -> bool {
     active_task_count_before_this_task == 0
 }
@@ -15658,18 +15558,6 @@ fn observe_site_warmth(
     } else {
         "warm_browser_first_seen_site"
     }
-}
-
-fn task_needs_visual_evidence(goal: &str) -> bool {
-    let terms = goal
-        .split(|character: char| !character.is_alphanumeric())
-        .map(str::to_ascii_lowercase)
-        .collect::<std::collections::BTreeSet<_>>();
-    [
-        "layout", "chart", "graph", "map", "canvas", "diagram", "overlap", "position", "visual",
-    ]
-    .iter()
-    .any(|term| terms.contains(*term))
 }
 
 fn task_parallel_research_allowed(
@@ -15760,102 +15648,6 @@ fn browser_tool_result(mut value: Value) -> rmcp::model::CallToolResult {
 /// deliberately left untouched because it is untrusted input.
 fn normalize_receipt_outcomes(value: &mut Value) {
     super::normalize_unknown_receipts(value);
-}
-
-fn finalize_visual_requirement(route: &mut Value, result: &mut Value) {
-    if route["visual_evidence_required"] != true {
-        return;
-    }
-    let evidence_present = result["receipts"].as_array().is_some_and(|receipts| {
-        receipts
-            .iter()
-            .any(|receipt| receipt["targeted_visual_evidence"]["status"] == "verified_read")
-    });
-    if result["status"] == "completed" {
-        result["status"] = json!(if evidence_present {
-            "visual_evidence_ready"
-        } else {
-            "incomplete_visual_evidence"
-        });
-    }
-    route["verification"] = json!(if evidence_present {
-        "required"
-    } else {
-        "inconclusive"
-    });
-    route["visual_reasoning"] = json!(if evidence_present {
-        "required_from_attached_image_content"
-    } else {
-        "visual_probe_unavailable"
-    });
-}
-
-fn research_profile_input(
-    task: &crate::v3_tasks::TaskPrimitive,
-    operation: &str,
-    url: &str,
-) -> Option<String> {
-    let goal = match task {
-        crate::v3_tasks::TaskPrimitive::Research {
-            goal: Some(goal), ..
-        } => goal.trim(),
-        _ => "",
-    };
-    let lower = goal.to_ascii_lowercase();
-    let extracted = match operation {
-        "search" => {
-            let value = ["search for ", "search ", "find ", "look for "]
-                .iter()
-                .find_map(|prefix| lower.strip_prefix(prefix).map(|_| &goal[prefix.len()..]))
-                .unwrap_or(goal);
-            (!value.trim().is_empty()).then(|| value.trim().to_owned())
-        }
-        "filter" => ["filter results by ", "filter by "]
-            .iter()
-            .find_map(|prefix| {
-                lower
-                    .strip_prefix(prefix)
-                    .map(|_| goal[prefix.len()..].trim().to_owned())
-            })
-            .filter(|value| !value.is_empty()),
-        "sort" => lower
-            .strip_prefix("sort by ")
-            .map(|_| goal[8..].trim().to_owned())
-            .filter(|value| !value.is_empty()),
-        "paginate" => {
-            let tokens = lower
-                .split(|ch: char| !ch.is_ascii_alphanumeric())
-                .filter(|v| !v.is_empty())
-                .collect::<Vec<_>>();
-            tokens
-                .windows(2)
-                .find_map(|pair| {
-                    (pair[0] == "page" && pair[1].bytes().all(|b| b.is_ascii_digit()))
-                        .then(|| pair[1].to_owned())
-                })
-                .filter(|value| value.parse::<u32>().is_ok_and(|n| n > 0))
-        }
-        _ => None,
-    };
-    let input = extracted.or_else(|| {
-        (operation == "search")
-            .then(|| research_query(url))
-            .flatten()
-    })?;
-    (input.len() <= 512).then_some(input)
-}
-fn page_tool_signature(name: &str, schema: &Value) -> String {
-    use sha2::Digest as _;
-    sha2::Sha256::digest(
-        [
-            name.as_bytes(),
-            &serde_json::to_vec(schema).unwrap_or_default(),
-        ]
-        .concat(),
-    )
-    .iter()
-    .map(|b| format!("{b:02x}"))
-    .collect()
 }
 
 async fn call_page_tool(app: &AppV3, args: &V3ActArgs) -> Result<Value, rmcp::ErrorData> {
@@ -17489,8 +17281,11 @@ impl AppV3 {
             let workflow: crate::browser_workflow::BrowserWorkflowDefinition =
                 serde_json::from_value(definition.workflow.clone())
                     .map_err(|error| invalid(format!("invalid skill workflow: {error}")))?;
-            crate::browser_workflow::compile_browser_workflow(workflow.clone())
-                .map_err(|error| invalid(format!("unsafe skill workflow: {error}")))?;
+            let execution_plan = crate::execution_plan::ExecutionPlan::for_skill_workflow(
+                &workflow,
+            )
+            .map_err(invalid)?
+            .receipt();
             let current_url = self.readiness_url(session_id, tab_id).await?;
             let selector = workflow.steps.iter().find_map(|step| match step {
                 crate::browser_workflow::BrowserWorkflowStep::Extract { selector, .. } => Some(selector.clone()),
@@ -17505,7 +17300,9 @@ impl AppV3 {
                 .skills
                 .register_candidate(definition)
                 .map_err(|error| invalid(error.to_string()))?;
-            return Ok(json!({"status":"candidate","record":record}));
+            return Ok(
+                json!({"status":"candidate","record":record,"execution_plan":execution_plan}),
+            );
         }
         if action == "replay" {
             let skill_id = args
@@ -17563,8 +17360,10 @@ impl AppV3 {
                     .replay(skill_id, &site_scope, &structural_signature, now_ms())
                     .map_err(|error| invalid(error.to_string()))?
             };
+            let execution_plan = crate::execution_plan::ExecutionPlan::for_skill_replay(&replay.workflow)
+                .map(|plan| plan.receipt());
             return Ok(
-                json!({"status":"qualified_hit","route":"qualified_skill","internal_model_calls":0,"skill_id":replay.skill_id,"version":replay.version,"workflow":replay.workflow}),
+                json!({"status":"qualified_hit","route":"qualified_skill","internal_model_calls":0,"skill_id":replay.skill_id,"version":replay.version,"workflow":replay.workflow,"execution_plan":execution_plan}),
             );
         }
         if matches!(
@@ -17963,10 +17762,23 @@ impl AppV3 {
                 }
                 return self.run_task_program(&args, program).await;
             }
-            let task = args.task.ok_or_else(|| invalid("task is required"))?;
-            let auto_headless = args.session_id.is_none();
+            // Clone the small task envelope so the same args can also drive
+            // automatic tab binding without a partial move.
+            let task = args.task.clone().ok_or_else(|| invalid("task is required"))?;
+            let auto_headless = args.session_id.is_none() && args.mode.as_deref() == Some("headless");
+            // A read-only task with no session may bind one uniquely matching
+            // existing tab in this call. This is the routine path: callers with
+            // one open document should not need discover -> pair -> task.
+            let mut auto_binding = None;
             let task_mode = if auto_headless {
                 crate::v3::BrowserMode::Headless
+            } else if args.session_id.is_none() {
+                if args.mode.as_deref().is_some_and(|mode| mode != "background") {
+                    return Err(invalid(
+                        "session_id is required unless action=task uses mode=headless, mode=background, or a uniquely matching read-only task",
+                    ));
+                }
+                crate::v3::BrowserMode::Background
             } else if let Some(mode) = args.mode.as_deref() {
                 parse_mode(Some(mode))?
             } else {
@@ -17984,11 +17796,6 @@ impl AppV3 {
             };
             require_browser_operation(task_mode, capability_action)?;
             let (session_id, chrome_tab_id) = if auto_headless {
-                if args.mode.as_deref() != Some("headless") {
-                    return Err(invalid(
-                        "session_id is required unless action=task uses mode=headless for a one-call private task",
-                    ));
-                }
                 if !private_headless_task_is_supported(&task) {
                     return Err(invalid(
                         "one-call private headless tasks support read-only Research without tab_ids; use an existing session for other task kinds",
@@ -18001,6 +17808,46 @@ impl AppV3 {
                 }
                 let (session_id, tab_id) = self.launch_private_headless("about:blank").await?;
                 (session_id, tab_id)
+            } else if args.session_id.is_none() {
+                match self.auto_bind_read_only_task(&args, &task).await? {
+                    AutoBindOutcome::Bound { session_id, tab_id, matched_by, url } => {
+                        auto_binding = Some(json!({
+                            "auto_bound": true,
+                            "session_id": session_id,
+                            "chrome_tab_id": tab_id,
+                            "matched_by": matched_by,
+                            "url": url,
+                            "requires_manual_pairing": false
+                        }));
+                        (session_id, tab_id)
+                    }
+                    AutoBindOutcome::Ambiguous { candidates } => {
+                        return Ok(Json(json!({
+                            "status":"ambiguous",
+                            "action":"task",
+                            "reason_code":"multiple_matching_tabs",
+                            "dispatch_may_have_occurred":false,
+                            "candidates":candidates,
+                            "next_action":"retry with session_id and chrome_tab_id for one candidate"
+                        })));
+                    }
+                    AutoBindOutcome::NoMatch { inspected, hint_count } => {
+                        return Ok(Json(json!({
+                            "status":"not_available",
+                            "action":"task",
+                            "reason_code":"no_matching_tab",
+                            "inspected_tabs":inspected,
+                            "hint_count":hint_count,
+                            "dispatch_may_have_occurred":false,
+                            "next_action":"pass session_id and chrome_tab_id, or open the URL first"
+                        })));
+                    }
+                    AutoBindOutcome::NotApplicable => {
+                        return Err(invalid(
+                            "session_id is required for this task kind; automatic binding is limited to read-only Research with one unique matching tab",
+                        ));
+                    }
+                }
             } else {
                 let session_id = args.session_id.as_deref().unwrap_or_default();
                 let tab_id = args
@@ -18009,13 +17856,15 @@ impl AppV3 {
                     .ok_or_else(|| invalid("chrome_tab_id is required"))?;
                 (session_id.to_owned(), tab_id.to_owned())
             };
-            let release_after_task = auto_headless || args.release_after_task.unwrap_or(false);
+            let auto_bound = auto_binding.is_some();
+            let release_after_task = auto_headless || auto_bound || args.release_after_task.unwrap_or(false);
             if release_after_task
+                && !auto_bound
                 && self.browser_modes.lock().await.get(&session_id)
                     != Some(&crate::v3::BrowserMode::Headless)
             {
                 return Err(invalid(
-                    "release_after_task is supported only for private headless sessions",
+                    "release_after_task is supported only for private headless or automatically bound sessions",
                 ));
             }
             let result = self
@@ -18033,6 +17882,10 @@ impl AppV3 {
                 return match result {
                     Ok(rmcp::handler::server::wrapper::Json(mut value)) => {
                         value["private_session_released"] = json!(released);
+                        if let Some(binding) = auto_binding {
+                            value["binding"] = binding;
+                            value["auto_bound_session_released"] = json!(released);
+                        }
                         if !released {
                             value["private_session_id"] = json!(session_id);
                             value["cleanup_retry_action"] = json!({"action":"release","mode":"headless","session_id":session_id});
@@ -19083,6 +18936,16 @@ impl AppV3 {
                 max_scan_nodes: args.max_scan_nodes,
             };
             let mut snapshot = snapshot_impl(&self.core, &base).await?;
+            snapshot["snapshot_fence"] = json!({
+                "version":1,
+                "snapshot_id":snapshot["snapshot_id"],
+                "semantic_revision":snapshot["semantic_revision"],
+                "document":snapshot["document"],
+                "session_id":&args.session_id,
+                "chrome_tab_id":&args.chrome_tab_id,
+                "reference_scope":"exact_snapshot_and_document",
+                "contract":"discard this fence after a document identity change; a stale reference must be reacquired from a fresh snapshot"
+            });
             if args.since_snapshot_id.is_some() {
                 shape_incremental_snapshot(&mut snapshot);
             }
@@ -19152,6 +19015,11 @@ impl AppV3 {
                 .into_iter().map(|(key, entry)| json!({
                     "intent":key.intent,"action":entry.action,"semantic_target":entry.semantic_target,
                     "expected_postcondition":entry.expected_postcondition,"last_verified_ms":entry.last_verified_ms,
+                    "replay":entry.replay,
+                    "operation":entry.operation.as_ref().map(|operation| json!({
+                        "step_count":operation.steps.len(),"effect":operation.effect,
+                        "successes":operation.successes,"promoted":operation.promoted,
+                    })),
                     "advisory_only":true,"must_resolve_fresh_reference":true,
                 })).collect::<Vec<_>>();
             if !hints.is_empty() { snapshot["page_action_hints"] = json!(hints); }
@@ -19656,7 +19524,7 @@ impl AppV3 {
                 }
                 "multi_touch" => {
                     let reference=args.reference.as_deref().ok_or_else(||invalid("multi_touch requires a fresh semantic reference"))?;
-                    if reference.starts_with("@f:") {return Ok(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"frame_multi_touch_unsupported","dispatch_may_have_occurred":false}));}
+                    if reference.starts_with("@f:") {return multi_touch_frame_reference(self,&args).await;}
                     if mode==crate::v3::BrowserMode::Headless {return Ok(json!({"status":"not_dispatched","action":"multi_touch","reason_code":"headless_multi_touch_unsupported","dispatch_may_have_occurred":false}));}
                     let presentation=if background_mutation {presentation_state(self,&args.session_id,&args.chrome_tab_id).await} else {None};
                     if background_mutation {
@@ -19780,8 +19648,12 @@ impl AppV3 {
                             .find(|item| item["reference"] == args.reference.as_deref().unwrap_or_default()))
                         .cloned();
                     let Some(item) = item else {
-                        return Ok(json!({"status":"not_dispatched","action":"hover",
-                            "reason_code":"stale_reference","dispatch_may_have_occurred":false}));
+                        return Ok(stale_reference_receipt(
+                            self,
+                            &args,
+                            args.reference.as_deref().unwrap_or_default(),
+                        )
+                        .await);
                     };
                     semantic_widget_pointer(self, &args, &item, None, true, None, None).await
                 }
@@ -19854,6 +19726,13 @@ impl AppV3 {
                         .reference
                         .as_deref()
                         .ok_or_else(|| invalid(format!("{} requires reference", args.action)))?;
+                    if args.action == "fill" && args.expected_value.is_some() {
+                        let expected = args.expected_value.as_deref().unwrap_or_default();
+                        let requested = args.value.as_deref().unwrap_or_default();
+                        if let Some(receipt) = text_conflict_preflight(self, &args, reference, expected, requested).await {
+                            return Ok(receipt);
+                        }
+                    }
                     if background_mutation && matches!(args.action.as_str(), "fill" | "select") {
                         return Box::pin(self.background_dom_action(&args, reference, None)).await;
                     }
@@ -19878,6 +19757,26 @@ impl AppV3 {
                     .await
                 }
                 "type" => {
+                    // Only a caller-declared precondition can prove a conflicting
+                    // edit. Without expected_value, typing into a non-empty field
+                    // is ordinary append semantics, not a conflict.
+                    if args.expected_value.is_some()
+                        && let Some(reference) = args.reference.as_deref()
+                        && !reference.starts_with("@f:")
+                    {
+                        let expected_raw = args.expected_value.as_deref().unwrap_or_default();
+                        // A blank rich editor exposes whitespace (often a lone
+                        // newline) for an empty value. Canonicalize it before
+                        // comparing the caller's declared prefix.
+                        let expected = if expected_raw.trim().is_empty() { "" } else { expected_raw };
+                        let requested = format!(
+                            "{expected}{}",
+                            normalize_key_text(args.value.as_deref().unwrap_or_default())
+                        );
+                        if let Some(receipt) = text_conflict_preflight(self, &args, reference, expected, &requested).await {
+                            return Ok(receipt);
+                        }
+                    }
                     if let Some(refusal) = hidden_canvas_editor_refusal(self, &args).await {
                         return Ok(refusal);
                     }
@@ -20079,11 +19978,12 @@ impl AppV3 {
                 crate::verifier::Verification::Inconclusive
             };
             let entry = crate::page_action_memory::ActionMemoryEntry {
+                replay: learned_action_replay(&args.action, &target, args.outcome.as_ref()),
                 semantic_target: target,
                 action: args.action.clone(),
                 expected_postcondition: json!({"kind":"fresh_live_postcondition","action":args.action,
                     "verification":"passed","outcome_kind":result.as_ref().ok().and_then(|receipt| receipt["outcome"]["kind"].as_str())}),
-                replay: None,
+                operation: None,
                 preconditions: None,
                 repair: None,
                 last_verified_ms: now_ms(),
@@ -22862,11 +22762,12 @@ impl AppV3 {
         args: &V3BrowserArgs,
         program: crate::task_program::TaskProgram,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        let compiled = crate::task_program::compile_task_program(
-            &program,
-            crate::task_program::TaskProgramLimits::default(),
-        )
-        .map_err(invalid)?;
+        // The shared plan owns compilation, the conservative read scheduler,
+        // the operation contract, and the static route. Only independent
+        // observation/extraction steps are grouped; stateful or short runs
+        // stay serial.
+        let (scheduled, plan) =
+            crate::execution_plan::ExecutionPlan::for_task_program(&program).map_err(invalid)?;
         let session_id = args
             .session_id
             .clone()
@@ -22875,7 +22776,7 @@ impl AppV3 {
             .chrome_tab_id
             .clone()
             .ok_or_else(|| invalid("task_program requires chrome_tab_id"))?;
-        let ops = expand_app_adapter_ops(task_program_ops(&program)?)?;
+        let ops = expand_app_adapter_ops(task_program_ops(&scheduled)?)?;
         validate_workflow_ops(&ops, 0)?;
         let result = self
             .workflow(Parameters(V3WorkflowArgs {
@@ -22895,11 +22796,12 @@ impl AppV3 {
         let mut value = result.structured_content.ok_or_else(|| {
             invalid("task program execution returned no structured receipt")
         })?;
+        value["execution_plan"] = plan.receipt();
         if value["status"] == "completed" || value["status"] == "completed_unverified" {
             value["task_program"] = json!({
-                "steps": compiled.expanded_steps,
-                "control_flow": compiled.has_control_flow,
-                "has_mutation": compiled.has_mutation,
+                "steps": plan.body.expanded_steps(),
+                "control_flow": plan.body.has_control_flow(),
+                "has_mutation": plan.contract.effect.is_mutation(),
                 "one_observation_policy": true,
             });
         }
@@ -23431,6 +23333,14 @@ impl AppV3 {
         );
         let mut execution_route =
             crate::capability_router::route_execution(signals, read_only_task);
+        // A registered read-only site tool is tried before extraction, so the
+        // static plan must not advertise a slower qualified-skill route first.
+        if read_only_task && signals.site_tool {
+            execution_route.selected = crate::capability_router::ExecutionTier::WebMcpOrSiteTool;
+            execution_route.reason =
+                "a runtime-qualified site tool is preferred for this read-only task";
+            execution_route.predicted_model_calls = 0;
+        }
         let available_routes = route_candidates(signals, read_only_task);
         let selected_by_history = if let Some((origin, intent, size)) = cost_context.as_ref() {
             let context = crate::execution_cost_router::RouteCostContext {
@@ -23514,10 +23424,21 @@ impl AppV3 {
                 "reason":if allow_speculation {"no competing V3 task is active"} else {"speculative reads skipped under concurrent V3 task load"}},
             "intent_fingerprint":task_intent.clone(),
         });
+        route_receipt["task_conditioned_filter"] =
+            crate::task_observation::TaskObservationFilter::for_task(&args.task).receipt();
         if let Some((origin, intent, size)) = cost_context.as_ref() {
             route_receipt["cost_cohort"] =
                 json!({"origin_key":origin,"intent":intent,"warmth":cost_warmth,"task_size":size,"environment":args.session_id});
         }
+        let mut plan = crate::execution_plan::ExecutionPlan::from_primitive(
+            args.task.clone(),
+            execution_route.clone(),
+            available_routes.clone(),
+        );
+        if selected_by_history.is_some() {
+            plan = plan.with_empirical_route(execution_route.selected, execution_route.expected_cost);
+        }
+        route_receipt["execution_plan"] = plan.receipt();
         if let crate::v3_tasks::TaskPrimitive::Research { urls, tab_ids, .. } = &args.task {
             let tab_ids = tab_ids
                 .clone()
@@ -23588,6 +23509,12 @@ impl AppV3 {
                     "one or more exact qualified read-only workflows matched live site structure"
                 );
                 route_receipt["predicted_model_calls"] = json!(0);
+                plan = plan.with_selected_tier(
+                    crate::capability_router::ExecutionTier::QualifiedSkill,
+                    "one or more exact qualified read-only workflows matched live site structure",
+                    0,
+                );
+                route_receipt["execution_plan"] = plan.receipt();
             }
             attach_execution_actuals(&mut route_receipt, route_started, &result);
             result["execution_route"] = route_receipt;
@@ -23638,6 +23565,12 @@ impl AppV3 {
             route_receipt["tier"] = json!(crate::capability_router::ExecutionTier::QualifiedSkill);
             route_receipt["reason"] = json!("qualified bounded mutation template matched live site and structure; every step requires a fresh outcome");
             route_receipt["predicted_model_calls"] = json!(0);
+            plan = plan.with_selected_tier(
+                crate::capability_router::ExecutionTier::QualifiedSkill,
+                "qualified bounded mutation template matched live site and structure; every step requires a fresh outcome",
+                0,
+            );
+            route_receipt["execution_plan"] = plan.receipt();
             attach_execution_actuals(&mut route_receipt, route_started, &replayed);
             replayed["execution_route"] = route_receipt;
             return Ok(Json(replayed));
@@ -23652,6 +23585,12 @@ impl AppV3 {
                 "qualified fill-only form workflow matched the live site and structure"
             });
             route_receipt["predicted_model_calls"] = json!(0);
+            plan = plan.with_selected_tier(
+                crate::capability_router::ExecutionTier::QualifiedSkill,
+                "qualified form workflow matched live site and structure",
+                0,
+            );
+            route_receipt["execution_plan"] = plan.receipt();
             attach_execution_actuals(&mut route_receipt, route_started, &replayed);
             replayed["execution_route"] = route_receipt;
             return Ok(Json(replayed));
@@ -23662,6 +23601,12 @@ impl AppV3 {
             route_receipt["tier"] = json!(crate::capability_router::ExecutionTier::QualifiedSkill);
             route_receipt["reason"] = json!("qualified explicit-outcome repeat-click template matched the live site and structure");
             route_receipt["predicted_model_calls"] = json!(0);
+            plan = plan.with_selected_tier(
+                crate::capability_router::ExecutionTier::QualifiedSkill,
+                "qualified explicit-outcome repeat-click template matched the live site and structure",
+                0,
+            );
+            route_receipt["execution_plan"] = plan.receipt();
             attach_execution_actuals(&mut route_receipt, route_started, &replayed);
             replayed["execution_route"] = route_receipt;
             return Ok(Json(replayed));
@@ -23932,10 +23877,12 @@ impl AppV3 {
                         && let Some(memory) = self.action_memory.as_ref()
                         && let Some(entry) = memory.lock().await.lookup(key, now_ms()).cloned()
                         && entry.action == "extract"
-                        && let Some(crate::page_action_memory::ReplayPlan::Extract { selector: remembered_selector }) = entry.replay
+                        && let Some(crate::page_action_memory::ReplayPlan::Extract { selector: remembered_selector }) = entry.replay.clone()
                     {
                         memory_selector = Some(remembered_selector);
                         action_memory_status = "hit";
+                        let learned = crate::execution_plan::ExecutionPlan::from_learned_operation(&entry);
+                        route_receipt["learned_operation"] = learned.receipt();
                     } else if action_memory_candidate {
                         action_memory_status = "stale";
                     }
@@ -23993,11 +23940,15 @@ impl AppV3 {
                         let mut registry = self.capabilities.lock().await;
                         for capability in capabilities { registry.register(capability).map_err(invalid)?; }
                     }
-                    if skill_result.is_none()
-                        && execution_route.selected == crate::capability_router::ExecutionTier::QualifiedSkill
+                    if webmcp_result.is_none()
+                        && skill_result.is_none()
+                        && matches!(execution_route.selected,
+                            crate::capability_router::ExecutionTier::QualifiedSkill
+                                | crate::capability_router::ExecutionTier::WebMcpOrSiteTool
+                                | crate::capability_router::ExecutionTier::SpeculativeRead)
                     {
                         route_receipt["tier"] = json!(crate::capability_router::ExecutionTier::SemanticProgram);
-                        route_receipt["reason"] = json!("qualified skill candidate failed live preconditions; used bounded semantic extraction");
+                        route_receipt["reason"] = json!("qualified read candidate failed live preconditions; used bounded semantic extraction");
                         route_receipt["predicted_model_calls"] = json!(0);
                     }
                     let memory_used = webmcp_result.is_none() && skill_result.is_none() && memory_selector.is_some();
@@ -24012,6 +23963,7 @@ impl AppV3 {
                             let mut unknown_result = json!({"status":"unknown","result":value,
                                 "no_retry":true,"next_action":"inspect the page before any further action"});
                             attach_execution_actuals(&mut route_receipt, route_started, &unknown_result);
+                            sync_plan_route(&mut plan, &mut route_receipt);
                             unknown_result["execution_route"] = route_receipt;
                             return Ok(Json(unknown_result));
                         }
@@ -24069,19 +24021,33 @@ impl AppV3 {
                             crate::site_profiles::Speculation::Unavailable|crate::site_profiles::Speculation::Candidate{..}=>{}
                         }
                     }
-                    if speculative_profile.is_none()
-                        && let crate::v3_tasks::TaskPrimitive::Research { urls, goal: Some(goal), .. } = &args.task
-                        && urls.len() == 1 && urls[0] == url
-                        && let Some(operation) = crate::capability_registry::operation_from_goal(goal)
-                        && !value["truncated"].as_bool().unwrap_or(true)
-                        && value["items"].as_array().is_some_and(|items| !items.is_empty())
-                        && crate::relevance::speculative_result_matches(goal, &value)
-                        && let Ok((site, signature)) = super::full::current_skill_context_core(&self.core, &args.session_id, &active_tab_id).await
-                        && site == site_scope_from_url(&url).unwrap_or_default()
-                        && let Err(error) = self.site_profiles.lock().await
-                            .observe_verified_operation(operation, &url, &signature, now_ms())
-                    {
-                        route_receipt["profile_learning_fallback_reason"] = json!(error);
+                    if speculative_profile.is_none() {
+                        match promote_learned_url_operation(
+                            self,
+                            &args.task,
+                            &url,
+                            &value,
+                            &args.session_id,
+                            &active_tab_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(profile)) => {
+                                route_receipt["url_promotion"] = json!({
+                                    "status":"promoted",
+                                    "profile_id":profile.id,
+                                    "intent":profile.intent,
+                                    "slot_name":profile.slot_name,
+                                    "source":profile.promotion_source,
+                                    "independent_successes":profile.independent_successes,
+                                    "read_only":true,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                route_receipt["profile_learning_fallback_reason"] = json!(error)
+                            }
+                        }
                     }
                     if memory_used
                         && task_receipt("extract", &url, None, &value)["verified"] != true
@@ -24109,6 +24075,7 @@ impl AppV3 {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
                             expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
                             replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            operation: None,
                             preconditions: None,
                             repair: None,
                             last_verified_ms: now_ms(),
@@ -24133,6 +24100,7 @@ impl AppV3 {
                             semantic_target: json!({"selector":selector}), action:"extract".into(),
                             expected_postcondition: json!({"kind":"nonempty_complete_extraction"}),
                             replay: Some(crate::page_action_memory::ReplayPlan::Extract { selector: selector.clone() }),
+                            operation: None,
                             preconditions: None,
                             repair: None,
                             last_verified_ms:now_ms(),
@@ -24158,8 +24126,7 @@ impl AppV3 {
                         snapshot_impl(&self.core, &BrowserSnapshotArgs {
                             session_id: args.session_id.clone(), chrome_tab_id: active_tab_id.clone(),
                             selector: None, max_items: None, max_text_chars: None, max_bytes: None, max_bytes_reason: None,
-                            href_hint: None, frame_id: None,
-            include_frames: None, goal: None, max_scan_nodes: None,
+                            href_hint: None, frame_id: None,                            include_frames: None, goal: task_snapshot_goal(&args.task), max_scan_nodes: None,
                         }).await?;
                     }
                     let resume_target_matches = if let Some(resume) = resume.as_ref() {
@@ -24259,7 +24226,7 @@ impl AppV3 {
                             href_hint: None,
                             frame_id: None,
                             include_frames: None,
-                            goal: None,
+                            goal: task_snapshot_goal(&args.task),
                             max_scan_nodes: None,
                         },
                     ).await?;
@@ -24284,7 +24251,7 @@ impl AppV3 {
                             href_hint: None,
                             frame_id: None,
             include_frames: None,
-            goal: None,
+            goal: task_snapshot_goal(&args.task),
             max_scan_nodes: None,
                         },
                     )
@@ -24344,7 +24311,7 @@ impl AppV3 {
                             href_hint: None,
                             frame_id: None,
             include_frames: None,
-            goal: None,
+            goal: task_snapshot_goal(&args.task),
             max_scan_nodes: None,
                         },
                     )
@@ -24578,6 +24545,7 @@ impl AppV3 {
                 });
                 attach_execution_actuals(&mut route_receipt, route_started, &lease_result);
                 finalize_visual_requirement(&mut route_receipt, &mut lease_result);
+                sync_plan_route(&mut plan, &mut route_receipt);
                 lease_result["execution_route"] = route_receipt;
                 return Ok(Json(lease_result));
             }
@@ -24591,16 +24559,31 @@ impl AppV3 {
                 let mut failed_result = json!({"status":status,"steps":receipts.len(),"receipts":receipts,"elapsed_ms":task_started.elapsed().as_millis() as u64});
                 attach_execution_actuals(&mut route_receipt, route_started, &failed_result);
                 finalize_visual_requirement(&mut route_receipt, &mut failed_result);
+                sync_plan_route(&mut plan, &mut route_receipt);
                 failed_result["execution_route"] = route_receipt;
                 return Ok(Json(failed_result));
             }
         }
         let final_status = if unverified_effect { "completed_unverified" } else { "completed" };
+        let operation_recorded = record_task_operation(
+            self,
+            &args.task,
+            &task_intent,
+            &args.session_id,
+            &active_tab_id,
+            &receipts,
+            final_status == "completed",
+        )
+        .await;
         let mut final_result = json!({"status":final_status,"steps":receipts.len(),"receipts":receipts,"elapsed_ms":task_started.elapsed().as_millis() as u64});
+        if operation_recorded {
+            final_result["operation_memory_recorded"] = json!(true);
+        }
         attach_execution_actuals(&mut route_receipt, route_started, &final_result);
         finalize_visual_requirement(&mut route_receipt, &mut final_result);
         schedule_task_trace(self, &args.task, &args.session_id, &active_tab_id, &receipts,
             final_result["status"].as_str().unwrap_or(final_status));
+        sync_plan_route(&mut plan, &mut route_receipt);
         final_result["execution_route"] = route_receipt;
         Ok(Json(final_result))
         }).await
@@ -24897,6 +24880,7 @@ pub(super) async fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod v3_batch_delivery_tests {
+    use super::execution_core::matching_task_tabs;
     use super::{
         AppV3, BrowserClickOutcome, BrowserPredicate, DEFAULT_V3_WORKFLOW_RECEIPT_BYTES,
         FILL_FORM_STEP, FileChooserCleanupGuard, HasUnknownOutcome, NativeDownloadSequence,
@@ -24939,6 +24923,32 @@ mod v3_batch_delivery_tests {
         workflow_should_verify_next, workflow_step_name, workflow_upload_requires_stop,
         workflow_verification_passed, workflow_vm_route_budget_receipt,
     };
+
+    #[test]
+    fn read_only_task_binding_matches_one_tab_and_reports_duplicates() {
+        let tabs = vec![
+            json!({"id":"41","url":"https://example.test/doc?tab=t.0","title":"Doc","last_accessed":10}),
+            json!({"id":"42","url":"https://example.test/other","title":"Other","last_accessed":20}),
+            json!({"id":"43","url":"https://example.test/doc?tab=t.9","title":"Doc view","last_accessed":30}),
+        ];
+        let one = matching_task_tabs(&tabs, &["https://example.test/other".into()], &[]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["id"], "42");
+
+        let two = matching_task_tabs(&tabs, &["https://example.test/doc".into()], &[]);
+        assert_eq!(two.len(), 2, "two views of one resource remain two real tabs");
+        assert_eq!(two[0]["id"], "41");
+        assert_eq!(two[1]["id"], "43");
+
+        let by_id = matching_task_tabs(&tabs, &[], &["43".into()]);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0]["id"], "43");
+
+        let none = matching_task_tabs(&tabs, &["https://example.test/missing".into()], &[]);
+        assert!(none.is_empty());
+        let no_hints = matching_task_tabs(&tabs, &[], &[]);
+        assert!(no_hints.is_empty(), "a task with no hint never binds an arbitrary tab");
+    }
 
     #[test]
     fn human_keys_accepts_unicode_scalars_and_rejects_controls_before_dispatch() {

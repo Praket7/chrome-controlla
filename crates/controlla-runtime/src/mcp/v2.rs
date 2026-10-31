@@ -1051,28 +1051,59 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         args.max_bytes_reason.as_deref(),
         default_snapshot_response_bytes(targeted_compact),
     );
-    let collection_text_chars = args.max_text_chars.unwrap_or_else(|| {
+    let required_roles = args
+        .goal
+        .as_ref()
+        .and_then(|goal| goal.roles.as_deref())
+        .unwrap_or_default();
+    let mut collection_text_chars = args.max_text_chars.unwrap_or_else(|| {
         if decision.mode == crate::observation_router::ObservationMode::SemanticRich {
             6_000
         } else {
             snapshot_chars()
         }
     }).min(6000);
-    let legacy = app
-        .legacy
-        .shared_snapshot(Parameters(SharedSnapshotArgs {
-            session_id: args.session_id.clone(),
-            chrome_tab_id: args.chrome_tab_id.clone(),
-            selector: args.selector.clone().unwrap_or_else(snapshot_scope),
-            max_items: args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200),
-            max_text_chars: collection_text_chars,
-            max_bytes: snapshot_collection_budget(response_max_bytes, collection_text_chars),
-            href_hint: args.href_hint.clone(),
-            goal: args.goal.clone(),
-            max_scan_nodes: args.max_scan_nodes,
-        }))
-        .await?;
-    let Json(mut snapshot) = legacy;
+    let mut collection_items = args.max_items.unwrap_or_else(snapshot_items).clamp(1, 200);
+    let mut progressive =
+        crate::progressive_observation::ProgressiveObservation::new(decision.mode);
+    let mut snapshot = loop {
+        let Json(candidate) = app
+            .legacy
+            .shared_snapshot(Parameters(SharedSnapshotArgs {
+                session_id: args.session_id.clone(),
+                chrome_tab_id: args.chrome_tab_id.clone(),
+                selector: args.selector.clone().unwrap_or_else(snapshot_scope),
+                max_items: collection_items,
+                max_text_chars: collection_text_chars,
+                max_bytes: snapshot_collection_budget(response_max_bytes, collection_text_chars),
+                href_hint: args.href_hint.clone(),
+                goal: args.goal.clone(),
+                max_scan_nodes: args.max_scan_nodes,
+            }))
+            .await?;
+        let Some(reason) = progressive.escalation_reason(
+            &candidate,
+            required_roles,
+            request.query_required,
+        ) else {
+            break candidate;
+        };
+        let can_widen = args.max_items.is_none() || args.max_text_chars.is_none();
+        if !can_widen {
+            break candidate;
+        }
+        progressive.escalate(reason);
+        if args.max_items.is_none() {
+            collection_items = collection_items.max(
+                crate::progressive_observation::ESCALATED_ITEMS,
+            );
+        }
+        if args.max_text_chars.is_none() {
+            collection_text_chars = collection_text_chars.max(
+                crate::progressive_observation::ESCALATED_TEXT_CHARS,
+            );
+        }
+    };
     if args.include_frames == Some(true) {
         let frame_handles = snapshot["frame_handles"]
             .as_array()
@@ -1147,11 +1178,6 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .unwrap_or_default();
     let intent_query = args.goal.as_ref().and_then(|goal| goal.query.as_deref());
     let candidate_count = items.len();
-    let required_roles = args
-        .goal
-        .as_ref()
-        .and_then(|goal| goal.roles.as_deref())
-        .unwrap_or_default();
     let items = crate::relevance::filter_items_for_task(
         &items,
         intent_query,
@@ -1241,6 +1267,24 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         .filter(|reference| !state.items.contains_key(*reference))
         .cloned()
         .collect::<Vec<_>>();
+    // A removed public reference is not necessarily a removed control: a
+    // rerender can move it to a new stable key. Classify every lost reference
+    // once, with the same bounded high-confidence rule used by stale-reference
+    // recovery, so callers can rebind instead of taking another snapshot.
+    let rebase_items = state.items.values().cloned().collect::<Vec<_>>();
+    let rebase = crate::reference_rebase::rebase_map(
+        state.identities.iter().map(|(reference, identity)| (reference.clone(), identity.clone())),
+        state.items.keys().cloned(),
+        state.document.as_ref(),
+        &rebase_items,
+        32,
+    );
+    let rebase_receipts = rebase.iter().map(|decision| decision.receipt()).collect::<Vec<_>>();
+    let rebound_count = rebase.iter().filter(|decision| decision.to.is_some()).count();
+    let ambiguous_count = rebase
+        .iter()
+        .filter(|decision| decision.class == crate::reference_rebase::RebaseClass::Ambiguous)
+        .count();
     state.snapshot_id = snapshot_id.clone();
     snapshot["items"] = json!(public_items);
     snapshot["semantic_revision"] = json!(snapshot_id);
@@ -1248,7 +1292,21 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         "full": previous_items.is_empty() || document_changed,
         "document_changed": document_changed,
         "upsert": upsert,
-        "removed": removed
+        "removed": removed,
+        "rebase": rebase_receipts
+    });
+    snapshot["semantic_mirror"] = json!({
+        "source":"shared_snapshot_delta",
+        "snapshot_id":snapshot_id,
+        "document_changed":document_changed,
+        "upsert_count":snapshot["delta"]["upsert"].as_array().map(Vec::len).unwrap_or(0),
+        "removed_count":snapshot["delta"]["removed"].as_array().map(Vec::len).unwrap_or(0),
+        "rebase_count":snapshot["delta"]["rebase"].as_array().map(Vec::len).unwrap_or(0),
+        "rebound_count":rebound_count,
+        "ambiguous_count":ambiguous_count,
+        "full":snapshot["delta"]["full"],
+        "mutation_clock":snapshot["semantic_revision"],
+        "policy":"stable_identity_delta_over_current_document; removed references carry one bounded rebase class; page text and values are never mirrored into keys"
     });
     drop(semantic);
     if decision.mode == crate::observation_router::ObservationMode::HtmlScoped {
@@ -1298,7 +1356,9 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         "source": response_source,
         "reason": response_reason
     });
-    attach_observation_metadata(&mut snapshot, decision);
+    snapshot["progressive_observation"] = progressive.receipt();
+    let effective_decision = progressive.effective_decision(decision);
+    attach_observation_metadata(&mut snapshot, effective_decision);
     let bytes = bound_snapshot_response(&mut snapshot, response_max_bytes);
     if snapshot["truncation_reason"] == "response_byte_limit"
         && let Some(state) = app.semantic.lock().await.get_mut(&key)
@@ -1306,7 +1366,7 @@ async fn snapshot_impl(app: &AppV2, args: &BrowserSnapshotArgs) -> Result<Value,
         state.scope_complete = false;
         state.root_scope_complete = false;
     }
-    record_observation_feedback(app, request, decision, started, &snapshot, bytes);
+    record_observation_feedback(app, request, effective_decision, started, &snapshot, bytes);
     controlla_browser::scheduler::telemetry::record_observation(
         snapshot["scanned_nodes"].as_u64().unwrap_or(0),
         bytes,

@@ -109,6 +109,22 @@ export class PointerEngine {
     return this.send(target, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
   }
 
+  // Two-finger gestures need both contact points in one trusted CDP event.
+  // Single-point helpers stay intact for ordinary taps and swipes.
+  async touchMulti(target, type, points) {
+    if (!["touchStart", "touchMove", "touchEnd"].includes(type)) throw new Error("invalid touch phase");
+    if (!Array.isArray(points) || points.length < 1 || points.length > 10) throw new Error("touch point count is out of bounds");
+    const touchPoints = points.map((point, index) => {
+      if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("touch point geometry is invalid");
+      return {
+        id: Number.isSafeInteger(point.id) ? point.id : index + 1,
+        x: point.x, y: point.y,
+        radiusX: 1, radiusY: 1, force: 1,
+      };
+    });
+    return this.send(target, "Input.dispatchTouchEvent", { type, touchPoints });
+  }
+
   async touch(target, type, touchPoints) {
     return this.send(target, "Input.dispatchTouchEvent", { type, touchPoints });
   }

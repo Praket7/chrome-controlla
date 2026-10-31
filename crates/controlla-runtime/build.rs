@@ -24,6 +24,11 @@ const EXTENSION_RUNTIME_ASSETS: &[&str] = &[
     "lib/owned-resources.js",
     "lib/presentation-slots.js",
     "lib/tab-control.js",
+    "lib/focus-emulation.js",
+    "lib/owned-pool.js",
+    "lib/execution-counters.js",
+    "lib/navigation-url.js",
+    "lib/frame-multitouch.js",
     "lib/owned-open.js",
 ];
 
