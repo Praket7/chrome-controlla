@@ -432,12 +432,22 @@ impl PersistentEvidenceStore {
             }
         };
         database.handles.insert(handle.clone(), scope.to_owned());
+        // Never evict the scope this call just wrote. A saturated store plus a
+        // scope that sorts first would otherwise discard the caller's evidence
+        // in the same transaction and return a handle that resolves to nothing.
         while database.scopes.len() > MAX_SCOPES {
-            let oldest = database.scopes.keys().next().cloned().unwrap_or_default();
-            database.scopes.remove(&oldest);
+            let Some(evicted) = database
+                .scopes
+                .keys()
+                .find(|key| key.as_str() != scope)
+                .cloned()
+            else {
+                break;
+            };
+            database.scopes.remove(&evicted);
             database
                 .handles
-                .retain(|_, mapped_scope| mapped_scope != &oldest);
+                .retain(|_, mapped_scope| mapped_scope != &evicted);
         }
         let encoded = serde_json::to_vec(&database).map_err(|error| error.to_string())?;
         if encoded.len() > MAX_STORE_BYTES {

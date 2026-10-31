@@ -70,6 +70,12 @@ export function chooseInputBackend({ strategy, text, probe }) {
   const described = describeEditorProbe(probe);
   if (strategy === "native_setter") return { backend: "native_setter", reason: "explicit" };
   if (strategy === "insert_text") return { backend: "insert_text", reason: "explicit" };
+  // `bulk_insert`, `auto`, `block`, and `insert_text` all insert the text as
+  // written; the transaction decides whether that is one CDP insertion or a
+  // bounded trusted key block for a canvas editor.
+  if (strategy === "bulk_insert" || strategy === "block" || strategy === "auto") {
+    return { backend: "insert_text", reason: "bulk_insert" };
+  }
   if (strategy === "key_events") return { backend: "key_events", reason: "explicit" };
   if (strategy === "dom_typing") return { backend: "dom_typing", reason: "explicit" };
   if (strategy === "ime") return { backend: "ime_composition", reason: "explicit" };
@@ -78,9 +84,9 @@ export function chooseInputBackend({ strategy, text, probe }) {
     return { backend: "key_events", reason: "trusted_surface" };
   }
   if (described.rich) return { backend: "insert_text", reason: "rich_editor_generic" };
-  if (described.ordinary && !stringNeedsComposition(text)) {
-    return { backend: "insert_text", reason: "ordinary_text" };
-  }
+  // Unicode is inserted as written. `stringNeedsComposition` is true only when
+  // a caller asks for composition, not because a string has non-ASCII bytes.
+  if (described.ordinary) return { backend: "insert_text", reason: "ordinary_text" };
   if (stringNeedsComposition(text)) return { backend: "ime_composition", reason: "composition_text" };
   return { backend: "insert_text", reason: "auto" };
 }

@@ -49,6 +49,7 @@ async function run({ text, strategy = "key_events", pacing = 0, rich = false, ca
     const cdp = await page.context().newCDPSession(page);
     const handle = await cdp.send("Runtime.evaluate", { expression: "document.getElementById('ed')" });
     let commands = 0;
+    let presentationAcquisitions = 0;
     const ctx = {
       now: () => performance.now(),
       commandCount: () => commands,
@@ -63,6 +64,7 @@ async function run({ text, strategy = "key_events", pacing = 0, rich = false, ca
       // fixture only flips the emulated visibility flag: regaining the slot
       // means the window presents the tab again.
       acquirePresentation: async () => {
+        presentationAcquisitions += 1;
         if (!recoverPresentation) return null;
         await page.evaluate(() => { window.__hide = false; window.__defer = false; });
         return "fixture-presentation-token";
@@ -121,7 +123,7 @@ async function run({ text, strategy = "key_events", pacing = 0, rich = false, ca
       const raw = ed.value !== undefined ? ed.value : (ed.innerText ?? "");
       return raw.replace(/\n$/, "");
     });
-    return { receipt, value };
+    return { receipt, value, presentationAcquisitions };
   } finally {
     await page.close();
   }
@@ -196,4 +198,42 @@ test("a human edit still stops the transaction instead of overwriting it", async
   const { receipt, value } = await run({ text: TEXT, pacing: 25, editAt: 120 });
   assert.notEqual(receipt.status, "verified");
   assert.ok(value.includes(" HUMAN"));
+});
+
+// The fast path is one bounded insertion per block, not per character. A plain
+// control takes one Input.insertText; key_events stays zero.
+test("bulk insertion types four thousand characters without per-character keys", async () => {
+  const body = Array.from({ length: 80 }, (_, index) => `Line ${index}: the quick brown fox jumps over the lazy dog.\n`).join("").slice(0, 4000);
+  const { receipt, value } = await run({ text: body, strategy: "bulk_insert", rich: true });
+  assert.equal(receipt.status, "verified", JSON.stringify(receipt));
+  assert.equal(receipt.bulk_insert, true);
+  assert.equal(receipt.text_semantics, "plain_unicode_insert");
+  assert.equal(receipt.key_events, 0);
+  assert.ok(receipt.input_commands <= 2, `one insert command, got ${receipt.input_commands}`);
+  assert.equal(value, body);
+});
+
+test("bulk insertion carries unicode verbatim", async () => {
+  const text = "café 🙂 こんにちは\ncombining é and an em dash — done";
+  const { receipt, value } = await run({ text, strategy: "bulk_insert", rich: true });
+  assert.equal(receipt.status, "verified", JSON.stringify(receipt));
+  assert.equal(receipt.text_semantics, "plain_unicode_insert");
+  assert.equal(value, text);
+});
+
+// A canvas editor cannot be inserted into; it has to be presented first. The
+// slot acquisition proves the fast path still refuses to fake delivery.
+test("bulk insertion on a canvas editor takes the presentation slot first", async () => {
+  const { receipt, value, presentationAcquisitions } = await run({ text: TEXT, strategy: "bulk_insert", canvas: true, hideAt: 0, recoverPresentation: true });
+  assert.equal(receipt.status, "verified", JSON.stringify(receipt));
+  assert.equal(receipt.bulk_insert, true);
+  assert.ok(presentationAcquisitions >= 1, "the canvas was presented before dispatch");
+  assert.ok(receipt.key_events < Array.from(TEXT).length, "a block, not a key per character");
+  assert.equal(value, TEXT);
+});
+
+test("bulk insertion refuses a canvas editor it cannot present", async () => {
+  const { receipt } = await run({ text: TEXT, strategy: "bulk_insert", canvas: true, hideAt: 0 });
+  assert.equal(receipt.status, "not_dispatched", JSON.stringify(receipt));
+  assert.equal(receipt.reason, "canvas_presentation_unavailable");
 });

@@ -152,7 +152,7 @@ function(q) {
   const maxScanNodes = Number.isSafeInteger(q.max_scan_nodes) ? Math.max(1, Math.min(65536, q.max_scan_nodes)) : 65536;
   const encoder = new TextEncoder();
   let shadow_roots_seen = 0, iframes_seen = 0, cross_origin_frames_unread = 0, same_origin_frames_read = 0, same_origin_frames_pending = 0, blank_frames_seen = 0;
-  const scopes = [{root, frame:'main', kind:'light', depth:0}];
+  const scopes = [{root, frame:'main', kind:'light', depth:0, owner:null}];
   for (let scopeIndex = 0; scopeIndex < scopes.length; scopeIndex++) {
     const scope = scopes[scopeIndex], walker = scope.root.ownerDocument.createTreeWalker(scope.root, NodeFilter.SHOW_ELEMENT);
     let e = scope.root.nodeType === Node.ELEMENT_NODE ? scope.root : walker.nextNode();
@@ -168,12 +168,12 @@ function(q) {
       iframes_seen++;
       try {
         const doc = e.contentDocument;
-        if (doc?.body && doc.location.href !== 'about:blank' && scopes.length < 32 && scope.depth < 8) { scopes.push({root:doc.body,frame:scope.frame+'/iframe['+iframes_seen+']',kind:'same_origin_frame',depth:scope.depth+1}); same_origin_frames_read++; }
+        if (doc?.body && doc.location.href !== 'about:blank' && scopes.length < 32 && scope.depth < 8) { scopes.push({root:doc.body,frame:scope.frame+'/iframe['+iframes_seen+']',kind:'same_origin_frame',depth:scope.depth+1,owner:e}); same_origin_frames_read++; }
         else if (doc?.body && doc.location.href === 'about:blank') {
           const src = e.getAttribute('src');
           if (src && src !== 'about:blank' && new URL(src, location.href).origin === location.origin) same_origin_frames_pending++;
           else if (src && src !== 'about:blank') cross_origin_frames_unread++;
-          else if (doc.body.children.length && scopes.length < 32 && scope.depth < 8) { scopes.push({root:doc.body,frame:scope.frame+'/iframe['+iframes_seen+']',kind:'same_origin_blank_frame',depth:scope.depth+1}); same_origin_frames_read++; }
+          else if (doc.body.children.length && scopes.length < 32 && scope.depth < 8) { scopes.push({root:doc.body,frame:scope.frame+'/iframe['+iframes_seen+']',kind:'same_origin_blank_frame',depth:scope.depth+1,owner:e}); same_origin_frames_read++; }
           else blank_frames_seen++;
         }
         else if (!doc) cross_origin_frames_unread++;
@@ -185,7 +185,12 @@ function(q) {
       if (goalRoles && !goalRoles.has(role) || q.goal?.href_hint && !(e.tagName === 'A' && e.href.includes(q.goal.href_hint))) { e = walker.nextNode(); continue; }
       const b = e.getBoundingClientRect();
       const state = presentation(e, b);
-      if (!state.rendered) { e = walker.nextNode(); continue; }
+      const frameRelay = !state.rendered
+        && scope.kind === 'same_origin_blank_frame'
+        && richEditor(e)
+        && (!goalRoles || goalRoles.has('textbox'))
+        && e.isContentEditable === true;
+      if (!state.rendered && !frameRelay) { e = walker.nextNode(); continue; }
       if (items.length >= q.max_items && !q.goal) { omitted_by_limit++; truncated = true; truncation_reason = truncation_reason || 'max_items'; e = walker.nextNode(); continue; }
       const credential = isCredentialInput(e), value = raw(e), label = name(e);
       if (typeof value === 'string' && value.length > 16384 || label.length > 2000) { omitted_oversized++; truncated = true; truncation_reason = truncation_reason || 'oversized_value'; e = walker.nextNode(); continue; }
@@ -204,7 +209,7 @@ function(q) {
       const canvasHost = rich && (() => { if (paintsCanvas(e)) return true; for (let p = e.parentElement, depth = 0; p && depth < 3; p = p.parentElement, depth += 1) if (paintsCanvas(p)) return true; return false; })();
       const valueReadable = !rich || !(scope.kind === 'same_origin_blank_frame' || canvasHost);
       const feedbackRegion = e.closest('[role="alert"],[role="status"],[role="log"],[aria-live]') !== null;
-      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),id:e.id || null,size:fileSizeOf(e),role,name:label,text:label,raw_value:value,...state,feedback_region:feedbackRegion,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',control_type:typeof e.type==='string'?e.type:null,multiple:'multiple'in e?e.multiple===true:null,min:e.getAttribute('min'),max:e.getAttribute('max'),step:e.getAttribute('step'),hover_reveals:e.getAttribute('data-hover-reveals')==='true'||e.hasAttribute('data-hover-reveals'),draggable:e.draggable===true||e.getAttribute('data-draggable')==='true',drop_target:e.getAttribute('data-drop-target')==='true'||e.getAttribute('aria-dropeffect')==='move',widget_kind:e.getAttribute('data-widget-kind'),href:e.tagName === 'A' ? e.href : null,target:e.tagName === 'A' ? e.getAttribute('target') : null,rel:e.tagName === 'A' ? e.getAttribute('rel') : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,test_id:e.getAttribute('data-testid') || e.getAttribute('data-test') || e.getAttribute('data-qa') || null,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),bounds:scope.frame==='main'?{x:b.left+e.ownerDocument.defaultView.scrollX,y:b.top+e.ownerDocument.defaultView.scrollY,width:b.width,height:b.height}:null,source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind,value_readable:valueReadable};
+      const item = {reference:q.token+':'+items.length,tag:e.tagName.toLowerCase(),id:e.id || null,size:fileSizeOf(e),role,name:label,text:label,raw_value:value,...state,feedback_region:feedbackRegion,editable_kind:rich?'rich_text':editable?'plain_text':null,credential_input:credential,requires_user_input:credential,multiline:rich||e.tagName==='TEXTAREA'||e.getAttribute('aria-multiline')==='true',control_type:typeof e.type==='string'?e.type:null,multiple:'multiple'in e?e.multiple===true:null,min:e.getAttribute('min'),max:e.getAttribute('max'),step:e.getAttribute('step'),hover_reveals:e.getAttribute('data-hover-reveals')==='true'||e.hasAttribute('data-hover-reveals'),draggable:e.draggable===true||e.getAttribute('data-draggable')==='true',drop_target:e.getAttribute('data-drop-target')==='true'||e.getAttribute('aria-dropeffect')==='move',widget_kind:e.getAttribute('data-widget-kind'),href:e.tagName === 'A' ? e.href : null,target:e.tagName === 'A' ? e.getAttribute('target') : null,rel:e.tagName === 'A' ? e.getAttribute('rel') : null,expanded:e.getAttribute('aria-expanded'),selected:e.getAttribute('aria-selected') || e.getAttribute('aria-checked'),controls_selector:e.getAttribute('aria-controls')?.split(/\s+/).filter(Boolean).map(id=>'#'+CSS.escape(id)).join(',') || null,datetime,test_id:e.getAttribute('data-testid') || e.getAttribute('data-test') || e.getAttribute('data-qa') || null,datetime_utc_ms:exactInstant && Number.isFinite(parsedTime)?parsedTime:null,datetime_precision:exactInstant?'instant':dateOnly?'date':null,freshness_upper_bound_ms:Number.isFinite(freshnessUpperBound)?freshnessUpperBound:null,section:sectionOf(e),semantic_ancestor:semanticAncestor(e),dom_path_fingerprint:domPathFingerprint(e),rect_bucket:rectBucket(b),bounds:scope.frame==='main'?{x:b.left+e.ownerDocument.defaultView.scrollX,y:b.top+e.ownerDocument.defaultView.scrollY,width:b.width,height:b.height}:null,source_frame:scope.frame,source_frame_revision:String(e.ownerDocument.defaultView.performance.timeOrigin),source_frame_url:e.ownerDocument.location.href,source_kind:scope.kind,source_frame_owner:scope.owner?{tag:'iframe',id:scope.owner.id||null,class:typeof scope.owner.className==='string'?scope.owner.className||null:null,name:scope.owner.getAttribute('name')||null,src:scope.owner.getAttribute('src')||null}:null,hidden_editor:!state.rendered,value_readable:valueReadable};
       let queryScore = 0;
       if (q.goal) {
         const normalize = text => text.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,' ').trim();
@@ -215,7 +220,7 @@ function(q) {
           : normalize(label) === goalQuery || typeof value === 'string' && normalize(value) === goalQuery ? 100
           : candidateText.includes(goalQuery) ? 60
           : goalTerms.size ? Math.round(60 * overlap / goalTerms.size) : 0;
-        const roleScore = !goalRoles ? 0 : goalRoles.has(item.role) ? 40 : -1000;
+        const roleScore = (!goalRoles ? 0 : goalRoles.has(item.role) ? 40 : -1000) + (state.rendered ? 0 : -20);
         const hrefScore = !q.goal.href_hint ? 0 : item.href?.includes(q.goal.href_hint) ? 30 : -1000;
         if (roleScore < 0 || hrefScore < 0) { e = walker.nextNode(); continue; }
         item.goal_score = queryScore + roleScore + hrefScore;

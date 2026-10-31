@@ -683,7 +683,7 @@ const chrome = {
 };
 const backgroundSource = fs.readFileSync(new URL("./background.js", `file://${__filename}`), "utf8");
 const extensionLibraryAssets = [
-  "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input.js",
+  "lib/transport.js", "lib/frame-tree.js", "lib/debugger-sessions.js", "lib/presentation-input.js", "lib/input-scripts.js", "lib/typing-support.js", "lib/input.js",
   "lib/editor-adapters.js", "lib/observation.js", "lib/pointer.js", "lib/resource-keys.js",
   "lib/owned-resources.js", "lib/presentation-slots.js", "lib/tab-control.js", "lib/owned-open.js",
 ];
@@ -3350,7 +3350,12 @@ async function waitFor(predicate, description) {
   await new Promise(resolve => setTimeout(resolve, 0));
   const coldPort = nativePorts.at(-1);
   coldPort.hostMessage({ type: "ready" });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  // `ready` awaits the extension build digest and the lease journal before the
+  // worker reports capabilities. Creating a tab before that handshake finishes
+  // is refused by design, so wait for the handshake instead of assuming one
+  // macrotask is enough under full-suite load.
+  await waitFor(() => coldPort.sent.some(message => message.type === "capabilities"),
+    "cold worker capabilities after ready");
   const coldReuseUrl = "https://example.test/owned-window-reuse";
   const coldRequest = { type: "create_tab", request_id: "b".repeat(32), url: coldReuseUrl,
     idempotency_key: "client-fixture:cold-reuse-1234", active: false, create_background_window: true,

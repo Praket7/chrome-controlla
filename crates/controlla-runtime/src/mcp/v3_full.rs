@@ -12,6 +12,9 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
+#[path = "../mcp/v3_canvas_proof.rs"]
+mod canvas_proof;
+use canvas_proof::{verify_canvas_document_text, verify_canvas_text_present};
 use sha2::Digest as _;
 use std::{
     future::Future,
@@ -2312,14 +2315,19 @@ impl AppV3 {
                 "background_safe":true
             }));
         }
+        let moved = result["before"]["x"] != result["after"]["x"]
+            || result["before"]["y"] != result["after"]["y"]
+            || scroll_to_target;
         Ok(json!({
-            "status":"verified",
+            "status":if moved {"verified"} else {"inconclusive"},
+            "reason_code":if moved {Value::Null} else {json!("scroll_offset_unchanged")},
             "action":if scroll_to_target {"scroll_to"} else {"scroll"},
             "dispatch_acknowledged":true,
             "dispatch_may_have_occurred":true,
             "background_safe":true,
             "transport":"dom_scroll",
             "reference":reference,
+            "viewport_moved":moved,
             "readback":result
         }))
     }
@@ -3036,9 +3044,9 @@ impl V3ReadyWhen {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("allOf" = [{
     "if":{"properties":{"action":{"const":"scroll"}},"required":["action"]},
-    "then":{"required":["delta_x","delta_y"],"oneOf":[
-        {"properties":{"delta_x":{"type":"integer","minimum":-1200,"maximum":1200,"not":{"const":0}},"delta_y":{"type":"integer","const":0}}},
-        {"properties":{"delta_x":{"type":"integer","const":0},"delta_y":{"type":"integer","minimum":-1200,"maximum":1200,"not":{"const":0}}}}
+    "then":{"oneOf":[
+        {"required":["delta_x"],"properties":{"delta_x":{"type":"integer","minimum":-1200,"maximum":1200,"not":{"const":0}},"delta_y":{"type":"integer","const":0}}},
+        {"required":["delta_y"],"properties":{"delta_x":{"type":"integer","const":0},"delta_y":{"type":"integer","minimum":-1200,"maximum":1200,"not":{"const":0}}}}
     ]}
 }, {
     "if":{"properties":{"action":{"const":"scroll_to"}},"required":["action"]},
@@ -6251,12 +6259,16 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "kind",
         "action",
         "typing_mode",
+        "bulk_insert",
+        "completed_chars",
         "verified",
         "reason_code",
         "reference",
         "url",
         "elapsed_ms",
         "verification",
+        "document_text",
+        "readback",
         "identity",
         "document",
         "coverage",
@@ -6375,6 +6387,12 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
         "step",
         "kind",
         "action",
+        "typing_mode",
+        "bulk_insert",
+        "completed_chars",
+        "verification",
+        "document_text",
+        "readback",
         "verified",
         "dispatch_acknowledged",
         "reason_code",
@@ -6465,6 +6483,10 @@ fn compact_v3_workflow_step(value: Value, intermediate_snapshot: bool, mutation:
             "url_truncated",
             "action",
             "typing_mode",
+            "bulk_insert",
+            "completed_chars",
+            "verification",
+            "document_text",
             "verified",
             "dispatch_acknowledged",
             "reason_code",
@@ -6907,6 +6929,10 @@ fn compact_v3_step_for_response_budget(value: Value) -> Value {
             "url",
             "action",
             "typing_mode",
+            "bulk_insert",
+            "completed_chars",
+            "verification",
+            "document_text",
             "verified",
             "dispatch_acknowledged",
             "reason_code",
@@ -13723,6 +13749,8 @@ async fn hidden_canvas_editor_refusal(app: &AppV3, args: &V3ActArgs) -> Option<V
     )
 }
 
+
+
 /// Dispatch one trusted key chord through the shared extension. Used only for
 /// the document-text readback copy: select all, copy, and collapse the
 /// resulting selection.
@@ -13877,183 +13905,7 @@ async fn execute_page_copy(
     }
 }
 
-/// Prove a canvas-editor insertion against the document itself.
-///
-/// The editable element never reports the typed text, and the page's DOM text
-/// does not contain it (Google Docs paints a canvas). The document's own copy
-/// path does: select all, copy, and read the plain-text flavor from the local
-/// clipboard. The browser's editing commands are used (not bare key events), so
-/// the editor that owns the selection performs the copy the same way a user's
-/// shortcut would. The user's clipboard is captured first and restored
-/// afterwards, and only derived evidence (lengths, a hash, and window-match
-/// counts) is returned.
-async fn verify_canvas_document_text(
-    connection: &super::super::PageSessionTransport,
-    registry: &controlla_browser::sessions::SessionRegistry,
-    handle: &controlla_browser::sessions::SessionHandle,
-    tab_id: &str,
-    object_id: &str,
-    typed: &str,
-    deadline: tokio::time::Instant,
-) -> Value {
-    use crate::document_text;
-    let unavailable = |verification: &'static str| {
-        json!({
-            "status": "dispatched_unverified",
-            "verification": verification,
-            "document_text": Value::Null
-        })
-    };
-    let sampled = document_text::verification_windows(typed).len();
-    if sampled == 0 {
-        return unavailable("too_short_for_text_match");
-    }
-    let cutoff = deadline.min(tokio::time::Instant::now() + Duration::from_secs(8));
-    // Chrome withholds the document copy path from a hidden tab: the selection
-    // never reaches the editor, so every readback would compare the user's
-    // untouched clipboard against the document and call a successful insert a
-    // mismatch. Say why instead, and leave the clipboard alone.
-    if document_tab_visible(connection, registry, handle, tab_id, cutoff).await == Some(false) {
-        return json!({
-            "status": "dispatched_unverified",
-            "verification": "tab_hidden",
-            "document_text": Value::Null,
-            "reason": "the document was not read because Chrome keeps a hidden tab's selection and clipboard out of reach",
-            "next_action": "Bring this tab to the foreground and read the inserted text in the document; do not replay the insertion."
-        });
-    }
-    let modifiers = if cfg!(target_os = "macos") { 4 } else { 2 };
-    let selected = press_shortcut(connection, registry, handle, tab_id, cutoff, "a", "KeyA", 65, modifiers).await;
-    // A background tab can swallow the OS copy shortcut, but the document can
-    // still answer the copy event itself: dispatching `copy` with a writable
-    // DataTransfer lets the editor write the selection into our own buffer.
-    // That proves the insertion without touching the user's clipboard at all.
-    let mut copy_event_characters = 0_usize;
-    for attempt in 0..6 {
-        if tokio::time::Instant::now() >= cutoff {
-            break;
-        }
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        if let Some(document) = copy_document_selection_event(
-            connection,
-            registry,
-            handle,
-            tab_id,
-            object_id,
-            cutoff,
-        )
-        .await
-        {
-            copy_event_characters = document.chars().count();
-            let result = document_text::verify_typed_text(typed, &document);
-            if result.proven() {
-                return json!({
-                    "status": "verified",
-                    "verification": "document_copy_event",
-                    "document_text": {
-                        "characters": document.chars().count(),
-                        "hash": document_text::text_hash(&document),
-                        "matched_windows": result.matched_windows,
-                        "sampled_windows": result.sampled_windows,
-                        "exact_contains": result.exact_contains,
-                        "attempts": attempt + 1
-                    }
-                });
-            }
-        }
-    }
-    let Some(clipboard) = document_text::Clipboard::capture().await else {
-        let mut receipt = unavailable("clipboard_unavailable");
-        receipt["copy_event_characters"] = json!(copy_event_characters);
-        return receipt;
-    };
-    let copied = if selected {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        press_shortcut(connection, registry, handle, tab_id, cutoff, "c", "KeyC", 67, modifiers).await
-    } else {
-        false
-    };
-    let mut latest: Option<(String, document_text::TextMatch)> = None;
-    if copied {
-        for _ in 0..24 {
-            if tokio::time::Instant::now() >= cutoff {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            if let Some(text) = clipboard.read().await {
-                let result = document_text::verify_typed_text(typed, &text);
-                let proven = result.proven();
-                latest = Some((text, result));
-                if proven {
-                    break;
-                }
-            }
-        }
-        // A hidden tab can swallow the shortcut before the editor sees it. The
-        // same copy command is still reachable from the document itself with
-        // user activation, so ask for it once more before giving up.
-        if !latest.as_ref().is_some_and(|(_, result)| result.proven()) {
-            let _ = execute_page_copy(connection, registry, handle, tab_id, cutoff).await;
-            for _ in 0..12 {
-                if tokio::time::Instant::now() >= cutoff {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                if let Some(text) = clipboard.read().await {
-                    let result = document_text::verify_typed_text(typed, &text);
-                    let proven = result.proven();
-                    latest = Some((text, result));
-                    if proven {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    // Collapse the select-all selection and return the user's clipboard even if
-    // the copy or comparison failed.
-    let _ = press_shortcut(connection, registry, handle, tab_id, cutoff, "ArrowRight", "ArrowRight", 39, 0).await;
-    let restored = clipboard.restore().await;
-    match latest {
-        Some((document, result)) if result.proven() => json!({
-            "status": "verified",
-            "verification": "clipboard_document_text",
-            "document_text": {
-                "characters": document.chars().count(),
-                "hash": document_text::text_hash(&document),
-                "matched_windows": result.matched_windows,
-                "sampled_windows": result.sampled_windows,
-                "exact_contains": result.exact_contains,
-                "clipboard_restored": restored
-            }
-        }),
-        Some((document, result)) => json!({
-            "status": "dispatched_unverified",
-            "verification": "clipboard_text_mismatch",
-            "copy_event_characters": copy_event_characters,
-            "document_text": {
-                "characters": document.chars().count(),
-                "hash": document_text::text_hash(&document),
-                "matched_windows": result.matched_windows,
-                "sampled_windows": result.sampled_windows,
-                "exact_contains": result.exact_contains,
-                "clipboard_restored": restored
-            }
-        }),
-        None => {
-            let mut unavailable = unavailable(if copied {
-                "clipboard_read_failed"
-            } else {
-                "clipboard_copy_failed"
-            });
-            unavailable["copy_event_characters"] = json!(copy_event_characters);
-            unavailable["document_text"] = json!({"characters": Value::Null, "clipboard_restored": restored});
-            unavailable
-        }
-    }
-}
+
 
 fn direct_action_budget(args: &V3ActArgs) -> crate::v3::CommandBudget {
     let mut budget = crate::v3::CommandBudget::interactive_default();
@@ -14200,6 +14052,10 @@ async fn rich_block_type(
     text: &str,
     typing_mode: &str,
 ) -> Result<Value, rmcp::ErrorData> {
+    // A canvas editor (Google Docs) keeps its editable in an event-target
+    // frame whose DOM never receives the text. One trusted Input.insertText is
+    // still the cheapest way to deliver a block; only the verification changes.
+    let unreadable = editor_value_unreadable(app, args, reference).await;
     let legacy_reference =
         resolve_reference(&app.core, &args.session_id, &args.chrome_tab_id, reference).await?;
     let live = app
@@ -14265,8 +14121,8 @@ async fn rich_block_type(
         expected,
         true,
         true,
-        true,
-        true,
+        !unreadable,
+        !unreadable,
         tokio::time::Instant::now() + Duration::from_secs(30),
     )
     .await?;
@@ -14298,6 +14154,42 @@ async fn rich_block_type(
         return Ok(
             json!({"status":"unknown","action":"type","typing_mode":"block","dispatch_may_have_occurred":true,"reason":format!("text insertion delivery is unknown; inspect state and do not retry: {error}")}),
         );
+    }
+    if unreadable {
+        let connection = shared.connection.as_ref().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let proof = verify_canvas_document_text(
+            connection,
+            shared.registry()?,
+            &shared.handle,
+            &args.chrome_tab_id,
+            &snapshot.object_id,
+            &format!("{expected}{text}"),
+            deadline,
+        )
+        .await;
+        let status = proof["status"].as_str().unwrap_or("dispatched_unverified");
+        let mut receipt = json!({
+            "status": status,
+            "action": "type",
+            "typing_mode": typing_mode,
+            "dispatch_acknowledged": true,
+            "dispatch_may_have_occurred": true,
+            "bulk_insert": true,
+            "completed_chars": text.chars().count(),
+            "verification": proof["verification"],
+            "document_text": proof["document_text"],
+            "surface": {"canvas": false, "event_target_frame": true, "text_readable": false},
+            "next_action": if status == "verified" {
+                Value::Null
+            } else {
+                json!("Read the document text to confirm the insertion; do not replay this transaction.")
+            }
+        });
+        if let Some(reason) = proof.get("reason") {
+            receipt["reason"] = reason.clone();
+        }
+        return Ok(receipt);
     }
     let final_value = format!("{expected}{text}");
     let readback = {
@@ -14598,6 +14490,23 @@ enum EditorRebind {
 /// revision does not. Mutations still refuse to dispatch unless exactly one
 /// editable candidate matches — a focused match is accepted when every other
 /// named candidate is unpainted.
+async fn editor_identity(
+    app: &AppV3,
+    session_id: &str,
+    tab_id: &str,
+    reference: &str,
+) -> Option<(String, String, String)> {
+    let state = app.core.semantic.lock().await;
+    let item = state.get(&super::tab_key(session_id, tab_id))?.items.get(reference)?;
+    let role = item["role"].as_str()?.trim();
+    let name = item["name"].as_str()?.trim();
+    let tag = item["tag"].as_str()?.trim().to_ascii_uppercase();
+    if role.is_empty() || name.is_empty() || tag.is_empty() {
+        return None;
+    }
+    Some((role.to_owned(), name.to_owned(), tag))
+}
+
 async fn rebind_editor_object(
     connection: &super::super::PageSessionTransport,
     registry: &controlla_browser::sessions::SessionRegistry,
@@ -14797,26 +14706,14 @@ async fn key_type(
         // document, immediately before dispatch. Refuse unless exactly one
         // editable candidate matches, so a rebind can never reach a different
         // control than the one that was observed.
-        let identity = app
-            .core
-            .semantic
-            .lock()
-            .await
-            .get(&super::tab_key(&args.session_id, &args.chrome_tab_id))
-            .and_then(|state| state.items.get(reference).cloned());
-        let role = identity
-            .as_ref()
-            .and_then(|item| item["role"].as_str())
-            .unwrap_or_default();
-        let name = identity
-            .as_ref()
-            .and_then(|item| item["name"].as_str())
-            .unwrap_or_default();
-        let tag = identity
-            .as_ref()
-            .and_then(|item| item["tag"].as_str())
-            .map(str::to_ascii_uppercase)
-            .unwrap_or_default();
+        let identity = editor_identity(
+            app,
+            &args.session_id,
+            &args.chrome_tab_id,
+            reference,
+        )
+        .await;
+        let (role, name, tag) = identity.unwrap_or_default();
         if role.is_empty() || name.is_empty() || tag.is_empty() {
             let mut receipt = pre_dispatch_stale_receipt("type", Some(mode_label));
             receipt["resolution"] = json!({
@@ -14836,8 +14733,8 @@ async fn key_type(
                 shared.registry()?,
                 &shared.handle,
                 &args.chrome_tab_id,
-                role,
-                name,
+                &role,
+                &name,
                 &tag,
             )
             .await?
@@ -14881,7 +14778,7 @@ async fn key_type(
     // so focus is not a precondition there. An unreadable surface also cannot
     // satisfy a value precondition: demanding one refuses an empty document
     // whose raw value is two zero-width marks, which blocked Google Docs typing.
-    let (preflight, executed) = complete_editor_guard(
+    let (mut preflight, executed) = complete_editor_guard(
         shared
             .connection
             .as_ref()
@@ -14899,6 +14796,79 @@ async fn key_type(
         deadline,
     )
     .await?;
+    // A retained node can detach between the snapshot and the guard even when
+    // the document identity did not change (Google Docs recreates its
+    // event-target document as the editor settles). Re-resolve the same
+    // control by exact role/name/tag and retry the preflight once. Refuse on
+    // ambiguity, and never rebind after any input was dispatched.
+    if preflight["ok"] != true
+        && preflight["reason"].as_str() == Some("target_replaced")
+        && !rebound_target
+        && let Some((role, name, tag)) = editor_identity(
+            app,
+            &args.session_id,
+            &args.chrome_tab_id,
+            reference,
+        )
+        .await
+        && let Some(connection) = shared.connection.as_ref()
+    {
+            match rebind_editor_object(
+                connection,
+                shared.registry()?,
+                &shared.handle,
+                &args.chrome_tab_id,
+                &role,
+                &name,
+                &tag,
+            )
+            .await?
+            {
+                EditorRebind::Rebound { object_id } => {
+                    snapshot.object_id = object_id;
+                    resolution = json!({
+                        "status":"rebound",
+                        "by":"role_and_accessible_name",
+                        "role":role,
+                        "name":name,
+                        "tag":tag,
+                        "attempts":1,
+                        "epoch_changed":false,
+                        "trigger":"target_replaced"
+                    });
+                    preflight = complete_editor_guard(
+                        connection,
+                        shared.registry()?,
+                        &shared.handle,
+                        &args.chrome_tab_id,
+                        &snapshot.object_id,
+                        index,
+                        &progress,
+                        true,
+                        rich_editor,
+                        false,
+                        !unreadable_surface,
+                        deadline,
+                    )
+                    .await?
+                    .0;
+                }
+                EditorRebind::Refused {
+                    reason,
+                    candidates,
+                    editable,
+                } => {
+                    resolution = json!({
+                        "status":"not_rebound",
+                        "reason":reason,
+                        "candidates":candidates,
+                        "editable_surfaces":editable,
+                        "epoch_changed":false,
+                        "trigger":"target_replaced"
+                    });
+                }
+            }
+    }
     if preflight["ok"] != true {
         let mut receipt =
             json!({"status":"not_dispatched","action":"type","reason":preflight["reason"],"readback":preflight});
@@ -14930,7 +14900,7 @@ async fn key_type(
                 receipt["target_state"] = probe;
             }
         }
-        executed.attach(&mut receipt);
+        receipt["resolution"] = resolution;
         receipt["recovery_stage"] = json!("internal_ladder_exhausted");
         return Ok(receipt);
     }
@@ -19422,11 +19392,11 @@ impl AppV3 {
         )
         .map_err(invalid)?;
         if args.action == "scroll" {
-            let (Some(delta_x), Some(delta_y)) = (args.delta_x, args.delta_y) else {
-                return Ok(Json(
-                    json!({"status":"not_dispatched","action":"scroll","reason_code":"wheel_delta_required","dispatch_may_have_occurred":false,"reason":"scroll requires integer delta_x and delta_y; exactly one must be nonzero."}),
-                ));
-            };
+            // A one-axis scroll is the common call. An omitted axis is zero, not
+            // a missing argument; validate_wheel_delta still rejects both zero
+            // and out-of-range magnitudes before dispatch.
+            let delta_x = args.delta_x.unwrap_or(0);
+            let delta_y = args.delta_y.unwrap_or(0);
             if let Err(reason) = super::validate_wheel_delta(delta_x, delta_y) {
                 return Ok(Json(
                     json!({"status":"not_dispatched","action":"scroll","reason_code":"invalid_wheel_delta","dispatch_may_have_occurred":false,"reason":reason}),
@@ -19709,7 +19679,10 @@ impl AppV3 {
                     if background_mutation && !background_policy.is_some_and(|policy| policy.allow_scroll) {
                         return Ok(json!({"status":"not_dispatched","action":"scroll","reason_code":"execution_policy_forbids_scroll","dispatch_may_have_occurred":false}));
                     }
-                    let reference=args.reference.as_deref().ok_or_else(||invalid("scroll requires a fresh semantic reference"))?;
+                    // Page scroll does not need a target: a wheel over the
+                    // document scrolls the viewport. A container scroll still
+                    // names one, and scroll_to always requires it.
+                    let reference=args.reference.as_deref().unwrap_or_default();
                     if background_mutation {
                         return self.background_dom_scroll(
                             &args.session_id,
@@ -19719,6 +19692,12 @@ impl AppV3 {
                             args.delta_y.ok_or_else(||invalid("scroll requires delta_y"))?,
                             false,
                         ).await;
+                    }
+                    if reference.is_empty() {
+                        return Ok(json!({"status":"not_dispatched","action":"scroll",
+                            "reason_code":"page_scroll_requires_background",
+                            "dispatch_may_have_occurred":false,
+                            "reason":"Foreground page scroll needs a target in this build; run mode=background or name a scrollable element."}));
                     }
                     let presentation=if background_mutation {presentation_state(self,&args.session_id,&args.chrome_tab_id).await} else {None};
                     if background_mutation {
@@ -19917,6 +19896,13 @@ impl AppV3 {
                     if background_mutation && !required && args.typing_mode.as_deref().unwrap_or("block") == "block" {
                         let reference = args.reference.as_deref().ok_or_else(|| invalid("type requires reference"))?;
                         let expected = args.expected_value.clone().unwrap_or_default();
+                        // A canvas editor keeps its editable in an event-target
+                        // frame. The background DOM path writes through the page
+                        // bridge and cannot reach it; one trusted bulk insertion
+                        // can, and it verifies against the document text.
+                        if editor_value_unreadable(self, &args, reference).await {
+                            return rich_block_type(self, &args, reference, &expected, args.value.as_deref().unwrap_or_default(), "block").await;
+                        }
                         let mut final_value = expected.clone();
                         final_value.push_str(args.value.as_deref().unwrap_or_default());
                         let mut background_args = args.clone();
@@ -24787,6 +24773,10 @@ impl AppV3 {
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         measured_receipt(async {
             self.require_v3_session(&args.session_id).await?;
+            let canvas_text = match &args.predicate {
+                BrowserPredicate::TextPresent { scope: None, text } => Some(text.clone()),
+                _ => None,
+            };
             let receipt = verify_impl(
                 &self.core,
                 &BrowserVerifyArgs {
@@ -24796,6 +24786,23 @@ impl AppV3 {
                 },
             )
             .await?;
+            let receipt = if receipt["status"] == "passed" || receipt["verified"] == true {
+                receipt
+            } else if let Some(text) = canvas_text {
+                match verify_canvas_text_present(
+                    self,
+                    &args.session_id,
+                    &args.chrome_tab_id,
+                    &text,
+                )
+                .await
+                {
+                    Some(proof) => proof,
+                    None => receipt,
+                }
+            } else {
+                receipt
+            };
             if args.reconcile_unknown && receipt["status"] == "passed" {
                 let target = lease_target_key(&args.session_id, &args.chrome_tab_id);
                 let released = process_lease_coordinator()
@@ -27420,16 +27427,20 @@ mod v3_batch_delivery_tests {
                 .iter()
                 .any(|field| field == "reference")
         );
-        assert!(
-            scroll_schema["then"]["required"]
-                .as_array()
-                .is_some_and(|required| required.contains(&json!("delta_x"))
-                    && required.contains(&json!("delta_y")))
-        );
-        assert_eq!(
-            scroll_schema["then"]["oneOf"].as_array().map(Vec::len),
-            Some(2)
-        );
+        // A one-axis scroll is valid: the omitted axis defaults to zero, and
+        // the schema must say so rather than requiring both fields.
+        let scroll_variants = scroll_schema["then"]["oneOf"]
+            .as_array()
+            .expect("scroll action schema variants");
+        assert_eq!(scroll_variants.len(), 2);
+        assert!(scroll_variants.iter().any(|variant| {
+            variant["required"].as_array() == Some(&vec![json!("delta_y")])
+                && variant["properties"]["delta_x"]["const"] == 0
+        }));
+        assert!(scroll_variants.iter().any(|variant| {
+            variant["required"].as_array() == Some(&vec![json!("delta_x")])
+                && variant["properties"]["delta_y"]["const"] == 0
+        }));
         let mut schema_actions = browser_schema["properties"]["action"]["enum"]
             .as_array()
             .expect("browser action schema enum")

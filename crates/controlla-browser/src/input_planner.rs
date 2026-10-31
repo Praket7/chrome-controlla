@@ -32,7 +32,7 @@ pub fn plan(text: &str, requires_trusted: bool, prefers_composition: bool) -> In
     let characteristics = InputCharacteristics {
         ordinary_text_control: !requires_trusted,
         requires_trusted_events: requires_trusted,
-        ime_required: prefers_composition || !text.is_ascii(),
+        ime_required: prefers_composition,
         value_length: text.len(),
         ..InputCharacteristics::default()
     };
@@ -144,7 +144,9 @@ mod tests {
     fn planner_chooses_canonical_modes() {
         assert_eq!(plan("hello", false, false).mode, InputMode::Block);
         assert_eq!(plan("hello", true, false).mode, InputMode::FastKeys);
-        assert_eq!(plan("こんにちは", false, false).mode, InputMode::Ime);
+        // Unicode is inserted as written, not treated as composition.
+        assert_eq!(plan("こんにちは", false, false).mode, InputMode::Block);
+        assert_eq!(plan("こんにちは", false, true).mode, InputMode::Ime);
     }
 
     #[test]
@@ -152,7 +154,11 @@ mod tests {
         let program = compile_microprogram("hello", InputMode::Block);
         assert_eq!(program.steps.len(), 3);
         assert!(matches!(program.steps[2], MicroStep::Composition { .. }));
-        let keys = compile_microprogram("ab", InputMode::FastKeys);
+        // Fast keys are one bounded insertion, not a key microprogram.
+        let bulk = compile_microprogram("ab", InputMode::FastKeys);
+        assert!(matches!(bulk.steps[2], MicroStep::Composition { .. }));
+        // Human pacing keeps per-character delivery.
+        let keys = compile_microprogram("ab", InputMode::HumanKeys);
         assert_eq!(
             keys.steps
                 .iter()

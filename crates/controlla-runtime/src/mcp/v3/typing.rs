@@ -36,10 +36,13 @@ pub fn human_keys_control_character(text: &str) -> Option<char> {
 
 pub fn backend_for_mode(mode: PublicTypingMode) -> InputBackend {
     match mode {
-        PublicTypingMode::Block => InputBackend::InsertText,
-        PublicTypingMode::FastKeys | PublicTypingMode::HumanKeys => InputBackend::KeyEvents,
+        // Fast typing is bulk insertion. One CDP command covers a whole block;
+        // it is not a trusted key event per character.
+        PublicTypingMode::Block | PublicTypingMode::FastKeys | PublicTypingMode::Auto => {
+            InputBackend::InsertText
+        }
+        PublicTypingMode::HumanKeys => InputBackend::KeyEvents,
         PublicTypingMode::Ime => InputBackend::ImeComposition,
-        PublicTypingMode::Auto => InputBackend::InsertText,
     }
 }
 
@@ -48,13 +51,12 @@ pub fn pace_for_mode(mode: PublicTypingMode, delay_ms: u16) -> InputPace {
         PublicTypingMode::HumanKeys => InputPace::Human {
             delay_ms: delay_ms.min(600),
         },
-        PublicTypingMode::FastKeys => InputPace::Adaptive {
-            min_ms: 0,
-            max_ms: 4,
-        },
-        PublicTypingMode::Block | PublicTypingMode::Ime | PublicTypingMode::Auto => {
-            InputPace::Immediate
-        }
+        // Bulk insertion is one bounded dispatch per block; no per-character
+        // pause.
+        PublicTypingMode::FastKeys
+        | PublicTypingMode::Block
+        | PublicTypingMode::Ime
+        | PublicTypingMode::Auto => InputPace::Immediate,
     }
 }
 
@@ -68,7 +70,7 @@ pub fn chunk_chars_for(backend: InputBackend) -> usize {
 pub fn verify_every_for(mode: PublicTypingMode) -> u16 {
     match mode {
         PublicTypingMode::HumanKeys => 1,
-        PublicTypingMode::FastKeys => 4,
+        PublicTypingMode::FastKeys => 1,
         PublicTypingMode::Block | PublicTypingMode::Ime | PublicTypingMode::Auto => 1,
     }
 }
@@ -150,7 +152,10 @@ pub enum TransactionTarget {
 pub fn strategy_for(mode: PublicTypingMode) -> &'static str {
     match mode {
         PublicTypingMode::Block | PublicTypingMode::Auto => "insert_text",
-        PublicTypingMode::FastKeys | PublicTypingMode::HumanKeys => "key_events",
+        // The extension sizes this as a bounded bulk insertion and keeps the
+        // same guards and document-readback verification.
+        PublicTypingMode::FastKeys => "bulk_insert",
+        PublicTypingMode::HumanKeys => "key_events",
         PublicTypingMode::Ime => "ime",
     }
 }
@@ -168,8 +173,8 @@ pub fn extension_transaction_payload(
         "operation": "append",
         "text": text,
         "strategy": strategy_for(mode),
-        "chunk_chars": if mode == PublicTypingMode::HumanKeys { 8 } else { 64 },
-        "verify_every_chunks": if mode == PublicTypingMode::HumanKeys { 1 } else { 4 },
+        "chunk_chars": if mode == PublicTypingMode::HumanKeys { 8 } else if mode == PublicTypingMode::FastKeys { 1024 } else { 256 },
+        "verify_every_chunks": 1,
         "pacing_ms": if mode == PublicTypingMode::HumanKeys { delay_ms } else { 0 },
         "normalize_paragraphs": true,
         "deadline_ms": deadline_ms.clamp(1, 900_000),
@@ -209,6 +214,8 @@ pub fn compact_transaction_receipt(
             PublicTypingMode::Ime => "ime",
         },
         "input_method": receipt["backend"],
+        "text_semantics": receipt["text_semantics"],
+        "bulk_insert": receipt["bulk_insert"],
         "completed_chars": receipt["completed_chars"],
         "key_events": receipt["key_events"],
         "cdp_commands": receipt["cdp_commands"],
@@ -249,8 +256,9 @@ mod tests {
         );
         assert_eq!(
             backend_for_mode(PublicTypingMode::FastKeys),
-            InputBackend::KeyEvents
+            InputBackend::InsertText
         );
+        assert_eq!(strategy_for(PublicTypingMode::FastKeys), "bulk_insert");
         assert_eq!(
             backend_for_mode(PublicTypingMode::HumanKeys),
             InputBackend::KeyEvents

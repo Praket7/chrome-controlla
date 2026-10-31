@@ -223,13 +223,41 @@ pub fn pace_for(mode: PublicTypingMode, delay_ms: u16) -> InputPace {
         PublicTypingMode::HumanKeys => InputPace::Human {
             delay_ms: delay_ms.min(600),
         },
-        PublicTypingMode::FastKeys => InputPace::Adaptive {
-            min_ms: 0,
-            max_ms: 4,
-        },
-        PublicTypingMode::Block | PublicTypingMode::Ime | PublicTypingMode::AppAdapter => {
-            InputPace::Immediate
+        // Bulk insertion is one bounded dispatch per block; a per-character
+        // adaptive pause would only add latency.
+        PublicTypingMode::FastKeys
+        | PublicTypingMode::Block
+        | PublicTypingMode::Ime
+        | PublicTypingMode::AppAdapter => InputPace::Immediate,
+    }
+}
+
+// Text is inserted as written. Unicode does not imply IME composition: a
+// Japanese sentence is plain text, and only an explicit composition request or
+// a surface that requires composition takes the IME path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextSemantics {
+    PlainUnicodeInsert,
+    ImeComposition,
+}
+
+impl TextSemantics {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlainUnicodeInsert => "plain_unicode_insert",
+            Self::ImeComposition => "ime_composition",
         }
+    }
+}
+
+pub fn classify_text_semantics(
+    mode: PublicTypingMode,
+    composition_sensitive: bool,
+) -> TextSemantics {
+    if mode == PublicTypingMode::Ime || composition_sensitive {
+        TextSemantics::ImeComposition
+    } else {
+        TextSemantics::PlainUnicodeInsert
     }
 }
 
@@ -275,18 +303,18 @@ pub fn compile_transaction(
                 }
             }
         }
-        PublicTypingMode::FastKeys | PublicTypingMode::HumanKeys => StrategyDecision {
+        PublicTypingMode::FastKeys => StrategyDecision {
+            // One bounded insertion covers a whole block. This is not a
+            // trusted key event per character.
+            backend: Some(InputBackend::InsertText),
+            chunk_chars: 1024,
+            verify_every_chunks: 1,
+            requires_app_adapter: false,
+        },
+        PublicTypingMode::HumanKeys => StrategyDecision {
             backend: Some(InputBackend::KeyEvents),
-            chunk_chars: if mode == PublicTypingMode::HumanKeys {
-                8
-            } else {
-                32
-            },
-            verify_every_chunks: if mode == PublicTypingMode::HumanKeys {
-                1
-            } else {
-                4
-            },
+            chunk_chars: 8,
+            verify_every_chunks: 1,
             requires_app_adapter: false,
         },
         PublicTypingMode::Ime => StrategyDecision {
@@ -324,7 +352,7 @@ pub fn plan_legacy(
     let characteristics = InputCharacteristics {
         ordinary_text_control: !requires_trusted,
         requires_trusted_events: requires_trusted,
-        ime_required: prefers_composition || !text.is_ascii(),
+        ime_required: prefers_composition,
         value_length: text.len(),
         ..InputCharacteristics::default()
     };
@@ -434,7 +462,7 @@ mod tests {
     fn table_driven_transaction_compilation_is_canonical() {
         let cases = [
             (PublicTypingMode::Block, InputBackend::NativeSetter),
-            (PublicTypingMode::FastKeys, InputBackend::KeyEvents),
+            (PublicTypingMode::FastKeys, InputBackend::InsertText),
             (PublicTypingMode::HumanKeys, InputBackend::KeyEvents),
             (PublicTypingMode::Ime, InputBackend::ImeComposition),
         ];
@@ -479,8 +507,23 @@ mod tests {
 
     #[test]
     fn unicode_and_newlines_are_not_app_adapter_exclusives() {
+        // Unicode is plain text; only an explicit composition request is IME.
         let decision = plan_legacy("こんにちは", false, false);
-        assert_eq!(decision.backend, Some(InputBackend::ImeComposition));
+        assert_eq!(decision.backend, Some(InputBackend::NativeSetter));
+        let composed = plan_legacy("こんにちは", false, true);
+        assert_eq!(composed.backend, Some(InputBackend::ImeComposition));
+        assert_eq!(
+            classify_text_semantics(PublicTypingMode::Block, false).label(),
+            "plain_unicode_insert"
+        );
+        assert_eq!(
+            classify_text_semantics(PublicTypingMode::Ime, false).label(),
+            "ime_composition"
+        );
+        assert_eq!(
+            classify_text_semantics(PublicTypingMode::Block, true).label(),
+            "ime_composition"
+        );
         let transaction = compile_transaction(
             PublicTypingMode::Ime,
             InputOperation::Replace,
@@ -491,6 +534,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(transaction.backend, InputBackend::ImeComposition);
+    }
+
+    #[test]
+    fn fast_keys_compile_to_one_bounded_insertion() {
+        let transaction = compile_transaction(
+            PublicTypingMode::FastKeys,
+            InputOperation::Append,
+            InputExpectation::Unchecked,
+            "0123456789",
+            characteristics(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(transaction.backend, InputBackend::InsertText);
+        assert_eq!(transaction.chunk_chars, 1024);
+        assert_eq!(transaction.pace, InputPace::Immediate);
     }
 
     #[test]

@@ -14,6 +14,8 @@ const EXTENSION_RUNTIME_ASSETS: &[&str] = &[
     "lib/frame-tree.js",
     "lib/debugger-sessions.js",
     "lib/presentation-input.js",
+    "lib/input-scripts.js",
+    "lib/typing-support.js",
     "lib/input.js",
     "lib/editor-adapters.js",
     "lib/observation.js",

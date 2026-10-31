@@ -1,5 +1,9 @@
 # Build progress
 
+## Docs bulk typing and bounded tab reuse — 2026-10-30
+
+The last live blocker in the bulk-text fast path is closed. Google Docs keeps its editable in an event-target frame around a canvas, so the DOM guard cannot read its value. A background `type` now recognises that surface, dispatches the whole block through one trusted `Input.insertText`, and verifies through the document's own copy event instead of a DOM readback. `verify {kind:"text_present"}` uses the same copy proof when the DOM has no answer. Live installed Chrome completed 1,027 characters in 1,475 ms and 4,027 characters in 1,595 ms; both persisted across a same-tab reopen, and the exact URL reused the session's existing tab instead of adding another. Background page scroll now works without a target, reports `inconclusive` when the viewport did not move, and retains its readback through the compact receipt. The canvas proof moved to `mcp/v3_canvas_proof.rs`; `v3_full.rs` is 31,987 lines under its 32,000-line ratchet. Full Rust workspace, strict Clippy, extension fixtures, Playwright Chrome tests, release/v3 checks, and the live Docs/ESPN script pass. The runtime's §17–§45 architecture and benchmark items remain open.
+
 ## Performance implementation — 2026-10-23
 
 Concrete changes and retained evidence are recorded in [the implementation ledger](performance-implementation-2026-10-23.md). This pass implements bounded collection, read batching, ordered storage workers, lease notifications, scoped/expiring costs, native WebMCP compatibility, independent basic fixture acceptance, and CI efficiency. Installed-client/site qualification and full prompt-to-outcome performance remain separate gates.

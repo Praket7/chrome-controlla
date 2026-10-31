@@ -1288,6 +1288,14 @@ mod tests {
                 include_bytes!("../../../extensions/chrome-controlla/lib/presentation-input.js"),
             ),
             (
+                "lib/input-scripts.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/input-scripts.js"),
+            ),
+            (
+                "lib/typing-support.js",
+                include_bytes!("../../../extensions/chrome-controlla/lib/typing-support.js"),
+            ),
+            (
                 "lib/input.js",
                 include_bytes!("../../../extensions/chrome-controlla/lib/input.js"),
             ),
